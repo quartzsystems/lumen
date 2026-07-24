@@ -81,6 +81,14 @@ jobs:
     needs: iso
     runs-on: ubuntu-latest
     steps:
+      - name: Enable KVM for the runner user
+        # /dev/kvm exists on hosted runners but is root-only by default;
+        # this is GitHub's documented udev recipe to open it up.
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
       - name: Install QEMU + OVMF
         run: |
           sudo apt-get update

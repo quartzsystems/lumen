@@ -78,7 +78,9 @@ make lint    # shellcheck, rpmlint, cargo fmt/clippy
 
 ## Installing the appliance
 
-Boot the ISO (UEFI, **Secure Boot disabled** — zfs.ko is unsigned); the
+Boot the ISO (UEFI, **Secure Boot disabled** — zfs.ko is unsigned; the
+media has **no BIOS boot path**, so VMs must use EFI firmware — in VMware
+Workstation: VM Settings → Options → Advanced → Firmware type → UEFI); the
 Quartz-styled installer asks exactly four questions: root password, time
 zone, management NIC (DHCP or static), and the boot drive. NICs are named
 `nic0…nicN` (PCI order) in the installer and identically on the installed
