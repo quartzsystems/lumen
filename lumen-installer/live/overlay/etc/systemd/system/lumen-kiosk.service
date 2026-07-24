@@ -9,6 +9,12 @@
 # starts the Kiosk compositor plus /usr/bin/gnome-kiosk-script, which
 # defers to /root/.local/bin/gnome-kiosk-script — our exec of
 # lumen-installer.
+#
+# No dbus-run-session wrapper: EL10 gnome-session delegates to the systemd
+# user session (pam_systemd starts user@0.service; dbus-broker provides the
+# user bus). An ad-hoc wrapper bus would split the session between two
+# buses — and /usr/bin/dbus-run-session isn't even installed (dbus-daemon
+# package), which made this unit fail with 203/EXEC.
 
 [Unit]
 Description=Lumen installer kiosk (gnome-kiosk on Wayland)
@@ -31,7 +37,7 @@ UtmpMode=user
 Environment=HOME=/root
 Environment=XDG_SESSION_TYPE=wayland
 Environment=GDK_BACKEND=wayland
-ExecStart=/usr/bin/dbus-run-session -- /usr/bin/gnome-session --session=gnome-kiosk-script
+ExecStart=/usr/bin/gnome-session --session=gnome-kiosk-script
 Restart=always
 RestartSec=2
 

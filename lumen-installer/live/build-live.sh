@@ -100,6 +100,26 @@ systemctl --root="$ROOT" enable \
     lumen-kiosk.service lumen-nicnames.service NetworkManager chronyd
 systemctl --root="$ROOT" set-default graphical.target
 
+# Gate: every binary the live units and the install engine invoke must
+# exist in the rootfs — a missing one otherwise surfaces only as a
+# 203/EXEC crash-loop on real hardware.
+echo "==> Gate: live environment binaries present"
+live_bins=(
+    /usr/bin/gnome-session /usr/bin/gnome-kiosk /usr/bin/gnome-kiosk-script
+    /usr/bin/lumen-installer /usr/sbin/lumen-nicnames /usr/sbin/agetty
+    /usr/bin/openssl /usr/bin/dnf /usr/sbin/zpool /usr/sbin/zfs
+    /usr/sbin/zgenhostid /usr/sbin/sgdisk /usr/sbin/mkfs.vfat
+    /usr/sbin/mkfs.ext4 /usr/sbin/wipefs /usr/sbin/partprobe
+    /usr/sbin/blkid /usr/sbin/efibootmgr /usr/sbin/ip /usr/sbin/chroot
+    /usr/bin/lsblk /usr/bin/findmnt /usr/bin/udevadm /usr/bin/systemctl
+)
+missing_bins=()
+for bin in "${live_bins[@]}"; do
+    [ -e "$ROOT$bin" ] || missing_bins+=("$bin")
+done
+[ "${#missing_bins[@]}" -eq 0 ] \
+    || die "live rootfs is missing binaries: ${missing_bins[*]}"
+
 echo "==> Building live initramfs (dracut dmsquash-live, no-hostonly)"
 chroot "$ROOT" dracut --force --no-hostonly --no-hostonly-cmdline \
     --no-hostonly-default-device \
