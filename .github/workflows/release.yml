@@ -52,34 +52,13 @@ jobs:
             dist/rpms/*.rpm
             dist/rpms/SHA256SUMS
 
+  # Shared with the manually triggerable ISO workflow (Actions tab ->
+  # "ISO" -> Run workflow); on release it attaches the ISO to the release.
   release-iso:
-    name: Build + publish ISO (AlmaLinux 10)
+    name: Build + publish ISO
     needs: release-rpms
-    runs-on: ubuntu-latest
-    container: almalinux:10
-    steps:
-      - name: Install build dependencies
-        run: dnf -y install rpm-build rpmdevtools createrepo_c pykickstart xorriso mtools isomd5sum make git-core
-      - uses: actions/checkout@v4
-      - name: Restore cached upstream ISO
-        uses: actions/cache@v4
-        with:
-          path: upstream.iso
-          key: upstream-iso-${{ hashFiles('iso/upstream.env') }}
-      - name: Download upstream ISO (cache miss only)
-        run: |
-          . iso/upstream.env
-          if [ ! -f upstream.iso ]; then
-            curl -fL --retry 3 -o upstream.iso "$UPSTREAM_ISO_URL"
-          fi
-          echo "$UPSTREAM_ISO_SHA256  upstream.iso" | sha256sum -c -
-      - name: Build ISO
-        run: |
-          . iso/upstream.env
-          make iso UPSTREAM_ISO="$PWD/upstream.iso" UPSTREAM_SHA256="$UPSTREAM_ISO_SHA256"
-      - name: Attach ISO to release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/*.iso
-            dist/*.iso.sha256
+    permissions:
+      contents: write
+    uses: ./.github/workflows/iso.yml
+    with:
+      attach-to-release: true

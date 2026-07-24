@@ -99,6 +99,12 @@ is pinned by URL + SHA-256 in `iso/upstream.env` and cached between runs
 with `actions/cache`; update that file (both values together, from the
 official CHECKSUM) to move to a new upstream point release.
 
+An ISO build can also be kicked off manually: Actions tab → **ISO** →
+*Run workflow* (`workflow_dispatch` on `.github/workflows/iso.yml`). Manual
+runs upload the ISO + `.sha256` as a workflow artifact named `lumen-iso`
+(14-day retention) instead of attaching to a release. The release workflow
+reuses the same job via `workflow_call`, so the two paths cannot drift.
+
 ## Notes and conventions
 
 - **Architecture**: AlmaLinux 10 standard x86_64 targets the x86-64-v3

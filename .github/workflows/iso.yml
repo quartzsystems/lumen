@@ -1,0 +1,60 @@
+# ISO build — runs fully unprivileged (see docs/build.md).
+#
+# Two entry points:
+#   - workflow_dispatch: manual run from the Actions tab; the ISO is
+#     uploaded as a workflow artifact (14-day retention).
+#   - workflow_call: invoked by release.yml on tag push with
+#     attach-to-release: true; the ISO is attached to the GitHub release.
+name: ISO
+
+on:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      attach-to-release:
+        description: Attach the ISO to the release for the current tag
+        type: boolean
+        default: false
+
+jobs:
+  iso:
+    name: Build ISO (AlmaLinux 10)
+    runs-on: ubuntu-latest
+    container: almalinux:10
+    steps:
+      - name: Install build dependencies
+        run: dnf -y install rpm-build rpmdevtools createrepo_c pykickstart xorriso mtools isomd5sum make git-core
+      - uses: actions/checkout@v4
+      - name: Restore cached upstream ISO
+        uses: actions/cache@v4
+        with:
+          path: upstream.iso
+          key: upstream-iso-${{ hashFiles('iso/upstream.env') }}
+      - name: Download upstream ISO (cache miss only)
+        run: |
+          . iso/upstream.env
+          if [ ! -f upstream.iso ]; then
+            curl -fL --retry 3 -o upstream.iso "$UPSTREAM_ISO_URL"
+          fi
+          echo "$UPSTREAM_ISO_SHA256  upstream.iso" | sha256sum -c -
+      - name: Build ISO
+        run: |
+          . iso/upstream.env
+          make iso UPSTREAM_ISO="$PWD/upstream.iso" UPSTREAM_SHA256="$UPSTREAM_ISO_SHA256"
+      - name: Attach ISO to release
+        if: inputs.attach-to-release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.iso
+            dist/*.iso.sha256
+      - name: Upload ISO as workflow artifact
+        if: ${{ !inputs.attach-to-release }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumen-iso
+          path: |
+            dist/*.iso
+            dist/*.iso.sha256
+          if-no-files-found: error
+          retention-days: 14
