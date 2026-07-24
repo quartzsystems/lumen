@@ -88,8 +88,8 @@ zone, management NIC (DHCP or static), and the boot drive. NICs are named
 `nic0…nicN` (PCI order) in the installer and identically on the installed
 system. The chosen drive is erased: EFI system partition + ext4 `/boot` +
 ZFS pool `rpool` holding the OS root dataset. Everything else is fixed
-appliance policy: minimal package set, SELinux enforcing (first boot
-relabels), firewalld with SSH only, chronyd enabled, hostname `lumen`.
+appliance policy: minimal package set, SELinux enforcing (labeled at
+install time), firewalld with SSH only, chronyd enabled, hostname `lumen`.
 Log in as `root` with the password chosen in the installer.
 
 ## Versioning
