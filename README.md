@@ -5,7 +5,7 @@
   </picture>
 </p>
 
-**Lumen — a KVM hypervisor built to illuminate your machines.**
+**Lumen — a KVM hypervisor built to illuminate your infrastructure.**
 
 Lumen is a KVM hypervisor platform by [Quartz Systems](https://www.quartzsystems.net).
 At this stage the repository contains the **appliance ISO with a custom
