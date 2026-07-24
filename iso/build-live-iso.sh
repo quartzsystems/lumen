@@ -40,8 +40,9 @@ VERSION="$(tr -d '[:space:]' < "$REPO_ROOT/VERSION")"
 [ -n "$VERSION" ] || die "VERSION file is empty"
 # shellcheck disable=SC1091
 . "$REPO_ROOT/iso/pins.env"
-[ -n "${KERNEL_NEVR:-}" ] && [ -n "${ZFS_REPO_URL:-}" ] && [ -n "${ZFS_SERIES:-}" ] \
-    || die "iso/pins.env is missing KERNEL_NEVR / ZFS_REPO_URL / ZFS_SERIES"
+if [ -z "${KERNEL_NEVR:-}" ] || [ -z "${ZFS_REPO_URL:-}" ] || [ -z "${ZFS_SERIES:-}" ]; then
+    die "iso/pins.env is missing KERNEL_NEVR / ZFS_REPO_URL / ZFS_SERIES"
+fi
 
 UPSTREAM_ISO="${UPSTREAM_ISO:-}"
 UPSTREAM_SHA256="${UPSTREAM_SHA256:-}"

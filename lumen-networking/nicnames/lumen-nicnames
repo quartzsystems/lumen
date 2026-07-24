@@ -46,7 +46,7 @@ mapfile -t nics < <(
         [ -e "$path/device" ] || continue            # physical devices only
         [ "$(cat "$path/type")" = "1" ] || continue  # ethernet only
         mac="$(cat "$path/address")"
-        [ -n "$mac" ] && [ "$mac" != "00:00:00:00:00:00" ] || continue
+        if [ -z "$mac" ] || [ "$mac" = "00:00:00:00:00:00" ]; then continue; fi
         printf '%s %s %s\n' "$(readlink -f "$path/device")" "$mac" "$dev"
     done | LC_ALL=C sort
 )
