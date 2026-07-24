@@ -127,7 +127,9 @@ efi_part="$(awk '/^GPT type GUID/ && /28732ac11ff8d211ba4b00a0c93ec93b/ {print $
 [ -n "$efi_part" ] || die "no EFI system partition found in $UPSTREAM_ISO (unexpected media layout)"
 read -r efi_start efi_size < <(awk -v p="$efi_part" \
     '$1=="GPT" && $2=="start" && $6==p {print $7, $8}' <<<"$sysarea")
-[ -n "${efi_start:-}" ] && [ -n "${efi_size:-}" ] || die "could not determine EFI partition geometry"
+if [ -z "${efi_start:-}" ] || [ -z "${efi_size:-}" ]; then
+    die "could not determine EFI partition geometry"
+fi
 echo "==> EFI partition: #$efi_part start=$efi_start size=$efi_size (512-byte blocks)"
 
 # --- extract the ISO tree ---------------------------------------------------
