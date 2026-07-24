@@ -196,6 +196,16 @@ rm -rf "$resolve_root"
 echo "==> Building lumen-installer (cargo, release)"
 locked=()
 [ -f "$REPO_ROOT/lumen-installer/app/Cargo.lock" ] && locked=(--locked)
+# Warm the registry with backoff first: on a cold cargo cache the initial
+# crates.io contact is the flakiest network step of the whole ISO build
+# (see packages/build-rpms.sh, which hardens its fetches the same way).
+for attempt in 1 2 3 4; do
+    CARGO_NET_RETRY=10 cargo fetch "${locked[@]}" \
+        --manifest-path "$REPO_ROOT/lumen-installer/app/Cargo.toml" && break
+    [ "$attempt" -lt 4 ] || die "cargo fetch failed after 4 attempts (crates.io unreachable?)"
+    echo "==> cargo fetch failed (attempt $attempt/4); retrying in $((attempt * 10))s"
+    sleep $((attempt * 10))
+done
 cargo build --release "${locked[@]}" \
     --manifest-path "$REPO_ROOT/lumen-installer/app/Cargo.toml" \
     --target-dir "$REPO_ROOT/build/cargo-target"

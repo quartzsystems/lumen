@@ -28,16 +28,32 @@ done
 rm -rf "$TOPDIR"
 mkdir -p "$TOPDIR"/{SOURCES,BUILD,RPMS,SRPMS} "$DIST_DIR"
 
+# The first crates.io contact is the fragile step of a cold-cache CI build
+# (a 2026-07-24 ISO run died on three straight connect failures inside
+# cargo's ~15s of built-in retries). Warm the registry with our own
+# backoff before building; the build itself then barely needs the network.
+cargo_fetch_with_retry() {
+    local manifest="$1" attempt
+    for attempt in 1 2 3 4; do
+        CARGO_NET_RETRY=10 cargo fetch --locked --manifest-path "$manifest" && return 0
+        [ "$attempt" -lt 4 ] || break
+        echo "==> cargo fetch failed (attempt $attempt/4); retrying in $((attempt * 10))s"
+        sleep $((attempt * 10))
+    done
+    die "cargo fetch failed after 4 attempts (crates.io unreachable?)"
+}
+
 # --- controlplane artifacts ---------------------------------------------------
 echo "==> Building lumen-controlplane (cargo, release)"
-locked=()
-[ -f "$REPO_ROOT/lumen-controlplane/Cargo.lock" ] && locked=(--locked)
-cargo build --release "${locked[@]}" \
+cargo_fetch_with_retry "$REPO_ROOT/lumen-controlplane/Cargo.toml"
+cargo build --release --locked \
     --manifest-path "$REPO_ROOT/lumen-controlplane/Cargo.toml" \
     --target-dir "$REPO_ROOT/build/cargo-target-cp"
 
 echo "==> Building lumen-webui (static export)"
-(cd "$REPO_ROOT/lumen-webui" && npm ci --no-audit --no-fund && npm run build)
+(cd "$REPO_ROOT/lumen-webui" && \
+    npm ci --no-audit --no-fund --fetch-retries=5 --fetch-retry-maxtimeout=60000 && \
+    npm run build)
 [ -f "$REPO_ROOT/lumen-webui/out/index.html" ] \
     || die "webui export missing (lumen-webui/out/index.html not produced)"
 tar -czf "$TOPDIR/SOURCES/lumen-webui.tar.gz" -C "$REPO_ROOT/lumen-webui/out" .
