@@ -142,12 +142,22 @@ chmod -R u+w "$TREE"
 [ -f "$TREE/EFI/BOOT/grub.cfg" ]   || die "unexpected media layout: no EFI/BOOT/grub.cfg"
 
 # --- brand the boot configuration -------------------------------------------
-# Point every LABEL= reference at the new volid and append the kickstart to
-# each kernel command line (grub2 config on the ISO plus BOOT.conf copy).
+# Point every LABEL= reference at the new volid, retitle the GRUB menu
+# entries ("Install AlmaLinux 10.x" -> "Install Lumen <version>"), and
+# append the kickstart to each kernel command line (grub2 config on the
+# ISO plus BOOT.conf copy). Titles are only touched on menuentry/submenu
+# lines so paths and kernel arguments stay intact.
 KS_ARG="inst.ks=hd:LABEL=$VOLID:/lumen.ks"
 brand_grub_cfg() {
-    sed -i -e "s/$OLD_VOLID/$VOLID/g" \
-           -e "/^[[:space:]]*linux\(efi\)\{0,1\}[[:space:]]/s|\$| $KS_ARG|" "$1"
+    sed -i \
+        -e "s/$OLD_VOLID/$VOLID/g" \
+        -e "/^[[:space:]]*\(menuentry\|submenu\)[[:space:]]/{
+                s/an AlmaLinux system/a Lumen system/g
+                s/AlmaLinux [0-9][0-9.]*/Lumen $VERSION/g
+                s/AlmaLinux/Lumen/g
+            }" \
+        -e "/^[[:space:]]*linux\(efi\)\{0,1\}[[:space:]]/s|\$| $KS_ARG|" \
+        "$1"
 }
 echo "==> Branding boot configs"
 brand_grub_cfg "$TREE/EFI/BOOT/grub.cfg"
