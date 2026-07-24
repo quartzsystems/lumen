@@ -14,7 +14,9 @@ VERSION := $(shell cat VERSION)
 
 SCRIPTS := packages/build-rpms.sh iso/build-live-iso.sh \
            lumen-installer/live/build-live.sh \
-           lumen-networking/nicnames/lumen-nicnames
+           lumen-networking/nicnames/lumen-nicnames \
+           branding/console/lumen-console-banner \
+           branding/console/50-lumen-banner
 SPECS   := packages/lumen-release.spec packages/lumen-logos.spec \
            packages/lumen-networking.spec
 CARGO_MANIFEST := lumen-installer/app/Cargo.toml
