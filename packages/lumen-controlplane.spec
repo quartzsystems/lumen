@@ -55,6 +55,26 @@ replaced with operator-provided files.
 install -D -p -m 0755 %{SOURCE0} %{buildroot}%{_sbindir}/lumen-controlplane
 mkdir -p %{buildroot}%{_datadir}/lumen-webui
 tar -xzf %{SOURCE1} -C %{buildroot}%{_datadir}/lumen-webui
+# The web console export repeats a lot of bytes: every route's index.txt is
+# identical to its __next._full.txt, and the per-segment navigation payloads
+# are shared verbatim across routes. That is inherent to the export format,
+# and it grows with the navigation tree — past a handful of routes it is
+# enough waste for rpmlint to fail the build (files-duplicated-waste).
+# Collapse the identical files into hardlinks: same bytes served, one copy
+# on disk and in the payload.
+(
+    cd %{buildroot}%{_datadir}/lumen-webui
+    prev=
+    keep=
+    find . -type f -exec sha256sum {} + | sort | while read -r sum path; do
+        if [ "$sum" = "$prev" ]; then
+            ln -f "$keep" "$path"
+        else
+            prev=$sum
+            keep=$path
+        fi
+    done
+)
 install -D -p -m 0644 %{SOURCE2} %{buildroot}%{_sysconfdir}/pam.d/lumen-controlplane
 install -D -p -m 0644 %{SOURCE3} %{buildroot}%{_unitdir}/lumen-controlplane.service
 install -D -p -m 0644 %{SOURCE4} %{buildroot}%{_prefix}/lib/firewalld/services/lumen-controlplane.xml
