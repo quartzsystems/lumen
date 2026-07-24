@@ -106,8 +106,16 @@ GPT: 1 GiB ESP + 2 GiB ext4 `/boot` + remainder ZFS pool `rpool`
 (the pool creator) into the target and the pool is exported before reboot,
 so the first import never needs force. `/etc/dracut.conf.d/zfs.conf` keeps
 the zfs module in every future initramfs, and `/etc/kernel/cmdline` carries
-the root argument for future kernel installs. First boot relabels for
-SELinux (`.autorelabel`) — allow a few minutes.
+the root argument for future kernel installs. The filesystem is
+SELinux-labeled at install time: the live kernel runs `selinux=0`, so the
+installer runs `setfiles -c` against the target's binary policy and the
+labels land as raw `security.selinux` xattrs (`xattr=sa`; the EL10 policy
+has `fs_use_xattr zfs`). First boot therefore comes up enforcing directly —
+no `.autorelabel` pass, which could never run anyway: enforcing boot on an
+unlabeled root fails before init ("Failed to allocate manager object").
+The boot menu reuses the ISO's Quartz gfxmenu theme: lumen-release ships it
+under `/usr/share/lumen-release/grub/` and the installer stages it, plus
+`unicode.pf2`, onto `/boot/grub2/`.
 
 **Secure Boot must be disabled**: zfs.ko is unsigned. The installer checks
 firmware state and refuses with a clear message otherwise.

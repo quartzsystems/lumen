@@ -15,9 +15,11 @@ URL:            https://www.quartzsystems.net
 BuildArch:      noarch
 
 Source0:        lumen-release.in
-Source1:        os-release-lumen.conf
+Source1:        os-release-lumen.conf.in
 Source2:        issue.in
 Source3:        motd.in
+Source4:        theme.txt
+Source5:        lumen-grub-bg.png
 
 # %%{?el10}: only pull the AlmaLinux base release package when building for
 # EL10; other build targets (future rebases) may provide their own.
@@ -40,8 +42,10 @@ identification, and branded login banner content.
 %install
 install -d -m 0755 %{buildroot}%{_sysconfdir}
 install -d -m 0755 %{buildroot}%{_datadir}/lumen-release
+install -d -m 0755 %{buildroot}%{_datadir}/lumen-release/grub
 
 sed 's/@VERSION@/%{version}/g' %{SOURCE0} > %{buildroot}%{_sysconfdir}/lumen-release
+sed 's/@VERSION@/%{version}/g' %{SOURCE1} > %{buildroot}%{_datadir}/lumen-release/os-release-lumen.conf
 sed 's/@VERSION@/%{version}/g' %{SOURCE2} > %{buildroot}%{_datadir}/lumen-release/issue
 # @ESC@ keeps the template readable in git; render it to a real escape byte
 # so the motd shows the Lumen mark in its brand greens (Quartz tokens
@@ -49,19 +53,25 @@ sed 's/@VERSION@/%{version}/g' %{SOURCE2} > %{buildroot}%{_datadir}/lumen-releas
 sed -e 's/@VERSION@/%{version}/g' \
     -e "s/@ESC@/$(printf '\033')/g" \
     %{SOURCE3} > %{buildroot}%{_datadir}/lumen-release/motd
-install -p -m 0644 %{SOURCE1} %{buildroot}%{_datadir}/lumen-release/os-release-lumen.conf
+# GRUB gfxmenu theme for the installed system's boot menu; the installer
+# stages these onto /boot/grub2/themes/lumen (same theme the ISO menu uses).
+install -p -m 0644 %{SOURCE4} %{buildroot}%{_datadir}/lumen-release/grub/theme.txt
+install -p -m 0644 %{SOURCE5} %{buildroot}%{_datadir}/lumen-release/grub/lumen-grub-bg.png
 chmod 0644 %{buildroot}%{_sysconfdir}/lumen-release \
+           %{buildroot}%{_datadir}/lumen-release/os-release-lumen.conf \
            %{buildroot}%{_datadir}/lumen-release/issue \
            %{buildroot}%{_datadir}/lumen-release/motd
 
 %post
 # /etc/os-release is stock a symlink to /usr/lib/os-release (owned by
 # almalinux-release). Materialize a real /etc/os-release — the documented
-# override path — with Lumen's VARIANT/HOME_URL keys, instead of editing
-# the almalinux-release-owned target.
+# override path — with Lumen's identity keys, instead of editing the
+# almalinux-release-owned target. NAME/PRETTY_NAME/ANSI_COLOR are what
+# systemd's "Welcome to ..." boot banner and agetty's \S render; ID and
+# VERSION_ID stay AlmaLinux so tooling keyed on them keeps working.
 if [ -r /usr/lib/os-release ]; then
     {
-        grep -Ev '^(VARIANT|VARIANT_ID|HOME_URL)=' /usr/lib/os-release
+        grep -Ev '^(NAME|PRETTY_NAME|ANSI_COLOR|VARIANT|VARIANT_ID|HOME_URL)=' /usr/lib/os-release
         cat %{_datadir}/lumen-release/os-release-lumen.conf
     } > /etc/os-release.lumen-new && mv -f /etc/os-release.lumen-new /etc/os-release
 fi
@@ -87,11 +97,18 @@ fi
 %files
 %{_sysconfdir}/lumen-release
 %dir %{_datadir}/lumen-release
+%dir %{_datadir}/lumen-release/grub
 %{_datadir}/lumen-release/os-release-lumen.conf
 %{_datadir}/lumen-release/issue
 %{_datadir}/lumen-release/motd
+%{_datadir}/lumen-release/grub/theme.txt
+%{_datadir}/lumen-release/grub/lumen-grub-bg.png
 
 %changelog
+* Fri Jul 24 2026 Quartz Systems Engineering <engineering@quartz.systems> - 0.1.0-1
+- Brand the boot banner: os-release NAME/PRETTY_NAME/ANSI_COLOR overrides
+- Ship the GRUB gfxmenu theme for the installed system's boot menu
+
 * Thu Jul 23 2026 Quartz Systems Engineering <engineering@quartz.systems> - 0.1.0-1
 - Initial lumen-release package: /etc/lumen-release, os-release VARIANT
   additions, branded issue and motd

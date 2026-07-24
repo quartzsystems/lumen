@@ -1309,10 +1309,7 @@ fn page_done() -> gtk::Box {
         "Installation Complete",
         "Remove the installation media, then reboot into Lumen.",
     );
-    let note = gtk::Label::new(Some(
-        "First boot relabels the filesystem for SELinux and may take a few \
-         minutes. Log in as root with the password you chose.",
-    ));
+    let note = gtk::Label::new(Some("Log in as root with the password you chose."));
     note.set_wrap(true);
     note.set_halign(gtk::Align::Start);
     content.append(&note);

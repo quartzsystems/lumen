@@ -197,6 +197,7 @@ pub fn build_plan(cfg: &InstallConfig, pins: &BuildPins) -> Vec<Step> {
              grub2-efi-x64 shim-x64 grub2-tools grubby efibootmgr \
              e2fsprogs dosfstools \
              NetworkManager chrony firewalld openssh-server \
+             policycoreutils selinux-policy-targeted \
              lumen-release lumen-networking"
             )),
         ],
@@ -319,6 +320,18 @@ pub fn build_plan(cfg: &InstallConfig, pins: &BuildPins) -> Vec<Step> {
                  sed -i -e 's|^linux /boot/|linux /|' -e 's|^initrd /boot/|initrd /|' \
                      {TARGET}/boot/loader/entries/*.conf"
             )),
+            // Same branded menu as the install media (see build-live-iso.sh):
+            // gfxmenu/png are compiled into the signed EL GRUB, the font is
+            // not, so theme + font are staged on /boot where $root points.
+            // lumen-release ships the theme; unicode.pf2 comes from
+            // grub2-common — both are already installed in the target.
+            sh(format!(
+                "mkdir -p {TARGET}/boot/grub2/fonts {TARGET}/boot/grub2/themes/lumen && \
+                 cp {TARGET}/usr/share/grub/unicode.pf2 {TARGET}/boot/grub2/fonts/unicode.pf2 && \
+                 cp {TARGET}/usr/share/lumen-release/grub/theme.txt \
+                    {TARGET}/usr/share/lumen-release/grub/lumen-grub-bg.png \
+                    {TARGET}/boot/grub2/themes/lumen/"
+            )),
             sh(format!(
                 "boot_uuid=$(blkid -s UUID -o value {boot}) && \
                  {{ printf '%s\\n' \
@@ -334,6 +347,13 @@ pub fn build_plan(cfg: &InstallConfig, pins: &BuildPins) -> Vec<Step> {
                     printf 'search --no-floppy --fs-uuid --set=root %s\\n' \"$boot_uuid\"; \
                     printf '%s\\n' \
                         'set boot=$root' \
+                        'if loadfont /grub2/fonts/unicode.pf2; then' \
+                        '    set gfxmode=1024x768,auto' \
+                        '    terminal_output gfxterm' \
+                        '    set color_normal=light-gray/black' \
+                        '    set color_highlight=black/green' \
+                        '    set theme=/grub2/themes/lumen/theme.txt' \
+                        'fi' \
                         'insmod blscfg' \
                         'blscfg' \
                         \"menuentry 'UEFI Firmware Settings' --id uefi-firmware {{\" \
@@ -359,9 +379,34 @@ pub fn build_plan(cfg: &InstallConfig, pins: &BuildPins) -> Vec<Step> {
             sh(format!(
                 "efibootmgr -c -d {boot_disk} -p 1 -L Lumen -l '\\EFI\\almalinux\\shimx64.efi'"
             )),
-            // Live env runs selinux=0, so nothing is labeled: relabel on
-            // first boot (zfs xattr=sa carries security.selinux fine).
-            sh(format!("touch {TARGET}/.autorelabel")),
+        ],
+    });
+
+    steps.push(Step {
+        title: "Label filesystem for SELinux".into(),
+        actions: vec![
+            // The live env runs selinux=0, so the target boots with a
+            // completely unlabeled root — and in enforcing mode an
+            // unlabeled /usr/lib/systemd/systemd leaves init in a domain
+            // that is denied everything ("Failed to allocate manager
+            // object"), long before a .autorelabel pass could run. Label
+            // at install time instead: with no policy loaded in the live
+            // kernel, setfiles must validate against the target's binary
+            // policy (-c) and the labels land as raw security.selinux
+            // xattrs (zfs xattr=sa stores them inline). The EL10 policy
+            // has fs_use_xattr for zfs, so the labels are honored at boot.
+            // /proc, /sys, /dev are live bind mounts; the ESP is vfat and
+            // cannot hold xattrs.
+            sh(format!(
+                "chroot {TARGET} sh -c 'pol=$(ls /etc/selinux/targeted/policy/policy.* | tail -n1) && \
+                 setfiles -F -e /proc -e /sys -e /dev -e /boot/efi \
+                     -c \"$pol\" /etc/selinux/targeted/contexts/files/file_contexts /'"
+            )),
+            // Hard gate: an unlabeled init binary is exactly the
+            // unbootable case, so fail the install if labels did not stick.
+            sh(format!(
+                "chroot {TARGET} ls -Z /usr/lib/systemd/systemd | grep -q init_exec_t"
+            )),
         ],
     });
 
@@ -571,6 +616,61 @@ mod tests {
         assert!(script.contains("root=zfs:rpool/ROOT/lumen"));
         // Kernel image installed if kernel-install skipped that too.
         assert!(script.contains("/usr/lib/modules/"));
+    }
+
+    #[test]
+    fn target_is_labeled_at_install_time_not_first_boot() {
+        let plan = build_plan(&test_cfg(), &BuildPins::default());
+        let shells: Vec<&str> = plan
+            .iter()
+            .flat_map(|s| &s.actions)
+            .filter_map(|a| match a {
+                Action::Shell(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        let setfiles = shells
+            .iter()
+            .find(|s| s.contains("setfiles"))
+            .expect("plan must label the target with setfiles");
+        // No policy is loaded in the live kernel (selinux=0): validation
+        // must run against the target's binary policy.
+        assert!(setfiles.contains("-c"));
+        assert!(setfiles.contains("file_contexts"));
+        // vfat cannot hold security xattrs.
+        assert!(setfiles.contains("-e /boot/efi"));
+        // The broken first-boot relabel path must be gone: enforcing boot
+        // on an unlabeled root dies before .autorelabel can run.
+        assert!(!shells.iter().any(|s| s.contains(".autorelabel")));
+        // The label result is verified before the pool is exported.
+        assert!(shells.iter().any(|s| s.contains("init_exec_t")));
+        // Labeling runs after all target writes: last step before Finalize.
+        assert_eq!(plan[plan.len() - 2].title, "Label filesystem for SELinux");
+    }
+
+    #[test]
+    fn installed_grub_menu_is_branded() {
+        let plan = build_plan(&test_cfg(), &BuildPins::default());
+        let shells: Vec<&str> = plan
+            .iter()
+            .flat_map(|s| &s.actions)
+            .filter_map(|a| match a {
+                Action::Shell(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        let grub_cfg = shells
+            .iter()
+            .find(|s| s.contains("> /mnt/sysroot/boot/grub2/grub.cfg"))
+            .expect("plan must write the static grub.cfg");
+        assert!(grub_cfg.contains("loadfont /grub2/fonts/unicode.pf2"));
+        assert!(grub_cfg.contains("theme=/grub2/themes/lumen/theme.txt"));
+        assert!(grub_cfg.contains("terminal_output gfxterm"));
+        let staged = shells
+            .iter()
+            .find(|s| s.contains("unicode.pf2") && s.contains("themes/lumen"))
+            .expect("plan must stage the theme and font on /boot");
+        assert!(staged.contains("lumen-grub-bg.png"));
     }
 
     #[test]

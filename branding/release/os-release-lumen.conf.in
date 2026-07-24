@@ -1,0 +1,6 @@
+NAME="Quartz Systems Lumen"
+PRETTY_NAME="Quartz Systems Lumen @VERSION@"
+ANSI_COLOR="0;38;5;42"
+VARIANT="Lumen"
+VARIANT_ID=lumen
+HOME_URL="https://www.quartzsystems.net"
