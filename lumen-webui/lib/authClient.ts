@@ -12,9 +12,15 @@
 /// Only a 401 means "sign in again".
 export class ApiError extends Error {
   status: number;
-  constructor(message: string, status: number) {
+  /// The decoded error body, when the response had one. Endpoints that reject
+  /// a whole document (networking validation) return the per-field detail
+  /// alongside the standard `error` string; without this the caller could
+  /// only show the joined sentence.
+  body?: unknown;
+  constructor(message: string, status: number, body?: unknown) {
     super(message);
     this.status = status;
+    this.body = body;
   }
 }
 
@@ -111,11 +117,13 @@ export const apiFetch = async <T>(path: string, init?: RequestInit): Promise<T> 
 
   if (!res.ok) {
     let message = `Request failed (${res.status})`;
+    let payload: unknown;
     try {
       const body = await res.json();
+      payload = body;
       if (body?.error) message = body.error;
     } catch {}
-    throw new ApiError(message, res.status);
+    throw new ApiError(message, res.status, payload);
   }
 
   const text = await res.text();

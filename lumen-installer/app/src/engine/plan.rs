@@ -28,8 +28,20 @@ fn sh(script: impl Into<String>) -> Action {
     Action::Shell(script.into())
 }
 
-/// NetworkManager keyfile for the management connection.
-pub fn nm_keyfile(nic: &str, net: &NetworkConfig) -> String {
+/// The management bridge. `br0` carries the address; the chosen NIC is a port
+/// of it. See docs/networking.md — the appliance is bridged from the first
+/// boot so the first virtual machine does not require moving the management
+/// address, which is the one change that costs a trip to the rack.
+pub const MGMT_BRIDGE: &str = "br0";
+
+/// NetworkManager keyfiles for the management connection: the bridge that
+/// holds the address, and the port that attaches the NIC to it.
+///
+/// `mac` is the NIC's hardware address and is pinned onto the bridge. Without
+/// the pin a Linux bridge takes the lowest MAC among its ports, so the day a
+/// second NIC is added the management MAC changes underneath the DHCP
+/// reservation and any switch-side port security — silently, at boot.
+pub fn nm_keyfiles(nic: &str, mac: &str, net: &NetworkConfig) -> (String, String) {
     let ipv4 = match net {
         NetworkConfig::Dhcp => "[ipv4]\nmethod=auto\n".to_string(),
         NetworkConfig::Static { cidr, gateway, dns } => {
@@ -41,17 +53,44 @@ pub fn nm_keyfile(nic: &str, net: &NetworkConfig) -> String {
             format!("[ipv4]\nmethod=manual\naddress1={cidr},{gateway}\n{dns_line}")
         }
     };
-    format!(
+    // mac-address is omitted rather than written empty when the live
+    // environment could not read one: an empty value is a parse error for
+    // NetworkManager, and an unpinned bridge still works.
+    let mac_line = if mac.is_empty() {
+        String::new()
+    } else {
+        format!("mac-address={mac}\n")
+    };
+
+    let bridge = format!(
         "# Written by the Lumen installer.\n\
          [connection]\n\
          id=management\n\
-         type=ethernet\n\
-         interface-name={nic}\n\
+         type=bridge\n\
+         interface-name={MGMT_BRIDGE}\n\
          autoconnect=true\n\n\
+         [bridge]\n\
+         stp=false\n\
+         forward-delay=0\n\
+         {mac_line}\n\
          {ipv4}\n\
          [ipv6]\n\
          method=disabled\n"
-    )
+    );
+    // controller=/port-type=, not the deprecated master=/slave-type=: EL10's
+    // NetworkManager is well past 1.46. One spelling everywhere — the control
+    // plane writes the same one over D-Bus.
+    let port = format!(
+        "# Written by the Lumen installer.\n\
+         [connection]\n\
+         id=management-port\n\
+         type=ethernet\n\
+         interface-name={nic}\n\
+         controller={MGMT_BRIDGE}\n\
+         port-type=bridge\n\
+         autoconnect=true\n"
+    );
+    (bridge, port)
 }
 
 pub fn build_plan(cfg: &InstallConfig, pins: &BuildPins) -> Vec<Step> {
@@ -63,6 +102,8 @@ pub fn build_plan(cfg: &InstallConfig, pins: &BuildPins) -> Vec<Step> {
     let boot = part_dev(boot_disk, 2);
     let kernel_pkg = pins.kernel_nevr.clone().unwrap_or_else(|| "kernel".into());
     let root_arg = "root=zfs:rpool/ROOT/lumen";
+    let (mgmt_bridge_keyfile, mgmt_port_keyfile) =
+        nm_keyfiles(&cfg.nic, &cfg.nic_mac, &cfg.network);
 
     let mut steps: Vec<Step> = Vec::new();
 
@@ -244,7 +285,14 @@ pub fn build_plan(cfg: &InstallConfig, pins: &BuildPins) -> Vec<Step> {
                 path: format!(
                     "{TARGET}/etc/NetworkManager/system-connections/management.nmconnection"
                 ),
-                contents: nm_keyfile(&cfg.nic, &cfg.network),
+                contents: mgmt_bridge_keyfile.clone(),
+                mode: 0o600,
+            },
+            Action::WriteFile {
+                path: format!(
+                    "{TARGET}/etc/NetworkManager/system-connections/management-port.nmconnection"
+                ),
+                contents: mgmt_port_keyfile.clone(),
                 mode: 0o600,
             },
             // Same NIC names on the installed system as in the live env:
@@ -445,6 +493,7 @@ mod tests {
             keymap: "us".into(),
             hostname: "lumen01.example.lan".into(),
             nic: "nic0".into(),
+            nic_mac: "52:54:00:aa:bb:00".into(),
             network: NetworkConfig::Dhcp,
             disks: vec!["/dev/sda".into()],
             topology: PoolTopology::Single,
@@ -730,10 +779,19 @@ mod tests {
 
     #[test]
     fn nm_keyfile_dhcp() {
-        let text = nm_keyfile("nic0", &NetworkConfig::Dhcp);
-        assert!(text.contains("interface-name=nic0"));
-        assert!(text.contains("method=auto"));
-        assert!(!text.contains("address1"));
+        let (bridge, port) = nm_keyfiles("nic0", "52:54:00:aa:bb:00", &NetworkConfig::Dhcp);
+        // The address lives on the bridge, not on the NIC.
+        assert!(bridge.contains("type=bridge"));
+        assert!(bridge.contains("interface-name=br0"));
+        assert!(bridge.contains("method=auto"));
+        assert!(!bridge.contains("address1"));
+        assert!(!bridge.contains("interface-name=nic0"));
+        // …and the NIC is a port of it, with no addressing of its own.
+        assert!(port.contains("type=ethernet"));
+        assert!(port.contains("interface-name=nic0"));
+        assert!(port.contains("controller=br0"));
+        assert!(port.contains("port-type=bridge"));
+        assert!(!port.contains("[ipv4]"));
     }
 
     #[test]
@@ -743,23 +801,69 @@ mod tests {
             gateway: "10.0.0.1".into(),
             dns: vec!["9.9.9.9".into(), "1.1.1.1".into()],
         };
-        let text = nm_keyfile("nic2", &net);
-        assert!(text.contains("interface-name=nic2"));
-        assert!(text.contains("method=manual"));
-        assert!(text.contains("address1=10.0.0.5/24,10.0.0.1"));
-        assert!(text.contains("dns=9.9.9.9;1.1.1.1;"));
+        let (bridge, port) = nm_keyfiles("nic2", "52:54:00:aa:bb:02", &net);
+        assert!(bridge.contains("interface-name=br0"));
+        assert!(bridge.contains("method=manual"));
+        assert!(bridge.contains("address1=10.0.0.5/24,10.0.0.1"));
+        assert!(bridge.contains("dns=9.9.9.9;1.1.1.1;"));
+        assert!(bridge.contains("[ipv6]\nmethod=disabled"));
+        assert!(port.contains("interface-name=nic2"));
     }
 
     #[test]
-    fn nmconnection_is_root_only() {
+    fn management_bridge_pins_the_nic_mac() {
+        // Unpinned, a bridge inherits the lowest MAC among its ports, so
+        // adding a second NIC later would move the management MAC and break
+        // the DHCP reservation.
+        let (bridge, _) = nm_keyfiles("nic0", "52:54:00:aa:bb:00", &NetworkConfig::Dhcp);
+        assert!(bridge.contains("[bridge]"));
+        assert!(bridge.contains("mac-address=52:54:00:aa:bb:00"));
+        assert!(bridge.contains("stp=false"));
+        assert!(bridge.contains("forward-delay=0"));
+
+        // No MAC to pin is not a reason to write an empty value NM rejects.
+        let (bridge, _) = nm_keyfiles("nic0", "", &NetworkConfig::Dhcp);
+        assert!(!bridge.contains("mac-address"));
+    }
+
+    #[test]
+    fn the_deprecated_port_property_spelling_is_not_written() {
+        // One spelling across the appliance: the control plane writes
+        // controller=/port-type= over D-Bus, so the installer must too.
+        let (_, port) = nm_keyfiles("nic0", "52:54:00:aa:bb:00", &NetworkConfig::Dhcp);
+        assert!(!port.contains("master="));
+        assert!(!port.contains("slave-type="));
+    }
+
+    #[test]
+    fn both_management_keyfiles_reach_the_target_root_only() {
         let plan = build_plan(&test_cfg(), &BuildPins::default());
-        let found = plan.iter().flat_map(|s| &s.actions).any(|a| {
-            matches!(
-                a,
-                Action::WriteFile { path, mode, .. }
-                    if path.ends_with(".nmconnection") && *mode == 0o600
-            )
-        });
-        assert!(found, "nmconnection must be written with mode 0600");
+        let keyfiles: Vec<(&str, &str)> = plan
+            .iter()
+            .flat_map(|s| &s.actions)
+            .filter_map(|a| match a {
+                Action::WriteFile {
+                    path,
+                    contents,
+                    mode,
+                } if path.ends_with(".nmconnection") => {
+                    assert_eq!(*mode, 0o600, "nmconnection must be written with mode 0600");
+                    Some((path.as_str(), contents.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keyfiles.len(), 2, "bridge plus port: {keyfiles:?}");
+        let bridge = keyfiles
+            .iter()
+            .find(|(p, _)| p.ends_with("/management.nmconnection"))
+            .expect("plan must write the management bridge");
+        assert!(bridge.1.contains("type=bridge"));
+        let port = keyfiles
+            .iter()
+            .find(|(p, _)| p.ends_with("/management-port.nmconnection"))
+            .expect("plan must write the management port");
+        assert!(port.1.contains("controller=br0"));
+        assert!(port.1.contains("interface-name=nic0"));
     }
 }

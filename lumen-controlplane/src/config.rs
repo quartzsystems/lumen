@@ -25,6 +25,10 @@ pub struct Config {
     pub pam_service: String,
     /// Session ticket lifetime in seconds.
     pub session_ttl_secs: u64,
+    /// How long an applied network change waits to be confirmed before
+    /// NetworkManager rolls it back on its own. Short enough that a mistake
+    /// heals before anyone drives to the rack, long enough to click Confirm.
+    pub net_confirm_secs: u32,
 }
 
 impl Config {
@@ -46,6 +50,10 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(12 * 60 * 60),
+            net_confirm_secs: env::var("LUMEN_CP_NET_CONFIRM_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60),
         }
     }
 }

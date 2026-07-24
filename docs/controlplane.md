@@ -52,9 +52,32 @@ non-sensitive display user in localStorage.
 | `/api/auth/me`         | GET    | Current principal, or 401                  |
 | `/api/version`         | GET    | Lumen version (from the VERSION file)      |
 
+Networking (all require a session; see
+[docs/networking.md](networking.md) for the model, the staged-apply
+mechanism, and a copy-pasteable `curl` walkthrough):
+
+| Endpoint                                   | Method | Purpose                                  |
+| ------------------------------------------ | ------ | ---------------------------------------- |
+| `/api/network/interfaces`                  | GET    | Observed state, grouped by node          |
+| `/api/network/interfaces/:name`            | GET    | One link on the local node, detailed     |
+| `/api/network/config`                      | GET    | Current desired state                    |
+| `/api/network/pending`                     | GET    | Staged delta + validation + checkpoint   |
+| `/api/network/pending`                     | DELETE | Discard all staged changes               |
+| `/api/network/bridges` `/bonds` `/vlans`   | POST   | Stage a create                           |
+| `/api/network/{bridges,bonds,vlans,nics}/:name` | PATCH | Stage an update                     |
+| `/api/network/{bridges,bonds,vlans}/:name` | DELETE | Stage a delete                           |
+| `/api/network/apply`                       | POST   | Validate, checkpoint, apply              |
+| `/api/network/confirm`                     | POST   | Destroy the checkpoint, make permanent   |
+| `/api/network/rollback`                    | POST   | Roll back now                            |
+| `/api/network/apply/extend`                | POST   | Extend the confirm window                |
+| `/api/network/management-bridge`           | POST   | Convert the management NIC to a bridge   |
+
 Errors are `{ "error": "<user-facing text>" }`. Login failures are a
 uniform 401 regardless of cause, so responses don't leak whether an
-account exists.
+account exists. A rejected network configuration adds an `errors` array
+alongside the envelope — one entry per problem, each with a stable `code`
+and the `link`/`field` it belongs to, so the console can render it
+against the offending input.
 
 ### Configuration (environment)
 
@@ -67,6 +90,7 @@ account exists.
 | `LUMEN_CP_PAM_SERVICE`     | `lumen-controlplane`          |
 | `LUMEN_CP_SESSION_TTL_SECS`| `43200` (12 h)                |
 | `LUMEN_CP_NO_TLS`          | unset (dev only: `1` = HTTP)  |
+| `LUMEN_CP_NET_CONFIRM_SECS`| `60` (network auto-revert)    |
 
 ## Web UI
 

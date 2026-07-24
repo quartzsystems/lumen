@@ -9,12 +9,16 @@
 
 [package]
 name = "lumen-controlplane"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Lumen control plane: authentication API + web UI server"
 license = "MIT"
 
 [dependencies]
+# The networking domain: model, validation, planning, and the NetworkManager
+# backend. A path dependency, deliberately not a workspace member — see the
+# note at the top of lumen-networking/lumen-net/Cargo.toml.
+lumen-net = { path = "../lumen-networking/lumen-net" }
 axum = "0.8"
 # Typed cookie jar for the httpOnly session cookie.
 axum-extra = { version = "0.10", features = ["cookie"] }

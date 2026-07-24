@@ -5,6 +5,9 @@ use anyhow::{Context, Result};
 use lumen_controlplane::config::Config;
 use lumen_controlplane::realm::{lumen::LumenRealm, RealmRegistry};
 use lumen_controlplane::{app, security, tls, AppState};
+use lumen_net::backend::nm::NmBackend;
+use lumen_net::backend::unavailable::UnavailableBackend;
+use lumen_net::NetworkService;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -29,6 +32,34 @@ async fn main() -> Result<()> {
     let realms =
         RealmRegistry::new().register(Box::new(LumenRealm::new(config.pam_service.clone())));
 
+    // Networking. The backend is NetworkManager over the system bus: it does
+    // the privileged work in its own process, so the unit's ProtectSystem=
+    // strict / ProtectKernelTunables=yes hardening stays as it is. A failure
+    // here is not fatal — the console must still come up to report it.
+    let network = match NmBackend::connect().await {
+        Ok(backend) => {
+            let service = Arc::new(NetworkService::new(
+                Arc::new(backend),
+                &config.state_dir,
+                config.net_confirm_secs,
+            ));
+            // Adopt a change still waiting to be confirmed, or clear up after
+            // a run that died mid-apply.
+            if let Err(err) = service.reconcile().await {
+                tracing::error!("networking startup reconcile failed: {err}");
+            }
+            service
+        }
+        Err(err) => {
+            tracing::error!("networking is unavailable: {err}");
+            Arc::new(NetworkService::new(
+                Arc::new(UnavailableBackend::new(err.to_string())),
+                &config.state_dir,
+                config.net_confirm_secs,
+            ))
+        }
+    };
+
     let listen: std::net::SocketAddr = config
         .listen
         .parse()
@@ -42,6 +73,7 @@ async fn main() -> Result<()> {
         config,
         jwt_secret,
         realms,
+        network,
     }));
 
     if no_tls {

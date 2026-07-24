@@ -12,6 +12,8 @@ use tower::ServiceExt;
 use lumen_controlplane::config::Config;
 use lumen_controlplane::realm::{AuthFailure, Realm, RealmKind, RealmRegistry};
 use lumen_controlplane::{app, AppState};
+use lumen_net::backend::mock::MockBackend;
+use lumen_net::NetworkService;
 
 struct MockRealm;
 
@@ -42,10 +44,17 @@ fn test_app() -> axum::Router {
     config.webui_dir = std::env::temp_dir().join("lumen-webui-none");
     config.no_tls = true;
     config.session_ttl_secs = 3600;
+    let state_dir = std::env::temp_dir().join("lumen-auth-flow-state");
+    let network = Arc::new(NetworkService::new(
+        Arc::new(MockBackend::appliance()),
+        &state_dir,
+        60,
+    ));
     let state = AppState {
         config,
         jwt_secret: b"test-secret-test-secret-test-secret!".to_vec(),
         realms: RealmRegistry::new().register(Box::new(MockRealm)),
+        network,
     };
     app(Arc::new(state))
 }

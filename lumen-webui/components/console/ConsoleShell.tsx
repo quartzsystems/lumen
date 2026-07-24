@@ -5,7 +5,9 @@ import { useRouter } from "next/navigation";
 import { Sidebar } from "@/components/console/Sidebar";
 import { CommandPalette } from "@/components/console/CommandPalette";
 import { Toast } from "@/components/console/Toast";
+import { CheckpointBar } from "@/components/network/CheckpointBar";
 import { ConsoleProvider, useConsole } from "@/lib/ConsoleContext";
+import { NetworkCheckpointProvider } from "@/lib/NetworkCheckpointContext";
 
 function Shell({ children }: { children: React.ReactNode }) {
   const router = useRouter();
@@ -43,6 +45,10 @@ function Shell({ children }: { children: React.ReactNode }) {
         onNavigate={(href) => router.push(href)}
       />
       {toast && <Toast message={toast} onDismiss={() => setToast(null)} />}
+      {/* Renders nothing unless a network change is waiting to be confirmed.
+          It lives here rather than on the Interfaces page so its countdown
+          survives navigating away from that page. */}
+      <CheckpointBar />
     </div>
   );
 }
@@ -52,7 +58,9 @@ function Shell({ children }: { children: React.ReactNode }) {
 export function ConsoleShell({ children }: { children: React.ReactNode }) {
   return (
     <ConsoleProvider>
-      <Shell>{children}</Shell>
+      <NetworkCheckpointProvider>
+        <Shell>{children}</Shell>
+      </NetworkCheckpointProvider>
     </ConsoleProvider>
   );
 }

@@ -91,6 +91,10 @@ cp "$REPO_ROOT"/branding/release/lumen-release.in \
    "$REPO_ROOT"/branding/console/50-lumen-banner \
    "$REPO_ROOT"/lumen-networking/nicnames/lumen-nicnames \
    "$TOPDIR/SOURCES/"
+# The network policy fragment shares a very common basename; stage it under a
+# distinct source name so it cannot collide in the flat SOURCES dir.
+cp "$REPO_ROOT/lumen-networking/system/NetworkManager/00-lumen.conf" \
+   "$TOPDIR/SOURCES/lumen-nm-00-lumen.conf"
 
 for spec in "$REPO_ROOT"/packages/*.spec; do
     echo "==> rpmbuild $(basename "$spec") (version $VERSION)"

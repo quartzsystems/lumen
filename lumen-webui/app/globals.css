@@ -205,6 +205,257 @@ body {
   to   { transform: none; opacity: 1; }
 }
 
+/* --- Data table ---
+   Ported from Quartz Command's inventory tables for the Networking views:
+   dense rows, monospace values, a sticky head that survives a long list of
+   interfaces. */
+.qz-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--qz-border);
+  border-radius: 10px;
+  background: var(--qz-surface);
+  box-shadow: var(--qz-inset-line);
+}
+.qz-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+.qz-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--qz-surface);
+  text-align: left;
+  font-family: var(--qz-font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--qz-fg-4);
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--qz-border);
+}
+.qz-table tbody td {
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--qz-divider);
+  color: var(--qz-fg-2);
+  vertical-align: middle;
+}
+.qz-table tbody tr:last-child td { border-bottom: 0; }
+.qz-table tbody tr:hover td { background: color-mix(in oklab, white 3%, transparent); }
+.qz-mono { font-family: var(--qz-font-mono); }
+/* A port sits under its controller; the indent is what makes that readable. */
+.qz-table td.qz-indent { padding-left: 28px; }
+.qz-dim { color: var(--qz-fg-4); }
+
+/* --- Buttons --- */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 12px;
+  border-radius: 7px;
+  border: 1px solid var(--qz-border);
+  background: var(--qz-surface-raised);
+  color: var(--qz-fg-2);
+  font-family: var(--qz-font-sans);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+  transition: all var(--qz-dur-1) var(--qz-ease-out);
+  white-space: nowrap;
+}
+.btn:hover:not(:disabled) { border-color: var(--qz-border-strong); color: var(--qz-fg-1); }
+.btn:focus-visible { outline: none; box-shadow: var(--qz-focus-ring); }
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn-primary {
+  background: var(--qz-accent);
+  border-color: var(--qz-accent);
+  color: var(--qz-fg-on-accent);
+}
+.btn-primary:hover:not(:disabled) {
+  background: var(--qz-accent-hover);
+  border-color: var(--qz-accent-hover);
+  color: var(--qz-fg-on-accent);
+}
+.btn-danger { border-color: color-mix(in oklab, var(--qz-danger) 45%, transparent); color: var(--qz-danger); }
+.btn-danger:hover:not(:disabled) { background: var(--qz-danger-soft); color: var(--qz-danger); }
+.btn-ghost { background: transparent; }
+.btn-sm { padding: 5px 9px; font-size: 12px; }
+
+/* --- Form controls --- */
+.field { display: flex; flex-direction: column; gap: 5px; }
+.field-label {
+  font-family: var(--qz-font-mono);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--qz-fg-4);
+}
+.input, .select {
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 7px;
+  border: 1px solid var(--qz-border);
+  background: var(--qz-input-bg);
+  color: var(--qz-fg-1);
+  font-family: var(--qz-font-mono);
+  font-size: 13px;
+}
+.input:focus, .select:focus { outline: none; box-shadow: var(--qz-focus-ring); }
+.input-invalid, .select-invalid { border-color: var(--qz-danger); }
+.field-error { font-size: 12px; color: var(--qz-danger); }
+.field-hint { font-size: 12px; color: var(--qz-fg-4); }
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--qz-fg-2);
+  cursor: pointer;
+}
+.port-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 168px;
+  overflow-y: auto;
+  padding: 8px 10px;
+  border-radius: 7px;
+  border: 1px solid var(--qz-border);
+  background: var(--qz-input-bg);
+}
+
+/* --- Dialog --- */
+.dialog-scrim {
+  position: fixed;
+  inset: 0;
+  background: rgba(8, 9, 13, 0.6);
+  backdrop-filter: blur(6px);
+  z-index: 90;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+.dialog {
+  width: min(560px, 100%);
+  max-height: calc(100vh - 96px);
+  overflow-y: auto;
+  background: var(--qz-surface-raised);
+  border: 1px solid var(--qz-border);
+  border-radius: 12px;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.6);
+  padding: 22px 24px;
+}
+.dialog-title { font-size: 17px; font-weight: 700; color: var(--qz-fg-1); margin: 0; }
+.dialog-subtitle { font-size: 13px; color: var(--qz-fg-4); margin: 6px 0 0; }
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 22px;
+  padding-top: 16px;
+  border-top: 1px solid var(--qz-divider);
+}
+
+/* --- Menu (the Create split control) --- */
+.menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 40;
+  min-width: 190px;
+  padding: 5px;
+  background: var(--qz-surface-raised);
+  border: 1px solid var(--qz-border);
+  border-radius: 9px;
+  box-shadow: var(--qz-shadow-3);
+}
+.menu-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--qz-fg-2);
+  font-family: var(--qz-font-sans);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+.menu-item:hover { background: color-mix(in oklab, white 5%, transparent); color: var(--qz-fg-1); }
+
+/* --- Callout (the management-bridge banner and friends) --- */
+.callout {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 14px 16px;
+  border-radius: 10px;
+  border: 1px solid var(--qz-border);
+  background: var(--qz-surface);
+}
+.callout-warn {
+  border-color: color-mix(in oklab, var(--qz-warn) 40%, transparent);
+  background: var(--qz-warn-soft);
+}
+.callout-crit {
+  border-color: color-mix(in oklab, var(--qz-danger) 45%, transparent);
+  background: var(--qz-danger-soft);
+}
+
+/* --- Pending bar: staged-but-unapplied changes --- */
+.pending-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border-radius: 10px;
+  border: 1px solid var(--qz-accent-border);
+  background: var(--qz-accent-soft);
+}
+
+/* --- Checkpoint countdown ---
+   Docked to the bottom of the viewport, above the toast host, because it
+   outranks anything else on screen: the node reverts when it hits zero. */
+.checkpoint-bar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 75;
+  background: var(--qz-surface-raised);
+  border-top: 2px solid var(--qz-accent);
+  box-shadow: 0 -12px 32px rgba(0, 0, 0, 0.45);
+}
+.checkpoint-bar-critical { border-top-color: var(--qz-danger); }
+.checkpoint-bar-fill {
+  height: 3px;
+  background: var(--qz-accent);
+  transition: width 1s linear;
+}
+.checkpoint-bar-critical .checkpoint-bar-fill { background: var(--qz-danger); }
+.checkpoint-bar-body {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 24px;
+}
+.checkpoint-countdown {
+  font-family: var(--qz-font-mono);
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--qz-accent);
+  font-variant-numeric: tabular-nums;
+}
+.checkpoint-countdown-critical { color: var(--qz-danger); }
+
 /* --- Scrollbars --- */
 ::-webkit-scrollbar { width: 10px; }
 ::-webkit-scrollbar-thumb { background: var(--qz-ink-5); border-radius: 999px; }

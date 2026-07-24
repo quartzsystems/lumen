@@ -15,6 +15,12 @@ pub struct InstallConfig {
     pub hostname: String,
     /// Management NIC name as shown in the live env (nic0..nicN).
     pub nic: String,
+    /// The management NIC's hardware address, as read from
+    /// /sys/class/net/<nic>/address — the same value lumen-nicnames pins names
+    /// to. It is written into the management bridge so the bridge keeps this
+    /// address instead of inheriting the lowest MAC among its ports; see
+    /// docs/networking.md.
+    pub nic_mac: String,
     pub network: NetworkConfig,
     /// Whole-disk target device paths, e.g. ["/dev/sda", "/dev/sdb"]. The
     /// first disk carries the EFI system partition and /boot; every disk
@@ -170,6 +176,7 @@ mod tests {
             keymap: "us".into(),
             hostname: "lumen01.example.lan".into(),
             nic: "nic0".into(),
+            nic_mac: "52:54:00:aa:bb:00".into(),
             network: NetworkConfig::Static {
                 cidr: "192.168.10.5/24".into(),
                 gateway: "192.168.10.1".into(),
@@ -182,9 +189,39 @@ mod tests {
         let back: InstallConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.disks, vec!["/dev/nvme0n1", "/dev/nvme1n1"]);
         assert_eq!(back.topology, PoolTopology::Mirror);
+        assert_eq!(back.nic_mac, "52:54:00:aa:bb:00");
         match back.network {
             NetworkConfig::Static { ref cidr, .. } => assert_eq!(cidr, "192.168.10.5/24"),
             _ => panic!("expected static config"),
         }
+    }
+
+    /// The control plane rewrites the management settings this installer
+    /// writes, through `lumen_net::model::IpConfig`. The two crates do not
+    /// depend on each other — the networking crate pulls in a D-Bus stack the
+    /// installer has no business linking (docs/networking.md) — so this test
+    /// and its mirror image in lumen-net
+    /// (`ip_config_matches_installer_network_config`) pin the wire format
+    /// both sides must keep producing.
+    #[test]
+    fn network_config_wire_format_matches_lumen_net() {
+        assert_eq!(
+            serde_json::to_value(NetworkConfig::Dhcp).unwrap(),
+            serde_json::json!({ "mode": "dhcp" })
+        );
+        assert_eq!(
+            serde_json::to_value(NetworkConfig::Static {
+                cidr: "192.168.10.5/24".into(),
+                gateway: "192.168.10.1".into(),
+                dns: vec!["9.9.9.9".into()],
+            })
+            .unwrap(),
+            serde_json::json!({
+                "mode": "static",
+                "cidr": "192.168.10.5/24",
+                "gateway": "192.168.10.1",
+                "dns": ["9.9.9.9"],
+            })
+        );
     }
 }

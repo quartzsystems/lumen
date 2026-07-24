@@ -12,6 +12,7 @@
 # `cargo build` runs inside the crate directories)
 lumen-installer/app/target/
 lumen-controlplane/target/
+lumen-networking/lumen-net/target/
 
 # Editor / OS noise
 *.swp
