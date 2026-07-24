@@ -82,12 +82,16 @@ the three gates above.
   CHECKSUM file)
 - `iso/pins.env` — `KERNEL_NEVR` (must equal the kernel in that ISO's
   Minimal repo; the gate prints the actual media kernel on mismatch, so a
-  failed build tells you the correct value), `ZFS_REPO_URL` (**point-release
-  path**, e.g. `epel/10.2/kmod/`), `ZFS_SERIES`
+  failed build tells you the correct value), `ZFS_REPO_URL`
+  (**major-version path** `epel/10/kmod/`, server-side aliased to the
+  point release OpenZFS currently targets; plain http — the host serves no
+  https, and integrity comes from RPM signatures against the pinned key in
+  `iso/keys/`), `ZFS_SERIES`
 
 Moving to a new AlmaLinux point release means updating both files in one
 commit — and checking that OpenZFS has published kABI kmods for that point
-release first ([they can lag](https://github.com/openzfs/zfs/issues/17966)).
+release first ([they can lag](https://github.com/openzfs/zfs/issues/17966);
+the kABI gate fails the build if the aliased repo hasn't caught up).
 
 ### Installed system layout (UEFI-only, ZFS-only)
 
@@ -131,8 +135,10 @@ firmware state and refuses with a clear message otherwise.
   /proc in the CI container, dnf4 flag syntax for `--repofrompath`/
   `download`/`repoquery --qf`, xorrisofs UEFI-only El Torito form, OpenZFS
   library subpackage names in the download glob.
-- **TODO(security)**: pin and verify the OpenZFS RPM signing key at mirror
-  time (today: HTTPS + version pins + the kABI gate).
+- **OpenZFS RPM verification**: every mirrored RPM is checked with
+  `rpmkeys --checksig` against `iso/keys/RPM-GPG-KEY-openzfs-2022`
+  (extracted from the official `zfs-release-3-0.el10` package); the build
+  fails on any unsigned or wrongly-signed package.
 - `/etc/issue` has no ASCII art on purpose (agetty escape handling);
   `/etc/motd` carries the ANSI-color lockup. `/etc/os-release`, `issue`,
   `motd` are applied via `lumen-release` `%post` (files owned by

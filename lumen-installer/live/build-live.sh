@@ -16,8 +16,10 @@ die() { echo "FATAL: $*" >&2; exit 1; }
 usage() {
     cat <<'EOF'
 Usage: build-live.sh --workdir DIR --installer-binary PATH --lumen-repo DIR
-                     --zfs-repo URL --kernel-nevr NEVR --version V
-                     --out-tree DIR
+                     --kernel-nevr NEVR --version V --out-tree DIR
+
+The lumen repo must already contain the signature-verified OpenZFS subset
+(zfs, kmod-zfs, libraries) — this script never talks to the ZFS mirror.
 
 Produces in --out-tree:  images/vmlinuz, images/initrd.img,
                          LiveOS/squashfs.img
@@ -26,13 +28,12 @@ consumed from it by the caller).
 EOF
 }
 
-WORKDIR='' INSTALLER_BINARY='' LUMEN_REPO='' ZFS_REPO='' KERNEL_NEVR='' VERSION='' OUT_TREE=''
+WORKDIR='' INSTALLER_BINARY='' LUMEN_REPO='' KERNEL_NEVR='' VERSION='' OUT_TREE=''
 while [ $# -gt 0 ]; do
     case "$1" in
         --workdir)          WORKDIR="${2:?}"; shift 2 ;;
         --installer-binary) INSTALLER_BINARY="${2:?}"; shift 2 ;;
         --lumen-repo)       LUMEN_REPO="${2:?}"; shift 2 ;;
-        --zfs-repo)         ZFS_REPO="${2:?}"; shift 2 ;;
         --kernel-nevr)      KERNEL_NEVR="${2:?}"; shift 2 ;;
         --version)          VERSION="${2:?}"; shift 2 ;;
         --out-tree)         OUT_TREE="${2:?}"; shift 2 ;;
@@ -40,7 +41,7 @@ while [ $# -gt 0 ]; do
         *) usage >&2; die "unknown argument: $1" ;;
     esac
 done
-for v in WORKDIR INSTALLER_BINARY LUMEN_REPO ZFS_REPO KERNEL_NEVR VERSION OUT_TREE; do
+for v in WORKDIR INSTALLER_BINARY LUMEN_REPO KERNEL_NEVR VERSION OUT_TREE; do
     [ -n "${!v}" ] || { usage >&2; die "missing --$(tr '[:upper:]_' '[:lower:]-' <<<"$v")"; }
 done
 [ -x "$INSTALLER_BINARY" ] || die "installer binary not executable: $INSTALLER_BINARY"
@@ -72,7 +73,6 @@ echo "==> Live rootfs: full package set (kernel $KERNEL_NEVR)"
 mapfile -t packages < <(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$LIVE_DIR/packages.txt")
 dnf -y --installroot="$ROOT" --releasever=10 --setopt=install_weak_deps=False \
     --repofrompath="lumen,file://$LUMEN_REPO" --setopt=lumen.gpgcheck=0 \
-    --repofrompath="zfs,$ZFS_REPO" --setopt=zfs.gpgcheck=0 \
     install "$KERNEL_NEVR" "kernel-modules-${KERNEL_NEVR#kernel-}" "${packages[@]}"
 
 echo "==> kABI gate: kmod-zfs must resolve against $KVER"

@@ -121,15 +121,25 @@ mkdir -p "$TREE/lumen"
 cp "$REPO_ROOT"/dist/rpms/*.noarch.rpm "$TREE/lumen/"
 
 echo "==> Mirroring OpenZFS $ZFS_SERIES kABI subset from $ZFS_REPO_URL"
-# TODO(security): verify RPM signatures against the OpenZFS signing key
-# (needs the key pinned in-repo); today this relies on HTTPS + version pins
-# + the kABI gate.
+zfs_dl="$WORK/zfs-download"
+mkdir -p "$zfs_dl"
 dnf download --quiet --disablerepo='*' \
     --repofrompath="zfs,$ZFS_REPO_URL" --setopt=zfs.gpgcheck=0 \
-    --destdir "$TREE/lumen" \
+    --exclude='*-debuginfo' --exclude='*-devel' \
+    --destdir "$zfs_dl" \
     "zfs-$ZFS_SERIES*" "kmod-zfs-$ZFS_SERIES*" "zfs-dracut-$ZFS_SERIES*" \
     "libzfs*" "libnvpair*" "libuutil*" "libzpool*" \
-    || die "OpenZFS download failed — does $ZFS_REPO_URL exist for this point release?"
+    || die "OpenZFS download failed — is $ZFS_REPO_URL reachable and does it carry the $ZFS_SERIES series?"
+
+echo "==> Gate: OpenZFS RPM signatures (pinned key)"
+rpmkeys --import "$REPO_ROOT/iso/keys/RPM-GPG-KEY-openzfs-2022"
+for rpm in "$zfs_dl"/*.rpm; do
+    sig="$(rpmkeys --checksig "$rpm")"
+    grep -q "signatures OK" <<<"$sig" \
+        || die "RPM signature check failed: $sig"
+done
+mv "$zfs_dl"/*.rpm "$TREE/lumen/"
+
 echo "==> Creating lumen repo"
 createrepo_c --quiet "$TREE/lumen"
 
@@ -168,7 +178,6 @@ bash "$REPO_ROOT/lumen-installer/live/build-live.sh" \
     --workdir "$WORK/live" \
     --installer-binary "$INSTALLER_BINARY" \
     --lumen-repo "$TREE/lumen" \
-    --zfs-repo "$ZFS_REPO_URL" \
     --kernel-nevr "$KERNEL_NEVR" \
     --version "$VERSION" \
     --out-tree "$TREE"
