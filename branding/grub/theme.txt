@@ -1,0 +1,47 @@
+# Quartz Systems Lumen boot menu (GRUB gfxmenu theme).
+#
+# Rendered by the signed EL GRUB: gfxmenu, png, and font are compiled in.
+# gfxterm_background (the `background_image` command) is NOT, so a theme
+# is the only way to paint a background under Secure Boot.
+#
+# Colors follow the Quartz design system: ink-1 #0f1117 background,
+# fg-2 #d7d9de text, fg-4 #6b6f7a muted, accent #00d992.
+
+desktop-image: "lumen-grub-bg.png"
+desktop-color: "#0f1117"
+title-text: ""
+terminal-font: "Unicode Regular 16"
+
++ boot_menu {
+    left = 15%
+    top = 40%
+    width = 70%
+    height = 35%
+    item_font = "Unicode Regular 16"
+    item_color = "#d7d9de"
+    selected_item_color = "#00d992"
+    item_height = 28
+    item_spacing = 6
+    item_padding = 4
+}
+
++ label {
+    id = "__timeout__"
+    left = 15%
+    top = 82%
+    width = 70%
+    align = "center"
+    font = "Unicode Regular 16"
+    color = "#6b6f7a"
+    text = "The highlighted entry will boot automatically in %d seconds."
+}
+
++ label {
+    left = 15%
+    top = 87%
+    width = 70%
+    align = "center"
+    font = "Unicode Regular 16"
+    color = "#6b6f7a"
+    text = "Use the arrow keys to choose an entry and Enter to boot it."
+}

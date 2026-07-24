@@ -63,6 +63,12 @@ selection {
     color: #a2a6b0;
 }
 
+/* Welcome-page tagline: body-sized, brighter than the version line. */
+.qz-tagline {
+    font-size: 15px;
+    color: #d7d9de;
+}
+
 .qz-error {
     font-size: 13px;
     color: #ff5d6c;
@@ -139,6 +145,12 @@ button.destructive-action:hover {
     background-color: #ff7583;
 }
 
+/* Nav-button arrow glyphs: larger than the 13px label, centered as their
+ * own widget (see nav_button) rather than baseline-aligned markup. */
+.qz-nav-arrow {
+    font-size: 16px;
+}
+
 entry {
     background-color: #1a1d26;
     background-image: none;
@@ -151,9 +163,11 @@ entry {
     transition: border-color 140ms;
 }
 
+/* Green border only — the focus outline on top of it reads as a double
+ * ring, so entries suppress it. */
 entry:focus-within {
     border-color: #00d992;
-    outline-color: rgba(0, 217, 146, 0.85);
+    outline-style: none;
 }
 
 entry:disabled,
@@ -230,11 +244,21 @@ popover > contents {
     color: #f2f3f5;
 }
 
+/* Borderless trough — a border ring around the bar reads as a stray
+ * highlight on the dark background. */
 progressbar trough {
     background-color: #1a1d26;
-    border: 1px solid #252830;
+    border: none;
     border-radius: 4px;
     min-height: 10px;
+}
+
+/* Step counter ("3/7") above the bar: readable, lifted off the trough. */
+progressbar text {
+    color: #d7d9de;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 12px;
+    margin-bottom: 8px;
 }
 
 progressbar progress {
@@ -267,11 +291,18 @@ separator {
     min-height: 1px;
 }
 
+/* Dimming layer behind the confirm modal (overlay child, so the card
+ * centers exactly on screen). */
+.qz-scrim {
+    background-color: rgba(11, 13, 18, 0.65);
+}
+
 /* Quartz modal: ink-0, border ink-5, radius 12 (ModalShell). */
-window.qz-dialog {
+.qz-dialog {
     background-color: #0b0d12;
     border: 1px solid #252830;
     border-radius: 12px;
+    padding: 28px 32px 24px;
 }
 
 /* ModalHeader title: 17px bold fg-1. */

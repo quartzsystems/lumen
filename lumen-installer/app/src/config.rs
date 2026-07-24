@@ -16,8 +16,63 @@ pub struct InstallConfig {
     /// Management NIC name as shown in the live env (nic0..nicN).
     pub nic: String,
     pub network: NetworkConfig,
-    /// Whole-disk target device path, e.g. "/dev/sda" or "/dev/nvme0n1".
-    pub disk: String,
+    /// Whole-disk target device paths, e.g. ["/dev/sda", "/dev/sdb"]. The
+    /// first disk carries the EFI system partition and /boot; every disk
+    /// contributes its third partition to the rpool vdev.
+    pub disks: Vec<String>,
+    /// vdev layout of rpool over `disks`.
+    pub topology: PoolTopology,
+}
+
+/// ZFS vdev layout for the boot pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PoolTopology {
+    Single,
+    Mirror,
+    Raidz1,
+    Raidz2,
+}
+
+impl Default for PoolTopology {
+    fn default() -> Self {
+        Self::Single
+    }
+}
+
+impl PoolTopology {
+    /// Menu order in the UI.
+    pub const ALL: [PoolTopology; 4] = [Self::Single, Self::Mirror, Self::Raidz1, Self::Raidz2];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Single => "Single disk",
+            Self::Mirror => "Mirror (RAID1)",
+            Self::Raidz1 => "RAIDZ1",
+            Self::Raidz2 => "RAIDZ2",
+        }
+    }
+
+    /// `zpool create` vdev keyword; a single disk is a plain top-level vdev.
+    pub fn vdev_keyword(self) -> Option<&'static str> {
+        match self {
+            Self::Single => None,
+            Self::Mirror => Some("mirror"),
+            Self::Raidz1 => Some("raidz1"),
+            Self::Raidz2 => Some("raidz2"),
+        }
+    }
+
+    /// Practical minimums (raidz accepts fewer, but below these the layout
+    /// is pointless), used for UI validation.
+    pub fn min_disks(self) -> usize {
+        match self {
+            Self::Single => 1,
+            Self::Mirror => 2,
+            Self::Raidz1 => 3,
+            Self::Raidz2 => 4,
+        }
+    }
 }
 
 /// Accepts a dotted-quad netmask ("255.255.240.0") or a bare prefix
@@ -125,11 +180,13 @@ mod tests {
                 gateway: "192.168.10.1".into(),
                 dns: vec!["9.9.9.9".into()],
             },
-            disk: "/dev/nvme0n1".into(),
+            disks: vec!["/dev/nvme0n1".into(), "/dev/nvme1n1".into()],
+            topology: PoolTopology::Mirror,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: InstallConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.disk, "/dev/nvme0n1");
+        assert_eq!(back.disks, vec!["/dev/nvme0n1", "/dev/nvme1n1"]);
+        assert_eq!(back.topology, PoolTopology::Mirror);
         match back.network {
             NetworkConfig::Static { ref cidr, .. } => assert_eq!(cidr, "192.168.10.5/24"),
             _ => panic!("expected static config"),

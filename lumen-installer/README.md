@@ -1,9 +1,10 @@
 # lumen-installer
 
 Custom graphical installer for the Lumen appliance. Replaces Anaconda so
-Lumen can install onto a **ZFS boot drive** (which Anaconda/blivet cannot
+Lumen can install onto **ZFS boot drives** (which Anaconda/blivet cannot
 do), with a deliberately small decision surface: root password, time zone,
-management NIC (DHCP/static), target disk.
+management NIC (DHCP/static), target drives + pool layout (single disk,
+mirror, RAIDZ1/2 — the first selected drive carries the ESP and /boot).
 
 ## Architecture
 

@@ -210,10 +210,13 @@ LIVEROOT="$WORK/live/rootfs"
 # --- boot configuration -------------------------------------------------------
 VOLID="LUMEN"
 CMDLINE="root=live:CDLABEL=$VOLID rd.live.image rd.live.overlay.overlayfs=1 rd.live.dir=/LiveOS selinux=0"
-# Branded menu: gfxterm + background image (gfxterm/png are built into the
-# signed EL GRUB; the font must be shipped — same as upstream Alma media).
-cp "$REPO_ROOT/branding/grub/lumen-grub-bg.png" "$TREE/EFI/BOOT/lumen-grub-bg.png"
-mkdir -p "$TREE/EFI/BOOT/fonts"
+# Branded menu: gfxmenu theme. gfxmenu/png ARE built into the signed EL
+# GRUB, but gfxterm_background (the `background_image` command) is not —
+# a theme is the only way to paint a background with the signed binary.
+# The font must be shipped — same as upstream Alma media.
+mkdir -p "$TREE/EFI/BOOT/theme" "$TREE/EFI/BOOT/fonts"
+cp "$REPO_ROOT/branding/grub/theme.txt" "$TREE/EFI/BOOT/theme/theme.txt"
+cp "$REPO_ROOT/branding/grub/lumen-grub-bg.png" "$TREE/EFI/BOOT/theme/lumen-grub-bg.png"
 [ -f "$LIVEROOT/usr/share/grub/unicode.pf2" ] \
     || die "unicode.pf2 not found in live rootfs (grub2-common missing?)"
 cp "$LIVEROOT/usr/share/grub/unicode.pf2" "$TREE/EFI/BOOT/fonts/unicode.pf2"
@@ -225,9 +228,10 @@ set timeout=10
 if loadfont /EFI/BOOT/fonts/unicode.pf2; then
     set gfxmode=1024x768,auto
     terminal_output gfxterm
-    background_image /EFI/BOOT/lumen-grub-bg.png
+    # Text-menu colors as a fallback if the theme fails to load.
     set color_normal=light-gray/black
     set color_highlight=black/green
+    set theme=/EFI/BOOT/theme/theme.txt
 fi
 
 menuentry 'Install Lumen $VERSION' {

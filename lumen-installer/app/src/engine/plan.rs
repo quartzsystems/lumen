@@ -4,7 +4,7 @@
 //! printed with --print-plan and unit-tested without touching hardware.
 
 use super::{Action, Step};
-use crate::config::{BuildPins, InstallConfig, NetworkConfig};
+use crate::config::{BuildPins, InstallConfig, NetworkConfig, PoolTopology};
 
 /// Target root while installing.
 pub const TARGET: &str = "/mnt/sysroot";
@@ -55,10 +55,12 @@ pub fn nm_keyfile(nic: &str, net: &NetworkConfig) -> String {
 }
 
 pub fn build_plan(cfg: &InstallConfig, pins: &BuildPins) -> Vec<Step> {
-    let disk = cfg.disk.as_str();
-    let esp = part_dev(disk, 1);
-    let boot = part_dev(disk, 2);
-    let pool = part_dev(disk, 3);
+    // Every disk gets the same ESP/boot/rpool layout so any of them can be
+    // promoted to the boot disk later, but only the first disk's ESP and
+    // /boot are formatted and used.
+    let boot_disk = cfg.disks[0].as_str();
+    let esp = part_dev(boot_disk, 1);
+    let boot = part_dev(boot_disk, 2);
     let kernel_pkg = pins.kernel_nevr.clone().unwrap_or_else(|| "kernel".into());
     let root_arg = "root=zfs:rpool/ROOT/lumen";
 
@@ -74,61 +76,75 @@ pub fn build_plan(cfg: &InstallConfig, pins: &BuildPins) -> Vec<Step> {
         ],
     });
 
+    let mut partition_actions: Vec<Action> = Vec::new();
+    for disk in &cfg.disks {
+        partition_actions.push(sh(format!("wipefs -a {disk} || true")));
+        partition_actions.push(cmd(&["sgdisk", "--zap-all", disk]));
+        partition_actions.push(cmd(&[
+            "sgdisk",
+            "-n1:1M:+1G",
+            "-t1:EF00",
+            "-c1:EFI",
+            "-n2:0:+2G",
+            "-t2:8300",
+            "-c2:boot",
+            "-n3:0:0",
+            "-t3:BF00",
+            "-c3:rpool",
+            disk,
+        ]));
+        partition_actions.push(cmd(&["partprobe", disk]));
+    }
+    partition_actions.push(cmd(&["udevadm", "settle"]));
     steps.push(Step {
-        title: "Partition target disk".into(),
-        actions: vec![
-            sh(format!("wipefs -a {disk} || true")),
-            cmd(&["sgdisk", "--zap-all", disk]),
-            cmd(&[
-                "sgdisk",
-                "-n1:1M:+1G",
-                "-t1:EF00",
-                "-c1:EFI",
-                "-n2:0:+2G",
-                "-t2:8300",
-                "-c2:boot",
-                "-n3:0:0",
-                "-t3:BF00",
-                "-c3:rpool",
-                disk,
-            ]),
-            cmd(&["partprobe", disk]),
-            cmd(&["udevadm", "settle"]),
-        ],
+        title: if cfg.disks.len() == 1 {
+            "Partition target disk".into()
+        } else {
+            format!("Partition {} target disks", cfg.disks.len())
+        },
+        actions: partition_actions,
     });
+
+    let mut zpool_create: Vec<String> = [
+        "zpool",
+        "create",
+        "-f",
+        "-o",
+        "ashift=12",
+        "-o",
+        "autotrim=on",
+        "-O",
+        "compression=lz4",
+        "-O",
+        "acltype=posixacl",
+        "-O",
+        "xattr=sa",
+        "-O",
+        "dnodesize=auto",
+        "-O",
+        "relatime=on",
+        "-O",
+        "canmount=off",
+        "-O",
+        "mountpoint=none",
+        "-R",
+        TARGET,
+        "rpool",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    if let Some(keyword) = cfg.topology.vdev_keyword() {
+        zpool_create.push(keyword.into());
+    }
+    zpool_create.extend(cfg.disks.iter().map(|d| part_dev(d, 3)));
 
     steps.push(Step {
         title: "Create filesystems and pool".into(),
         actions: vec![
             cmd(&["mkfs.vfat", "-F32", "-n", "EFI", &esp]),
             cmd(&["mkfs.ext4", "-F", "-L", "boot", &boot]),
-            cmd(&[
-                "zpool",
-                "create",
-                "-f",
-                "-o",
-                "ashift=12",
-                "-o",
-                "autotrim=on",
-                "-O",
-                "compression=lz4",
-                "-O",
-                "acltype=posixacl",
-                "-O",
-                "xattr=sa",
-                "-O",
-                "dnodesize=auto",
-                "-O",
-                "relatime=on",
-                "-O",
-                "canmount=off",
-                "-O",
-                "mountpoint=none",
-                "-R",
-                TARGET,
-                "rpool",
-                &pool,
-            ]),
+            Action::Cmd(zpool_create),
             cmd(&[
                 "zfs",
                 "create",
@@ -259,8 +275,43 @@ pub fn build_plan(cfg: &InstallConfig, pins: &BuildPins) -> Vec<Step> {
                  chroot {TARGET} depmod -a \"$kver\" && \
                  chroot {TARGET} dracut --force --add zfs /boot/initramfs-\"$kver\".img \"$kver\""
             )),
+            // grub2-mkconfig cannot run here: the EL10 GRUB userland has no
+            // ZFS support, so grub2-probe dies on the ZFS root and mkconfig
+            // writes nothing — GRUB then boots to an empty menu (only the
+            // firmware-settings entry). The menu is BLS-driven anyway, so
+            // write a static config that loads the BLS entries from /boot.
+            //
+            // kernel-install ran during the package step with no /proc in
+            // the target, so it could not see that /boot is its own
+            // filesystem: entry paths come out /boot/-prefixed, but blscfg
+            // resolves them against the /boot fs root. Normalize them (the
+            // ls doubles as a gate that entries exist at all).
             sh(format!(
-                "chroot {TARGET} grub2-mkconfig -o /boot/grub2/grub.cfg"
+                "ls {TARGET}/boot/loader/entries/*.conf >/dev/null && \
+                 sed -i -e 's|^linux /boot/|linux /|' -e 's|^initrd /boot/|initrd /|' \
+                     {TARGET}/boot/loader/entries/*.conf"
+            )),
+            sh(format!(
+                "boot_uuid=$(blkid -s UUID -o value {boot}) && \
+                 {{ printf '%s\\n' \
+                        'set timeout=5' \
+                        'set default=0' \
+                        'function load_video {{' \
+                        '    insmod efi_gop' \
+                        '    insmod efi_uga' \
+                        '    insmod all_video' \
+                        '}}' \
+                        'insmod part_gpt' \
+                        'insmod ext2'; \
+                    printf 'search --no-floppy --fs-uuid --set=root %s\\n' \"$boot_uuid\"; \
+                    printf '%s\\n' \
+                        'set boot=$root' \
+                        'insmod blscfg' \
+                        'blscfg' \
+                        \"menuentry 'UEFI Firmware Settings' --id uefi-firmware {{\" \
+                        '    fwsetup' \
+                        '}}'; \
+                 }} > {TARGET}/boot/grub2/grub.cfg"
             )),
             // The signed grubx64.efi has prefix /EFI/almalinux baked in and
             // loads $prefix/grub.cfg from the ESP. Anaconda normally writes
@@ -278,7 +329,7 @@ pub fn build_plan(cfg: &InstallConfig, pins: &BuildPins) -> Vec<Step> {
                 "chroot {TARGET} grubby --update-kernel=ALL --args='{root_arg}'"
             )),
             sh(format!(
-                "efibootmgr -c -d {disk} -p 1 -L Lumen -l '\\EFI\\almalinux\\shimx64.efi'"
+                "efibootmgr -c -d {boot_disk} -p 1 -L Lumen -l '\\EFI\\almalinux\\shimx64.efi'"
             )),
             // Live env runs selinux=0, so nothing is labeled: relabel on
             // first boot (zfs xattr=sa carries security.selinux fine).
@@ -314,8 +365,21 @@ mod tests {
             hostname: "lumen01.example.lan".into(),
             nic: "nic0".into(),
             network: NetworkConfig::Dhcp,
-            disk: "/dev/sda".into(),
+            disks: vec!["/dev/sda".into()],
+            topology: PoolTopology::Single,
         }
+    }
+
+    fn find_zpool_create(plan: &[Step]) -> Vec<String> {
+        plan.iter()
+            .flat_map(|s| &s.actions)
+            .find_map(|a| match a {
+                Action::Cmd(argv) if argv.starts_with(&["zpool".into(), "create".into()]) => {
+                    Some(argv.clone())
+                }
+                _ => None,
+            })
+            .expect("plan must contain zpool create")
     }
 
     #[test]
@@ -337,6 +401,54 @@ mod tests {
         assert!(files
             .iter()
             .any(|(p, c)| p.ends_with("/etc/vconsole.conf") && c.trim() == "KEYMAP=us"));
+    }
+
+    #[test]
+    fn single_disk_pool_has_plain_vdev() {
+        let argv = find_zpool_create(&build_plan(&test_cfg(), &BuildPins::default()));
+        assert_eq!(argv.last().unwrap(), "/dev/sda3");
+        assert!(!argv.iter().any(|a| a == "mirror" || a.starts_with("raidz")));
+    }
+
+    #[test]
+    fn mirror_pool_lists_keyword_then_partitions() {
+        let mut cfg = test_cfg();
+        cfg.disks = vec!["/dev/sda".into(), "/dev/nvme0n1".into()];
+        cfg.topology = PoolTopology::Mirror;
+        let plan = build_plan(&cfg, &BuildPins::default());
+        let argv = find_zpool_create(&plan);
+        let tail: Vec<&str> = argv.iter().rev().take(3).rev().map(String::as_str).collect();
+        assert_eq!(tail, ["mirror", "/dev/sda3", "/dev/nvme0n1p3"]);
+        // Both disks are partitioned; boot filesystems only on the first.
+        let shells: Vec<&str> = plan
+            .iter()
+            .flat_map(|s| &s.actions)
+            .filter_map(|a| match a {
+                Action::Shell(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(shells.iter().any(|s| s.contains("wipefs -a /dev/nvme0n1")));
+        let mkfs: Vec<&Vec<String>> = plan
+            .iter()
+            .flat_map(|s| &s.actions)
+            .filter_map(|a| match a {
+                Action::Cmd(argv) if argv[0].starts_with("mkfs.") => Some(argv),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(mkfs.len(), 2);
+        assert!(mkfs.iter().all(|argv| argv.last().unwrap().starts_with("/dev/sda")));
+    }
+
+    #[test]
+    fn raidz1_pool_uses_raidz_keyword() {
+        let mut cfg = test_cfg();
+        cfg.disks = vec!["/dev/sda".into(), "/dev/sdb".into(), "/dev/sdc".into()];
+        cfg.topology = PoolTopology::Raidz1;
+        let argv = find_zpool_create(&build_plan(&cfg, &BuildPins::default()));
+        let tail: Vec<&str> = argv.iter().rev().take(4).rev().map(String::as_str).collect();
+        assert_eq!(tail, ["raidz1", "/dev/sda3", "/dev/sdb3", "/dev/sdc3"]);
     }
 
     #[test]

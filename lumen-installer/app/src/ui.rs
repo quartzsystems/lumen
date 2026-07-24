@@ -3,7 +3,7 @@
 //! Linear flow over a GtkStack; state collected into `Draft`, converted to
 //! an InstallConfig when the operator confirms the summary.
 
-use crate::config::{parse_netmask, BuildPins, InstallConfig, NetworkConfig};
+use crate::config::{parse_netmask, BuildPins, InstallConfig, NetworkConfig, PoolTopology};
 use crate::engine;
 use crate::sysinfo;
 
@@ -33,8 +33,9 @@ struct Draft {
     prefix: u8,
     gateway: String,
     dns: Vec<String>,
-    disk: String,
-    disk_label: String,
+    disks: Vec<String>,
+    disk_labels: Vec<String>,
+    topology: PoolTopology,
 }
 
 pub fn load_css() {
@@ -72,12 +73,17 @@ pub fn build(app: &gtk::Application) {
     stack.set_hexpand(true);
     stack.set_vexpand(true);
 
+    // The overlay hosts the confirm modal (scrim + centered card); a
+    // transient window is placed by the compositor, not centered.
+    let overlay = gtk::Overlay::new();
+    overlay.set_child(Some(&stack));
+
     stack.add_named(&page_welcome(&stack), Some(PAGES[0]));
     stack.add_named(&page_password(&stack, &draft), Some(PAGES[1]));
     stack.add_named(&page_location(&stack, &draft), Some(PAGES[2]));
     stack.add_named(&page_network(&stack, &draft), Some(PAGES[3]));
     stack.add_named(&page_disk(&stack, &draft), Some(PAGES[4]));
-    stack.add_named(&page_summary(&stack, &draft, &window), Some(PAGES[5]));
+    stack.add_named(&page_summary(&stack, &draft, &overlay), Some(PAGES[5]));
 
     let progress = ProgressPage::new();
     stack.add_named(&progress.root, Some(PAGES[6]));
@@ -85,7 +91,7 @@ pub fn build(app: &gtk::Application) {
 
     PROGRESS.with(|slot| *slot.borrow_mut() = Some(progress));
 
-    window.set_child(Some(&stack));
+    window.set_child(Some(&overlay));
     window.fullscreen();
     window.present();
 }
@@ -99,28 +105,40 @@ thread_local! {
 
 // --- layout helpers ---------------------------------------------------------
 
-/// Lumen lockup (dark-background PNG compiled into the binary).
-fn lumen_lockup(height: i32) -> Option<gtk::Picture> {
+/// Lumen lockup (dark-background PNG compiled into the binary), the same
+/// height on every page. The pixbuf is scaled at load time because
+/// GtkPicture's natural size is the paintable's intrinsic size —
+/// size_request only raises the minimum, so a full-size texture renders
+/// huge regardless.
+fn lumen_lockup() -> Option<gtk::Picture> {
+    const HEIGHT: i32 = 40;
     let bytes = glib::Bytes::from_static(include_bytes!(
         "../../../branding/logos/png/lumen-lockup-dark-bg.png"
     ));
-    let texture = gtk::gdk::Texture::from_bytes(&bytes).ok()?;
+    let stream = gtk::gio::MemoryInputStream::from_bytes(&bytes);
+    let pixbuf =
+        gtk::gdk_pixbuf::Pixbuf::from_stream(&stream, gtk::gio::Cancellable::NONE).ok()?;
+    let width = HEIGHT * pixbuf.width() / pixbuf.height();
+    let scaled = pixbuf.scale_simple(width, HEIGHT, gtk::gdk_pixbuf::InterpType::Bilinear)?;
+    // for_pixbuf is soft-deprecated in 4.12 but is the only in-tree path
+    // from a scaled pixbuf to a paintable.
+    #[allow(deprecated)]
+    let texture = gtk::gdk::Texture::for_pixbuf(&scaled);
     let picture = gtk::Picture::for_paintable(&texture);
-    picture.set_can_shrink(true);
     picture.set_halign(gtk::Align::Start);
-    // Source is 808x288; keep the aspect ratio.
-    picture.set_size_request(height * 808 / 288, height);
     Some(picture)
 }
 
 fn shell(step: &str, title: &str, subtitle: &str) -> (gtk::Box, gtk::Box, gtk::Box) {
     let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
     outer.set_margin_top(40);
-    outer.set_margin_bottom(32);
+    // Bottom margin matches the side margin so the nav buttons sit the
+    // same distance from the bottom edge as from the right edge.
+    outer.set_margin_bottom(96);
     outer.set_margin_start(96);
     outer.set_margin_end(96);
 
-    if let Some(logo) = lumen_lockup(30) {
+    if let Some(logo) = lumen_lockup() {
         logo.set_margin_bottom(28);
         outer.append(&logo);
     }
@@ -159,14 +177,21 @@ fn shell(step: &str, title: &str, subtitle: &str) -> (gtk::Box, gtk::Box, gtk::B
 
 fn nav_button(label: &str, suggested: bool) -> gtk::Button {
     let button = gtk::Button::new();
-    // The ◂/▸ glyphs render tiny in JetBrains Mono; scale them up
-    // relative to the label text.
-    let markup = glib::markup_escape_text(label)
-        .replace('◂', "<span size=\"x-large\">◂</span>")
-        .replace('▸', "<span size=\"x-large\">▸</span>");
-    let text = gtk::Label::new(None);
-    text.set_markup(&markup);
-    button.set_child(Some(&text));
+    // The ◂/▸ glyphs need to render larger than the label text, but mixed
+    // Pango sizes in one label share a baseline, which sits the whole line
+    // below the button's vertical center. Give each glyph its own label
+    // (sized via .qz-nav-arrow) so the box centers them as widgets.
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    row.set_halign(gtk::Align::Center);
+    for part in label.split(' ') {
+        let piece = gtk::Label::new(Some(part));
+        piece.set_valign(gtk::Align::Center);
+        if part == "◂" || part == "▸" {
+            piece.add_css_class("qz-nav-arrow");
+        }
+        row.append(&piece);
+    }
+    button.set_child(Some(&row));
     if suggested {
         button.add_css_class("suggested-action");
     }
@@ -201,20 +226,6 @@ fn form_label(text: &str) -> gtk::Label {
     label
 }
 
-fn list_row(title: &str, subtitle: &str) -> gtk::ListBoxRow {
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    let title_label = gtk::Label::new(Some(title));
-    title_label.set_halign(gtk::Align::Start);
-    let subtitle_label = gtk::Label::new(Some(subtitle));
-    subtitle_label.set_halign(gtk::Align::Start);
-    subtitle_label.add_css_class("qz-hint");
-    content.append(&title_label);
-    content.append(&subtitle_label);
-    let row = gtk::ListBoxRow::new();
-    row.set_child(Some(&content));
-    row
-}
-
 fn valid_hostname(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 253
@@ -231,36 +242,43 @@ fn valid_hostname(name: &str) -> bool {
 
 fn page_welcome(stack: &gtk::Stack) -> gtk::Box {
     let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    outer.set_margin_top(72);
-    outer.set_margin_bottom(32);
+    outer.set_margin_top(40);
+    outer.set_margin_bottom(96);
     outer.set_margin_start(96);
     outer.set_margin_end(96);
 
-    let eyebrow = gtk::Label::new(Some("QUARTZ SYSTEMS"));
-    eyebrow.add_css_class("qz-step");
-    eyebrow.set_halign(gtk::Align::Start);
-    eyebrow.set_margin_bottom(16);
-    outer.append(&eyebrow);
-
-    match lumen_lockup(84) {
-        Some(logo) => outer.append(&logo),
+    match lumen_lockup() {
+        Some(logo) => {
+            logo.set_margin_bottom(28);
+            outer.append(&logo);
+        }
         None => {
             let title = gtk::Label::new(Some("Lumen"));
             title.add_css_class("qz-title");
             title.set_halign(gtk::Align::Start);
+            title.set_margin_bottom(28);
             outer.append(&title);
         }
     }
 
-    let subtitle = gtk::Label::new(Some(&format!(
-        "{} — hypervisor appliance installer",
-        sysinfo::lumen_version()
-    )));
+    // "Quartz Systems Lumen release 0.1.0" -> "Quartz Systems Lumen 0.1.0".
+    let subtitle = gtk::Label::new(Some(
+        &sysinfo::lumen_version().replace(" release ", " "),
+    ));
     subtitle.add_css_class("qz-subtitle");
     subtitle.set_halign(gtk::Align::Start);
     subtitle.set_margin_top(16);
-    subtitle.set_margin_bottom(24);
     outer.append(&subtitle);
+
+    let tagline = gtk::Label::new(Some(
+        "Lumen — a KVM hypervisor built to illuminate your infrastructure.",
+    ));
+    tagline.add_css_class("qz-tagline");
+    tagline.set_halign(gtk::Align::Start);
+    tagline.set_wrap(true);
+    tagline.set_margin_top(6);
+    tagline.set_margin_bottom(24);
+    outer.append(&tagline);
 
     let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
     content.set_vexpand(true);
@@ -288,9 +306,10 @@ fn page_welcome(stack: &gtk::Stack) -> gtk::Box {
         content.append(&error);
     } else {
         let blurb = gtk::Label::new(Some(
-            "This wizard installs Lumen onto a single disk: root password, \
-             location, management network, and the target drive. The target \
-             drive is formatted with ZFS (rpool) and completely erased.",
+            "This wizard collects the root password, location, management \
+             network, and target drives, then installs Lumen onto a ZFS \
+             pool (rpool) — a single drive, a mirror, or RAIDZ. All \
+             selected drives are completely erased.",
         ));
         blurb.set_wrap(true);
         blurb.set_halign(gtk::Align::Start);
@@ -315,7 +334,7 @@ fn page_welcome(stack: &gtk::Stack) -> gtk::Box {
 fn page_password(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
     let (outer, content, footer) = shell(
         "STEP 1 OF 4",
-        "Root password",
+        "Root Password",
         "Console and SSH login for the appliance. Minimum 8 characters.",
     );
 
@@ -390,7 +409,7 @@ fn page_password(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
 fn page_location(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
     let (outer, content, footer) = shell(
         "STEP 2 OF 4",
-        "Location and time zone",
+        "Location and Time Zone",
         "Selecting a country narrows the time zone list. The keyboard layout \
          applies to the installed system's console.",
     );
@@ -430,7 +449,7 @@ fn page_location(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
     form.set_size_request(520, -1);
     form.append(&form_label("Country"));
     form.append(&country_dd);
-    form.append(&form_label("Time zone"));
+    form.append(&form_label("Time Zone"));
     form.append(&zone_dd);
     form.append(&form_label("Keyboard layout"));
     form.append(&keymap_dd);
@@ -480,7 +499,7 @@ fn page_location(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
 fn page_network(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
     let (outer, content, footer) = shell(
         "STEP 3 OF 4",
-        "Management network",
+        "Management Network",
         "The interface used to manage this appliance. NIC names are final: \
          the installed system uses the same nic0…nicN names.",
     );
@@ -678,22 +697,26 @@ fn page_network(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
 fn page_disk(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
     let (outer, content, footer) = shell(
         "STEP 4 OF 4",
-        "Boot drive",
-        "The selected drive is completely erased: EFI system partition, ext4 \
-         /boot, and a ZFS pool (rpool) holding the operating system.",
+        "Boot Drives",
+        "Select the drives for the ZFS pool (rpool) and its layout. Every \
+         selected drive is completely erased; the first selected drive also \
+         carries the EFI system partition and /boot.",
     );
 
     let disks: Rc<RefCell<Vec<sysinfo::Disk>>> = Rc::new(RefCell::new(Vec::new()));
+    let checks: Rc<RefCell<Vec<gtk::CheckButton>>> = Rc::new(RefCell::new(Vec::new()));
     let list = gtk::ListBox::new();
-    list.set_selection_mode(gtk::SelectionMode::Single);
+    list.set_selection_mode(gtk::SelectionMode::None);
 
     let populate = {
         let list = list.clone();
         let disks = disks.clone();
+        let checks = checks.clone();
         move || {
             while let Some(child) = list.first_child() {
                 list.remove(&child);
             }
+            checks.borrow_mut().clear();
             let found = sysinfo::disks();
             for disk in &found {
                 let details = format!(
@@ -715,19 +738,58 @@ fn page_disk(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
                         format!(" · s/n {}", disk.serial)
                     },
                 );
-                list.append(&list_row(&disk.path, &details));
+                let check = gtk::CheckButton::new();
+                check.set_valign(gtk::Align::Center);
+                let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
+                let title_label = gtk::Label::new(Some(&disk.path));
+                title_label.set_halign(gtk::Align::Start);
+                let subtitle_label = gtk::Label::new(Some(&details));
+                subtitle_label.set_halign(gtk::Align::Start);
+                subtitle_label.add_css_class("qz-hint");
+                text.append(&title_label);
+                text.append(&subtitle_label);
+                let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+                row_box.append(&check);
+                row_box.append(&text);
+                let row = gtk::ListBoxRow::new();
+                row.set_activatable(true);
+                row.set_child(Some(&row_box));
+                list.append(&row);
+                checks.borrow_mut().push(check);
             }
             *disks.borrow_mut() = found;
-            list.select_row(list.row_at_index(0).as_ref());
+            // Preselect the first drive for the common single-disk case.
+            if let Some(first) = checks.borrow().first() {
+                first.set_active(true);
+            }
         }
     };
     populate();
+    {
+        // Clicking anywhere on a row toggles its checkbox.
+        let checks = checks.clone();
+        list.connect_row_activated(move |_, row| {
+            if let Some(check) = checks.borrow().get(row.index() as usize) {
+                check.set_active(!check.is_active());
+            }
+        });
+    }
 
     let rescan = gtk::Button::with_label("Rescan");
     {
         let populate = populate.clone();
         rescan.connect_clicked(move |_| populate());
     }
+
+    let topology_labels: Vec<&str> = PoolTopology::ALL.iter().map(|t| t.label()).collect();
+    let topology_dd = string_dropdown(&topology_labels);
+    let topology_hint = gtk::Label::new(Some(
+        "Mirror needs 2 or more drives, RAIDZ1 needs 3, RAIDZ2 needs 4. \
+         Pool capacity follows the smallest drive.",
+    ));
+    topology_hint.add_css_class("qz-hint");
+    topology_hint.set_halign(gtk::Align::Start);
+    topology_hint.set_wrap(true);
 
     let error = gtk::Label::new(None);
     error.add_css_class("qz-error");
@@ -740,6 +802,9 @@ fn page_disk(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
     scroll.set_min_content_height(220);
     card.append(&scroll);
     card.append(&rescan);
+    card.append(&form_label("Pool layout"));
+    card.append(&topology_dd);
+    card.append(&topology_hint);
     card.append(&error);
     content.append(&card);
 
@@ -752,33 +817,58 @@ fn page_disk(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
     {
         let stack = stack.clone();
         let draft = draft.clone();
-        let list = list.clone();
         let disks = disks.clone();
+        let checks = checks.clone();
+        let topology_dd = topology_dd.clone();
         let error = error.clone();
         next.connect_clicked(move |_| {
-            let Some(row) = list.selected_row() else {
-                error.set_text("Select a target drive.");
-                return;
-            };
             let disks = disks.borrow();
-            let Some(disk) = disks.get(row.index() as usize) else {
-                error.set_text("Select a target drive.");
+            let selected: Vec<&sysinfo::Disk> = checks
+                .borrow()
+                .iter()
+                .enumerate()
+                .filter(|(_, check)| check.is_active())
+                .filter_map(|(i, _)| disks.get(i))
+                .collect();
+            let topology = PoolTopology::ALL[topology_dd.selected() as usize];
+            if selected.is_empty() {
+                error.set_text("Select at least one target drive.");
                 return;
-            };
+            }
+            if topology == PoolTopology::Single && selected.len() != 1 {
+                error.set_text("Single disk uses exactly one drive — pick a RAID layout for several.");
+                return;
+            }
+            if selected.len() < topology.min_disks() {
+                error.set_text(&format!(
+                    "{} needs at least {} drives ({} selected).",
+                    topology.label(),
+                    topology.min_disks(),
+                    selected.len()
+                ));
+                return;
+            }
             {
                 let mut d = draft.borrow_mut();
-                d.disk = disk.path.clone();
-                d.disk_label = format!(
-                    "{} ({}, {})",
-                    disk.path,
-                    sysinfo::human_size(disk.size_bytes),
-                    if disk.model.is_empty() {
-                        "unknown model"
-                    } else {
-                        &disk.model
-                    }
-                );
+                d.topology = topology;
+                d.disks = selected.iter().map(|disk| disk.path.clone()).collect();
+                d.disk_labels = selected
+                    .iter()
+                    .map(|disk| {
+                        format!(
+                            "{} ({}, {})",
+                            disk.path,
+                            sysinfo::human_size(disk.size_bytes),
+                            if disk.model.is_empty() {
+                                "unknown model"
+                            } else {
+                                &disk.model
+                            }
+                        )
+                    })
+                    .collect();
             }
+            error.set_text("");
             // The summary page rebuilds its rows when it becomes visible.
             go(&stack, "summary");
         });
@@ -788,10 +878,11 @@ fn page_disk(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
     outer
 }
 
+/// Summary rows in the order the wizard collected them: password,
+/// location, network, then drives.
 fn summary_rows(d: &Draft) -> Vec<(String, String)> {
     let mut rows = vec![
-        ("Filesystem".into(), "ZFS (pool \"rpool\")".into()),
-        ("Disk".into(), d.disk_label.clone()),
+        ("Root password".into(), "Password Set".into()),
         ("Country".into(), d.country.clone()),
         ("Time zone".into(), d.timezone.clone()),
         (
@@ -817,8 +908,16 @@ fn summary_rows(d: &Draft) -> Vec<(String, String)> {
         ));
     }
     rows.push((
-        "Root password".into(),
-        format!("set ({} characters)", d.password.len()),
+        "ZFS pool".into(),
+        format!("rpool — {}", d.topology.label()),
+    ));
+    rows.push((
+        if d.disk_labels.len() == 1 {
+            "Drive".into()
+        } else {
+            "Drives".into()
+        },
+        d.disk_labels.join("\n"),
     ));
     rows
 }
@@ -826,13 +925,13 @@ fn summary_rows(d: &Draft) -> Vec<(String, String)> {
 fn page_summary(
     stack: &gtk::Stack,
     draft: &Rc<RefCell<Draft>>,
-    window: &gtk::ApplicationWindow,
+    overlay: &gtk::Overlay,
 ) -> gtk::Box {
     let (outer, content, footer) = shell(
         "REVIEW",
         "Summary",
         "Verify the configuration. Nothing has been written yet — installation \
-         starts only after confirmation and erases the selected drive.",
+         starts only after confirmation and erases the selected drives.",
     );
 
     let table = gtk::ListBox::new();
@@ -881,14 +980,14 @@ fn page_summary(
         back.connect_clicked(move |_| go(&stack, "disk"));
     }
 
-    let install = gtk::Button::with_label("Erase disk & install");
+    let install = gtk::Button::with_label("Erase & install");
     install.add_css_class("destructive-action");
     {
         let stack = stack.clone();
         let draft = draft.clone();
-        let window = window.clone();
+        let overlay = overlay.clone();
         install.connect_clicked(move |_| {
-            confirm_erase(&window, &stack, &draft);
+            confirm_erase(&overlay, &stack, &draft);
         });
     }
     footer.append(&back);
@@ -896,30 +995,42 @@ fn page_summary(
     outer
 }
 
-/// Quartz-styled destructive confirmation (GtkAlertDialog brings the stock
-/// theme's light chrome, so this is a plain undecorated modal instead).
-fn confirm_erase(window: &gtk::ApplicationWindow, stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) {
-    let dialog = gtk::Window::builder()
-        .transient_for(window)
-        .modal(true)
-        .decorated(false)
-        .resizable(false)
-        .build();
-    dialog.add_css_class("qz-dialog");
+/// Quartz-styled destructive confirmation. GtkAlertDialog brings the stock
+/// theme's light chrome, and a transient window is placed by the
+/// compositor (top-ish under gnome-kiosk) — an overlay child with a scrim
+/// is dead-centered instead.
+fn confirm_erase(overlay: &gtk::Overlay, stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) {
+    let scrim = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    scrim.add_css_class("qz-scrim");
+    scrim.set_hexpand(true);
+    scrim.set_vexpand(true);
 
-    let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    body.set_margin_top(28);
-    body.set_margin_bottom(24);
-    body.set_margin_start(32);
-    body.set_margin_end(32);
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    card.add_css_class("qz-dialog");
+    card.set_halign(gtk::Align::Center);
+    card.set_valign(gtk::Align::Center);
+    card.set_vexpand(true);
+    card.set_size_request(520, -1);
 
-    let title = gtk::Label::new(Some("Erase disk and install Lumen?"));
+    let many = draft.borrow().disk_labels.len() > 1;
+    let title = gtk::Label::new(Some(if many {
+        "Erase drives and install Lumen?"
+    } else {
+        "Erase disk and install Lumen?"
+    }));
     title.add_css_class("qz-dialog-title");
     title.set_halign(gtk::Align::Start);
-    let detail = gtk::Label::new(Some(&format!(
-        "ALL DATA on {} will be destroyed.",
-        draft.borrow().disk_label
-    )));
+    let detail = gtk::Label::new(Some(&if many {
+        format!(
+            "ALL DATA on these drives will be destroyed:\n{}",
+            draft.borrow().disk_labels.join("\n")
+        )
+    } else {
+        format!(
+            "ALL DATA on {} will be destroyed.",
+            draft.borrow().disk_labels.join(", ")
+        )
+    }));
     detail.add_css_class("qz-subtitle");
     detail.set_wrap(true);
     detail.set_halign(gtk::Align::Start);
@@ -930,27 +1041,40 @@ fn confirm_erase(window: &gtk::ApplicationWindow, stack: &gtk::Stack, draft: &Rc
     let cancel = gtk::Button::with_label("Cancel");
     let erase = gtk::Button::with_label("Erase & Install");
     erase.add_css_class("destructive-action");
+
+    let close = {
+        let overlay = overlay.clone();
+        let stack = stack.clone();
+        let scrim = scrim.clone();
+        move || {
+            overlay.remove_overlay(&scrim);
+            stack.set_sensitive(true);
+        }
+    };
     {
-        let dialog = dialog.clone();
-        cancel.connect_clicked(move |_| dialog.close());
+        let close = close.clone();
+        cancel.connect_clicked(move |_| close());
     }
     {
-        let dialog = dialog.clone();
         let stack = stack.clone();
         let draft = draft.clone();
         erase.connect_clicked(move |_| {
-            dialog.close();
+            close();
             start_install(&stack, &draft.borrow());
         });
     }
     buttons.append(&cancel);
     buttons.append(&erase);
 
-    body.append(&title);
-    body.append(&detail);
-    body.append(&buttons);
-    dialog.set_child(Some(&body));
-    dialog.present();
+    card.append(&title);
+    card.append(&detail);
+    card.append(&buttons);
+    scrim.append(&card);
+    overlay.add_overlay(&scrim);
+    // The scrim swallows pointer events; disable the page beneath so
+    // keyboard focus cannot reach it either.
+    stack.set_sensitive(false);
+    cancel.grab_focus();
 }
 
 struct ProgressPage {
@@ -979,6 +1103,8 @@ impl ProgressPage {
         log.set_editable(false);
         log.set_monospace(true);
         log.set_cursor_visible(false);
+        log.buffer()
+            .create_mark(Some("end"), &log.buffer().end_iter(), false);
         let scroll = gtk::ScrolledWindow::new();
         scroll.set_child(Some(&log));
         scroll.set_vexpand(true);
@@ -1018,6 +1144,11 @@ impl ProgressPage {
         let mut end = buffer.end_iter();
         buffer.insert(&mut end, line);
         buffer.insert(&mut end, "\n");
+        // Follow the newest output ("end" mark is right-gravity, created
+        // in new()) so the expanded details pane acts like tail -f.
+        if let Some(mark) = buffer.mark("end") {
+            self.log.scroll_to_mark(&mark, 0.0, false, 0.0, 0.0);
+        }
     }
 }
 
@@ -1054,7 +1185,8 @@ fn start_install(stack: &gtk::Stack, d: &Draft) {
         hostname: d.hostname.clone(),
         nic: d.nic.clone(),
         network,
-        disk: d.disk.clone(),
+        disks: d.disks.clone(),
+        topology: d.topology,
     };
     let plan = engine::plan::build_plan(&cfg, &BuildPins::load());
 
@@ -1105,7 +1237,7 @@ fn start_install(stack: &gtk::Stack, d: &Draft) {
 fn page_done() -> gtk::Box {
     let (outer, content, footer) = shell(
         "COMPLETE",
-        "Installation complete",
+        "Installation Complete",
         "Remove the installation media, then reboot into Lumen.",
     );
     let note = gtk::Label::new(Some(
