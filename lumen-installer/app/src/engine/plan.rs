@@ -243,9 +243,16 @@ pub fn build_plan(cfg: &InstallConfig, pins: &BuildPins) -> Vec<Step> {
                 "for d in dev proc sys; do mount --bind /$d {TARGET}/$d; done && \
                  mount --bind /sys/firmware/efi/efivars {TARGET}/sys/firmware/efi/efivars"
             )),
+            // /lib/modules holds a second directory for the kernel the kABI
+            // kmod was built against, so the running kernel version must
+            // come from the kernel-core RPM, not a directory listing. The
+            // explicit in-chroot depmod indexes the weak-updates symlinks
+            // (absolute paths — only resolvable inside the chroot) before
+            // dracut needs the zfs module.
             sh(format!(
-                "kver=$(ls {TARGET}/lib/modules) && \
-                 chroot {TARGET} dracut --force --add zfs /boot/initramfs-$kver.img $kver"
+                "kver=$(chroot {TARGET} rpm -q --qf '%{{VERSION}}-%{{RELEASE}}.%{{ARCH}}\\n' kernel-core | head -n1) && \
+                 chroot {TARGET} depmod -a \"$kver\" && \
+                 chroot {TARGET} dracut --force --add zfs /boot/initramfs-\"$kver\".img \"$kver\""
             )),
             sh(format!(
                 "chroot {TARGET} grub2-mkconfig -o /boot/grub2/grub.cfg"

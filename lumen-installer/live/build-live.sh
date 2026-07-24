@@ -76,7 +76,11 @@ dnf -y --installroot="$ROOT" --releasever=10 --setopt=install_weak_deps=False \
     install "$KERNEL_NEVR" "kernel-modules-${KERNEL_NEVR#kernel-}" "${packages[@]}"
 
 echo "==> kABI gate: kmod-zfs must resolve against $KVER"
-depmod -b "$ROOT" "$KVER"
+# Both commands run INSIDE the chroot: kABI kmods live under the kernel
+# version they were built against, and weak-modules links them into our
+# kernel's weak-updates/ with ABSOLUTE symlinks — resolvable only from
+# within the root.
+chroot "$ROOT" depmod -a "$KVER"
 chroot "$ROOT" /sbin/modprobe --dry-run -S "$KVER" zfs \
     || die "kmod-zfs does not resolve against $KVER (kABI mismatch — check iso/pins.env)"
 
