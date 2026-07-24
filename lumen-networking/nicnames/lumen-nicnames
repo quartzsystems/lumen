@@ -7,6 +7,12 @@
 #   <root>/etc/systemd/network/70-lumen-nic<N>.link
 #     [Match] PermanentMACAddress=<mac>  ->  [Link] Name=nic<N>
 #
+# The name the kernel gave the adapter (enp3s0, eno1, …) is recorded as
+# AlternativeName=, so udev keeps it usable and the console can show it in
+# the Alternative Name column — that string is what ties a row in the table
+# to a label on the chassis. It is only written when the adapter is actually
+# being renamed; a NIC already called nic<N> has no alternative name.
+#
 # Existing MAC->nic<N> pins are preserved: NICs added later get the next
 # free index, so adding/replacing hardware never renames survivors. The
 # .link files take effect when udev (re)processes the devices — i.e. on the
@@ -53,7 +59,10 @@ mapfile -t nics < <(
 [ "${#nics[@]}" -gt 0 ] || die "no physical ethernet interfaces found"
 
 # --- load existing MAC -> index pins ----------------------------------------
-declare -A mac_to_idx used_idx
+# The recorded alternative name comes back too: on a re-run the adapter is
+# already called nic<N>, so the original name is only still knowable from the
+# file that recorded it the first time.
+declare -A mac_to_idx used_idx idx_to_alt
 for f in "$LINKDIR"/70-lumen-nic*.link; do
     [ -e "$f" ] || continue
     idx="$(basename "$f")"; idx="${idx#70-lumen-nic}"; idx="${idx%.link}"
@@ -62,6 +71,8 @@ for f in "$LINKDIR"/70-lumen-nic*.link; do
     [ -n "$mac" ] || continue
     mac_to_idx["$mac"]="$idx"
     used_idx["$idx"]=1
+    alt="$(sed -n 's/^AlternativeName=//p' "$f" | head -n1)"
+    if [ -n "$alt" ]; then idx_to_alt["$idx"]="$alt"; fi
 done
 
 # --- assign indices: keep pins, give new NICs the next free index -----------
@@ -88,7 +99,11 @@ for entry in "${nics[@]}"; do
     read -r _ mac dev <<<"$entry"
     mac="$(tr 'A-F' 'a-f' <<<"$mac")"
     idx="${dev_to_idx[$dev]}"
-    cat > "$LINKDIR/70-lumen-nic$idx.link" <<EOF
+    # The kernel's own name, if this NIC is being renamed; otherwise whatever
+    # a previous run recorded, so a re-run never loses it.
+    if [ "$dev" != "nic$idx" ]; then alt="$dev"; else alt="${idx_to_alt[$idx]:-}"; fi
+    {
+        cat <<EOF
 # Written by lumen-nicnames. MAC pin is authoritative; do not renumber.
 [Match]
 PermanentMACAddress=$mac
@@ -96,7 +111,9 @@ PermanentMACAddress=$mac
 [Link]
 Name=nic$idx
 EOF
-    echo "nic$idx: $mac ($dev)"
+        if [ -n "$alt" ]; then echo "AlternativeName=$alt"; fi
+    } > "$LINKDIR/70-lumen-nic$idx.link"
+    echo "nic$idx: $mac ($dev)${alt:+ [$alt]}"
 done
 
 # --- optionally rename the running interfaces in place ----------------------

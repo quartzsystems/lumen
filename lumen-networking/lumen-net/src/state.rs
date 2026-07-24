@@ -25,9 +25,13 @@ impl ObservedState {
         self.links.iter().find(|l| l.name == name)
     }
 
-    /// Links reporting an address, in observation order.
+    /// Links reporting an address, in observation order. Loopback is not one
+    /// of them: 127.0.0.1 is on every box and is never how anyone reaches it,
+    /// so counting it would make an unaddressed appliance look addressed.
     pub fn addressed(&self) -> impl Iterator<Item = &ObservedLink> {
-        self.links.iter().filter(|l| !l.addresses.is_empty())
+        self.links
+            .iter()
+            .filter(|l| !l.addresses.is_empty() && l.name != "lo")
     }
 }
 
@@ -69,6 +73,11 @@ impl LinkState {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservedLink {
     pub name: String,
+    /// What the kernel called this NIC before lumen-nicnames pinned it to
+    /// `nicN` — `enp3s0`, `eno1`, and so on. The operator's link between a
+    /// label on the chassis and a row in the table, so it is shown as-is.
+    /// `None` for virtual links and for a NIC that was never renamed.
+    pub altname: Option<String>,
     pub kind: LinkKind,
     pub state: LinkState,
     /// NetworkManager is managing this device.
@@ -123,9 +132,19 @@ pub fn derive_desired(observed: &ObservedState) -> NetworkDesiredState {
     let mut desired = NetworkDesiredState::default();
 
     for link in &observed.links {
+        // A port's addressing belongs to its controller; the box reports none
+        // on it either way, but seeding it explicitly keeps the invariant the
+        // validator enforces true from the very first document.
+        let ip = if link.controller.is_some() {
+            IpConfig::Disabled
+        } else {
+            link.ip.clone()
+        };
         match link.kind {
             LinkKind::Ethernet => desired.nics.push(Nic {
                 name: link.name.clone(),
+                ip,
+                comment: None,
                 mtu: link.mtu,
                 autoneg: None,
                 speed: None,
@@ -134,12 +153,14 @@ pub fn derive_desired(observed: &ObservedState) -> NetworkDesiredState {
             LinkKind::Bond => desired.bonds.push(Bond {
                 name: link.name.clone(),
                 mode: link.bond_mode.unwrap_or_default(),
+                ip,
                 ports: link.ports.clone(),
                 mtu: link.mtu,
                 ..Bond::default()
             }),
             LinkKind::Bridge => desired.bridges.push(Bridge {
                 name: link.name.clone(),
+                ip,
                 ports: link.ports.clone(),
                 // Pin whatever the bridge is using now, so seeding does not
                 // itself become the change that moves the management MAC.
@@ -151,6 +172,8 @@ pub fn derive_desired(observed: &ObservedState) -> NetworkDesiredState {
                 name: link.name.clone(),
                 parent: link.parent.clone().unwrap_or_default(),
                 vlan_id: link.vlan_id.unwrap_or(1),
+                ip,
+                comment: None,
                 mtu: link.mtu,
             }),
             LinkKind::Other => {}
@@ -166,7 +189,7 @@ pub fn derive_desired(observed: &ObservedState) -> NetworkDesiredState {
     if let Some(link) = management {
         desired.management = ManagementRef {
             link: link.name.clone(),
-            ip: link.ip.clone(),
+            legacy_ip: None,
         };
     }
     desired
@@ -204,6 +227,23 @@ mod tests {
     }
 
     #[test]
+    fn loopback_never_counts_as_an_addressed_link() {
+        let state = ObservedState {
+            node: "lumen".into(),
+            links: vec![ObservedLink {
+                name: "lo".into(),
+                addresses: vec!["127.0.0.1/8".into()],
+                state: LinkState::Activated,
+                ..ObservedLink::default()
+            }],
+        };
+        assert_eq!(state.addressed().count(), 0);
+        // …so a box with nothing else configured has no management link, and
+        // validation is what says so.
+        assert!(derive_desired(&state).management.link.is_empty());
+    }
+
+    #[test]
     fn seeding_from_a_running_box_keeps_dhcp_dhcp() {
         let observed = ObservedState {
             node: "lumen".into(),
@@ -227,8 +267,42 @@ mod tests {
         let desired = derive_desired(&observed);
         assert_eq!(desired.nics.len(), 2);
         assert_eq!(desired.management.link, "nic0");
-        assert_eq!(desired.management.ip, IpConfig::Dhcp);
+        assert_eq!(desired.ip_of("nic0"), IpConfig::Dhcp);
+        // The spare NIC is not quietly signed up for a lease.
+        assert_eq!(desired.ip_of("nic1"), IpConfig::Disabled);
         assert_eq!(desired.nics[0].mtu, Some(1500));
+    }
+
+    /// A port has no addressing of its own, whatever the box happens to
+    /// report — the controller holds it.
+    #[test]
+    fn seeding_leaves_a_port_unaddressed() {
+        let observed = ObservedState {
+            node: "lumen".into(),
+            links: vec![
+                ObservedLink {
+                    name: "nic0".into(),
+                    kind: LinkKind::Ethernet,
+                    state: LinkState::Activated,
+                    controller: Some("br0".into()),
+                    ip: IpConfig::Dhcp,
+                    ..ObservedLink::default()
+                },
+                ObservedLink {
+                    name: "br0".into(),
+                    kind: LinkKind::Bridge,
+                    state: LinkState::Activated,
+                    ports: vec!["nic0".into()],
+                    addresses: vec!["192.168.10.5/24".into()],
+                    ip: IpConfig::Dhcp,
+                    ..ObservedLink::default()
+                },
+            ],
+        };
+        let desired = derive_desired(&observed);
+        assert_eq!(desired.ip_of("nic0"), IpConfig::Disabled);
+        assert_eq!(desired.ip_of("br0"), IpConfig::Dhcp);
+        assert_eq!(desired.management.link, "br0");
     }
 
     #[test]
@@ -259,7 +333,7 @@ mod tests {
         assert_eq!(desired.management.link, "br0");
         // DNS survives the round trip — an appliance seeded from its own box
         // must not silently lose its resolvers on the next apply.
-        match desired.management.ip {
+        match desired.ip_of("br0") {
             IpConfig::Static { ref dns, .. } => assert_eq!(dns, &vec!["9.9.9.9".to_string()]),
             ref other => panic!("expected static, got {other:?}"),
         }

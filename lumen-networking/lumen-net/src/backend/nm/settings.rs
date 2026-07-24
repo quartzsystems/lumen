@@ -282,6 +282,64 @@ pub fn get_bond_option(settings: &SettingsMap, key: &str) -> Option<String> {
     options.get(key).cloned()
 }
 
+/// The layer-3 configuration a stored profile asks for — the inverse of
+/// [`apply_ip`].
+///
+/// Reading this back is what lets a desired state be seeded from a running box
+/// without a DHCP appliance turning into a static one (or the other way
+/// round) on the very first apply.
+pub fn get_ip(settings: &SettingsMap) -> IpConfig {
+    match get_str(settings, IPV4, "method") {
+        Some("auto") => IpConfig::Dhcp,
+        Some("manual") => {
+            let Some(cidr) = first_address(settings) else {
+                // "manual" with no address is a profile that cannot come up;
+                // reporting it as disabled keeps a seeded document honest.
+                return IpConfig::Disabled;
+            };
+            IpConfig::Static {
+                cidr,
+                gateway: get_str(settings, IPV4, "gateway")
+                    .unwrap_or_default()
+                    .to_string(),
+                dns: dns_addresses(settings),
+            }
+        }
+        // "disabled", "link-local", "shared", or a profile with no ipv4
+        // setting at all: nothing Lumen models as an address.
+        _ => IpConfig::Disabled,
+    }
+}
+
+/// The first `ipv4.address-data` entry as "address/prefix".
+fn first_address(settings: &SettingsMap) -> Option<String> {
+    let value = settings.get(IPV4)?.get("address-data")?;
+    let entries: Vec<HashMap<String, OwnedValue>> = Vec::try_from(value.try_clone().ok()?).ok()?;
+    let entry = entries.first()?;
+    let address = entry
+        .get("address")
+        .and_then(|v| <&str>::try_from(v).ok())?;
+    let prefix = entry.get("prefix").and_then(|v| u32::try_from(v).ok())?;
+    Some(format!("{address}/{prefix}"))
+}
+
+/// `ipv4.dns` back from `au` — the mirror of [`dns_word`].
+fn dns_addresses(settings: &SettingsMap) -> Vec<String> {
+    let Some(value) = settings.get(IPV4).and_then(|group| group.get("dns")) else {
+        return Vec::new();
+    };
+    let Ok(words) = value.try_clone().and_then(Vec::<u32>::try_from) else {
+        return Vec::new();
+    };
+    words
+        .into_iter()
+        .map(|word| {
+            let [a, b, c, d] = word.to_ne_bytes();
+            format!("{a}.{b}.{c}.{d}")
+        })
+        .collect()
+}
+
 /// The controller a connection is enslaved to, accepting either spelling on
 /// read: a profile written by an older appliance (or by hand) still parses.
 pub fn get_controller(settings: &SettingsMap) -> Option<&str> {
@@ -474,6 +532,36 @@ mod tests {
             dns: vec![],
         };
         assert!(to_settings(&bad_cidr, None).is_err());
+    }
+
+    /// What is written has to read back as the same thing, or seeding a
+    /// desired state from a running box silently rewrites its addressing.
+    #[test]
+    fn ip_configuration_round_trips_through_a_profile() {
+        for ip in [
+            IpConfig::Dhcp,
+            IpConfig::Disabled,
+            IpConfig::Static {
+                cidr: "192.168.10.5/24".into(),
+                gateway: "192.168.10.1".into(),
+                dns: vec!["9.9.9.9".into(), "1.1.1.1".into()],
+            },
+        ] {
+            let mut link = spec("br0", LinkKind::Bridge);
+            link.bridge = Some(BridgeSpec::default());
+            link.ip = ip.clone();
+            let settings = to_settings(&link, None).unwrap();
+            assert_eq!(get_ip(&settings), ip);
+        }
+    }
+
+    #[test]
+    fn a_manual_profile_with_no_address_reads_as_disabled() {
+        let mut builder = SettingsBuilder::new();
+        builder.set(IPV4, "method", "manual");
+        assert_eq!(get_ip(&builder.build()), IpConfig::Disabled);
+        // …as does a profile with no ipv4 group at all.
+        assert_eq!(get_ip(&SettingsMap::new()), IpConfig::Disabled);
     }
 
     #[test]

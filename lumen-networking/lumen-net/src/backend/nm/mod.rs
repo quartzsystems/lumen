@@ -175,7 +175,11 @@ impl NmBackend {
             .await?)
     }
 
-    async fn observe_device(&self, path: &OwnedObjectPath) -> Result<Option<ObservedLink>> {
+    async fn observe_device(
+        &self,
+        path: &OwnedObjectPath,
+        altnames: &HashMap<String, String>,
+    ) -> Result<Option<ObservedLink>> {
         let device = self.device_at(&path.as_ref()).await?;
         let Ok(name) = device.interface().await else {
             return Ok(None);
@@ -202,6 +206,7 @@ impl NmBackend {
 
         let mut link = ObservedLink {
             name: name.clone(),
+            altname: altnames.get(&name).cloned(),
             kind,
             state,
             managed: device.managed().await.unwrap_or(false),
@@ -286,6 +291,10 @@ impl NmBackend {
         }
         if let Some(profile) = profile {
             link.controller = settings::get_controller(&profile).map(String::from);
+            // What the profile *asks for*, which is not the same question as
+            // what `addresses` above reports: a DHCP link with a lease and a
+            // static link with the same address look identical on the wire.
+            link.ip = settings::get_ip(&profile);
             if kind == LinkKind::Vlan {
                 link.vlan_id = settings::get_u32(&profile, settings::VLAN, "id")
                     .and_then(|id| u16::try_from(id).ok());
@@ -418,9 +427,10 @@ fn address_entry(entry: &HashMap<String, zbus::zvariant::OwnedValue>) -> Option<
 impl NetworkBackend for NmBackend {
     async fn observe(&self) -> Result<ObservedState> {
         let node = hostname();
+        let altnames = altnames(std::path::Path::new(LINK_DIR));
         let mut links = Vec::new();
         for path in self.nm().await?.get_all_devices().await? {
-            if let Some(link) = self.observe_device(&path).await? {
+            if let Some(link) = self.observe_device(&path, &altnames).await? {
                 links.push(link);
             }
         }
@@ -516,6 +526,53 @@ fn object_path(id: &CheckpointId) -> Result<ObjectPath<'_>> {
         .map_err(|err| NetError::Backend(anyhow!("bad checkpoint id {}: {err}", id.0)))
 }
 
+/// Where lumen-nicnames writes its `70-lumen-nic<N>.link` files.
+const LINK_DIR: &str = "/etc/systemd/network";
+
+/// `nicN` -> the name the kernel gave the adapter before udev renamed it.
+///
+/// Read from lumen-nicnames' own link files rather than from the kernel: an
+/// alternative name is not exposed in sysfs, and the netlink property list is
+/// a whole dependency for one string per NIC. The tool that does the renaming
+/// is also the one that knows what the name used to be, so it records it —
+/// `AlternativeName=` for udev, and this reads the same line back.
+///
+/// A missing or unreadable directory is not an error: the column is simply
+/// empty, which is also the honest answer on a box whose NICs were never
+/// renamed.
+fn altnames(dir: &std::path::Path) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_lumen_link = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("70-lumen-nic") && name.ends_with(".link"));
+        if !is_lumen_link {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let mut name = None;
+        let mut altname = None;
+        for line in text.lines().map(str::trim) {
+            if let Some(value) = line.strip_prefix("Name=") {
+                name = Some(value.to_string());
+            } else if let Some(value) = line.strip_prefix("AlternativeName=") {
+                altname = Some(value.to_string());
+            }
+        }
+        if let (Some(name), Some(altname)) = (name, altname) {
+            out.insert(name, altname);
+        }
+    }
+    out
+}
+
 /// The node name observed state is grouped by. `/etc/hostname` is not read —
 /// `ProtectSystem=strict` leaves /etc readable, but the kernel's own value is
 /// the one that matters and needs no file at all.
@@ -568,5 +625,43 @@ mod tests {
     #[test]
     fn a_hostname_is_always_reported() {
         assert!(!hostname().is_empty());
+    }
+
+    #[test]
+    fn alternative_names_come_out_of_the_link_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "lumen-net-altnames-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("70-lumen-nic0.link"),
+            "[Match]\nPermanentMACAddress=52:54:00:aa:bb:00\n\n\
+             [Link]\nName=nic0\nAlternativeName=enp1s0\n",
+        )
+        .unwrap();
+        // A NIC that was already called nicN has nothing to record.
+        std::fs::write(
+            dir.join("70-lumen-nic1.link"),
+            "[Match]\nPermanentMACAddress=52:54:00:aa:bb:01\n\n[Link]\nName=nic1\n",
+        )
+        .unwrap();
+        // Somebody else's link file is none of our business.
+        std::fs::write(
+            dir.join("99-default.link"),
+            "[Link]\nName=eth0\nAlternativeName=whatever\n",
+        )
+        .unwrap();
+
+        let found = altnames(&dir);
+        assert_eq!(found.get("nic0").map(String::as_str), Some("enp1s0"));
+        assert_eq!(found.get("nic1"), None);
+        assert_eq!(found.get("eth0"), None);
+
+        // A box with no link files at all is empty, not an error.
+        assert!(altnames(std::path::Path::new("/nonexistent-lumen-test")).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

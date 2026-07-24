@@ -13,6 +13,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { PageHeader } from "@/components/PageHeader";
+import { DataTable, Dash, type Column } from "@/components/console/DataTable";
 import { LinkDialog, dialogKindFor, type DialogKind } from "@/components/network/LinkDialog";
 import { ApiError } from "@/lib/authClient";
 import { useConsole } from "@/lib/ConsoleContext";
@@ -263,10 +264,8 @@ export default function InterfacesPage() {
 
       {interfaces?.nodes.map((node) => (
         <section key={node.node} className="mb-6">
-          <h2 className="text-[13px] font-semibold text-[var(--qz-fg-2)] mb-2 qz-mono">
-            {node.node}
-          </h2>
           <InterfaceTable
+            node={node.node}
             rows={node.interfaces}
             busy={busy || outstanding}
             onEdit={(link) => setDialog({ kind: dialogKindFor(link.kind), editing: link })}
@@ -313,118 +312,211 @@ const CHANGE_BADGE: Record<string, string> = {
   deleted: "badge badge-crit",
 };
 
-/// Rows arrive already ordered so a controller is immediately followed by its
-/// ports (lumen-net orders them); the indent is what makes that visible.
+/// Whether the link is up on the box right now. A link that only exists in the
+/// staged target has no answer yet, which is a third state and reads as one.
+const activeText = (link: LinkView): string => {
+  if (!link.present) return "staged";
+  if (link.oper_state === "activating") return "coming up";
+  return link.oper_state === "activated" ? "yes" : "no";
+};
+
+/// The addressing the configuration asks for. The box's own `addresses` are
+/// what a running link reports; showing the desired value instead is what
+/// makes a staged address visible before anyone applies it.
+const addressText = (link: LinkView): string => {
+  if (link.ip.mode === "dhcp") return "DHCP";
+  if (link.ip.mode === "static") return link.ip.cidr;
+  // Nothing configured, but the box may still hold a lease from elsewhere.
+  return link.addresses.join(", ");
+};
+
+const gatewayText = (link: LinkView): string =>
+  link.ip.mode === "static" ? link.ip.gateway : (link.gateway ?? "");
+
+/// One row per link on the node. Ports are listed against their controller
+/// rather than nested under it: an operator scanning the Name column wants a
+/// flat list of everything the box has.
 function InterfaceTable({
+  node,
   rows,
   busy,
   onEdit,
   onDelete,
 }: {
+  node: string;
   rows: LinkView[];
   busy: boolean;
   onEdit: (link: LinkView) => void;
   onDelete: (link: LinkView) => void;
 }) {
-  const dash = <span className="qz-dim">—</span>;
+  const columns: Column<LinkView>[] = [
+    {
+      key: "name",
+      header: "Name",
+      width: 170,
+      value: (link) => link.name,
+      render: (link) => (
+        <span className="inline-flex items-center gap-2 min-w-0">
+          <span className="qz-mono text-[var(--qz-fg-1)] font-semibold truncate">{link.name}</span>
+          {link.change !== "unchanged" && (
+            <span className={CHANGE_BADGE[link.change]}>{link.change}</span>
+          )}
+        </span>
+      ),
+    },
+    {
+      key: "altname",
+      header: "Alternative Name",
+      width: 150,
+      value: (link) => link.altname ?? "",
+      render: (link) => (link.altname ? <span className="qz-mono">{link.altname}</span> : <Dash />),
+    },
+    {
+      key: "kind",
+      header: "Type",
+      width: 100,
+      filterable: true,
+      value: (link) => link.kind,
+      render: (link) => <span className="qz-dim">{link.kind}</span>,
+    },
+    {
+      key: "active",
+      header: "Active",
+      width: 110,
+      filterable: true,
+      value: activeText,
+      render: (link) => <ActiveCell link={link} />,
+    },
+    {
+      key: "vlan_aware",
+      header: "VLAN Aware",
+      width: 110,
+      value: (link) => (link.kind === "bridge" ? (link.vlan_aware ? "yes" : "no") : ""),
+      render: (link) =>
+        link.kind === "bridge" ? (
+          <span className="qz-mono qz-dim">{link.vlan_aware ? "yes" : "no"}</span>
+        ) : (
+          <Dash />
+        ),
+    },
+    {
+      key: "ports",
+      header: "Ports/Slaves",
+      width: 150,
+      value: (link) => link.ports.join(", "),
+      render: (link) =>
+        link.ports.length > 0 ? (
+          <span className="qz-mono" title={link.ports.join(", ")}>
+            {link.ports.join(", ")}
+          </span>
+        ) : (
+          <Dash />
+        ),
+    },
+    {
+      key: "bond_mode",
+      header: "Bond Mode",
+      width: 130,
+      value: (link) => link.bond_mode ?? "",
+      render: (link) =>
+        link.bond_mode ? <span className="qz-mono">{link.bond_mode}</span> : <Dash />,
+    },
+    {
+      key: "address",
+      header: "Address",
+      width: 170,
+      value: addressText,
+      render: (link) => {
+        const text = addressText(link);
+        return text ? <span className="qz-mono">{text}</span> : <Dash />;
+      },
+    },
+    {
+      key: "gateway",
+      header: "Gateway",
+      width: 150,
+      value: gatewayText,
+      render: (link) => {
+        const text = gatewayText(link);
+        return text ? <span className="qz-mono">{text}</span> : <Dash />;
+      },
+    },
+    {
+      key: "comment",
+      header: "Description",
+      width: 220,
+      value: (link) => link.comment ?? "",
+      render: (link) =>
+        link.comment ? (
+          <span className="text-[var(--qz-fg-3)]" title={link.comment}>
+            {link.comment}
+          </span>
+        ) : (
+          <Dash />
+        ),
+    },
+    {
+      key: "actions",
+      header: "",
+      width: 92,
+      pinned: true,
+      align: "right",
+      value: () => "",
+      render: (link) => (
+        <div className="flex items-center gap-1 justify-end">
+          <button
+            type="button"
+            className="btn btn-sm btn-ghost"
+            disabled={busy || link.kind === "other"}
+            onClick={() => onEdit(link)}
+            title={link.kind === "other" ? "Not managed by Lumen" : `Edit ${link.name}`}
+          >
+            <Pencil size={13} />
+          </button>
+          <button
+            type="button"
+            className="btn btn-sm btn-ghost btn-danger"
+            disabled={busy || !link.deletable}
+            onClick={() => onDelete(link)}
+            // The control explains itself instead of being silently greyed
+            // out: the backend supplies the reason.
+            title={link.delete_blocked_reason ?? `Remove ${link.name}`}
+          >
+            <Trash2 size={13} />
+          </button>
+        </div>
+      ),
+    },
+  ];
+
   return (
-    <div className="qz-table-wrap">
-      <table className="qz-table">
-        <thead>
-          <tr>
-            <th>Name</th>
-            <th>Type</th>
-            <th>State</th>
-            <th>Ports</th>
-            <th>Controller</th>
-            <th>VLAN</th>
-            <th>Bond mode</th>
-            <th>MTU</th>
-            <th>Address</th>
-            <th>Gateway</th>
-            <th>MAC</th>
-            <th>Link</th>
-            <th />
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((link) => (
-            <tr key={link.name}>
-              <td className={link.controller ? "qz-indent" : undefined}>
-                <span className="qz-mono text-[var(--qz-fg-1)] font-semibold">{link.name}</span>
-                {link.management && <span className="badge badge-info ml-2">MGMT</span>}
-                {link.change !== "unchanged" && (
-                  <span className={`${CHANGE_BADGE[link.change]} ml-2`}>{link.change}</span>
-                )}
-              </td>
-              <td className="qz-dim">{link.kind}</td>
-              <td>
-                <StateCell link={link} />
-              </td>
-              <td className="qz-mono">{link.ports.join(", ") || dash}</td>
-              <td className="qz-mono">{link.controller ?? dash}</td>
-              <td className="qz-mono">{link.vlan_id ?? dash}</td>
-              <td className="qz-mono">{link.bond_mode ?? dash}</td>
-              <td className="qz-mono">{link.mtu ?? dash}</td>
-              <td className="qz-mono">{link.addresses.join(", ") || dash}</td>
-              <td className="qz-mono">{link.gateway ?? dash}</td>
-              <td
-                className="qz-mono qz-dim"
-                title={link.perm_mac ? `permanent ${link.perm_mac}` : undefined}
-              >
-                {link.mac ?? "—"}
-              </td>
-              <td className="qz-mono qz-dim">
-                {link.speed_mbps
-                  ? `${link.speed_mbps} Mb/s${link.duplex ? ` ${link.duplex}` : ""}`
-                  : "—"}
-              </td>
-              <td>
-                <div className="flex items-center gap-1 justify-end">
-                  <button
-                    type="button"
-                    className="btn btn-sm btn-ghost"
-                    disabled={busy || link.kind === "other"}
-                    onClick={() => onEdit(link)}
-                    title={link.kind === "other" ? "Not managed by Lumen" : `Edit ${link.name}`}
-                  >
-                    <Pencil size={13} />
-                  </button>
-                  <button
-                    type="button"
-                    className="btn btn-sm btn-ghost btn-danger"
-                    disabled={busy || !link.deletable}
-                    onClick={() => onDelete(link)}
-                    // The control explains itself instead of being silently
-                    // greyed out: the backend supplies the reason.
-                    title={link.delete_blocked_reason ?? `Remove ${link.name}`}
-                  >
-                    <Trash2 size={13} />
-                  </button>
-                </div>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+    <DataTable
+      id="network.interfaces"
+      columns={columns}
+      rows={rows}
+      rowKey={(link) => link.name}
+      title={node}
+      searchPlaceholder="Search interfaces…"
+      empty="No interfaces on this node."
+    />
   );
 }
 
-function StateCell({ link }: { link: LinkView }) {
+function ActiveCell({ link }: { link: LinkView }) {
   if (!link.present) return <span className="badge badge-muted">staged</span>;
   const up = link.oper_state === "activated";
   const coming = link.oper_state === "activating";
   return (
-    <span className="inline-flex items-center gap-2">
-      <span className={`badge ${up ? "badge-ok" : coming ? "badge-warn" : "badge-muted"}`}>
-        {link.oper_state}
-      </span>
-      {link.kind === "ethernet" && (
-        <span className={`badge ${link.carrier ? "badge-muted" : "badge-warn"}`}>
-          {link.carrier ? "carrier" : "no carrier"}
-        </span>
-      )}
+    <span
+      className={`badge ${up ? "badge-ok" : coming ? "badge-warn" : "badge-muted"}`}
+      // The full NetworkManager state is still one hover away.
+      title={
+        link.kind === "ethernet" && !link.carrier
+          ? `${link.oper_state} · no carrier`
+          : link.oper_state
+      }
+    >
+      {activeText(link)}
     </span>
   );
 }

@@ -12,6 +12,7 @@ import {
   validationErrorsOf,
   type BondMode,
   type Duplex,
+  type IpConfig,
   type LinkKind,
   type LinkView,
   type PendingResponse,
@@ -19,11 +20,20 @@ import {
 
 export type DialogKind = "bridge" | "bond" | "vlan" | "ethernet";
 
+/// How a link is addressed. The three arms of the backend's `IpConfig`, in the
+/// words the form uses.
+type IpMode = "none" | "dhcp" | "static";
+
 /// Every field the four link dialogs between them collect. Kept as strings so
 /// a half-typed number is a normal input state rather than NaN.
 interface Draft {
   name: string;
+  comment: string;
+  ipMode: IpMode;
+  cidr: string;
+  gateway: string;
   ports: string[];
+  vlanAware: boolean;
   stp: boolean;
   forwardDelay: string;
   mtu: string;
@@ -41,7 +51,12 @@ interface Draft {
 
 const emptyDraft = (): Draft => ({
   name: "",
+  comment: "",
+  ipMode: "none",
+  cidr: "",
+  gateway: "",
   ports: [],
+  vlanAware: false,
   stp: false,
   forwardDelay: "",
   mtu: "",
@@ -60,7 +75,12 @@ const emptyDraft = (): Draft => ({
 const draftFrom = (link: LinkView): Draft => ({
   ...emptyDraft(),
   name: link.name,
+  comment: link.comment ?? "",
+  ipMode: link.ip.mode === "disabled" ? "none" : link.ip.mode,
+  cidr: link.ip.mode === "static" ? link.ip.cidr : "",
+  gateway: link.ip.mode === "static" ? link.ip.gateway : "",
   ports: [...link.ports],
+  vlanAware: link.vlan_aware,
   mtu: link.mtu?.toString() ?? "",
   mode: link.bond_mode ?? "active-backup",
   parent: link.parent ?? "",
@@ -80,6 +100,22 @@ const TITLES: Record<DialogKind, string> = {
 const validName = (name: string): boolean =>
   name.length > 0 && name.length <= 15 && !/[\s/:]/.test(name);
 
+/// Dotted quad, each octet 0–255.
+const validIpv4 = (value: string): boolean =>
+  /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.test(value) &&
+  value.split(".").every((octet) => Number(octet) <= 255);
+
+/// "192.168.1.10/24" — an address and a prefix length in the same field, which
+/// is how an operator reads one off a network diagram.
+const validCidr = (value: string): boolean => {
+  const [address, prefix, ...rest] = value.split("/");
+  if (rest.length > 0 || prefix === undefined) return false;
+  const length = Number(prefix);
+  return (
+    validIpv4(address) && /^\d{1,2}$/.test(prefix) && Number.isInteger(length) && length <= 32
+  );
+};
+
 const numberOrUndefined = (text: string): number | undefined => {
   const trimmed = text.trim();
   if (trimmed === "") return undefined;
@@ -87,9 +123,21 @@ const numberOrUndefined = (text: string): number | undefined => {
   return Number.isFinite(value) ? value : undefined;
 };
 
-/// Create or edit one link. Server-side validation errors come back with the
-/// field they belong to, so they land under the input that caused them
-/// instead of in a banner at the top.
+const ipConfigOf = (draft: Draft): IpConfig => {
+  if (draft.ipMode === "dhcp") return { mode: "dhcp" };
+  if (draft.ipMode === "static") {
+    return { mode: "static", cidr: draft.cidr.trim(), gateway: draft.gateway.trim() };
+  }
+  return { mode: "disabled" };
+};
+
+/// Create or edit one link.
+///
+/// All four kinds share one form: name, addressing, MTU, and a comment are in
+/// the same place every time, with only the middle — ports, VLAN id, bond
+/// options — changing. Server-side validation errors come back with the field
+/// they belong to, so they land under the input that caused them instead of in
+/// a banner at the top.
 export function LinkDialog({
   kind,
   editing,
@@ -148,6 +196,16 @@ export function LinkDialog({
     if (kind === "bond" && draft.ports.length === 0) {
       found.ports = "A bond needs at least one port.";
     }
+    if (draft.ipMode === "static") {
+      if (!validCidr(draft.cidr.trim())) {
+        found.ip = "Use an address and prefix length, like 192.168.1.10/24.";
+      }
+      // A gateway is optional — a storage or migration network has none — but
+      // a malformed one is a mistake, not a choice.
+      if (draft.gateway.trim() !== "" && !validIpv4(draft.gateway.trim())) {
+        found.gateway = "Use a plain IPv4 address, like 192.168.1.1.";
+      }
+    }
     if (draft.mtu.trim() !== "") {
       const mtu = numberOrUndefined(draft.mtu);
       if (mtu === undefined || mtu < 576 || mtu > 65536) found.mtu = "Use an MTU from 576 to 65536.";
@@ -161,36 +219,37 @@ export function LinkDialog({
     setSaving(true);
     try {
       const mtu = numberOrUndefined(draft.mtu);
+      const common = { ip: ipConfigOf(draft), comment: draft.comment.trim(), mtu };
       let pending: PendingResponse;
       if (kind === "bridge") {
         const body = {
+          ...common,
           ports: draft.ports,
           stp: draft.stp,
           forward_delay: numberOrUndefined(draft.forwardDelay),
-          vlan_filtering: false,
-          mtu,
+          vlan_filtering: draft.vlanAware,
         };
         pending = editing
           ? await updateBridge(editing.name, body)
           : await createBridge({ name: draft.name, ...body });
       } else if (kind === "bond") {
         const body = {
+          ...common,
           mode: draft.mode,
           ports: draft.ports,
           miimon: numberOrUndefined(draft.miimon),
           lacp_rate: draft.lacpRate || undefined,
           xmit_hash_policy: draft.hashPolicy || undefined,
           primary: draft.primary || undefined,
-          mtu,
         };
         pending = editing
           ? await updateBond(editing.name, body)
           : await createBond({ name: draft.name, ...body });
       } else if (kind === "vlan") {
         const body = {
+          ...common,
           parent: draft.parent,
           vlan_id: numberOrUndefined(draft.vlanId) ?? 0,
-          mtu,
         };
         pending = editing
           ? await updateVlan(editing.name, body)
@@ -198,7 +257,7 @@ export function LinkDialog({
       } else {
         // A physical NIC is configured, never created.
         pending = await updateNic(editing!.name, {
-          mtu,
+          ...common,
           autoneg: draft.autoneg === "" ? undefined : draft.autoneg === "on",
           speed: draft.autoneg === "off" ? numberOrUndefined(draft.speed) : undefined,
           duplex: draft.autoneg === "off" && draft.duplex ? draft.duplex : undefined,
@@ -230,6 +289,10 @@ export function LinkDialog({
     }));
 
   const showPorts = kind === "bridge" || kind === "bond";
+  const portLabel = kind === "bridge" ? "Bridge ports" : "Bond ports";
+  // A port hands its addressing to its controller, so offering the fields
+  // would be offering a setting the box discards.
+  const isPort = editing?.controller != null;
 
   return (
     <div className="dialog-scrim" role="dialog" aria-modal="true">
@@ -244,20 +307,41 @@ export function LinkDialog({
         </p>
 
         <div className="flex flex-col gap-4 mt-5">
-          {!editing && (
+          <div className="field">
+            <label className="field-label" htmlFor="link-name">
+              Name
+            </label>
+            <input
+              id="link-name"
+              className={`input${errors.name ? " input-invalid" : ""}`}
+              value={draft.name}
+              // An interface cannot be renamed in place — the profile, the
+              // ports pointing at it, and the running device all carry the
+              // name — so editing shows it rather than offering it.
+              readOnly={editing !== null}
+              autoFocus={editing === null}
+              placeholder={kind === "bridge" ? "br1" : kind === "bond" ? "bond0" : "vlan100"}
+              onChange={(e) => set("name", e.target.value)}
+            />
+            {errors.name && <span className="field-error">{errors.name}</span>}
+          </div>
+
+          {kind === "ethernet" && editing && (
             <div className="field">
-              <label className="field-label" htmlFor="link-name">
-                Name
+              <label className="field-label" htmlFor="link-altname">
+                Alternative name
               </label>
               <input
-                id="link-name"
-                className={`input${errors.name ? " input-invalid" : ""}`}
-                value={draft.name}
-                autoFocus
-                placeholder={kind === "bridge" ? "br1" : kind === "bond" ? "bond0" : "vlan100"}
-                onChange={(e) => set("name", e.target.value)}
+                id="link-altname"
+                className="input"
+                value={editing.altname ?? ""}
+                placeholder="—"
+                readOnly
               />
-              {errors.name && <span className="field-error">{errors.name}</span>}
+              <span className="field-hint">
+                What the kernel called this adapter before Lumen pinned it to{" "}
+                <span className="qz-mono">{editing.name}</span>.
+              </span>
             </div>
           )}
 
@@ -302,7 +386,7 @@ export function LinkDialog({
           {kind === "bond" && (
             <div className="field">
               <label className="field-label" htmlFor="bond-mode">
-                Mode
+                Bond mode
               </label>
               <select
                 id="bond-mode"
@@ -317,9 +401,20 @@ export function LinkDialog({
             </div>
           )}
 
+          {kind === "bridge" && (
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={draft.vlanAware}
+                onChange={(e) => set("vlanAware", e.target.checked)}
+              />
+              VLAN aware
+            </label>
+          )}
+
           {showPorts && (
             <div className="field">
-              <span className="field-label">Ports</span>
+              <span className="field-label">{portLabel}</span>
               <div className="port-list">
                 {portCandidates.length === 0 && (
                   <span className="field-hint">No interfaces are free to add.</span>
@@ -333,20 +428,81 @@ export function LinkDialog({
                     />
                     <span className="qz-mono">{link.name}</span>
                     <span className="qz-dim text-[12px]">
-                      {link.kind}
+                      {link.altname ?? link.kind}
                       {link.carrier ? "" : " · no carrier"}
                     </span>
                   </label>
                 ))}
               </div>
-              {managementLink && (
+              {/* Only when the management link is genuinely missing from the
+                  list above. Editing the management link itself excludes it
+                  for the ordinary reason — nothing is a port of itself — and
+                  saying otherwise there is just confusing. */}
+              {managementLink && managementLink !== draft.name && (
                 <span className="field-hint">
-                  {managementLink} carries the management address and is not listed. Use
-                  &ldquo;Create management bridge&rdquo; to move it safely.
+                  <span className="qz-mono">{managementLink}</span> carries the management address
+                  and is not listed. Use &ldquo;Create management bridge&rdquo; to move it safely.
                 </span>
               )}
               {errors.ports && <span className="field-error">{errors.ports}</span>}
             </div>
+          )}
+
+          {isPort ? (
+            <span className="field-hint">
+              <span className="qz-mono">{editing?.name}</span> is a port of{" "}
+              <span className="qz-mono">{editing?.controller}</span>, so its address is configured
+              on <span className="qz-mono">{editing?.controller}</span> instead.
+            </span>
+          ) : (
+            <>
+              <div className="field">
+                <label className="field-label" htmlFor="link-ipmode">
+                  IPv4
+                </label>
+                <select
+                  id="link-ipmode"
+                  className="select"
+                  value={draft.ipMode}
+                  onChange={(e) => set("ipMode", e.target.value as IpMode)}
+                >
+                  <option value="none">No address</option>
+                  <option value="static">Static</option>
+                  <option value="dhcp">Automatic (DHCP)</option>
+                </select>
+              </div>
+
+              {draft.ipMode === "static" && (
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="field">
+                    <label className="field-label" htmlFor="link-cidr">
+                      IPv4/CIDR
+                    </label>
+                    <input
+                      id="link-cidr"
+                      className={`input${errors.ip ? " input-invalid" : ""}`}
+                      value={draft.cidr}
+                      placeholder="192.168.1.10/24"
+                      onChange={(e) => set("cidr", e.target.value)}
+                    />
+                    {errors.ip && <span className="field-error">{errors.ip}</span>}
+                  </div>
+                  <div className="field">
+                    <label className="field-label" htmlFor="link-gateway">
+                      Gateway (IPv4)
+                    </label>
+                    <input
+                      id="link-gateway"
+                      className={`input${errors.gateway ? " input-invalid" : ""}`}
+                      value={draft.gateway}
+                      placeholder="192.168.1.1"
+                      onChange={(e) => set("gateway", e.target.value)}
+                    />
+                    {errors.gateway && <span className="field-error">{errors.gateway}</span>}
+                  </div>
+                </div>
+              )}
+            </>
           )}
 
           {kind === "bond" && (
@@ -512,6 +668,20 @@ export function LinkDialog({
               onChange={(e) => set("mtu", e.target.value)}
             />
             {errors.mtu && <span className="field-error">{errors.mtu}</span>}
+          </div>
+
+          <div className="field">
+            <label className="field-label" htmlFor="link-comment">
+              Comment
+            </label>
+            <input
+              id="link-comment"
+              className="input"
+              value={draft.comment}
+              placeholder="What this interface is for"
+              onChange={(e) => set("comment", e.target.value)}
+            />
+            <span className="field-hint">Shown in the Description column.</span>
           </div>
 
           {errors.management && <span className="field-error">{errors.management}</span>}

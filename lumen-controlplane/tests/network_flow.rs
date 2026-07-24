@@ -182,6 +182,16 @@ async fn stage_validate_apply_confirm() {
     assert_eq!(nic0["management"], true);
     assert_eq!(nic0["deletable"], false);
     assert_eq!(nic0["addresses"][0], "192.168.10.5/24");
+    // Every column the console renders comes out of this one response.
+    assert_eq!(nic0["altname"], "enp1s0");
+    assert_eq!(nic0["ip"]["mode"], "static");
+    assert_eq!(nic0["ip"]["cidr"], "192.168.10.5/24");
+    assert_eq!(nic0["vlan_aware"], false);
+    assert!(nic0["comment"].is_null());
+    assert!(
+        !rows.iter().any(|r| r["name"] == "lo"),
+        "loopback is not a row anyone can act on"
+    );
 
     // Stage a bridge over the spare NIC.
     let (status, staged) = h
@@ -444,6 +454,66 @@ async fn a_nic_can_be_patched_but_not_deleted() {
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 }
 
+/// The bridge dialog's fields, end to end: address, gateway, VLAN awareness,
+/// ports, and a comment, staged in one request and read back off the table.
+#[tokio::test]
+async fn a_bridge_can_be_created_with_an_address_and_a_comment() {
+    let h = harness("bridge-fields").await;
+    let (status, staged) = h
+        .post(
+            "/api/network/bridges",
+            r#"{"name":"br1","ports":["nic1"],"vlan_filtering":true,
+                "comment":"guest traffic",
+                "ip":{"mode":"static","cidr":"10.0.0.5/24","gateway":"10.0.0.1"}}"#,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{staged}");
+    assert_eq!(staged["errors"].as_array().unwrap().len(), 0);
+
+    let rows = h.get("/api/network/interfaces").await["nodes"][0]["interfaces"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let br1 = rows.iter().find(|r| r["name"] == "br1").unwrap();
+    assert_eq!(br1["vlan_aware"], true);
+    assert_eq!(br1["comment"], "guest traffic");
+    assert_eq!(br1["ip"]["cidr"], "10.0.0.5/24");
+    assert_eq!(br1["ip"]["gateway"], "10.0.0.1");
+
+    // And it applies without disturbing the management address on nic0.
+    let (status, applied) = h.post("/api/network/apply", "{}").await;
+    assert_eq!(status, StatusCode::OK, "{applied}");
+    let state = h.backend.state();
+    assert_eq!(
+        state.link("br1").unwrap().addresses,
+        vec!["10.0.0.5/24".to_string()]
+    );
+    assert_eq!(
+        state.link("nic0").unwrap().addresses,
+        vec!["192.168.10.5/24".to_string()]
+    );
+}
+
+/// Leaving an address on a link while enslaving it is silently dropped by the
+/// kernel, so it is refused here with the field it belongs to.
+#[tokio::test]
+async fn an_address_left_on_a_port_is_refused() {
+    let h = harness("port-address").await;
+    h.call(
+        "PATCH",
+        "/api/network/nics/nic1",
+        Some(r#"{"ip":{"mode":"dhcp"}}"#),
+    )
+    .await;
+    let (status, body) = h
+        .post("/api/network/bridges", r#"{"name":"br1","ports":["nic1"]}"#)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["errors"][0]["code"], "port_has_address");
+    assert_eq!(body["errors"][0]["field"], "ip");
+    assert_eq!(body["errors"][0]["link"], "nic1");
+}
+
 #[tokio::test]
 async fn a_staged_delete_stays_visible_until_it_is_applied() {
     let h = harness("staged-delete").await;
@@ -484,6 +554,7 @@ async fn one_interface_can_be_fetched_on_its_own() {
     assert_eq!(nic0["kind"], "ethernet");
     assert_eq!(nic0["perm_mac"], "52:54:00:aa:bb:00");
     assert_eq!(nic0["speed_mbps"], 1000);
+    assert_eq!(nic0["altname"], "enp1s0");
 
     let (status, _) = h.call("GET", "/api/network/interfaces/nic9", None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);

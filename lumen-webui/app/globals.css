@@ -246,9 +246,122 @@ body {
 .qz-table tbody tr:last-child td { border-bottom: 0; }
 .qz-table tbody tr:hover td { background: color-mix(in oklab, white 3%, transparent); }
 .qz-mono { font-family: var(--qz-font-mono); }
-/* A port sits under its controller; the indent is what makes that readable. */
-.qz-table td.qz-indent { padding-left: 28px; }
 .qz-dim { color: var(--qz-fg-4); }
+
+/* Resizable columns need a fixed layout: with `auto`, the browser reflows
+   every column to fit its content and the width the operator dragged is
+   ignored. Cells clip rather than wrap, so row height stays constant. */
+.qz-table-fixed { table-layout: fixed; }
+.qz-table-fixed th, .qz-table-fixed td {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* The node these rows belong to, above the column headers. It stays above the
+   header row it sits on (both inherit `position: sticky` from the rule above,
+   which is also what the resizer positions against). */
+.qz-table thead th.qz-table-title {
+  z-index: 3;
+  font-family: var(--qz-font-mono);
+  font-size: 11.5px;
+  letter-spacing: 0.04em;
+  text-transform: none;
+  color: var(--qz-fg-2);
+  background: var(--qz-surface-sunken);
+  border-bottom: 1px solid var(--qz-border);
+  padding: 8px 12px;
+}
+.qz-th-label { display: block; overflow: hidden; text-overflow: ellipsis; }
+.qz-resizer {
+  position: absolute;
+  top: 0;
+  right: -3px;
+  width: 7px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 2;
+  /* The grab target is wider than the line the operator sees. */
+  background:
+    linear-gradient(to right, transparent 3px, var(--qz-border) 3px 4px, transparent 4px);
+}
+.qz-resizer:hover { background: linear-gradient(to right, transparent 3px, var(--qz-accent) 3px 4px, transparent 4px); }
+.qz-table-empty {
+  padding: 28px 12px !important;
+  text-align: center;
+  color: var(--qz-fg-4);
+}
+/* Row controls stay against the right edge while the rest of the table
+   scrolls under them: ten columns do not fit a laptop, and an edit button you
+   have to scroll to find is a control the operator does not know is there.
+   The cell needs its own background — the row's would scroll away with it. */
+.qz-table .qz-sticky-right {
+  position: sticky;
+  right: 0;
+  z-index: 1;
+  background: var(--qz-surface);
+  box-shadow: inset 1px 0 0 var(--qz-divider);
+}
+.qz-table thead th.qz-sticky-right { z-index: 2; }
+.qz-table tbody tr:hover td.qz-sticky-right {
+  background: color-mix(in oklab, white 3%, var(--qz-surface));
+}
+
+/* --- Table toolbar: search, filters, column picker, row count --- */
+.qz-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+.qz-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 220px;
+  padding: 7px 10px;
+  border-radius: 7px;
+  border: 1px solid var(--qz-border);
+  background: var(--qz-input-bg);
+}
+.qz-search:focus-within { box-shadow: var(--qz-focus-ring); }
+.qz-search-input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--qz-fg-1);
+  font-family: var(--qz-font-sans);
+  font-size: 13px;
+}
+.qz-filter { display: flex; align-items: center; gap: 6px; }
+.qz-filter-label {
+  font-family: var(--qz-font-mono);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--qz-fg-4);
+}
+.qz-filter-select { width: auto; padding: 6px 8px; font-size: 12px; }
+.qz-columns-menu { min-width: 210px; max-height: 60vh; overflow-y: auto; }
+.qz-rowcount {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--qz-font-mono);
+  font-size: 11.5px;
+  color: var(--qz-fg-4);
+  white-space: nowrap;
+}
+.qz-clear-filters {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  color: var(--qz-accent);
+  font-family: var(--qz-font-mono);
+  font-size: 11.5px;
+  cursor: pointer;
+}
 
 /* --- Buttons --- */
 .btn {

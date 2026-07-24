@@ -26,8 +26,8 @@ use tokio::sync::Mutex;
 use crate::backend::NetworkBackend;
 use crate::error::{NetError, Result};
 use crate::model::{
-    Bond, BondMode, Bridge, Duplex, LacpRate, LinkKind, ManagementRef, NetworkDesiredState, Vlan,
-    XmitHashPolicy,
+    Bond, BondMode, Bridge, Duplex, IpConfig, LacpRate, LinkKind, ManagementRef,
+    NetworkDesiredState, Vlan, XmitHashPolicy,
 };
 use crate::plan::plan;
 use crate::state::{derive_desired, LinkState, ObservedLink, ObservedState};
@@ -50,6 +50,8 @@ pub enum ChangeState {
 #[derive(Debug, Clone, Serialize)]
 pub struct LinkView {
     pub name: String,
+    /// The kernel's name for this NIC before it was pinned to `nicN`.
+    pub altname: Option<String>,
     pub kind: LinkKind,
     /// Whether the appliance intends this link to be up.
     pub admin_up: bool,
@@ -61,14 +63,23 @@ pub struct LinkView {
     pub speed_mbps: Option<u32>,
     pub duplex: Option<Duplex>,
     pub mtu: Option<u32>,
+    /// Addresses the box actually has on the link right now.
     pub addresses: Vec<String>,
     pub gateway: Option<String>,
     pub dns: Vec<String>,
+    /// The addressing the configuration asks for — what the dialog edits, and
+    /// what the table shows for a link that is staged but not yet applied.
+    pub ip: IpConfig,
     pub controller: Option<String>,
     pub ports: Vec<String>,
     pub bond_mode: Option<BondMode>,
     pub vlan_id: Option<u16>,
     pub parent: Option<String>,
+    /// "VLAN aware" — a bridge that passes tagged frames to its ports. Always
+    /// false for anything that is not a bridge.
+    pub vlan_aware: bool,
+    /// Free text the operator wrote about this link.
+    pub comment: Option<String>,
     /// This link carries the management address.
     pub management: bool,
     /// Physical NICs and the management link are never deletable.
@@ -152,9 +163,15 @@ pub struct ManagementBridgeResponse {
 
 /// PATCH bodies. Absent fields are left alone; there is no way to clear a
 /// value back to "unset" through a patch — create the link again for that.
+///
+/// `ip` and `comment` are common to all four: the console's dialogs are the
+/// same form with different middles, and an address is now a property of the
+/// link rather than of the appliance.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NicPatch {
+    pub ip: Option<IpConfig>,
+    pub comment: Option<String>,
     pub mtu: Option<u32>,
     pub autoneg: Option<bool>,
     pub speed: Option<u32>,
@@ -164,6 +181,8 @@ pub struct NicPatch {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BridgePatch {
+    pub ip: Option<IpConfig>,
+    pub comment: Option<String>,
     pub ports: Option<Vec<String>>,
     pub stp: Option<bool>,
     pub forward_delay: Option<u32>,
@@ -175,6 +194,8 @@ pub struct BridgePatch {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BondPatch {
+    pub ip: Option<IpConfig>,
+    pub comment: Option<String>,
     pub mode: Option<BondMode>,
     pub ports: Option<Vec<String>>,
     pub miimon: Option<u32>,
@@ -187,9 +208,22 @@ pub struct BondPatch {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VlanPatch {
+    pub ip: Option<IpConfig>,
+    pub comment: Option<String>,
     pub parent: Option<String>,
     pub vlan_id: Option<u16>,
     pub mtu: Option<u32>,
+}
+
+/// An empty comment means "no comment", not a comment that is the empty
+/// string — the console clears the field by sending `""`.
+fn comment_of(patch: Option<String>) -> Option<Option<String>> {
+    patch.map(|text| tidy_comment(Some(text)))
+}
+
+fn tidy_comment(comment: Option<String>) -> Option<String> {
+    let trimmed = comment?.trim().to_string();
+    (!trimmed.is_empty()).then_some(trimmed)
 }
 
 pub struct NetworkService {
@@ -350,26 +384,29 @@ impl NetworkService {
         self.pending().await
     }
 
-    pub async fn create_bridge(&self, bridge: Bridge) -> Result<PendingResponse> {
+    pub async fn create_bridge(&self, mut bridge: Bridge) -> Result<PendingResponse> {
         let _guard = self.gate.lock().await;
         let mut target = self.working().await?;
         reject_existing(&target, &bridge.name)?;
+        bridge.comment = tidy_comment(bridge.comment);
         target.bridges.push(bridge);
         self.stage(target).await
     }
 
-    pub async fn create_bond(&self, bond: Bond) -> Result<PendingResponse> {
+    pub async fn create_bond(&self, mut bond: Bond) -> Result<PendingResponse> {
         let _guard = self.gate.lock().await;
         let mut target = self.working().await?;
         reject_existing(&target, &bond.name)?;
+        bond.comment = tidy_comment(bond.comment);
         target.bonds.push(bond);
         self.stage(target).await
     }
 
-    pub async fn create_vlan(&self, vlan: Vlan) -> Result<PendingResponse> {
+    pub async fn create_vlan(&self, mut vlan: Vlan) -> Result<PendingResponse> {
         let _guard = self.gate.lock().await;
         let mut target = self.working().await?;
         reject_existing(&target, &vlan.name)?;
+        vlan.comment = tidy_comment(vlan.comment);
         target.vlans.push(vlan);
         self.stage(target).await
     }
@@ -382,6 +419,12 @@ impl NetworkService {
             .iter_mut()
             .find(|b| b.name == name)
             .ok_or_else(|| NetError::NotFound(format!("No bridge named \"{name}\".")))?;
+        if let Some(ip) = patch.ip {
+            bridge.ip = ip;
+        }
+        if let Some(comment) = comment_of(patch.comment) {
+            bridge.comment = comment;
+        }
         if let Some(ports) = patch.ports {
             bridge.ports = ports;
         }
@@ -411,6 +454,12 @@ impl NetworkService {
             .iter_mut()
             .find(|b| b.name == name)
             .ok_or_else(|| NetError::NotFound(format!("No bond named \"{name}\".")))?;
+        if let Some(ip) = patch.ip {
+            bond.ip = ip;
+        }
+        if let Some(comment) = comment_of(patch.comment) {
+            bond.comment = comment;
+        }
         if let Some(mode) = patch.mode {
             bond.mode = mode;
         }
@@ -443,6 +492,12 @@ impl NetworkService {
             .iter_mut()
             .find(|v| v.name == name)
             .ok_or_else(|| NetError::NotFound(format!("No VLAN interface named \"{name}\".")))?;
+        if let Some(ip) = patch.ip {
+            vlan.ip = ip;
+        }
+        if let Some(comment) = comment_of(patch.comment) {
+            vlan.comment = comment;
+        }
         if let Some(parent) = patch.parent {
             vlan.parent = parent;
         }
@@ -463,6 +518,12 @@ impl NetworkService {
             .iter_mut()
             .find(|n| n.name == name)
             .ok_or_else(|| NetError::NotFound(format!("No interface named \"{name}\".")))?;
+        if let Some(ip) = patch.ip {
+            nic.ip = ip;
+        }
+        if let Some(comment) = comment_of(patch.comment) {
+            nic.comment = comment;
+        }
         if let Some(mtu) = patch.mtu {
             nic.mtu = Some(mtu);
         }
@@ -682,6 +743,10 @@ impl NetworkService {
         let mut target = desired.clone();
         target.bridges.push(Bridge {
             name: bridge_name.clone(),
+            // Exactly the addressing that was there before, moved rather than
+            // copied: a port may not keep an address of its own.
+            ip: desired.ip_of(&link),
+            comment: None,
             ports: vec![link.clone()],
             stp: false,
             forward_delay: Some(0),
@@ -689,10 +754,10 @@ impl NetworkService {
             mac_address: mac,
             mtu: observed.link(&link).and_then(|l| l.mtu),
         });
+        target.set_ip(&link, crate::model::IpConfig::Disabled);
         target.management = ManagementRef {
             link: bridge_name.clone(),
-            // Exactly the addressing that was there before.
-            ip: desired.management.ip.clone(),
+            legacy_ip: None,
         };
 
         // Stage and apply as one operation: the box must never be left with
@@ -860,6 +925,12 @@ fn change_of(
     }
 }
 
+/// Loopback is present on every Linux box, is not configurable, and is never
+/// what an operator opened this page to look at.
+fn is_loopback(link: &ObservedLink) -> bool {
+    link.name == "lo"
+}
+
 /// Build the console's rows: every link the box has, plus every link only the
 /// staged target has, ordered so a controller is immediately followed by its
 /// ports.
@@ -874,7 +945,7 @@ fn views(
     let mut rows: Vec<LinkView> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
 
-    for link in &observed.links {
+    for link in observed.links.iter().filter(|l| !is_loopback(l)) {
         rows.push(view_of(link, desired, pending, management, true));
         seen.push(link.name.clone());
     }
@@ -948,6 +1019,7 @@ fn view_of(
 
     LinkView {
         name: link.name.clone(),
+        altname: link.altname.clone(),
         kind,
         admin_up: effective.kind_of(name).is_some() && change != ChangeState::Deleted,
         oper_state: link.state,
@@ -966,6 +1038,9 @@ fn view_of(
         addresses: link.addresses.clone(),
         gateway: link.gateway.clone(),
         dns: link.dns.clone(),
+        // The configuration, not the box: a staged address must show in the
+        // table before anyone applies it.
+        ip: effective.ip_of(name),
         controller,
         ports,
         bond_mode: effective.bond(name).map(|b| b.mode).or(link.bond_mode),
@@ -974,6 +1049,8 @@ fn view_of(
             .vlan(name)
             .map(|v| v.parent.clone())
             .or_else(|| link.parent.clone()),
+        vlan_aware: effective.bridge(name).is_some_and(|b| b.vlan_filtering),
+        comment: effective.comment_of(name).map(String::from),
         management: is_management,
         deletable: delete_blocked_reason.is_none(),
         delete_blocked_reason,
@@ -1177,7 +1254,7 @@ mod tests {
                 name: "vlan9999".into(),
                 parent: "nic1".into(),
                 vlan_id: 9999,
-                mtu: None,
+                ..Vlan::default()
             })
             .await
             .unwrap_err();
@@ -1250,6 +1327,9 @@ mod tests {
         service.confirm().await.unwrap();
         let config = service.config().await.unwrap();
         assert_eq!(config.management.link, "br0");
+        // The address moved onto the bridge; the port keeps none.
+        assert!(config.ip_of("br0").is_addressed());
+        assert_eq!(config.ip_of("nic0"), IpConfig::Disabled);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1294,6 +1374,110 @@ mod tests {
         let nic1 = rows.iter().find(|r| r.name == "nic1").unwrap();
         assert!(!nic1.management);
         assert!(!nic1.deletable, "a physical NIC is never deletable");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn rows_carry_the_alternative_name_and_never_the_loopback() {
+        let (service, _backend, dir) = service("altnames");
+        let rows = service
+            .interfaces()
+            .await
+            .unwrap()
+            .nodes
+            .remove(0)
+            .interfaces;
+        assert!(
+            !rows.iter().any(|r| r.name == "lo"),
+            "loopback is not a row anyone can act on"
+        );
+        let nic0 = rows.iter().find(|r| r.name == "nic0").unwrap();
+        assert_eq!(nic0.altname.as_deref(), Some("enp1s0"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The three columns that come from the configuration rather than from the
+    /// box: a comment, VLAN awareness, and the addressing being asked for.
+    #[tokio::test]
+    async fn a_bridge_reports_its_comment_addressing_and_vlan_awareness() {
+        let (service, _backend, dir) = service("bridge-view");
+        service
+            .create_bridge(Bridge {
+                vlan_filtering: true,
+                comment: Some("guest traffic".into()),
+                ip: IpConfig::Static {
+                    cidr: "10.0.0.5/24".into(),
+                    gateway: "10.0.0.1".into(),
+                    dns: vec![],
+                },
+                ..bridge("br1", &["nic1"])
+            })
+            .await
+            .unwrap();
+        let rows = service
+            .interfaces()
+            .await
+            .unwrap()
+            .nodes
+            .remove(0)
+            .interfaces;
+        let br1 = rows.iter().find(|r| r.name == "br1").unwrap();
+        assert!(br1.vlan_aware);
+        assert_eq!(br1.comment.as_deref(), Some("guest traffic"));
+        // An empty comment on create is no comment, exactly as on update —
+        // the console sends "" for a field the operator left blank.
+        service
+            .create_bridge(Bridge {
+                comment: Some("   ".into()),
+                ..bridge("br2", &[])
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .pending()
+                .await
+                .unwrap()
+                .target
+                .unwrap()
+                .comment_of("br2"),
+            None
+        );
+        assert!(matches!(br1.ip, IpConfig::Static { .. }));
+        // Staged, so the box itself still reports no address on it.
+        assert!(br1.addresses.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A comment is a change like any other: staged, applied, committed.
+    #[tokio::test]
+    async fn a_comment_can_be_set_and_cleared_on_a_nic() {
+        let (service, _backend, dir) = service("nic-comment");
+        service
+            .update_nic(
+                "nic1",
+                NicPatch {
+                    comment: Some("  spare  ".into()),
+                    ..NicPatch::default()
+                },
+            )
+            .await
+            .unwrap();
+        let target = service.pending().await.unwrap().target.unwrap();
+        assert_eq!(target.comment_of("nic1"), Some("spare"));
+
+        service
+            .update_nic(
+                "nic1",
+                NicPatch {
+                    comment: Some(String::new()),
+                    ..NicPatch::default()
+                },
+            )
+            .await
+            .unwrap();
+        let target = service.pending().await.unwrap().target.unwrap();
+        assert_eq!(target.comment_of("nic1"), None);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1359,7 +1543,12 @@ mod tests {
         // conversion's job in the API, but the guard has to hold for any
         // target that does it, however it got staged.
         let mut target = service.config().await.unwrap();
-        target.bridges.push(bridge("br1", &["nic1"]));
+        let moved = target.ip_of("nic0");
+        target.bridges.push(Bridge {
+            ip: moved,
+            ..bridge("br1", &["nic1"])
+        });
+        target.set_ip("nic0", IpConfig::Disabled);
         target.management.link = "br1".into();
         service.store.set_pending(&target).unwrap();
 

@@ -56,14 +56,24 @@ impl MockBackend {
         }
     }
 
-    /// Two NICs, nic0 up with a static management address on it — the shape
-    /// of a freshly installed appliance before the bridge conversion.
+    /// Two NICs, nic0 up with a static management address on it, plus the
+    /// loopback every Linux box has — the shape of a freshly installed
+    /// appliance before the bridge conversion.
     pub fn appliance() -> Self {
         Self::new(ObservedState {
             node: "lumen".into(),
             links: vec![
                 ObservedLink {
+                    name: "lo".into(),
+                    kind: LinkKind::Other,
+                    state: LinkState::Activated,
+                    mtu: Some(65536),
+                    addresses: vec!["127.0.0.1/8".into()],
+                    ..ObservedLink::default()
+                },
+                ObservedLink {
                     name: "nic0".into(),
+                    altname: Some("enp1s0".into()),
                     kind: LinkKind::Ethernet,
                     state: LinkState::Activated,
                     managed: true,
@@ -87,6 +97,7 @@ impl MockBackend {
                 },
                 ObservedLink {
                     name: "nic1".into(),
+                    altname: Some("enp2s0".into()),
                     kind: LinkKind::Ethernet,
                     state: LinkState::Disconnected,
                     managed: true,
@@ -395,6 +406,11 @@ mod tests {
             nics: vec![
                 Nic {
                     name: "nic0".into(),
+                    ip: IpConfig::Static {
+                        cidr: "192.168.10.5/24".into(),
+                        gateway: "192.168.10.1".into(),
+                        dns: vec![],
+                    },
                     ..Nic::default()
                 },
                 Nic {
@@ -409,11 +425,7 @@ mod tests {
             }],
             management: ManagementRef {
                 link: "nic0".into(),
-                ip: IpConfig::Static {
-                    cidr: "192.168.10.5/24".into(),
-                    gateway: "192.168.10.1".into(),
-                    dns: vec![],
-                },
+                ..ManagementRef::default()
             },
             ..NetworkDesiredState::default()
         }

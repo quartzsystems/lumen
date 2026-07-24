@@ -97,8 +97,18 @@ impl Store {
         }
     }
 
+    /// Both documents go through `migrate` on the way out, so nothing above
+    /// the store ever sees the older shape.
+    fn read_state(&self, name: &str) -> Result<Option<NetworkDesiredState>> {
+        let mut state: Option<NetworkDesiredState> = self.read(name)?;
+        if let Some(state) = state.as_mut() {
+            state.migrate();
+        }
+        Ok(state)
+    }
+
     pub fn desired(&self) -> Result<Option<NetworkDesiredState>> {
-        self.read("desired.json")
+        self.read_state("desired.json")
     }
 
     pub fn set_desired(&self, state: &NetworkDesiredState) -> Result<()> {
@@ -106,7 +116,7 @@ impl Store {
     }
 
     pub fn pending(&self) -> Result<Option<NetworkDesiredState>> {
-        self.read("pending.json")
+        self.read_state("pending.json")
     }
 
     pub fn set_pending(&self, state: &NetworkDesiredState) -> Result<()> {
@@ -118,7 +128,11 @@ impl Store {
     }
 
     pub fn checkpoint(&self) -> Result<Option<CheckpointRecord>> {
-        self.read("checkpoint.json")
+        let mut record: Option<CheckpointRecord> = self.read("checkpoint.json")?;
+        if let Some(record) = record.as_mut() {
+            record.target.migrate();
+        }
+        Ok(record)
     }
 
     pub fn set_checkpoint(&self, record: &CheckpointRecord) -> Result<()> {
@@ -141,7 +155,7 @@ pub fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{IpConfig, ManagementRef};
+    use crate::model::{IpConfig, ManagementRef, Nic};
 
     fn temp_dir() -> PathBuf {
         let base = std::env::temp_dir().join(format!(
@@ -155,9 +169,14 @@ mod tests {
 
     fn sample() -> NetworkDesiredState {
         NetworkDesiredState {
+            nics: vec![Nic {
+                name: "nic0".into(),
+                ip: IpConfig::Dhcp,
+                ..Nic::default()
+            }],
             management: ManagementRef {
                 link: "nic0".into(),
-                ip: IpConfig::Dhcp,
+                ..ManagementRef::default()
             },
             ..NetworkDesiredState::default()
         }
@@ -199,6 +218,25 @@ mod tests {
         store.set_desired(&sample()).unwrap();
         fs::write(dir.join("network/desired.json"), "{ not json").unwrap();
         assert_eq!(store.desired().unwrap(), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The migration runs on the way out of the store, so nothing above it
+    /// ever has to know the older shape existed.
+    #[test]
+    fn a_document_written_by_an_older_appliance_is_migrated_on_read() {
+        let dir = temp_dir();
+        let store = Store::new(&dir);
+        fs::create_dir_all(dir.join("network")).unwrap();
+        fs::write(
+            dir.join("network/desired.json"),
+            r#"{"nics":[{"name":"nic0"}],
+                "management":{"link":"nic0","ip":{"mode":"dhcp"}}}"#,
+        )
+        .unwrap();
+        let desired = store.desired().unwrap().expect("it parses");
+        assert_eq!(desired.ip_of("nic0"), IpConfig::Dhcp);
+        assert!(desired.management.legacy_ip.is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 

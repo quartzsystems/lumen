@@ -14,6 +14,9 @@ export type Duplex = "full" | "half";
 /// table never makes a second request to fill a column.
 export interface LinkView {
   name: string;
+  /// What the kernel called this NIC before it was pinned to nicN, e.g.
+  /// "enp3s0". Null for virtual links and NICs that were never renamed.
+  altname: string | null;
   kind: LinkKind;
   admin_up: boolean;
   oper_state: LinkState;
@@ -23,14 +26,21 @@ export interface LinkView {
   speed_mbps: number | null;
   duplex: Duplex | null;
   mtu: number | null;
+  /// What the box has on the link right now.
   addresses: string[];
   gateway: string | null;
   dns: string[];
+  /// What the configuration asks for — this is what the dialog edits, and what
+  /// a staged-but-unapplied row shows.
+  ip: IpConfig;
   controller: string | null;
   ports: string[];
   bond_mode: BondMode | null;
   vlan_id: number | null;
   parent: string | null;
+  /// A bridge that passes tagged frames through to its ports.
+  vlan_aware: boolean;
+  comment: string | null;
   management: boolean;
   deletable: boolean;
   delete_blocked_reason: string | null;
@@ -94,30 +104,45 @@ export interface ManagementBridgeResponse {
   operations: string[];
 }
 
+/// Addressing, as every link now carries it. `dns` is optional on the wire —
+/// the backend defaults it — so the dialogs never have to send an empty list.
 export type IpConfig =
   | { mode: "dhcp" }
-  | { mode: "static"; cidr: string; gateway: string; dns: string[] }
+  | { mode: "static"; cidr: string; gateway: string; dns?: string[] }
   | { mode: "disabled" };
 
+/// Fields every link shares, in the order the dialogs collect them.
+interface LinkCommon {
+  ip?: IpConfig;
+  comment?: string;
+  mtu?: number;
+}
+
+export interface NicInput extends LinkCommon {
+  name: string;
+  autoneg?: boolean;
+  speed?: number;
+  duplex?: Duplex;
+}
+
 export interface DesiredState {
-  nics: { name: string; mtu?: number; autoneg?: boolean; speed?: number; duplex?: Duplex }[];
+  nics: NicInput[];
   bonds: BondInput[];
   vlans: VlanInput[];
   bridges: BridgeInput[];
-  management: { link: string; ip: IpConfig };
+  management: { link: string };
 }
 
-export interface BridgeInput {
+export interface BridgeInput extends LinkCommon {
   name: string;
   ports: string[];
   stp: boolean;
   forward_delay?: number;
   vlan_filtering: boolean;
   mac_address?: string;
-  mtu?: number;
 }
 
-export interface BondInput {
+export interface BondInput extends LinkCommon {
   name: string;
   mode: BondMode;
   ports: string[];
@@ -125,18 +150,15 @@ export interface BondInput {
   lacp_rate?: "slow" | "fast";
   xmit_hash_policy?: "layer2" | "layer2+3" | "layer3+4";
   primary?: string;
-  mtu?: number;
 }
 
-export interface VlanInput {
+export interface VlanInput extends LinkCommon {
   name: string;
   parent: string;
   vlan_id: number;
-  mtu?: number;
 }
 
-export interface NicPatch {
-  mtu?: number;
+export interface NicPatch extends LinkCommon {
   autoneg?: boolean;
   speed?: number;
   duplex?: Duplex;

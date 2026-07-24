@@ -192,6 +192,7 @@ pub fn specs(desired: &NetworkDesiredState) -> BTreeMap<String, ConnectionSpec> 
     for nic in &desired.nics {
         let mut spec = ConnectionSpec::base(&nic.name, LinkKind::Ethernet);
         spec.mtu = nic.mtu;
+        spec.ip = nic.ip.clone();
         spec.ethernet = Some(EthernetSpec {
             autoneg: nic.autoneg,
             speed: nic.speed,
@@ -202,6 +203,7 @@ pub fn specs(desired: &NetworkDesiredState) -> BTreeMap<String, ConnectionSpec> 
     for bond in &desired.bonds {
         let mut spec = ConnectionSpec::base(&bond.name, LinkKind::Bond);
         spec.mtu = bond.mtu;
+        spec.ip = bond.ip.clone();
         spec.bond = Some(BondSpec {
             mode: bond.mode,
             miimon: bond.miimon,
@@ -214,12 +216,14 @@ pub fn specs(desired: &NetworkDesiredState) -> BTreeMap<String, ConnectionSpec> 
     for bridge in &desired.bridges {
         let mut spec = ConnectionSpec::base(&bridge.name, LinkKind::Bridge);
         spec.mtu = bridge.mtu;
+        spec.ip = bridge.ip.clone();
         spec.bridge = Some(bridge_spec(bridge));
         out.insert(bridge.name.clone(), spec);
     }
     for vlan in &desired.vlans {
         let mut spec = ConnectionSpec::base(&vlan.name, LinkKind::Vlan);
         spec.mtu = vlan.mtu;
+        spec.ip = vlan.ip.clone();
         spec.vlan = Some(VlanSpec {
             parent: vlan.parent.clone(),
             id: vlan.vlan_id,
@@ -249,16 +253,12 @@ pub fn specs(desired: &NetworkDesiredState) -> BTreeMap<String, ConnectionSpec> 
         }
     }
 
-    // The management link is the one link with an address, and it keeps the
-    // installer's profile ids so an upgrade rewrites those files in place.
+    // The management link keeps the installer's profile ids so an upgrade
+    // rewrites those files in place rather than leaving a second profile
+    // behind that also autoconnects. Its addressing comes from the link like
+    // everyone else's.
     if let Some(spec) = out.get_mut(&desired.management.link) {
-        spec.ip = desired.management.ip.clone();
         spec.id = MANAGEMENT_ID.to_string();
-        if spec.controller.is_some() {
-            // A management link that is itself a port cannot hold the address;
-            // validation rejects that, so this is belt and braces.
-            spec.ip = IpConfig::Disabled;
-        }
     }
     for port in desired.ports_of(&desired.management.link) {
         if let Some(spec) = out.get_mut(port) {
@@ -491,6 +491,14 @@ mod tests {
         }
     }
 
+    fn management_ip() -> IpConfig {
+        IpConfig::Static {
+            cidr: "192.168.10.5/24".into(),
+            gateway: "192.168.10.1".into(),
+            dns: vec!["9.9.9.9".into()],
+        }
+    }
+
     fn observed_nic(name: &str, uuid: Option<&str>) -> ObservedLink {
         ObservedLink {
             name: name.into(),
@@ -520,14 +528,16 @@ mod tests {
 
     fn flat() -> NetworkDesiredState {
         NetworkDesiredState {
-            nics: vec![nic("nic0"), nic("nic1")],
+            nics: vec![
+                Nic {
+                    ip: management_ip(),
+                    ..nic("nic0")
+                },
+                nic("nic1"),
+            ],
             management: ManagementRef {
                 link: "nic0".into(),
-                ip: IpConfig::Static {
-                    cidr: "192.168.10.5/24".into(),
-                    gateway: "192.168.10.1".into(),
-                    dns: vec!["9.9.9.9".into()],
-                },
+                ..ManagementRef::default()
             },
             ..NetworkDesiredState::default()
         }
@@ -601,7 +611,7 @@ mod tests {
             name: "vlan100".into(),
             parent: "bond0".into(),
             vlan_id: 100,
-            mtu: None,
+            ..Vlan::default()
         });
         let ops = plan(&desired, &observed());
         assert!(position(&ops, "add bond0 (bond)") < position(&ops, "add vlan100 (vlan)"));
@@ -683,9 +693,11 @@ mod tests {
         desired.bridges.push(Bridge {
             name: "br0".into(),
             ports: vec!["nic0".into()],
+            ip: management_ip(),
             mac_address: Some("52:54:00:11:22:33".into()),
             ..Bridge::default()
         });
+        desired.set_ip("nic0", IpConfig::Disabled);
         desired.management.link = "br0".into();
         let specs = specs(&desired);
         assert_eq!(specs["br0"].id, MANAGEMENT_ID);
@@ -720,13 +732,39 @@ mod tests {
     #[test]
     fn changing_the_management_address_does_reactivate_it() {
         let mut desired = flat();
-        desired.management.ip = IpConfig::Static {
-            cidr: "192.168.10.9/24".into(),
-            gateway: "192.168.10.1".into(),
-            dns: vec![],
-        };
+        desired.set_ip(
+            "nic0",
+            IpConfig::Static {
+                cidr: "192.168.10.9/24".into(),
+                gateway: "192.168.10.1".into(),
+                dns: vec![],
+            },
+        );
         let ops = plan(&desired, &observed());
         assert!(names(&ops).contains(&"activate nic0".to_string()));
+    }
+
+    /// Addressing follows the link, not the management reference: a second
+    /// bridge on a storage VLAN gets its address without anything moving.
+    #[test]
+    fn any_link_can_carry_an_address_of_its_own() {
+        let mut desired = flat();
+        desired.bridges.push(Bridge {
+            name: "br1".into(),
+            ports: vec!["nic1".into()],
+            ip: IpConfig::Static {
+                cidr: "10.0.0.5/24".into(),
+                gateway: "10.0.0.1".into(),
+                dns: vec![],
+            },
+            ..Bridge::default()
+        });
+        let specs = specs(&desired);
+        assert!(matches!(specs["br1"].ip, IpConfig::Static { .. }));
+        // The management link keeps its own, and the port keeps none.
+        assert!(matches!(specs["nic0"].ip, IpConfig::Static { .. }));
+        assert_eq!(specs["nic1"].ip, IpConfig::Disabled);
+        assert_eq!(specs["nic0"].id, MANAGEMENT_ID);
     }
 
     #[test]

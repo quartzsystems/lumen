@@ -12,6 +12,7 @@ lumen-networking/
 lumen-controlplane/
 └── src/api/network.rs thin HTTP handlers over lumen-net
 lumen-webui/
+├── components/console/DataTable.tsx   search/filter/resize/hide columns
 └── app/(console)/networking/{overview,interfaces}
 ```
 
@@ -218,6 +219,37 @@ The management bridge is `br0` on a fresh install because it is allocated
 first. It is not special-cased: what makes a link the management link is
 `management.link` in the desired state, not its name.
 
+### Addressing lives on the link, not on `management`
+
+`Nic`, `Bond`, `Bridge`, and `Vlan` each carry their own `ip: IpConfig`
+(defaulting to `Disabled`) and their own `comment`. `ManagementRef` is now
+just a pointer: it names the link the console is reached on, which is the link
+the appliance must not be allowed to strand, and nothing more.
+
+An earlier shape put the single address on `ManagementRef.ip`. That made a
+storage or migration network unrepresentable, and it made the console's
+interface dialogs lie — a bridge's address is a property of the bridge, not of
+the appliance. Two invariants keep the safety the old shape got for free, both
+enforced in `validate`:
+
+- `port_has_address` — a link enslaved to a bridge or bond may not hold an
+  address. The kernel drops it; refusing beats accepting a setting the box
+  ignores.
+- `management_not_addressed` — the management link must have *some*
+  addressing. Clearing it is the same failure as unplugging the cable and
+  otherwise produces no error anywhere.
+
+A document written by an older appliance still has `management.ip`.
+`ManagementRef::legacy_ip` reads it and `NetworkDesiredState::migrate` folds
+it onto the link; `Store` runs that on every read, so nothing above the store
+knows the older shape existed, and it is never written back out. Without the
+migration an in-place upgrade would fail `deny_unknown_fields`, re-seed from
+the box, and silently lose every setting NetworkManager does not report back.
+
+`IpConfig::default()` is `Disabled` rather than `Dhcp` for the same reason: an
+unconfigured NIC now carries one of these, and it must not quietly start
+asking for a lease.
+
 ### Component classes added to `globals.css`
 
 Added to the same component layer, in the file's existing commented-section
@@ -226,7 +258,8 @@ comment anticipates:
 
 | Section | Classes | Ported from |
 | ------- | ------- | ----------- |
-| Data table | `.qz-table-wrap`, `.qz-table`, `.qz-mono`, `.qz-indent`, `.qz-dim` | Quartz Command inventory tables |
+| Data table | `.qz-table-wrap`, `.qz-table`, `.qz-table-fixed`, `.qz-table-title`, `.qz-resizer`, `.qz-th-label`, `.qz-table-empty`, `.qz-mono`, `.qz-dim` | Quartz Command inventory tables |
+| Table toolbar | `.qz-toolbar`, `.qz-search`, `.qz-search-input`, `.qz-filter`, `.qz-filter-label`, `.qz-filter-select`, `.qz-columns-menu`, `.qz-rowcount`, `.qz-clear-filters` | Quartz Command inventory tables |
 | Buttons | `.btn`, `.btn-primary`, `.btn-danger`, `.btn-ghost`, `.btn-sm` | Quartz Command action bars |
 | Form controls | `.field`, `.field-label`, `.input`, `.select`, `.input-invalid`, `.field-error`, `.field-hint`, `.checkbox-row`, `.port-list` | Quartz Command settings forms |
 | Dialog | `.dialog-scrim`, `.dialog`, `.dialog-title`, `.dialog-subtitle`, `.dialog-actions` | Quartz Command modals |
@@ -236,6 +269,32 @@ comment anticipates:
 
 No CSS-in-JS and no component library was added. Icons are `lucide-react`,
 already a dependency.
+
+### `DataTable`: one table component, ported from Quartz Command
+
+`components/console/DataTable.tsx` is the shape Quartz Command's inventory
+tables established — a search box and per-column drop-down filters over the
+top, a **Columns** menu to hide what does not matter today, columns the
+operator drags to resize, and a row count. Every console table that follows
+gets it for free; the Interfaces page is the first caller.
+
+Two things are worth knowing about it:
+
+- **`table-layout: fixed`.** A dragged width is meaningless under `auto`,
+  where the browser reflows every column to fit its content. Cells clip with
+  an ellipsis rather than wrap, so row height stays constant down a long list.
+- **Layout is remembered per table id** in `localStorage`, under
+  `<id>.widths` and `<id>.hidden`. A resize writes once on mouse-up, not once
+  per mousemove. A browser with no storage is not an error — the table just
+  starts from its defaults each time.
+
+The node's hostname is a full-width row inside the table, above the column
+headers, rather than a heading above it: with clustering there will be several
+of these stacked up, and the name belongs to the rows, not to the page.
+
+Ports are listed flat, against their controller in the Ports/Slaves column,
+rather than indented under it. An operator scanning the Name column wants a
+plain list of everything the box has.
 
 ### `no-auto-default=*`
 
@@ -341,6 +400,8 @@ and a human sentence the console renders verbatim.
 | `duplicate_name` | two links with one name |
 | `invalid_name` | not a usable interface name |
 | `primary_not_a_port` | a bond `primary` that is not one of its ports |
+| `port_has_address` | a link that is a port of a bridge/bond has an address of its own — the kernel drops it |
+| `management_not_addressed` | the management link has no addressing at all, so applying would leave the console unreachable |
 | `management_disconnect` | the change moves the management address off a reachable link without `i_understand_this_may_disconnect_me` |
 
 `management_is_a_port` is not in the original list but is the trap worth
@@ -438,11 +499,32 @@ field are in place from day one so neither changes when clustering lands, and
 so the console can render its per-node layout now.
 
 Each interface object carries everything a table row needs without a second
-round trip: `name`, `kind`, `admin_up`, `oper_state`, `carrier`, `perm_mac`,
-`mac`, `speed_mbps`, `duplex`, `mtu`, `addresses` (CIDR), `gateway`, `dns`,
-`controller`, `ports`, `bond_mode`, `vlan_id`, `parent`, `management`,
-`deletable`, `delete_blocked_reason`, `change`, and `present`. Rows arrive
-ordered so a controller is immediately followed by its ports.
+round trip: `name`, `altname`, `kind`, `admin_up`, `oper_state`, `carrier`,
+`perm_mac`, `mac`, `speed_mbps`, `duplex`, `mtu`, `addresses` (CIDR),
+`gateway`, `dns`, `ip`, `controller`, `ports`, `bond_mode`, `vlan_id`,
+`parent`, `vlan_aware`, `comment`, `management`, `deletable`,
+`delete_blocked_reason`, `change`, and `present`. Rows arrive ordered so a
+controller is immediately followed by its ports.
+
+`addresses` and `ip` answer different questions and the console shows the
+second: `addresses` is what the box has on the link right now, `ip` is what
+the configuration asks for. A staged-but-unapplied address exists only in
+`ip`; a DHCP link with a lease and a static link with the same address are
+indistinguishable in `addresses`.
+
+Loopback is not among the rows. It is on every Linux box, is not
+configurable, and is never what an operator opened the page to look at — so
+`views()` drops it, and `ObservedState::addressed()` ignores it too (127.0.0.1
+must never make an unaddressed appliance look addressed).
+
+`altname` is the name the kernel gave a physical adapter before udev renamed
+it — `enp3s0`, `eno1` — which is what ties a row in the table to a label on
+the chassis. An alternative name is not exposed in sysfs and reading the
+netlink property list is a whole dependency for one string per NIC, so
+`lumen-nicnames` records it as `AlternativeName=` in the same
+`70-lumen-nic<N>.link` file that does the renaming, and the backend reads that
+line back. The tool that renames the adapter is the one that knows what the
+name used to be.
 
 ---
 

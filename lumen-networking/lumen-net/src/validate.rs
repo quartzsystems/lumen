@@ -43,6 +43,13 @@ pub enum ValidationCode {
     ManagementDisconnect,
     /// A bond `primary` that is not one of its ports.
     PrimaryNotAPort,
+    /// A link that is a port of a bridge or bond has an address configured.
+    /// The kernel hands a port's addressing to its controller, so the address
+    /// would simply be dropped.
+    PortHasAddress,
+    /// The management link has no addressing at all, so applying would leave
+    /// the console unreachable.
+    ManagementNotAddressed,
 }
 
 impl ValidationCode {
@@ -60,6 +67,8 @@ impl ValidationCode {
             ValidationCode::InvalidName => "invalid_name",
             ValidationCode::ManagementDisconnect => "management_disconnect",
             ValidationCode::PrimaryNotAPort => "primary_not_a_port",
+            ValidationCode::PortHasAddress => "port_has_address",
+            ValidationCode::ManagementNotAddressed => "management_not_addressed",
         }
     }
 }
@@ -132,10 +141,41 @@ pub fn validate(
     check_references(desired, &kinds, &mut errors);
     check_vlans(desired, &mut errors);
     check_controllers(desired, &mut errors);
+    check_addressing(desired, &mut errors);
     check_mtus(desired, observed, &mut errors);
     check_management(desired, observed, ack, &mut errors);
 
     errors
+}
+
+/// A port hands its addressing to its controller: Linux drops an address
+/// configured on an enslaved link. Refusing beats accepting a setting the box
+/// will silently ignore — and it is the mistake an operator makes when moving
+/// an address from a NIC onto a new bridge and only doing half of it.
+fn check_addressing(desired: &NetworkDesiredState, errors: &mut Vec<ValidationError>) {
+    for (name, _) in desired.link_kinds() {
+        // The management link enslaved to something is the same mistake, and
+        // `ManagementIsAPort` says so in the terms that matter. Reporting both
+        // would just be the same sentence twice.
+        if name == desired.management.link {
+            continue;
+        }
+        let Some(controller) = desired.controller_of(name) else {
+            continue;
+        };
+        if desired.ip_of(name).is_addressed() {
+            errors.push(
+                ValidationError::new(
+                    ValidationCode::PortHasAddress,
+                    format!(
+                        "\"{name}\" is a port of \"{controller}\", so it cannot hold an address \
+                         of its own — configure the address on \"{controller}\" instead."
+                    ),
+                )
+                .at(name, "ip"),
+            );
+        }
+    }
 }
 
 fn check_names(kinds: &[(&str, LinkKind)], errors: &mut Vec<ValidationError>) {
@@ -412,24 +452,38 @@ fn check_management(
         );
     }
 
+    // Clearing the management link's address is the same failure as unplugging
+    // it, and unlike a bad address it produces no error anywhere else.
+    if desired.kind_of(link).is_some() && !desired.ip_of(link).is_addressed() {
+        errors.push(
+            ValidationError::new(
+                ValidationCode::ManagementNotAddressed,
+                format!(
+                    "\"{link}\" is the link this console is reached on, but it has no address \
+                     configured — give it one, or move the management address to another link."
+                ),
+            )
+            .at(link, "ip"),
+        );
+    }
+
     // A controller with no ports has no path to the wire, so the management
     // address on it is unreachable the moment it is applied.
-    match desired.kind_of(link) {
-        Some(LinkKind::Bridge) | Some(LinkKind::Bond) => {
-            if desired.ports_of(link).is_empty() {
-                errors.push(
-                    ValidationError::new(
-                        ValidationCode::EmptyManagementController,
-                        format!(
-                            "\"{link}\" carries the management address but has no ports — it \
-                             would have no path to the network."
-                        ),
-                    )
-                    .at(link, "ports"),
-                );
-            }
-        }
-        _ => {}
+    let is_controller = matches!(
+        desired.kind_of(link),
+        Some(LinkKind::Bridge) | Some(LinkKind::Bond)
+    );
+    if is_controller && desired.ports_of(link).is_empty() {
+        errors.push(
+            ValidationError::new(
+                ValidationCode::EmptyManagementController,
+                format!(
+                    "\"{link}\" carries the management address but has no ports — it \
+                     would have no path to the network."
+                ),
+            )
+            .at(link, "ports"),
+        );
     }
 
     // Moving the address off a link that is currently reachable is exactly the
@@ -506,10 +560,16 @@ mod tests {
     /// on nic0 exactly where the box already has it.
     fn baseline() -> NetworkDesiredState {
         NetworkDesiredState {
-            nics: vec![nic("nic0"), nic("nic1")],
+            nics: vec![
+                Nic {
+                    ip: IpConfig::Dhcp,
+                    ..nic("nic0")
+                },
+                nic("nic1"),
+            ],
             management: ManagementRef {
                 link: "nic0".into(),
-                ip: IpConfig::Dhcp,
+                ..ManagementRef::default()
             },
             ..NetworkDesiredState::default()
         }
@@ -603,13 +663,13 @@ mod tests {
                         name: "vlan100".into(),
                         parent: "nic0".into(),
                         vlan_id: 100,
-                        mtu: None,
+                        ..Vlan::default()
                     });
                     d.vlans.push(Vlan {
                         name: "vlan100b".into(),
                         parent: "nic0".into(),
                         vlan_id: 100,
-                        mtu: None,
+                        ..Vlan::default()
                     });
                 },
                 ValidationCode::DuplicateVlan,
@@ -621,7 +681,7 @@ mod tests {
                         name: "vlan4095".into(),
                         parent: "nic0".into(),
                         vlan_id: 4095,
-                        mtu: None,
+                        ..Vlan::default()
                     });
                 },
                 ValidationCode::VlanIdOutOfRange,
@@ -633,7 +693,7 @@ mod tests {
                         name: "vlan0".into(),
                         parent: "nic0".into(),
                         vlan_id: 0,
-                        mtu: None,
+                        ..Vlan::default()
                     });
                 },
                 ValidationCode::VlanIdOutOfRange,
@@ -669,7 +729,7 @@ mod tests {
                         name: "vlan100".into(),
                         parent: "bond9".into(),
                         vlan_id: 100,
-                        mtu: None,
+                        ..Vlan::default()
                     });
                 },
                 ValidationCode::UnknownReference,
@@ -690,6 +750,25 @@ mod tests {
                 "duplicate link name",
                 |d| d.nics.push(nic("nic0")),
                 ValidationCode::DuplicateName,
+            ),
+            (
+                "an address left on a link that was just enslaved",
+                |d| {
+                    d.set_ip("nic1", IpConfig::Dhcp);
+                    d.bridges.push(Bridge {
+                        name: "br0".into(),
+                        ports: vec!["nic1".into()],
+                        ..Bridge::default()
+                    });
+                },
+                ValidationCode::PortHasAddress,
+            ),
+            (
+                "the management link's address cleared",
+                |d| {
+                    d.set_ip("nic0", IpConfig::Disabled);
+                },
+                ValidationCode::ManagementNotAddressed,
             ),
             (
                 "interface name too long",
@@ -749,11 +828,14 @@ mod tests {
     #[test]
     fn moving_the_management_address_needs_an_acknowledgement() {
         let mut desired = baseline();
+        // The move done correctly: the address goes with the reference.
         desired.bridges.push(Bridge {
             name: "br0".into(),
             ports: vec!["nic0".into()],
+            ip: IpConfig::Dhcp,
             ..Bridge::default()
         });
+        desired.set_ip("nic0", IpConfig::Disabled);
         desired.management.link = "br0".into();
 
         let errors = validate(&desired, &observed(), Acknowledgements::default());
@@ -775,6 +857,27 @@ mod tests {
         desired.bridges.push(Bridge {
             name: "br0".into(),
             ports: vec!["nic1".into()],
+            ..Bridge::default()
+        });
+        assert_eq!(
+            validate(&desired, &observed(), Acknowledgements::default()),
+            vec![]
+        );
+    }
+
+    /// A second addressed link — a storage or migration network — is ordinary,
+    /// not an error. Only a *port* may not hold one.
+    #[test]
+    fn a_link_that_is_not_management_may_still_be_addressed() {
+        let mut desired = baseline();
+        desired.bridges.push(Bridge {
+            name: "br1".into(),
+            ports: vec!["nic1".into()],
+            ip: IpConfig::Static {
+                cidr: "10.0.0.5/24".into(),
+                gateway: "10.0.0.1".into(),
+                dns: vec![],
+            },
             ..Bridge::default()
         });
         assert_eq!(
@@ -813,7 +916,7 @@ mod tests {
             name: "vlan9999".into(),
             parent: "nic0".into(),
             vlan_id: 9999,
-            mtu: None,
+            ..Vlan::default()
         });
         let errors = validate(&desired, &observed(), Acknowledgements::default());
         let err = &errors[0];
@@ -830,7 +933,7 @@ mod tests {
             name: "vlan0".into(),
             parent: "nic9".into(),
             vlan_id: 0,
-            mtu: None,
+            ..Vlan::default()
         });
         let errors = validate(&desired, &observed(), Acknowledgements::default());
         assert!(codes(&errors).contains(&ValidationCode::UnknownReference));

@@ -22,14 +22,20 @@ pub struct NetworkDesiredState {
     pub management: ManagementRef,
 }
 
-/// The management address and the single link that carries it. Exactly one
-/// link has an IP configuration in this stage — guest networks come later.
+/// Which link the console is reached on. Addressing itself lives on the link
+/// (every link carries its own [`IpConfig`]); this only says which of them the
+/// appliance must not be allowed to strand.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagementRef {
     /// Link name: `nic0`, `br0`, `bond0`, `vlan100`, …
     pub link: String,
-    pub ip: IpConfig,
+    /// Where the management addressing used to live, before links carried
+    /// their own. Read so an appliance upgraded in place keeps its committed
+    /// configuration; folded onto the link by [`NetworkDesiredState::migrate`]
+    /// and never written again.
+    #[serde(default, rename = "ip", skip_serializing)]
+    pub legacy_ip: Option<IpConfig>,
 }
 
 /// Layer-3 configuration of a link.
@@ -38,10 +44,11 @@ pub struct ManagementRef {
 /// `NetworkConfig` (same `mode` tag, same field names) so an installed
 /// appliance's management settings round-trip through both. See
 /// `ip_config_matches_installer_network_config` below and docs/networking.md.
+/// The default is `Disabled`, not `Dhcp`: every link carries one of these now,
+/// and a link nobody has configured must not quietly start asking for a lease.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
 pub enum IpConfig {
-    #[default]
     Dhcp,
     Static {
         /// Address in CIDR form, e.g. "192.168.10.5/24".
@@ -50,7 +57,15 @@ pub enum IpConfig {
         #[serde(default)]
         dns: Vec<String>,
     },
+    #[default]
     Disabled,
+}
+
+impl IpConfig {
+    /// Anything that puts an address on the link.
+    pub fn is_addressed(&self) -> bool {
+        !matches!(self, IpConfig::Disabled)
+    }
 }
 
 /// A physical NIC. Never created or destroyed — only configured. The name is
@@ -59,6 +74,13 @@ pub enum IpConfig {
 #[serde(deny_unknown_fields)]
 pub struct Nic {
     pub name: String,
+    /// Layer-3 configuration. `Disabled` for a NIC that is only ever a port.
+    #[serde(default)]
+    pub ip: IpConfig,
+    /// Free text the operator wrote about this link; the table's Description
+    /// column. Never reaches NetworkManager — it lives in `desired.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtu: Option<u32>,
     /// `None` leaves the driver default (which is autonegotiation).
@@ -92,6 +114,10 @@ impl Duplex {
 pub struct Bond {
     pub name: String,
     pub mode: BondMode,
+    #[serde(default)]
+    pub ip: IpConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
     #[serde(default)]
     pub ports: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -175,6 +201,10 @@ pub struct Vlan {
     /// The link the VLAN rides on: a NIC, a bond, or a bridge.
     pub parent: String,
     pub vlan_id: u16,
+    #[serde(default)]
+    pub ip: IpConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtu: Option<u32>,
 }
@@ -184,13 +214,17 @@ pub struct Vlan {
 pub struct Bridge {
     pub name: String,
     #[serde(default)]
+    pub ip: IpConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    #[serde(default)]
     pub ports: Vec<String>,
     #[serde(default)]
     pub stp: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forward_delay: Option<u32>,
-    /// Present now so a later stage that turns it on is a config change and
-    /// not a schema migration. Nothing consumes it yet.
+    /// "VLAN aware" in the console: the bridge passes tagged frames through to
+    /// its ports instead of one VLAN interface per tag.
     #[serde(default)]
     pub vlan_filtering: bool,
     /// Pinned MAC. A Linux bridge otherwise inherits the lowest MAC among its
@@ -289,6 +323,66 @@ impl NetworkDesiredState {
         self.nics.iter().find(|n| n.name == name)
     }
 
+    /// The layer-3 configuration of a link, whatever kind it is. A name
+    /// nothing defines has no addressing.
+    pub fn ip_of(&self, name: &str) -> IpConfig {
+        self.nic(name)
+            .map(|n| n.ip.clone())
+            .or_else(|| self.bond(name).map(|b| b.ip.clone()))
+            .or_else(|| self.bridge(name).map(|b| b.ip.clone()))
+            .or_else(|| self.vlan(name).map(|v| v.ip.clone()))
+            .unwrap_or_default()
+    }
+
+    /// Set a link's layer-3 configuration. Returns false when nothing by that
+    /// name is defined.
+    pub fn set_ip(&mut self, name: &str, ip: IpConfig) -> bool {
+        if let Some(nic) = self.nics.iter_mut().find(|n| n.name == name) {
+            nic.ip = ip;
+            return true;
+        }
+        if let Some(bond) = self.bonds.iter_mut().find(|b| b.name == name) {
+            bond.ip = ip;
+            return true;
+        }
+        if let Some(bridge) = self.bridges.iter_mut().find(|b| b.name == name) {
+            bridge.ip = ip;
+            return true;
+        }
+        if let Some(vlan) = self.vlans.iter_mut().find(|v| v.name == name) {
+            vlan.ip = ip;
+            return true;
+        }
+        false
+    }
+
+    pub fn comment_of(&self, name: &str) -> Option<&str> {
+        self.nic(name)
+            .and_then(|n| n.comment.as_deref())
+            .or_else(|| self.bond(name).and_then(|b| b.comment.as_deref()))
+            .or_else(|| self.bridge(name).and_then(|b| b.comment.as_deref()))
+            .or_else(|| self.vlan(name).and_then(|v| v.comment.as_deref()))
+    }
+
+    /// Fold a document written before links carried their own addressing into
+    /// the current shape. Called on every read from the store, so an appliance
+    /// upgraded in place keeps its committed management address instead of
+    /// silently re-seeding from the box.
+    pub fn migrate(&mut self) {
+        let Some(ip) = self.management.legacy_ip.take() else {
+            return;
+        };
+        let link = self.management.link.clone();
+        if link.is_empty() {
+            return;
+        }
+        // Only if the link has nothing of its own: a document that already
+        // carries per-link addressing is the newer of the two.
+        if !self.ip_of(&link).is_addressed() {
+            self.set_ip(&link, ip);
+        }
+    }
+
     /// Ports of a link, whatever kind of controller it is.
     pub fn ports_of(&self, name: &str) -> &[String] {
         if let Some(bridge) = self.bridge(name) {
@@ -352,6 +446,46 @@ mod tests {
             }
             other => panic!("expected static, got {other:?}"),
         }
+    }
+
+    /// An appliance upgraded in place has `{"management":{"link":"br0","ip":…}}`
+    /// on disk. Losing that would re-seed from the box and drop every comment
+    /// and every setting NetworkManager does not report back.
+    #[test]
+    fn a_pre_per_link_document_migrates_onto_the_link() {
+        let mut state: NetworkDesiredState = serde_json::from_str(
+            r#"{
+                "bridges": [{"name":"br0","ports":["nic0"]}],
+                "nics": [{"name":"nic0"}],
+                "management": {
+                    "link": "br0",
+                    "ip": {"mode":"static","cidr":"192.168.10.5/24","gateway":"192.168.10.1"}
+                }
+            }"#,
+        )
+        .unwrap();
+        state.migrate();
+        assert!(state.management.legacy_ip.is_none());
+        match state.ip_of("br0") {
+            IpConfig::Static { cidr, gateway, .. } => {
+                assert_eq!(cidr, "192.168.10.5/24");
+                assert_eq!(gateway, "192.168.10.1");
+            }
+            other => panic!("expected the address to land on br0, got {other:?}"),
+        }
+        // The port keeps none of it.
+        assert_eq!(state.ip_of("nic0"), IpConfig::Disabled);
+        // …and it is never written back out.
+        let json = serde_json::to_value(&state).unwrap();
+        assert!(json["management"].get("ip").is_none(), "{json}");
+    }
+
+    #[test]
+    fn a_link_nobody_configured_has_no_addressing() {
+        assert_eq!(IpConfig::default(), IpConfig::Disabled);
+        assert_eq!(Nic::default().ip, IpConfig::Disabled);
+        assert!(!IpConfig::Disabled.is_addressed());
+        assert!(IpConfig::Dhcp.is_addressed());
     }
 
     #[test]
