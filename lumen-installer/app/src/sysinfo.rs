@@ -316,7 +316,7 @@ mod tests {
     #[test]
     fn nic_natural_sort() {
         let mut names = vec!["nic10", "nic2", "nic0", "nic1"];
-        names.sort_by(|a, b| natural_key(a).cmp(&natural_key(b)));
+        names.sort_by_key(|a| natural_key(a));
         assert_eq!(names, vec!["nic0", "nic1", "nic2", "nic10"]);
     }
 

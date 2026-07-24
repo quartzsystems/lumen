@@ -25,19 +25,14 @@ pub struct InstallConfig {
 }
 
 /// ZFS vdev layout for the boot pool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PoolTopology {
+    #[default]
     Single,
     Mirror,
     Raidz1,
     Raidz2,
-}
-
-impl Default for PoolTopology {
-    fn default() -> Self {
-        Self::Single
-    }
 }
 
 impl PoolTopology {
