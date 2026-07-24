@@ -140,6 +140,30 @@ for rpm in "$zfs_dl"/*.rpm; do
 done
 mv "$zfs_dl"/*.rpm "$TREE/lumen/"
 
+# ZFS userland dependencies the Minimal media repo lacks (see pins.env).
+# Pulled from the build container's AlmaLinux repos — the almalinux:10
+# container tracks the same point-release stream the upstream ISO pin
+# targets (the kernel-pin gate forces both pins to move together).
+if [ -n "${MEDIA_EXTRA_PACKAGES:-}" ]; then
+    echo "==> Mirroring AlmaLinux extras: $MEDIA_EXTRA_PACKAGES"
+    extra_dl="$WORK/alma-extra-download"
+    mkdir -p "$extra_dl"
+    # shellcheck disable=SC2086 # intentional word splitting of the package list
+    dnf download --quiet --destdir "$extra_dl" $MEDIA_EXTRA_PACKAGES \
+        || die "AlmaLinux extras download failed"
+
+    echo "==> Gate: AlmaLinux extras RPM signatures"
+    alma_key="/etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-10"
+    [ -r "$alma_key" ] || die "AlmaLinux GPG key not found at $alma_key (not building on AlmaLinux 10?)"
+    rpmkeys --import "$alma_key"
+    for rpm in "$extra_dl"/*.rpm; do
+        sig="$(rpmkeys --checksig "$rpm")"
+        grep -q "signatures OK" <<<"$sig" \
+            || die "RPM signature check failed: $sig"
+    done
+    mv "$extra_dl"/*.rpm "$TREE/lumen/"
+fi
+
 echo "==> Creating lumen repo"
 createrepo_c --quiet "$TREE/lumen"
 

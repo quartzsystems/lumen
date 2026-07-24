@@ -14,7 +14,10 @@ Pipeline (`iso/build-live-iso.sh`, entry point `make iso`):
 2. extract its on-media `Minimal` repo (the offline install source) and
    **gate**: the repo's kernel must equal `KERNEL_NEVR` in `iso/pins.env`
 3. build the Lumen RPMs; mirror the pinned OpenZFS EL10 kABI subset from
-   `ZFS_REPO_URL`; `createrepo_c` the combined `lumen` repo
+   `ZFS_REPO_URL` plus the AlmaLinux extras the media repo lacks
+   (`MEDIA_EXTRA_PACKAGES` — zfs userland requires sysstat); every
+   mirrored RPM is signature-checked; `createrepo_c` the combined
+   `lumen` repo
 4. **gate**: the full target package set must resolve against *only* the
    two on-media repos (catches offline-completeness regressions)
 5. `cargo build --release` the installer (AppStream rust, distro gtk4)
