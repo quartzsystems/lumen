@@ -20,7 +20,7 @@ VERSION              Single source of truth for the Lumen version
 Makefile             make rpms | installer | controlplane | webui | iso | test | lint
 lumen-installer/     Rust GUI installer (app/) + live environment (live/)
 lumen-controlplane/  Rust (axum) control plane: auth API + web UI server on :8443
-lumen-webui/         Next.js/TypeScript/Tailwind web console (login page)
+lumen-webui/         Next.js/TypeScript/Tailwind web console (login + shell)
 lumen-networking/    lumen-nicnames: deterministic nic0..nicN naming
 iso/                 ISO build pipeline + version pins (upstream.env, pins.env)
 branding/            Release files, MOTD/issue, os-release additions, artwork

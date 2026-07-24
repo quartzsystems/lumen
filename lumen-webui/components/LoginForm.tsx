@@ -222,7 +222,7 @@ export function LoginForm() {
   useEffect(() => {
     api
       .fetchMe()
-      .then(() => router.replace("/"))
+      .then(() => router.replace("/dashboard"))
       .catch(() => {});
   }, [router]);
 
@@ -244,7 +244,7 @@ export function LoginForm() {
     setLoading(true);
     try {
       await api.login(username, password, realm);
-      router.push("/");
+      router.push("/dashboard");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not reach the server.");
     } finally {
