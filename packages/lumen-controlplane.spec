@@ -34,15 +34,16 @@ Requires:       systemd
 BuildRequires:  systemd-rpm-macros
 
 # NOTE: description wording avoids tokens the EL10 rpmlint spelling check
-# flags as errors (zero-error policy) — no protocol or subsystem acronyms.
+# flags as errors (zero-error policy) — no protocol or subsystem acronyms,
+# and no compound coinages ("prebuilt" is an error there).
 %description
 Management daemon for Quartz Systems Lumen. Serves the management console
 and its programming interface on a single secured port. Sign-in is
 verified against the appliance's own local accounts, sessions are browser
-cookies that page scripts cannot read, and the console itself is prebuilt
-static content served by the daemon, so the appliance needs no extra
-runtime. A certificate is created on first start and can be replaced with
-operator-provided files.
+cookies that page scripts cannot read, and the console itself is static
+content built in advance and served by the daemon, so the appliance needs
+no extra runtime. A certificate is created on first start and can be
+replaced with operator-provided files.
 
 %prep
 # No source archive to unpack; the web console export is unpacked in install.
