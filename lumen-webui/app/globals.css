@@ -205,304 +205,237 @@ body {
   to   { transform: none; opacity: 1; }
 }
 
-/* --- Data table ---
-   Ported from Quartz Command's inventory tables for the Networking views:
-   dense rows, monospace values, a sticky head that survives a long list of
-   interfaces. */
-.qz-table-wrap {
-  overflow-x: auto;
-  border: 1px solid var(--qz-border);
-  border-radius: 10px;
+/* --- Table ---
+   The same table QuartzFire's console uses, rule for rule: dense rows, a
+   sticky monospace head, selectable rows, and a drag handle at every column
+   boundary. Anything that renders rows in Lumen goes through these classes so
+   the two consoles read as one product. */
+.qz-table { width: 100%; border-collapse: collapse; }
+.qz-table th {
+  text-align: left;
+  padding: 10px 14px;
+  font-family: var(--qz-font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--qz-fg-4);
+  border-bottom: 1px solid var(--qz-border);
   background: var(--qz-surface);
-  box-shadow: var(--qz-inset-line);
-}
-.qz-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 12.5px;
-  white-space: nowrap;
-}
-.qz-table thead th {
   position: sticky;
   top: 0;
   z-index: 1;
-  background: var(--qz-surface);
-  text-align: left;
-  font-family: var(--qz-font-mono);
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--qz-fg-4);
-  padding: 10px 12px;
-  border-bottom: 1px solid var(--qz-border);
 }
-.qz-table tbody td {
-  padding: 9px 12px;
+.qz-table td {
+  padding: 12px 14px;
   border-bottom: 1px solid var(--qz-divider);
+  font-size: 13px;
   color: var(--qz-fg-2);
-  vertical-align: middle;
 }
-.qz-table tbody tr:last-child td { border-bottom: 0; }
-.qz-table tbody tr:hover td { background: color-mix(in oklab, white 3%, transparent); }
+.qz-table tr { cursor: pointer; }
+.qz-table tbody tr:hover td { background: color-mix(in oklab, white 4%, var(--qz-surface)); }
+.qz-table tbody tr.selected td { background: var(--qz-accent-soft); }
+.qz-table td.mono { font-family: var(--qz-font-mono); color: var(--qz-fg-1); }
 .qz-mono { font-family: var(--qz-font-mono); }
 .qz-dim { color: var(--qz-fg-4); }
 
-/* Resizable columns need a fixed layout: with `auto`, the browser reflows
-   every column to fit its content and the width the operator dragged is
-   ignored. Cells clip rather than wrap, so row height stays constant. */
-.qz-table-fixed { table-layout: fixed; }
-.qz-table-fixed th, .qz-table-fixed td {
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-/* The node these rows belong to, above the column headers. It stays above the
-   header row it sits on (both inherit `position: sticky` from the rule above,
-   which is also what the resizer positions against). */
-.qz-table thead th.qz-table-title {
-  z-index: 3;
-  font-family: var(--qz-font-mono);
-  font-size: 11.5px;
-  letter-spacing: 0.04em;
-  text-transform: none;
-  color: var(--qz-fg-2);
-  background: var(--qz-surface-sunken);
-  border-bottom: 1px solid var(--qz-border);
-  padding: 8px 12px;
-}
-.qz-th-label { display: block; overflow: hidden; text-overflow: ellipsis; }
-.qz-resizer {
+/* Draggable column-width handle at a header-cell boundary. The ::after line is
+   the always-visible "|" affordance; the span itself is a wider hit target. */
+.qz-col-resize {
   position: absolute;
   top: 0;
-  right: -3px;
-  width: 7px;
+  right: -5px;
+  width: 11px;
   height: 100%;
   cursor: col-resize;
   z-index: 2;
-  /* The grab target is wider than the line the operator sees. */
-  background:
-    linear-gradient(to right, transparent 3px, var(--qz-border) 3px 4px, transparent 4px);
+  user-select: none;
+  touch-action: none;
 }
-.qz-resizer:hover { background: linear-gradient(to right, transparent 3px, var(--qz-accent) 3px 4px, transparent 4px); }
-.qz-table-empty {
-  padding: 28px 12px !important;
-  text-align: center;
-  color: var(--qz-fg-4);
+.qz-col-resize::after {
+  content: "";
+  position: absolute;
+  left: 5px;
+  top: 50%;
+  transform: translateY(-50%);
+  height: 55%;
+  width: 1px;
+  background: var(--qz-border-strong);
+  transition: background 0.12s ease, width 0.12s ease;
 }
-/* Row controls stay against the right edge while the rest of the table
-   scrolls under them: ten columns do not fit a laptop, and an edit button you
-   have to scroll to find is a control the operator does not know is there.
-   The cell needs its own background — the row's would scroll away with it. */
-.qz-table .qz-sticky-right {
-  position: sticky;
-  right: 0;
-  z-index: 1;
-  background: var(--qz-surface);
-  box-shadow: inset 1px 0 0 var(--qz-divider);
-}
-.qz-table thead th.qz-sticky-right { z-index: 2; }
-.qz-table tbody tr:hover td.qz-sticky-right {
-  background: color-mix(in oklab, white 3%, var(--qz-surface));
+.qz-col-resize:hover::after,
+.qz-col-resize.active::after {
+  left: 4.5px;
+  width: 2px;
+  background: var(--qz-accent);
 }
 
-/* --- Table toolbar: search, filters, column picker, row count --- */
-.qz-toolbar {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-bottom: 10px;
-  flex-wrap: wrap;
-}
-.qz-search {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 220px;
-  padding: 7px 10px;
-  border-radius: 7px;
-  border: 1px solid var(--qz-border);
+/* --- Dark checkbox --- */
+.qz-check {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+  border: 1px solid var(--qz-border-strong);
+  border-radius: 4px;
   background: var(--qz-input-bg);
-}
-.qz-search:focus-within { box-shadow: var(--qz-focus-ring); }
-.qz-search-input {
-  flex: 1;
-  min-width: 0;
-  border: 0;
-  outline: none;
-  background: transparent;
-  color: var(--qz-fg-1);
-  font-family: var(--qz-font-sans);
-  font-size: 13px;
-}
-.qz-filter { display: flex; align-items: center; gap: 6px; }
-.qz-filter-label {
-  font-family: var(--qz-font-mono);
-  font-size: 10px;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--qz-fg-4);
-}
-.qz-filter-select { width: auto; padding: 6px 8px; font-size: 12px; }
-.qz-columns-menu { min-width: 210px; max-height: 60vh; overflow-y: auto; }
-.qz-rowcount {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  font-family: var(--qz-font-mono);
-  font-size: 11.5px;
-  color: var(--qz-fg-4);
-  white-space: nowrap;
-}
-.qz-clear-filters {
-  border: 0;
-  background: transparent;
-  padding: 0;
-  color: var(--qz-accent);
-  font-family: var(--qz-font-mono);
-  font-size: 11.5px;
   cursor: pointer;
+  position: relative;
+  transition: background 120ms, border-color 120ms;
+  vertical-align: middle;
+}
+.qz-check:hover { border-color: var(--qz-fg-4); }
+.qz-check:checked,
+.qz-check:indeterminate {
+  background: var(--qz-accent);
+  border-color: var(--qz-accent);
+}
+.qz-check:checked::after {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 1px;
+  width: 4px;
+  height: 8px;
+  border: solid var(--qz-fg-on-accent);
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+.qz-check:indeterminate::after {
+  content: "";
+  position: absolute;
+  left: 3px;
+  top: 6px;
+  width: 7px;
+  height: 2px;
+  background: var(--qz-fg-on-accent);
 }
 
-/* --- Buttons --- */
+/* --- Buttons ---
+   The class form of `components/ui/Button`, kept in step with it metric for
+   metric: the same padding, radius, and kind colours, so a dialog written in
+   markup and a toolbar written in JSX produce the same control. */
 .btn {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  padding: 7px 12px;
-  border-radius: 7px;
+  justify-content: center;
+  gap: 7px;
+  padding: 8px 14px;
+  border-radius: 6px;
   border: 1px solid var(--qz-border);
   background: var(--qz-surface-raised);
-  color: var(--qz-fg-2);
+  color: var(--qz-fg-1);
   font-family: var(--qz-font-sans);
   font-size: 13px;
   font-weight: 600;
   line-height: 1;
   cursor: pointer;
-  transition: all var(--qz-dur-1) var(--qz-ease-out);
+  box-shadow: var(--qz-inset-line);
+  transition: all 140ms var(--qz-ease-out);
   white-space: nowrap;
 }
-.btn:hover:not(:disabled) { border-color: var(--qz-border-strong); color: var(--qz-fg-1); }
+.btn:hover:not(:disabled) { background: color-mix(in oklab, white 4%, var(--qz-surface-raised)); }
 .btn:focus-visible { outline: none; box-shadow: var(--qz-focus-ring); }
-.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
 .btn-primary {
   background: var(--qz-accent);
-  border-color: var(--qz-accent);
+  border-color: transparent;
   color: var(--qz-fg-on-accent);
+  box-shadow: none;
 }
-.btn-primary:hover:not(:disabled) {
-  background: var(--qz-accent-hover);
-  border-color: var(--qz-accent-hover);
-  color: var(--qz-fg-on-accent);
+.btn-primary:hover:not(:disabled) { background: var(--qz-accent-hover); }
+.btn-danger {
+  background: var(--qz-danger);
+  border-color: transparent;
+  color: var(--qz-fg-on-danger);
+  box-shadow: none;
 }
-.btn-danger { border-color: color-mix(in oklab, var(--qz-danger) 45%, transparent); color: var(--qz-danger); }
-.btn-danger:hover:not(:disabled) { background: var(--qz-danger-soft); color: var(--qz-danger); }
-.btn-ghost { background: transparent; }
-.btn-sm { padding: 5px 9px; font-size: 12px; }
-
-/* --- Form controls --- */
-.field { display: flex; flex-direction: column; gap: 5px; }
-.field-label {
-  font-family: var(--qz-font-mono);
-  font-size: 10px;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--qz-fg-4);
-}
-.input, .select {
-  width: 100%;
-  padding: 8px 10px;
-  border-radius: 7px;
-  border: 1px solid var(--qz-border);
-  background: var(--qz-input-bg);
-  color: var(--qz-fg-1);
-  font-family: var(--qz-font-mono);
-  font-size: 13px;
-}
-.input:focus, .select:focus { outline: none; box-shadow: var(--qz-focus-ring); }
-.input-invalid, .select-invalid { border-color: var(--qz-danger); }
-.field-error { font-size: 12px; color: var(--qz-danger); }
-.field-hint { font-size: 12px; color: var(--qz-fg-4); }
-.checkbox-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 13px;
+.btn-danger:hover:not(:disabled) { background: var(--qz-danger); opacity: 0.9; }
+.btn-ghost {
+  background: transparent;
+  border-color: transparent;
   color: var(--qz-fg-2);
+  box-shadow: none;
+}
+.btn-ghost:hover:not(:disabled) { background: var(--qz-surface); color: var(--qz-fg-1); }
+.btn-sm { padding: 5px 10px; font-size: 12px; gap: 6px; }
+
+/* --- Form controls ---
+   Modals and their fields are built from `components/ui/Modal` and
+   `components/ui/formkit`, ported from QuartzFire; there are deliberately no
+   `.input`/`.dialog` classes here for them to drift away from. */
+
+/* --- Switch --- */
+.switch {
+  width: 34px;
+  height: 20px;
+  background: var(--qz-ink-5);
+  border-radius: 999px;
+  position: relative;
   cursor: pointer;
+  transition: background 160ms;
+  flex-shrink: 0;
 }
-.port-list {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  max-height: 168px;
-  overflow-y: auto;
-  padding: 8px 10px;
-  border-radius: 7px;
-  border: 1px solid var(--qz-border);
-  background: var(--qz-input-bg);
+.switch-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  background: #fff;
+  border-radius: 50%;
+  transition: left 160ms var(--qz-ease-out);
 }
+.switch.on { background: var(--qz-accent); }
+.switch.on .switch-knob { left: 16px; background: var(--qz-fg-on-accent); }
 
-/* --- Dialog --- */
-.dialog-scrim {
-  position: fixed;
-  inset: 0;
-  background: rgba(8, 9, 13, 0.6);
-  backdrop-filter: blur(6px);
-  z-index: 90;
-  display: grid;
-  place-items: center;
-  padding: 24px;
-}
-.dialog {
-  width: min(560px, 100%);
-  max-height: calc(100vh - 96px);
-  overflow-y: auto;
-  background: var(--qz-surface-raised);
-  border: 1px solid var(--qz-border);
-  border-radius: 12px;
-  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.6);
-  padding: 22px 24px;
-}
-.dialog-title { font-size: 17px; font-weight: 700; color: var(--qz-fg-1); margin: 0; }
-.dialog-subtitle { font-size: 13px; color: var(--qz-fg-4); margin: 6px 0 0; }
-.dialog-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
-  margin-top: 22px;
-  padding-top: 16px;
-  border-top: 1px solid var(--qz-divider);
-}
-
-/* --- Menu (the Create split control) --- */
+/* --- Menu (the column picker, the Create split control) ---
+   QuartzFire's dropdown: a plain surface panel, a quiet uppercase label, and
+   full-bleed rows that light up on hover. */
 .menu {
   position: absolute;
-  top: calc(100% + 6px);
+  top: calc(100% + 4px);
   right: 0;
-  z-index: 40;
-  min-width: 190px;
-  padding: 5px;
-  background: var(--qz-surface-raised);
+  z-index: 20;
+  min-width: 200px;
+  max-height: 60vh;
+  overflow-y: auto;
+  padding: 4px 0;
+  background: var(--qz-surface);
   border: 1px solid var(--qz-border);
-  border-radius: 9px;
-  box-shadow: var(--qz-shadow-3);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+.menu-label {
+  padding: 4px 12px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--qz-fg-4);
 }
 .menu-item {
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: 8px;
   width: 100%;
-  padding: 8px 10px;
+  padding: 6px 12px;
   border: 0;
-  border-radius: 6px;
   background: transparent;
   color: var(--qz-fg-2);
   font-family: var(--qz-font-sans);
   font-size: 13px;
   text-align: left;
   cursor: pointer;
+  transition: background var(--qz-dur-1) var(--qz-ease-out), color var(--qz-dur-1) var(--qz-ease-out);
 }
-.menu-item:hover { background: color-mix(in oklab, white 5%, transparent); color: var(--qz-fg-1); }
+/* A row that is about the menu rather than about the data in it — "Reset
+   layout" under the column list. */
+.menu-item-quiet { color: var(--qz-fg-3); }
+.menu-item:hover:not(:disabled) { background: color-mix(in oklab, white 5%, transparent); color: var(--qz-fg-1); }
+.menu-item:disabled { opacity: 0.5; cursor: not-allowed; }
+.menu-separator { margin: 4px 12px; border-top: 1px solid var(--qz-divider); }
 
 /* --- Callout (the management-bridge banner and friends) --- */
 .callout {

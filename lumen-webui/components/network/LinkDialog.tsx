@@ -1,6 +1,17 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import { ModalShell, ModalHeader } from "@/components/ui/Modal";
+import { Switch } from "@/components/ui/Switch";
+import {
+  CheckList,
+  CheckRow,
+  ErrorText,
+  Field,
+  ModalFooter,
+  SelectInput,
+  TextInput,
+} from "@/components/ui/formkit";
 import {
   createBond,
   createBridge,
@@ -295,409 +306,362 @@ export function LinkDialog({
   const isPort = editing?.controller != null;
 
   return (
-    <div className="dialog-scrim" role="dialog" aria-modal="true">
-      <div className="dialog">
-        <h2 className="dialog-title">
-          {editing ? `Edit ${editing.name}` : `Create ${TITLES[kind]}`}
-        </h2>
-        <p className="dialog-subtitle">
-          {editing
+    <ModalShell onClose={onClose} maxWidth={560}>
+      <ModalHeader
+        title={editing ? `Edit ${editing.name}` : `Create ${TITLES[kind]}`}
+        subtitle={
+          editing
             ? "Changes are staged. Nothing reaches the node until you apply them."
-            : "The new interface is staged. Nothing reaches the node until you apply it."}
-        </p>
+            : "The new interface is staged. Nothing reaches the node until you apply it."
+        }
+        onClose={onClose}
+      />
 
-        <div className="flex flex-col gap-4 mt-5">
-          <div className="field">
-            <label className="field-label" htmlFor="link-name">
-              Name
-            </label>
-            <input
-              id="link-name"
-              className={`input${errors.name ? " input-invalid" : ""}`}
-              value={draft.name}
-              // An interface cannot be renamed in place — the profile, the
-              // ports pointing at it, and the running device all carry the
-              // name — so editing shows it rather than offering it.
-              readOnly={editing !== null}
-              autoFocus={editing === null}
-              placeholder={kind === "bridge" ? "br1" : kind === "bond" ? "bond0" : "vlan100"}
-              onChange={(e) => set("name", e.target.value)}
-            />
-            {errors.name && <span className="field-error">{errors.name}</span>}
-          </div>
+      <form
+        className="flex flex-col gap-4"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void submit();
+        }}
+      >
+        <Field label="Name" htmlFor="link-name" required={editing === null} error={errors.name}>
+          <TextInput
+            id="link-name"
+            value={draft.name}
+            mono
+            // An interface cannot be renamed in place — the profile, the ports
+            // pointing at it, and the running device all carry the name — so
+            // editing shows it rather than offering it.
+            readOnly={editing !== null}
+            autoFocus={editing === null}
+            invalid={!!errors.name}
+            placeholder={kind === "bridge" ? "br1" : kind === "bond" ? "bond0" : "vlan100"}
+            onChange={(v) => set("name", v)}
+          />
+        </Field>
 
-          {kind === "ethernet" && editing && (
-            <div className="field">
-              <label className="field-label" htmlFor="link-altname">
-                Alternative name
-              </label>
-              <input
-                id="link-altname"
-                className="input"
-                value={editing.altname ?? ""}
-                placeholder="—"
-                readOnly
-              />
-              <span className="field-hint">
+        {kind === "ethernet" && editing && (
+          <Field
+            label="Alternative name"
+            htmlFor="link-altname"
+            hint={
+              <>
                 What the kernel called this adapter before Lumen pinned it to{" "}
-                <span className="qz-mono">{editing.name}</span>.
-              </span>
-            </div>
-          )}
+                <span style={{ fontFamily: "var(--qz-font-mono)" }}>{editing.name}</span>.
+              </>
+            }
+          >
+            <TextInput
+              id="link-altname"
+              value={editing.altname ?? ""}
+              mono
+              readOnly
+              placeholder="—"
+              onChange={() => undefined}
+            />
+          </Field>
+        )}
 
-          {kind === "vlan" && (
-            <>
-              <div className="field">
-                <label className="field-label" htmlFor="vlan-parent">
-                  Parent interface
-                </label>
-                <select
-                  id="vlan-parent"
-                  className={`select${errors.parent ? " select-invalid" : ""}`}
-                  value={draft.parent}
-                  onChange={(e) => set("parent", e.target.value)}
-                >
-                  <option value="">Choose an interface…</option>
-                  {parentCandidates.map((link) => (
-                    <option key={link.name} value={link.name}>
-                      {link.name} ({link.kind})
-                    </option>
-                  ))}
-                </select>
-                {errors.parent && <span className="field-error">{errors.parent}</span>}
-              </div>
-              <div className="field">
-                <label className="field-label" htmlFor="vlan-id">
-                  VLAN id
-                </label>
-                <input
-                  id="vlan-id"
-                  className={`input${errors.vlan_id ? " input-invalid" : ""}`}
-                  inputMode="numeric"
-                  value={draft.vlanId}
-                  placeholder="1–4094"
-                  onChange={(e) => set("vlanId", e.target.value)}
-                />
-                {errors.vlan_id && <span className="field-error">{errors.vlan_id}</span>}
-              </div>
-            </>
-          )}
-
-          {kind === "bond" && (
-            <div className="field">
-              <label className="field-label" htmlFor="bond-mode">
-                Bond mode
-              </label>
-              <select
-                id="bond-mode"
-                className="select"
-                value={draft.mode}
-                onChange={(e) => set("mode", e.target.value as BondMode)}
+        {kind === "vlan" && (
+          <>
+            <Field label="Parent interface" htmlFor="vlan-parent" required error={errors.parent}>
+              <SelectInput
+                id="vlan-parent"
+                value={draft.parent}
+                mono
+                invalid={!!errors.parent}
+                onChange={(v) => set("parent", v)}
               >
-                <option value="active-backup">active-backup</option>
-                <option value="802.3ad">802.3ad (LACP)</option>
-                <option value="balance-xor">balance-xor</option>
-              </select>
-            </div>
-          )}
-
-          {kind === "bridge" && (
-            <label className="checkbox-row">
-              <input
-                type="checkbox"
-                checked={draft.vlanAware}
-                onChange={(e) => set("vlanAware", e.target.checked)}
+                <option value="">Choose an interface…</option>
+                {parentCandidates.map((link) => (
+                  <option key={link.name} value={link.name}>
+                    {link.name} ({link.kind})
+                  </option>
+                ))}
+              </SelectInput>
+            </Field>
+            <Field label="VLAN id" htmlFor="vlan-id" required error={errors.vlan_id}>
+              <TextInput
+                id="vlan-id"
+                value={draft.vlanId}
+                mono
+                inputMode="numeric"
+                invalid={!!errors.vlan_id}
+                placeholder="1–4094"
+                onChange={(v) => set("vlanId", v)}
               />
-              VLAN aware
-            </label>
-          )}
+            </Field>
+          </>
+        )}
 
-          {showPorts && (
-            <div className="field">
-              <span className="field-label">{portLabel}</span>
-              <div className="port-list">
-                {portCandidates.length === 0 && (
-                  <span className="field-hint">No interfaces are free to add.</span>
-                )}
+        {kind === "bond" && (
+          <Field label="Bond mode" htmlFor="bond-mode">
+            <SelectInput
+              id="bond-mode"
+              value={draft.mode}
+              mono
+              onChange={(v) => set("mode", v as BondMode)}
+            >
+              <option value="active-backup">active-backup</option>
+              <option value="802.3ad">802.3ad (LACP)</option>
+              <option value="balance-xor">balance-xor</option>
+            </SelectInput>
+          </Field>
+        )}
+
+        {kind === "bridge" && (
+          <label className="flex items-center gap-[10px] cursor-pointer select-none">
+            <Switch on={draft.vlanAware} onChange={(v) => set("vlanAware", v)} />
+            <span className="text-[13px] text-[var(--qz-fg-2)]">VLAN aware</span>
+          </label>
+        )}
+
+        {showPorts && (
+          <Field
+            label={portLabel}
+            error={errors.ports}
+            // Only when the management link is genuinely missing from the list
+            // above. Editing the management link itself excludes it for the
+            // ordinary reason — nothing is a port of itself — and saying
+            // otherwise there is just confusing.
+            hint={
+              managementLink && managementLink !== draft.name ? (
+                <>
+                  <span style={{ fontFamily: "var(--qz-font-mono)" }}>{managementLink}</span> carries
+                  the management address and is not listed. Use &ldquo;Create management
+                  bridge&rdquo; to move it safely.
+                </>
+              ) : undefined
+            }
+          >
+            {portCandidates.length === 0 ? (
+              <p className="text-[12px] text-[var(--qz-fg-4)] m-0">No interfaces are free to add.</p>
+            ) : (
+              <CheckList>
                 {portCandidates.map((link) => (
-                  <label key={link.name} className="checkbox-row">
-                    <input
-                      type="checkbox"
-                      checked={draft.ports.includes(link.name)}
-                      onChange={() => togglePort(link.name)}
-                    />
-                    <span className="qz-mono">{link.name}</span>
-                    <span className="qz-dim text-[12px]">
+                  <CheckRow
+                    key={link.name}
+                    checked={draft.ports.includes(link.name)}
+                    onChange={() => togglePort(link.name)}
+                  >
+                    <span
+                      className="text-[13px] text-[var(--qz-fg-2)]"
+                      style={{ fontFamily: "var(--qz-font-mono)" }}
+                    >
+                      {link.name}
+                    </span>
+                    <span className="text-[12px] text-[var(--qz-fg-4)]">
                       {link.altname ?? link.kind}
                       {link.carrier ? "" : " · no carrier"}
                     </span>
-                  </label>
+                  </CheckRow>
                 ))}
-              </div>
-              {/* Only when the management link is genuinely missing from the
-                  list above. Editing the management link itself excludes it
-                  for the ordinary reason — nothing is a port of itself — and
-                  saying otherwise there is just confusing. */}
-              {managementLink && managementLink !== draft.name && (
-                <span className="field-hint">
-                  <span className="qz-mono">{managementLink}</span> carries the management address
-                  and is not listed. Use &ldquo;Create management bridge&rdquo; to move it safely.
-                </span>
-              )}
-              {errors.ports && <span className="field-error">{errors.ports}</span>}
-            </div>
-          )}
+              </CheckList>
+            )}
+          </Field>
+        )}
 
-          {isPort ? (
-            <span className="field-hint">
-              <span className="qz-mono">{editing?.name}</span> is a port of{" "}
-              <span className="qz-mono">{editing?.controller}</span>, so its address is configured
-              on <span className="qz-mono">{editing?.controller}</span> instead.
-            </span>
-          ) : (
-            <>
-              <div className="field">
-                <label className="field-label" htmlFor="link-ipmode">
-                  IPv4
-                </label>
-                <select
-                  id="link-ipmode"
-                  className="select"
-                  value={draft.ipMode}
-                  onChange={(e) => set("ipMode", e.target.value as IpMode)}
-                >
-                  <option value="none">No address</option>
-                  <option value="static">Static</option>
-                  <option value="dhcp">Automatic (DHCP)</option>
-                </select>
-              </div>
+        {isPort ? (
+          <p className="text-[12px] text-[var(--qz-fg-4)] m-0">
+            <span style={{ fontFamily: "var(--qz-font-mono)" }}>{editing?.name}</span> is a port of{" "}
+            <span style={{ fontFamily: "var(--qz-font-mono)" }}>{editing?.controller}</span>, so its
+            address is configured on{" "}
+            <span style={{ fontFamily: "var(--qz-font-mono)" }}>{editing?.controller}</span> instead.
+          </p>
+        ) : (
+          <>
+            <Field label="IPv4" htmlFor="link-ipmode">
+              <SelectInput
+                id="link-ipmode"
+                value={draft.ipMode}
+                onChange={(v) => set("ipMode", v as IpMode)}
+              >
+                <option value="none">No address</option>
+                <option value="static">Static</option>
+                <option value="dhcp">Automatic (DHCP)</option>
+              </SelectInput>
+            </Field>
 
-              {draft.ipMode === "static" && (
-                <div className="grid grid-cols-2 gap-3">
-                  <div className="field">
-                    <label className="field-label" htmlFor="link-cidr">
-                      IPv4/CIDR
-                    </label>
-                    <input
-                      id="link-cidr"
-                      className={`input${errors.ip ? " input-invalid" : ""}`}
-                      value={draft.cidr}
-                      placeholder="192.168.1.10/24"
-                      onChange={(e) => set("cidr", e.target.value)}
-                    />
-                    {errors.ip && <span className="field-error">{errors.ip}</span>}
-                  </div>
-                  <div className="field">
-                    <label className="field-label" htmlFor="link-gateway">
-                      Gateway (IPv4)
-                    </label>
-                    <input
-                      id="link-gateway"
-                      className={`input${errors.gateway ? " input-invalid" : ""}`}
-                      value={draft.gateway}
-                      placeholder="192.168.1.1"
-                      onChange={(e) => set("gateway", e.target.value)}
-                    />
-                    {errors.gateway && <span className="field-error">{errors.gateway}</span>}
-                  </div>
-                </div>
-              )}
-            </>
-          )}
-
-          {kind === "bond" && (
-            <div className="grid grid-cols-2 gap-3">
-              <div className="field">
-                <label className="field-label" htmlFor="bond-miimon">
-                  Link check (ms)
-                </label>
-                <input
-                  id="bond-miimon"
-                  className="input"
-                  inputMode="numeric"
-                  value={draft.miimon}
-                  placeholder="100"
-                  onChange={(e) => set("miimon", e.target.value)}
-                />
+            {draft.ipMode === "static" && (
+              <div className="grid gap-4" style={{ gridTemplateColumns: "1fr 1fr" }}>
+                <Field label="IPv4/CIDR" htmlFor="link-cidr" required error={errors.ip}>
+                  <TextInput
+                    id="link-cidr"
+                    value={draft.cidr}
+                    mono
+                    invalid={!!errors.ip}
+                    placeholder="192.168.1.10/24"
+                    onChange={(v) => set("cidr", v)}
+                  />
+                </Field>
+                <Field label="Gateway (IPv4)" htmlFor="link-gateway" error={errors.gateway}>
+                  <TextInput
+                    id="link-gateway"
+                    value={draft.gateway}
+                    mono
+                    invalid={!!errors.gateway}
+                    placeholder="192.168.1.1"
+                    onChange={(v) => set("gateway", v)}
+                  />
+                </Field>
               </div>
-              <div className="field">
-                <label className="field-label" htmlFor="bond-primary">
-                  Primary port
-                </label>
-                <select
-                  id="bond-primary"
-                  className={`select${errors.primary ? " select-invalid" : ""}`}
-                  value={draft.primary}
-                  onChange={(e) => set("primary", e.target.value)}
-                >
-                  <option value="">None</option>
-                  {draft.ports.map((port) => (
-                    <option key={port} value={port}>
-                      {port}
-                    </option>
-                  ))}
-                </select>
-                {errors.primary && <span className="field-error">{errors.primary}</span>}
-              </div>
-              {draft.mode === "802.3ad" && (
-                <>
-                  <div className="field">
-                    <label className="field-label" htmlFor="bond-lacp">
-                      LACP rate
-                    </label>
-                    <select
-                      id="bond-lacp"
-                      className="select"
-                      value={draft.lacpRate}
-                      onChange={(e) => set("lacpRate", e.target.value as Draft["lacpRate"])}
-                    >
-                      <option value="">Default</option>
-                      <option value="slow">slow</option>
-                      <option value="fast">fast</option>
-                    </select>
-                  </div>
-                  <div className="field">
-                    <label className="field-label" htmlFor="bond-hash">
-                      Hash policy
-                    </label>
-                    <select
-                      id="bond-hash"
-                      className="select"
-                      value={draft.hashPolicy}
-                      onChange={(e) => set("hashPolicy", e.target.value as Draft["hashPolicy"])}
-                    >
-                      <option value="">Default</option>
-                      <option value="layer2">layer2</option>
-                      <option value="layer2+3">layer2+3</option>
-                      <option value="layer3+4">layer3+4</option>
-                    </select>
-                  </div>
-                </>
-              )}
-            </div>
-          )}
+            )}
+          </>
+        )}
 
-          {kind === "bridge" && (
-            <div className="grid grid-cols-2 gap-3">
-              <label className="checkbox-row mt-5">
-                <input
-                  type="checkbox"
-                  checked={draft.stp}
-                  onChange={(e) => set("stp", e.target.checked)}
-                />
-                Spanning tree (STP)
-              </label>
-              <div className="field">
-                <label className="field-label" htmlFor="bridge-delay">
-                  Forward delay (s)
-                </label>
-                <input
-                  id="bridge-delay"
-                  className="input"
-                  inputMode="numeric"
-                  value={draft.forwardDelay}
-                  placeholder="0"
-                  onChange={(e) => set("forwardDelay", e.target.value)}
-                />
-              </div>
-            </div>
-          )}
-
-          {kind === "ethernet" && (
-            <div className="grid grid-cols-2 gap-3">
-              <div className="field">
-                <label className="field-label" htmlFor="nic-autoneg">
-                  Link negotiation
-                </label>
-                <select
-                  id="nic-autoneg"
-                  className="select"
-                  value={draft.autoneg}
-                  onChange={(e) => set("autoneg", e.target.value as Draft["autoneg"])}
-                >
-                  <option value="">Leave as configured</option>
-                  <option value="on">Automatic</option>
-                  <option value="off">Forced</option>
-                </select>
-              </div>
-              {draft.autoneg === "off" && (
-                <>
-                  <div className="field">
-                    <label className="field-label" htmlFor="nic-speed">
-                      Speed (Mb/s)
-                    </label>
-                    <input
-                      id="nic-speed"
-                      className="input"
-                      inputMode="numeric"
-                      value={draft.speed}
-                      placeholder="1000"
-                      onChange={(e) => set("speed", e.target.value)}
-                    />
-                  </div>
-                  <div className="field">
-                    <label className="field-label" htmlFor="nic-duplex">
-                      Duplex
-                    </label>
-                    <select
-                      id="nic-duplex"
-                      className="select"
-                      value={draft.duplex}
-                      onChange={(e) => set("duplex", e.target.value as Draft["duplex"])}
-                    >
-                      <option value="">Choose…</option>
-                      <option value="full">full</option>
-                      <option value="half">half</option>
-                    </select>
-                  </div>
-                </>
-              )}
-            </div>
-          )}
-
-          <div className="field">
-            <label className="field-label" htmlFor="link-mtu">
-              MTU
-            </label>
-            <input
-              id="link-mtu"
-              className={`input${errors.mtu ? " input-invalid" : ""}`}
-              inputMode="numeric"
-              value={draft.mtu}
-              placeholder="1500"
-              onChange={(e) => set("mtu", e.target.value)}
-            />
-            {errors.mtu && <span className="field-error">{errors.mtu}</span>}
+        {kind === "bond" && (
+          <div className="grid gap-4" style={{ gridTemplateColumns: "1fr 1fr" }}>
+            <Field label="Link check (ms)" htmlFor="bond-miimon">
+              <TextInput
+                id="bond-miimon"
+                value={draft.miimon}
+                mono
+                inputMode="numeric"
+                placeholder="100"
+                onChange={(v) => set("miimon", v)}
+              />
+            </Field>
+            <Field label="Primary port" htmlFor="bond-primary" error={errors.primary}>
+              <SelectInput
+                id="bond-primary"
+                value={draft.primary}
+                mono
+                invalid={!!errors.primary}
+                onChange={(v) => set("primary", v)}
+              >
+                <option value="">None</option>
+                {draft.ports.map((port) => (
+                  <option key={port} value={port}>
+                    {port}
+                  </option>
+                ))}
+              </SelectInput>
+            </Field>
+            {draft.mode === "802.3ad" && (
+              <>
+                <Field label="LACP rate" htmlFor="bond-lacp">
+                  <SelectInput
+                    id="bond-lacp"
+                    value={draft.lacpRate}
+                    mono
+                    onChange={(v) => set("lacpRate", v as Draft["lacpRate"])}
+                  >
+                    <option value="">Default</option>
+                    <option value="slow">slow</option>
+                    <option value="fast">fast</option>
+                  </SelectInput>
+                </Field>
+                <Field label="Hash policy" htmlFor="bond-hash">
+                  <SelectInput
+                    id="bond-hash"
+                    value={draft.hashPolicy}
+                    mono
+                    onChange={(v) => set("hashPolicy", v as Draft["hashPolicy"])}
+                  >
+                    <option value="">Default</option>
+                    <option value="layer2">layer2</option>
+                    <option value="layer2+3">layer2+3</option>
+                    <option value="layer3+4">layer3+4</option>
+                  </SelectInput>
+                </Field>
+              </>
+            )}
           </div>
+        )}
 
-          <div className="field">
-            <label className="field-label" htmlFor="link-comment">
-              Comment
+        {kind === "bridge" && (
+          <div className="grid gap-4 items-end" style={{ gridTemplateColumns: "1fr 1fr" }}>
+            <Field label="Forward delay (s)" htmlFor="bridge-delay">
+              <TextInput
+                id="bridge-delay"
+                value={draft.forwardDelay}
+                mono
+                inputMode="numeric"
+                placeholder="0"
+                onChange={(v) => set("forwardDelay", v)}
+              />
+            </Field>
+            <label className="flex items-center gap-[10px] cursor-pointer select-none pb-[9px]">
+              <Switch on={draft.stp} onChange={(v) => set("stp", v)} />
+              <span className="text-[13px] text-[var(--qz-fg-2)]">Spanning tree (STP)</span>
             </label>
-            <input
-              id="link-comment"
-              className="input"
-              value={draft.comment}
-              placeholder="What this interface is for"
-              onChange={(e) => set("comment", e.target.value)}
-            />
-            <span className="field-hint">Shown in the Description column.</span>
           </div>
+        )}
 
-          {errors.management && <span className="field-error">{errors.management}</span>}
-          {errors.form && <span className="field-error">{errors.form}</span>}
-        </div>
+        {kind === "ethernet" && (
+          <div className="grid gap-4" style={{ gridTemplateColumns: "1fr 1fr" }}>
+            <Field label="Link negotiation" htmlFor="nic-autoneg">
+              <SelectInput
+                id="nic-autoneg"
+                value={draft.autoneg}
+                onChange={(v) => set("autoneg", v as Draft["autoneg"])}
+              >
+                <option value="">Leave as configured</option>
+                <option value="on">Automatic</option>
+                <option value="off">Forced</option>
+              </SelectInput>
+            </Field>
+            {draft.autoneg === "off" && (
+              <>
+                <Field label="Speed (Mb/s)" htmlFor="nic-speed">
+                  <TextInput
+                    id="nic-speed"
+                    value={draft.speed}
+                    mono
+                    inputMode="numeric"
+                    placeholder="1000"
+                    onChange={(v) => set("speed", v)}
+                  />
+                </Field>
+                <Field label="Duplex" htmlFor="nic-duplex">
+                  <SelectInput
+                    id="nic-duplex"
+                    value={draft.duplex}
+                    mono
+                    onChange={(v) => set("duplex", v as Draft["duplex"])}
+                  >
+                    <option value="">Choose…</option>
+                    <option value="full">full</option>
+                    <option value="half">half</option>
+                  </SelectInput>
+                </Field>
+              </>
+            )}
+          </div>
+        )}
 
-        <div className="dialog-actions">
-          <button type="button" className="btn" onClick={onClose} disabled={saving}>
-            Cancel
-          </button>
-          <button type="button" className="btn btn-primary" onClick={submit} disabled={saving}>
-            {editing ? "Stage changes" : "Stage interface"}
-          </button>
-        </div>
-      </div>
-    </div>
+        <Field label="MTU" htmlFor="link-mtu" error={errors.mtu}>
+          <TextInput
+            id="link-mtu"
+            value={draft.mtu}
+            mono
+            inputMode="numeric"
+            invalid={!!errors.mtu}
+            placeholder="1500"
+            onChange={(v) => set("mtu", v)}
+          />
+        </Field>
+
+        <Field label="Comment" htmlFor="link-comment" hint="Shown in the Description column.">
+          <TextInput
+            id="link-comment"
+            value={draft.comment}
+            placeholder="What this interface is for"
+            onChange={(v) => set("comment", v)}
+          />
+        </Field>
+
+        {errors.management && <ErrorText msg={errors.management} />}
+        {errors.form && <ErrorText msg={errors.form} />}
+
+        <ModalFooter
+          onCancel={onClose}
+          saving={saving}
+          savingLabel="Staging…"
+          submitLabel={editing ? "Stage changes" : "Stage interface"}
+        />
+      </form>
+    </ModalShell>
   );
 }
 

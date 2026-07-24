@@ -1,19 +1,21 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   Cable,
   ChevronDown,
   Network,
-  Pencil,
   Plus,
   Share2,
   Tags,
-  Trash2,
 } from "lucide-react";
-import { PageHeader } from "@/components/PageHeader";
-import { DataTable, Dash, type Column } from "@/components/console/DataTable";
+import { Page, PageBody, PageHeader } from "@/components/PageHeader";
+import { DataTable, Dash, type Column, type FilterDef } from "@/components/console/DataTable";
+import { RowActions } from "@/components/console/RowActions";
+import { Button } from "@/components/ui/Button";
+import { ModalShell, ModalHeader } from "@/components/ui/Modal";
+import { ModalFooter } from "@/components/ui/formkit";
 import { LinkDialog, dialogKindFor, type DialogKind } from "@/components/network/LinkDialog";
 import { ApiError } from "@/lib/authClient";
 import { useConsole } from "@/lib/ConsoleContext";
@@ -129,152 +131,174 @@ export default function InterfacesPage() {
     }, "Management bridge created. Confirm before the window runs out.");
 
   return (
-    <div className="p-[28px_36px]">
+    <Page>
       <PageHeader
         title="Interfaces"
         description="Physical adapters, bridges, bonds, and VLAN interfaces on this node."
         actions={
           <div className="relative">
-            <button
-              type="button"
-              className="btn btn-primary"
-              onClick={() => setMenuOpen((open) => !open)}
-              disabled={outstanding}
+            <span
               title={
-                outstanding
-                  ? "Confirm or roll back the outstanding change first"
-                  : "Create an interface"
+                outstanding ? "Confirm or roll back the outstanding change first" : undefined
               }
             >
-              <Plus size={14} />
-              Create
-              <ChevronDown size={14} />
-            </button>
+              <Button
+                kind="primary"
+                icon={Plus}
+                iconRight={ChevronDown}
+                onClick={() => setMenuOpen((open) => !open)}
+                disabled={outstanding}
+              >
+                Create
+              </Button>
+            </span>
             {menuOpen && (
-              <div className="menu">
-                {(
-                  [
-                    { kind: "bridge", label: "Linux Bridge", Icon: Network },
-                    { kind: "bond", label: "Linux Bond", Icon: Share2 },
-                    { kind: "vlan", label: "Linux VLAN", Icon: Tags },
-                  ] as const
-                ).map(({ kind, label, Icon }) => (
-                  <button
-                    key={kind}
-                    type="button"
-                    className="menu-item"
-                    onClick={() => {
-                      setMenuOpen(false);
-                      setDialog({ kind, editing: null });
-                    }}
-                  >
-                    <Icon size={15} /> {label}
-                  </button>
-                ))}
-              </div>
+              <>
+                {/* Click-away, so the menu closes the way every other one does. */}
+                <div className="fixed inset-0 z-10" onClick={() => setMenuOpen(false)} />
+                <div className="menu">
+                  {(
+                    [
+                      { kind: "bridge", label: "Linux Bridge", Icon: Network },
+                      { kind: "bond", label: "Linux Bond", Icon: Share2 },
+                      { kind: "vlan", label: "Linux VLAN", Icon: Tags },
+                    ] as const
+                  ).map(({ kind, label, Icon }) => (
+                    <button
+                      key={kind}
+                      type="button"
+                      className="menu-item"
+                      onClick={() => {
+                        setMenuOpen(false);
+                        setDialog({ kind, editing: null });
+                      }}
+                    >
+                      <Icon size={15} /> {label}
+                    </button>
+                  ))}
+                </div>
+              </>
             )}
           </div>
         }
       />
 
-      {error && (
-        <div className="callout callout-crit mb-4">
-          <AlertTriangle size={17} className="flex-shrink-0 text-[var(--qz-danger)] mt-[1px]" />
-          <div className="text-[13px] text-[var(--qz-fg-2)]">{error}</div>
-        </div>
-      )}
-
-      {!managementIsBridged && management && (
-        <div className="callout callout-warn mb-4">
-          <Cable size={17} className="flex-shrink-0 text-[var(--qz-warn)] mt-[1px]" />
-          <div className="flex-1 min-w-0">
-            <div className="text-[13px] font-semibold text-[var(--qz-fg-1)]">
-              The management address is on a bare interface
+      <PageBody>
+        <div className="flex flex-col gap-4">
+          {error && (
+            <div className="callout callout-crit">
+              <AlertTriangle size={17} className="flex-shrink-0 text-[var(--qz-danger)] mt-[1px]" />
+              <div className="text-[13px] text-[var(--qz-fg-2)]">{error}</div>
             </div>
-            <p className="text-[13px] text-[var(--qz-fg-3)] mt-1 mb-0">
-              Virtual machines attach to a bridge, not to an adapter. Converting{" "}
-              <span className="qz-mono">{management.name}</span> now moves the address onto{" "}
-              <span className="qz-mono">br0</span> with the same addressing and the same hardware
-              address, inside the usual confirm window — so a mistake reverts itself.
-            </p>
-          </div>
-          <button
-            type="button"
-            className="btn btn-primary flex-shrink-0"
-            onClick={convert}
-            disabled={busy || outstanding || staged.length > 0}
-            title={
-              staged.length > 0
-                ? "Apply or discard the staged changes first"
-                : outstanding
-                  ? "Confirm or roll back the outstanding change first"
-                  : undefined
-            }
-          >
-            Create management bridge
-          </button>
-        </div>
-      )}
+          )}
 
-      {staged.length > 0 && (
-        <div className="pending-bar mb-4">
-          <span className="text-[13px] font-semibold text-[var(--qz-fg-1)] flex-1">
-            {staged.length} staged {staged.length === 1 ? "change" : "changes"}, not yet applied
-          </span>
-          <button
-            type="button"
-            className="btn btn-ghost"
-            disabled={busy || outstanding}
-            onClick={() => run(discardPending, "Staged changes discarded.")}
-          >
-            Discard all
-          </button>
-          <button
-            type="button"
-            className="btn btn-primary"
-            disabled={busy || outstanding || (pending?.errors.length ?? 0) > 0}
-            onClick={() => setConfirming(true)}
-            title={
-              (pending?.errors.length ?? 0) > 0
-                ? "Fix the problems listed below first"
-                : "Apply the staged changes"
-            }
-          >
-            Apply configuration
-          </button>
-        </div>
-      )}
+          {!managementIsBridged && management && (
+            <div className="callout callout-warn">
+              <Cable size={17} className="flex-shrink-0 text-[var(--qz-warn)] mt-[1px]" />
+              <div className="flex-1 min-w-0">
+                <div className="text-[13px] font-semibold text-[var(--qz-fg-1)]">
+                  The management address is on a bare interface
+                </div>
+                <p className="text-[13px] text-[var(--qz-fg-3)] mt-1 mb-0">
+                  Virtual machines attach to a bridge, not to an adapter. Converting{" "}
+                  <span className="qz-mono">{management.name}</span> now moves the address onto{" "}
+                  <span className="qz-mono">br0</span> with the same addressing and the same
+                  hardware address, inside the usual confirm window — so a mistake reverts itself.
+                </p>
+              </div>
+              <span
+                className="flex-shrink-0"
+                title={
+                  staged.length > 0
+                    ? "Apply or discard the staged changes first"
+                    : outstanding
+                      ? "Confirm or roll back the outstanding change first"
+                      : undefined
+                }
+              >
+                <Button
+                  kind="primary"
+                  onClick={convert}
+                  disabled={busy || outstanding || staged.length > 0}
+                >
+                  Create management bridge
+                </Button>
+              </span>
+            </div>
+          )}
 
-      {(pending?.errors.length ?? 0) > 0 && (
-        <div className="callout callout-crit mb-4">
-          <AlertTriangle size={17} className="flex-shrink-0 text-[var(--qz-danger)] mt-[1px]" />
-          <ul className="m-0 pl-4 text-[13px] text-[var(--qz-fg-2)]">
-            {pending?.errors.map((item) => (
-              <li key={`${item.code}-${item.link ?? ""}`}>{item.message}</li>
-            ))}
-          </ul>
-        </div>
-      )}
+          {staged.length > 0 && (
+            <div className="pending-bar">
+              <span className="text-[13px] font-semibold text-[var(--qz-fg-1)] flex-1">
+                {staged.length} staged {staged.length === 1 ? "change" : "changes"}, not yet applied
+              </span>
+              <Button
+                kind="ghost"
+                disabled={busy || outstanding}
+                onClick={() => run(discardPending, "Staged changes discarded.")}
+              >
+                Discard all
+              </Button>
+              <span
+                title={
+                  (pending?.errors.length ?? 0) > 0
+                    ? "Fix the problems listed below first"
+                    : undefined
+                }
+              >
+                <Button
+                  kind="primary"
+                  disabled={busy || outstanding || (pending?.errors.length ?? 0) > 0}
+                  onClick={() => setConfirming(true)}
+                >
+                  Apply configuration
+                </Button>
+              </span>
+            </div>
+          )}
 
-      {interfaces === null && !error && (
-        <div className="surface px-6 py-12 text-center text-[13px] text-[var(--qz-fg-4)]">
-          Reading the network configuration…
-        </div>
-      )}
+          {(pending?.errors.length ?? 0) > 0 && (
+            <div className="callout callout-crit">
+              <AlertTriangle size={17} className="flex-shrink-0 text-[var(--qz-danger)] mt-[1px]" />
+              <ul className="m-0 pl-4 text-[13px] text-[var(--qz-fg-2)]">
+                {pending?.errors.map((item) => (
+                  <li key={`${item.code}-${item.link ?? ""}`}>{item.message}</li>
+                ))}
+              </ul>
+            </div>
+          )}
 
-      {interfaces?.nodes.map((node) => (
-        <section key={node.node} className="mb-6">
-          <InterfaceTable
-            node={node.node}
-            rows={node.interfaces}
-            busy={busy || outstanding}
-            onEdit={(link) => setDialog({ kind: dialogKindFor(link.kind), editing: link })}
-            onDelete={(link) =>
-              run(() => deleteLink(link.kind, link.name), `${link.name} staged for removal.`)
-            }
-          />
-        </section>
-      ))}
+          {interfaces === null && !error && (
+            <div className="text-[13px] text-[var(--qz-fg-4)]">
+              Reading the network configuration…
+            </div>
+          )}
+
+          {interfaces?.nodes.map((node) => (
+            <section key={node.node} className="flex flex-col gap-2">
+              {/* One appliance is the usual case, and naming it then is noise.
+                  A cluster is not, and then every table needs saying whose. */}
+              {(interfaces?.nodes.length ?? 0) > 1 && (
+                <h2
+                  className="text-[13px] font-semibold text-[var(--qz-fg-2)] m-0"
+                  style={{ fontFamily: "var(--qz-font-mono)" }}
+                >
+                  {node.node}
+                </h2>
+              )}
+              <InterfaceTable
+                rows={node.interfaces}
+                busy={busy || outstanding}
+                onRefresh={load}
+                onEdit={(link) => setDialog({ kind: dialogKindFor(link.kind), editing: link })}
+                onDelete={(link) =>
+                  run(() => deleteLink(link.kind, link.name), `${link.name} staged for removal.`)
+                }
+              />
+            </section>
+          ))}
+        </div>
+      </PageBody>
 
       {dialog && (
         <LinkDialog
@@ -302,7 +326,7 @@ export default function InterfacesPage() {
           onApply={apply}
         />
       )}
-    </div>
+    </Page>
   );
 }
 
@@ -333,171 +357,181 @@ const addressText = (link: LinkView): string => {
 const gatewayText = (link: LinkView): string =>
   link.ip.mode === "static" ? link.ip.gateway : (link.gateway ?? "");
 
+const columns: Column<LinkView>[] = [
+  {
+    key: "name",
+    header: "Name",
+    value: (link) => link.name,
+    sortable: true,
+    width: 170,
+    render: (link) => (
+      <span className="inline-flex items-center gap-2 min-w-0">
+        <span
+          className="text-[var(--qz-fg-1)] font-semibold truncate"
+          style={{ fontFamily: "var(--qz-font-mono)" }}
+        >
+          {link.name}
+        </span>
+        {link.change !== "unchanged" && (
+          <span className={CHANGE_BADGE[link.change]}>{link.change}</span>
+        )}
+      </span>
+    ),
+  },
+  {
+    key: "altname",
+    header: "Alternative Name",
+    value: (link) => link.altname ?? "",
+    render: (link) => link.altname || <Dash />,
+    mono: true,
+    sortable: true,
+    width: 150,
+  },
+  {
+    key: "kind",
+    header: "Type",
+    value: (link) => link.kind,
+    render: (link) => <span className="text-[var(--qz-fg-4)]">{link.kind}</span>,
+    sortable: true,
+    width: 100,
+  },
+  {
+    key: "active",
+    header: "Active",
+    value: activeText,
+    render: (link) => <ActiveCell link={link} />,
+    sortable: true,
+    width: 110,
+  },
+  {
+    key: "vlan_aware",
+    header: "VLAN Aware",
+    value: (link) => (link.kind === "bridge" ? (link.vlan_aware ? "yes" : "no") : ""),
+    render: (link) =>
+      link.kind === "bridge" ? (
+        <span className="text-[var(--qz-fg-4)]">{link.vlan_aware ? "yes" : "no"}</span>
+      ) : (
+        <Dash />
+      ),
+    mono: true,
+    width: 110,
+  },
+  {
+    key: "ports",
+    header: "Ports/Slaves",
+    value: (link) => link.ports.join(", "),
+    render: (link) =>
+      link.ports.length > 0 ? (
+        <span title={link.ports.join(", ")}>{link.ports.join(", ")}</span>
+      ) : (
+        <Dash />
+      ),
+    mono: true,
+    width: 150,
+  },
+  {
+    key: "bond_mode",
+    header: "Bond Mode",
+    value: (link) => link.bond_mode ?? "",
+    render: (link) => link.bond_mode || <Dash />,
+    mono: true,
+    width: 130,
+  },
+  {
+    key: "address",
+    header: "Address",
+    value: addressText,
+    render: (link) => addressText(link) || <Dash />,
+    mono: true,
+    sortable: true,
+    width: 170,
+  },
+  {
+    key: "gateway",
+    header: "Gateway",
+    value: gatewayText,
+    render: (link) => gatewayText(link) || <Dash />,
+    mono: true,
+    width: 150,
+  },
+  {
+    key: "comment",
+    header: "Description",
+    value: (link) => link.comment ?? "",
+    render: (link) =>
+      link.comment ? (
+        <span className="text-[var(--qz-fg-3)]" title={link.comment}>
+          {link.comment}
+        </span>
+      ) : (
+        <Dash />
+      ),
+    width: 220,
+  },
+];
+
 /// One row per link on the node. Ports are listed against their controller
 /// rather than nested under it: an operator scanning the Name column wants a
 /// flat list of everything the box has.
 function InterfaceTable({
-  node,
   rows,
   busy,
+  onRefresh,
   onEdit,
   onDelete,
 }: {
-  node: string;
   rows: LinkView[];
   busy: boolean;
+  onRefresh: () => Promise<void>;
   onEdit: (link: LinkView) => void;
-  onDelete: (link: LinkView) => void;
+  onDelete: (link: LinkView) => Promise<void>;
 }) {
-  const columns: Column<LinkView>[] = [
-    {
-      key: "name",
-      header: "Name",
-      width: 170,
-      value: (link) => link.name,
-      render: (link) => (
-        <span className="inline-flex items-center gap-2 min-w-0">
-          <span className="qz-mono text-[var(--qz-fg-1)] font-semibold truncate">{link.name}</span>
-          {link.change !== "unchanged" && (
-            <span className={CHANGE_BADGE[link.change]}>{link.change}</span>
-          )}
-        </span>
-      ),
-    },
-    {
-      key: "altname",
-      header: "Alternative Name",
-      width: 150,
-      value: (link) => link.altname ?? "",
-      render: (link) => (link.altname ? <span className="qz-mono">{link.altname}</span> : <Dash />),
-    },
-    {
-      key: "kind",
-      header: "Type",
-      width: 100,
-      filterable: true,
-      value: (link) => link.kind,
-      render: (link) => <span className="qz-dim">{link.kind}</span>,
-    },
-    {
-      key: "active",
-      header: "Active",
-      width: 110,
-      filterable: true,
-      value: activeText,
-      render: (link) => <ActiveCell link={link} />,
-    },
-    {
-      key: "vlan_aware",
-      header: "VLAN Aware",
-      width: 110,
-      value: (link) => (link.kind === "bridge" ? (link.vlan_aware ? "yes" : "no") : ""),
-      render: (link) =>
-        link.kind === "bridge" ? (
-          <span className="qz-mono qz-dim">{link.vlan_aware ? "yes" : "no"}</span>
-        ) : (
-          <Dash />
-        ),
-    },
-    {
-      key: "ports",
-      header: "Ports/Slaves",
-      width: 150,
-      value: (link) => link.ports.join(", "),
-      render: (link) =>
-        link.ports.length > 0 ? (
-          <span className="qz-mono" title={link.ports.join(", ")}>
-            {link.ports.join(", ")}
-          </span>
-        ) : (
-          <Dash />
-        ),
-    },
-    {
-      key: "bond_mode",
-      header: "Bond Mode",
-      width: 130,
-      value: (link) => link.bond_mode ?? "",
-      render: (link) =>
-        link.bond_mode ? <span className="qz-mono">{link.bond_mode}</span> : <Dash />,
-    },
-    {
-      key: "address",
-      header: "Address",
-      width: 170,
-      value: addressText,
-      render: (link) => {
-        const text = addressText(link);
-        return text ? <span className="qz-mono">{text}</span> : <Dash />;
+  // The drop-downs offer what is actually on this node, not every value the
+  // API can produce — a filter for a type the box does not have is dead space.
+  const filters: FilterDef<LinkView>[] = useMemo(() => {
+    const optionsOf = (of: (link: LinkView) => string) =>
+      Array.from(new Set(rows.map(of).filter(Boolean)))
+        .sort()
+        .map((value) => ({ value, label: value }));
+    return [
+      {
+        key: "kind",
+        label: "Type",
+        options: optionsOf((link) => link.kind),
+        predicate: (link, value) => link.kind === value,
       },
-    },
-    {
-      key: "gateway",
-      header: "Gateway",
-      width: 150,
-      value: gatewayText,
-      render: (link) => {
-        const text = gatewayText(link);
-        return text ? <span className="qz-mono">{text}</span> : <Dash />;
+      {
+        key: "active",
+        label: "Active",
+        options: optionsOf(activeText),
+        predicate: (link, value) => activeText(link) === value,
       },
-    },
-    {
-      key: "comment",
-      header: "Description",
-      width: 220,
-      value: (link) => link.comment ?? "",
-      render: (link) =>
-        link.comment ? (
-          <span className="text-[var(--qz-fg-3)]" title={link.comment}>
-            {link.comment}
-          </span>
-        ) : (
-          <Dash />
-        ),
-    },
-    {
-      key: "actions",
-      header: "",
-      width: 92,
-      pinned: true,
-      align: "right",
-      value: () => "",
-      render: (link) => (
-        <div className="flex items-center gap-1 justify-end">
-          <button
-            type="button"
-            className="btn btn-sm btn-ghost"
-            disabled={busy || link.kind === "other"}
-            onClick={() => onEdit(link)}
-            title={link.kind === "other" ? "Not managed by Lumen" : `Edit ${link.name}`}
-          >
-            <Pencil size={13} />
-          </button>
-          <button
-            type="button"
-            className="btn btn-sm btn-ghost btn-danger"
-            disabled={busy || !link.deletable}
-            onClick={() => onDelete(link)}
-            // The control explains itself instead of being silently greyed
-            // out: the backend supplies the reason.
-            title={link.delete_blocked_reason ?? `Remove ${link.name}`}
-          >
-            <Trash2 size={13} />
-          </button>
-        </div>
-      ),
-    },
-  ];
+    ];
+  }, [rows]);
 
   return (
     <DataTable
-      id="network.interfaces"
-      columns={columns}
       rows={rows}
-      rowKey={(link) => link.name}
-      title={node}
+      columns={columns}
+      filters={filters}
+      rowId={(link) => link.name}
+      storageKey="networking-interfaces"
       searchPlaceholder="Search interfaces…"
-      empty="No interfaces on this node."
+      emptyMessage="No interfaces on this node."
+      onRefresh={onRefresh}
+      actions={(link) => (
+        <RowActions
+          label={link.name}
+          onEdit={() => onEdit(link)}
+          onDelete={() => onDelete(link)}
+          editDisabled={busy || link.kind === "other"}
+          editTitle={link.kind === "other" ? "Not managed by Lumen" : undefined}
+          deleteDisabled={busy || !link.deletable}
+          // The control explains itself instead of being silently greyed out:
+          // the backend supplies the reason.
+          deleteTitle={link.delete_blocked_reason ?? undefined}
+        />
+      )}
     />
   );
 }
@@ -543,13 +577,15 @@ function ApplyDialog({
   const windowText = seconds !== null ? `${seconds} seconds` : "the confirm window";
 
   return (
-    <div className="dialog-scrim" role="dialog" aria-modal="true">
-      <div className="dialog">
-        <h2 className="dialog-title">Apply network configuration</h2>
-        <p className="dialog-subtitle">
-          {count} {count === 1 ? "change" : "changes"} will be applied to this node.
-        </p>
-        <div className="callout callout-warn mt-5">
+    <ModalShell onClose={onCancel}>
+      <ModalHeader
+        title="Apply network configuration"
+        subtitle={`${count} ${count === 1 ? "change" : "changes"} will be applied to this node.`}
+        onClose={onCancel}
+      />
+
+      <div className="flex flex-col gap-4">
+        <div className="callout callout-warn">
           <AlertTriangle size={17} className="flex-shrink-0 text-[var(--qz-warn)] mt-[1px]" />
           <div className="text-[13px] text-[var(--qz-fg-2)]">
             The node applies the changes and then waits for you to confirm them. If nobody confirms
@@ -557,26 +593,30 @@ function ApplyDialog({
             cuts your connection, doing nothing brings the node back.
           </div>
         </div>
+
         {requiresAck && (
-          <label className="checkbox-row mt-4">
-            <input type="checkbox" checked={acked} onChange={(e) => setAcked(e.target.checked)} />
-            This moves the management address and may disconnect me.
+          <label className="flex items-center gap-[10px] cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={acked}
+              onChange={(e) => setAcked(e.target.checked)}
+              style={{ accentColor: "var(--qz-accent)" }}
+            />
+            <span className="text-[13px] text-[var(--qz-fg-2)]">
+              This moves the management address and may disconnect me.
+            </span>
           </label>
         )}
-        <div className="dialog-actions">
-          <button type="button" className="btn" onClick={onCancel} disabled={busy}>
-            Cancel
-          </button>
-          <button
-            type="button"
-            className="btn btn-primary"
-            onClick={onApply}
-            disabled={busy || (requiresAck && !acked)}
-          >
-            Apply
-          </button>
-        </div>
+
+        <ModalFooter
+          onCancel={onCancel}
+          saving={busy}
+          disabled={requiresAck && !acked}
+          savingLabel="Applying…"
+          submitLabel="Apply"
+          onSubmit={onApply}
+        />
       </div>
-    </div>
+    </ModalShell>
   );
 }

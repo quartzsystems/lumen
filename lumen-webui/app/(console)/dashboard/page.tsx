@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { PageHeader } from "@/components/PageHeader";
+import { Page, PageBody, PageHeader } from "@/components/PageHeader";
 import { getCurrentUser } from "@/lib/authClient";
 import type { AuthUserInfo } from "@/lib/authClient";
 import { fetchVersion } from "@/lib/system";
@@ -21,24 +21,25 @@ export default function DashboardPage() {
   }, []);
 
   return (
-    <div className="p-[28px_36px]">
+    <Page>
       <PageHeader title="Dashboard" description="Appliance status at a glance." />
-
-      <div className="grid gap-4" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))" }}>
-        <Stat label="Signed in as" value={user ? `${user.username}@${user.realm}` : "—"} />
-        <Stat label="Control plane" value={version ?? "unavailable"} />
-        <Stat label="Guests" value="—" />
-      </div>
-
-      <div className="surface mt-6 px-6 py-12 text-center">
-        <div className="text-[14px] font-semibold text-[var(--qz-fg-2)]">
-          Hypervisor telemetry not wired up yet
+      <PageBody>
+        <div className="grid gap-4" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))" }}>
+          <Stat label="Signed in as" value={user ? `${user.username}@${user.realm}` : "—"} />
+          <Stat label="Control plane" value={version ?? "unavailable"} />
+          <Stat label="Guests" value="—" />
         </div>
-        <p className="text-[13px] text-[var(--qz-fg-4)] mt-2 mb-0">
-          Guest, host, and storage tiles land here as those subsystems arrive.
-        </p>
-      </div>
-    </div>
+
+        <div className="surface mt-6 px-6 py-12 text-center">
+          <div className="text-[14px] font-semibold text-[var(--qz-fg-2)]">
+            Hypervisor telemetry not wired up yet
+          </div>
+          <p className="text-[13px] text-[var(--qz-fg-4)] mt-2 mb-0">
+            Guest, host, and storage tiles land here as those subsystems arrive.
+          </p>
+        </div>
+      </PageBody>
+    </Page>
   );
 }
 
