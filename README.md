@@ -26,12 +26,12 @@ docs/              Build and design documentation
 
 ## Prerequisites
 
-Building is supported on **AlmaLinux 10 x86_64** (a container is fine for the
-RPMs; the ISO build needs the tools below on the host or a privileged
-container):
+Building is supported on **AlmaLinux 10 x86_64**; an unprivileged container
+works for both the RPMs and the ISO:
 
 ```sh
-dnf install rpm-build rpmdevtools rpmlint createrepo_c lorax pykickstart make
+dnf install rpm-build rpmdevtools rpmlint createrepo_c pykickstart \
+            xorriso mtools isomd5sum make
 ```
 
 Optional for linting shell scripts: `shellcheck` (EPEL).
@@ -58,9 +58,11 @@ make iso UPSTREAM_ISO=/path/to/AlmaLinux-10-latest-x86_64-minimal.iso \
 ```
 
 This verifies the upstream ISO checksum, builds the Lumen RPMs, embeds the
-kickstart and a local `lumen` package repo into the ISO with `mkksiso`, and
-produces `dist/lumen-<version>-x86_64.iso` (volume label `LUMEN`) plus a
-`.sha256` file.
+kickstart and a local `lumen` package repo into the ISO, sets the volume
+label to `LUMEN`, and produces `dist/lumen-<version>-x86_64.iso` plus a
+`.sha256` file. The remaster runs fully unprivileged (xorriso + mtools; no
+loop mounts) — see [docs/build.md](docs/build.md) for details and for why
+`mkksiso` is not used.
 
 Instead of passing `UPSTREAM_SHA256` on the command line you can place the
 expected checksum in a file next to the ISO named `<iso>.sha256`.

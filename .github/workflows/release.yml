@@ -1,11 +1,13 @@
-# Release workflow: on tag push (v*), build the Lumen RPMs in an
-# almalinux:10 container and attach them + checksums to a GitHub release.
+# Release workflow: on tag push (v*), build the Lumen RPMs and the appliance
+# ISO in almalinux:10 containers and attach everything to a GitHub release.
 #
-# The ISO is NOT built in CI: mkksiso must update boot configs inside the
-# EFI boot image when the volume label changes, which can fall back to
-# mkefiboot/loop mounts — unavailable in unprivileged GitHub-hosted runner
-# containers. Build the ISO locally with `make iso` (see docs/build.md) and
-# upload it to the release manually if desired.
+# The ISO build runs fully unprivileged: iso/build-iso.sh remasters with
+# xorriso/xorrisofs and edits the EFI boot image with mtools, so no loop
+# mounts or --privileged are needed (it deliberately does not use mkksiso,
+# which fails on AlmaLinux 10 media — see docs/build.md).
+#
+# The upstream AlmaLinux ISO is pinned (URL + SHA-256) in iso/upstream.env
+# and cached between runs; the build fails loudly on checksum mismatch.
 name: Release
 
 on:
@@ -43,15 +45,41 @@ jobs:
         run: |
           cd dist/rpms
           sha256sum ./*.rpm > SHA256SUMS
-      - name: Create release with artifacts
+      - name: Create release with RPM artifacts
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/rpms/*.rpm
             dist/rpms/SHA256SUMS
-          body: |
-            Lumen ${{ github.ref_name }} — RPM artifacts.
 
-            The appliance ISO is built locally (`make iso`, see
-            docs/build.md); CI publishes RPMs only because the ISO
-            remaster may need privileged loop mounts.
+  release-iso:
+    name: Build + publish ISO (AlmaLinux 10)
+    needs: release-rpms
+    runs-on: ubuntu-latest
+    container: almalinux:10
+    steps:
+      - name: Install build dependencies
+        run: dnf -y install rpm-build rpmdevtools createrepo_c pykickstart xorriso mtools isomd5sum make git-core
+      - uses: actions/checkout@v4
+      - name: Restore cached upstream ISO
+        uses: actions/cache@v4
+        with:
+          path: upstream.iso
+          key: upstream-iso-${{ hashFiles('iso/upstream.env') }}
+      - name: Download upstream ISO (cache miss only)
+        run: |
+          . iso/upstream.env
+          if [ ! -f upstream.iso ]; then
+            curl -fL --retry 3 -o upstream.iso "$UPSTREAM_ISO_URL"
+          fi
+          echo "$UPSTREAM_ISO_SHA256  upstream.iso" | sha256sum -c -
+      - name: Build ISO
+        run: |
+          . iso/upstream.env
+          make iso UPSTREAM_ISO="$PWD/upstream.iso" UPSTREAM_SHA256="$UPSTREAM_ISO_SHA256"
+      - name: Attach ISO to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.iso
+            dist/*.iso.sha256

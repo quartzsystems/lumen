@@ -7,13 +7,15 @@ step is best done on a host or privileged container, see
 [CI limitations](#ci-limitations)).
 
 ```sh
-dnf install rpm-build rpmdevtools rpmlint createrepo_c lorax pykickstart \
-            mtools make
+dnf install rpm-build rpmdevtools rpmlint createrepo_c pykickstart \
+            xorriso mtools isomd5sum make
 ```
 
-- `lorax` provides `mkksiso`
 - `pykickstart` provides `ksvalidator`
-- `mtools` lets `mkksiso` update the EFI boot image without loop mounts
+- `xorriso` (also provides `xorrisofs`) does the ISO remaster
+- `mtools` edits the EFI boot image without loop mounts — the entire ISO
+  build runs unprivileged
+- `isomd5sum` provides `implantisomd5`/`checkisomd5`
 - `rpmlint` and `shellcheck` (both from **EPEL 10**: `dnf install
   epel-release` first) are optional, for `make lint`
 
@@ -57,8 +59,24 @@ The script then:
 - builds the RPMs and creates a `lumen` repo directory (`createrepo_c`),
 - renders `iso/lumen.ks.in` (stamps `@LUMEN_VERSION@` / `@LUMEN_BUILD_DATE@`
   into `%post`) and validates it with `ksvalidator -v RHEL10`,
-- runs `mkksiso --volid LUMEN --ks ... --add lumen/` to produce
+- extracts the ISO tree, rewrites the grub configs (volume label `LUMEN` +
+  `inst.ks=`), re-brands the grub config inside the appended EFI boot
+  partition via `mtools`, and rebuilds with `xorrisofs` using the same
+  boot recipe as the upstream media (verified against
+  `xorriso -report_el_torito as_mkisofs`),
+- implants the media checksum (`implantisomd5`) and writes
   `dist/lumen-<version>-x86_64.iso` plus a `.sha256` file.
+
+### Why not mkksiso?
+
+lorax 40.x's `mkksiso` fails on AlmaLinux/RHEL 10 media with
+`xorriso : SORRY : Cannot enable EL Torito boot image #2 because it is not
+a data file in the ISO filesystem`: EL10 ISOs keep the EFI boot image only
+in an appended GPT partition, which mkksiso's `-boot_image any replay`
+invocation cannot re-enable. It also requires root for loop mounts
+(`mkefiboot`). The manual remaster in `iso/build-iso.sh` avoids both
+problems and verifies the result (both El Torito entries, volid,
+`checkisomd5`). Revisit if a fixed lorax lands in EL10.
 
 The kickstart installs `@core` + `lumen-release` only (no GUI), with SELinux
 enforcing, firewalld allowing SSH only, `chronyd`/`sshd` enabled, and static
@@ -71,14 +89,15 @@ The root password is `lumen` and is **pre-expired** (`chage -d 0 root` in
 this policy in `iso/lumen.ks.in` if the appliance will be provisioned
 differently.
 
-## CI limitations
+## CI
 
-The GitHub Actions release workflow builds and publishes the **RPMs only**
-(in an `almalinux:10` container). The ISO is not built in CI: when `mkksiso`
-changes the volume label it must regenerate boot configs inside the EFI boot
-image, which on some lorax versions falls back to `mkefiboot`/loop mounts —
-unavailable in unprivileged GitHub-hosted runner containers. Build the ISO
-locally with `make iso`; the workflow's release notes point this out.
+The GitHub Actions release workflow (tag push `v*`) builds the RPMs and the
+ISO in unprivileged `almalinux:10` containers and attaches everything to
+the release. Because the remaster needs no loop mounts (see above), no
+`--privileged` container options are required. The upstream AlmaLinux ISO
+is pinned by URL + SHA-256 in `iso/upstream.env` and cached between runs
+with `actions/cache`; update that file (both values together, from the
+official CHECKSUM) to move to a new upstream point release.
 
 ## Notes and conventions
 
