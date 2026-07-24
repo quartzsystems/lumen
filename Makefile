@@ -1,18 +1,23 @@
 # Lumen build entry points — see README.md and docs/build.md.
 #
-# make rpms                          build lumen-release + lumen-logos
+# make rpms                          build lumen-release/-logos/-networking
+# make installer                     cargo build the Rust installer (release)
 # make iso UPSTREAM_ISO=... \
 #          [UPSTREAM_SHA256=...]     build dist/lumen-<version>-x86_64.iso
-# make lint                          shellcheck + rpmlint
-# make ks-validate                   validate the kickstart (RHEL10 profile)
+# make test                          installer unit tests (headless)
+# make lint                          shellcheck + rpmlint + fmt/clippy
 # make clean                         remove build/ and dist/
 
 VERSION := $(shell cat VERSION)
 
-SCRIPTS := packages/build-rpms.sh iso/build-iso.sh
-SPECS   := packages/lumen-release.spec packages/lumen-logos.spec
+SCRIPTS := packages/build-rpms.sh iso/build-live-iso.sh \
+           lumen-installer/live/build-live.sh \
+           lumen-networking/nicnames/lumen-nicnames
+SPECS   := packages/lumen-release.spec packages/lumen-logos.spec \
+           packages/lumen-networking.spec
+CARGO_MANIFEST := lumen-installer/app/Cargo.toml
 
-.PHONY: all rpms iso lint ks-validate clean
+.PHONY: all rpms installer iso test lint clean
 
 all: rpms
 
@@ -21,16 +26,24 @@ all: rpms
 rpms:
 	bash packages/build-rpms.sh
 
+installer:
+	cargo build --release --manifest-path $(CARGO_MANIFEST) \
+		--target-dir build/cargo-target
+
 iso:
 	UPSTREAM_ISO="$(UPSTREAM_ISO)" UPSTREAM_SHA256="$(UPSTREAM_SHA256)" \
-		bash iso/build-iso.sh
+		bash iso/build-live-iso.sh
 
-ks-validate:
-	ksvalidator -v RHEL10 iso/lumen.ks.in
+test:
+	cargo test --manifest-path $(CARGO_MANIFEST) \
+		--target-dir build/cargo-target
 
 lint:
 	shellcheck $(SCRIPTS)
 	rpmlint $(SPECS)
+	cargo fmt --manifest-path $(CARGO_MANIFEST) --check
+	cargo clippy --manifest-path $(CARGO_MANIFEST) \
+		--target-dir build/cargo-target -- -D warnings
 
 clean:
 	rm -rf build dist

@@ -1,13 +1,12 @@
 # Release workflow: on tag push (v*), build the Lumen RPMs and the appliance
 # ISO in almalinux:10 containers and attach everything to a GitHub release.
 #
-# The ISO build runs fully unprivileged: iso/build-iso.sh remasters with
-# xorriso/xorrisofs and edits the EFI boot image with mtools, so no loop
-# mounts or --privileged are needed (it deliberately does not use mkksiso,
-# which fails on AlmaLinux 10 media — see docs/build.md).
+# The ISO is a custom live installer image (iso/build-live-iso.sh); the
+# build needs no loop mounts or --privileged (see docs/build.md).
 #
-# The upstream AlmaLinux ISO is pinned (URL + SHA-256) in iso/upstream.env
-# and cached between runs; the build fails loudly on checksum mismatch.
+# The upstream AlmaLinux ISO is pinned (URL + SHA-256) in iso/upstream.env,
+# with kernel/ZFS pins in iso/pins.env; the build fails loudly on checksum
+# mismatch or pin drift.
 name: Release
 
 on:
@@ -26,7 +25,7 @@ jobs:
       - name: Install build dependencies
         run: |
           dnf -y install epel-release   # rpmlint lives in EPEL on EL10
-          dnf -y install rpm-build rpmdevtools rpmlint pykickstart make git-core
+          dnf -y install rpm-build rpmdevtools rpmlint make git-core
       - uses: actions/checkout@v4
       - name: Verify tag matches VERSION
         run: |
@@ -39,8 +38,6 @@ jobs:
         run: make rpms
       - name: rpmlint (specs + built RPMs)
         run: rpmlint packages/*.spec dist/rpms/*.rpm
-      - name: Validate kickstart
-        run: make ks-validate
       - name: Generate checksums
         run: |
           cd dist/rpms

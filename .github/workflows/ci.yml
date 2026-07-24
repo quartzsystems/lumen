@@ -12,25 +12,55 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
-        run: shellcheck packages/build-rpms.sh iso/build-iso.sh
+        run: |
+          shellcheck packages/build-rpms.sh iso/build-live-iso.sh \
+                     lumen-installer/live/build-live.sh \
+                     lumen-networking/nicnames/lumen-nicnames
 
   rpms:
-    name: RPMs + kickstart (AlmaLinux 10)
+    name: RPMs (AlmaLinux 10)
     runs-on: ubuntu-latest
     container: almalinux:10
     steps:
       - name: Install build dependencies
         run: |
           dnf -y install epel-release   # rpmlint lives in EPEL on EL10
-          dnf -y install rpm-build rpmdevtools rpmlint pykickstart make git-core
+          dnf -y install rpm-build rpmdevtools rpmlint make git-core
       - uses: actions/checkout@v4
       - name: Build RPMs
         run: make rpms
       - name: rpmlint (specs + built RPMs)
         run: rpmlint packages/*.spec dist/rpms/*.rpm
-      - name: Validate kickstart
-        run: make ks-validate
       - uses: actions/upload-artifact@v4
         with:
           name: lumen-rpms
           path: dist/rpms/
+
+  installer:
+    name: Installer (Rust, AlmaLinux 10)
+    runs-on: ubuntu-latest
+    container: almalinux:10
+    steps:
+      - name: Install Rust + GTK4 toolchain
+        # gtk4-devel needs CRB on EL10; rustfmt/clippy ship with the
+        # AppStream rust toolset.
+        run: |
+          dnf -y install dnf-plugins-core
+          dnf config-manager --set-enabled crb
+          dnf -y install rust cargo rustfmt clippy gtk4-devel make git-core
+      - uses: actions/checkout@v4
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            build/cargo-target
+          key: cargo-${{ hashFiles('lumen-installer/app/Cargo.toml') }}
+      - name: Format
+        run: cargo fmt --manifest-path lumen-installer/app/Cargo.toml --check
+      - name: Clippy
+        run: |
+          cargo clippy --manifest-path lumen-installer/app/Cargo.toml \
+            --target-dir build/cargo-target -- -D warnings
+      - name: Tests
+        run: make test

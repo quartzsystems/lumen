@@ -1,0 +1,17 @@
+# Rename NICs to nic0..nicN (PCI order) before anything configures them,
+# so the installer shows exactly the names the installed system will have.
+
+[Unit]
+Description=Deterministic NIC names (nic0..nicN)
+DefaultDependencies=no
+After=systemd-udev-settle.service local-fs.target
+Wants=systemd-udev-settle.service
+Before=network-pre.target NetworkManager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/lumen-nicnames --apply
+
+[Install]
+WantedBy=multi-user.target

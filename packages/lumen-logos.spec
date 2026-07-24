@@ -22,8 +22,7 @@ Source6:        lumen-lockup-dark-bg.png
 Source7:        lumen-lockup-light-bg.png
 Source8:        lumen-mark-1024.png
 Source9:        README.md
-Source10:       lumen-profile.conf
-Source11:       lumen.plymouth
+Source10:       lumen.plymouth
 
 # %%{?el10}: filesystem guarantees /usr/share/pixmaps ownership on EL10.
 %if 0%{?el10}
@@ -33,7 +32,7 @@ Requires:       filesystem
 %description
 Logos and artwork for Quartz Systems Lumen: the layered mark, horizontal
 lockups for dark and light backgrounds, a square icon, and raster
-renditions, staged for later Anaconda installer and Plymouth boot-splash
+renditions, staged for the Lumen installer and Plymouth boot-splash
 branding. The lockup vector files set the product name in JetBrains Mono;
 use the raster renditions where that font is not available.
 
@@ -45,7 +44,6 @@ use the raster renditions where that font is not available.
 
 %install
 install -d -m 0755 %{buildroot}%{_datadir}/lumen-logos/png
-install -d -m 0755 %{buildroot}%{_datadir}/lumen-logos/anaconda
 install -d -m 0755 %{buildroot}%{_datadir}/lumen-logos/plymouth
 install -d -m 0755 %{buildroot}%{_datadir}/pixmaps
 
@@ -59,15 +57,13 @@ install -p -m 0644 %{SOURCE6} %{buildroot}%{_datadir}/lumen-logos/png/lumen-lock
 install -p -m 0644 %{SOURCE7} %{buildroot}%{_datadir}/lumen-logos/png/lumen-lockup-light-bg.png
 install -p -m 0644 %{SOURCE8} %{buildroot}%{_datadir}/lumen-logos/png/lumen-mark-1024.png
 install -p -m 0644 %{SOURCE9} %{buildroot}%{_datadir}/lumen-logos/README.md
-install -p -m 0644 %{SOURCE10} %{buildroot}%{_datadir}/lumen-logos/anaconda/lumen-profile.conf
-install -p -m 0644 %{SOURCE11} %{buildroot}%{_datadir}/lumen-logos/plymouth/lumen.plymouth
+install -p -m 0644 %{SOURCE10} %{buildroot}%{_datadir}/lumen-logos/plymouth/lumen.plymouth
 
 ln -s ../lumen-logos/lumen-mark.svg %{buildroot}%{_datadir}/pixmaps/lumen.svg
 
 %files
 %dir %{_datadir}/lumen-logos
 %dir %{_datadir}/lumen-logos/png
-%dir %{_datadir}/lumen-logos/anaconda
 %dir %{_datadir}/lumen-logos/plymouth
 %{_datadir}/lumen-logos/lumen-mark.svg
 %{_datadir}/lumen-logos/lumen-mark-light-bg.svg
@@ -79,7 +75,6 @@ ln -s ../lumen-logos/lumen-mark.svg %{buildroot}%{_datadir}/pixmaps/lumen.svg
 %{_datadir}/lumen-logos/png/lumen-lockup-light-bg.png
 %{_datadir}/lumen-logos/png/lumen-mark-1024.png
 %{_datadir}/lumen-logos/README.md
-%{_datadir}/lumen-logos/anaconda/lumen-profile.conf
 %{_datadir}/lumen-logos/plymouth/lumen.plymouth
 %{_datadir}/pixmaps/lumen.svg
 

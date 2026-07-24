@@ -1,0 +1,4 @@
+#!/bin/sh
+# gnome-kiosk-script-session runs this in a loop inside the Kiosk
+# compositor session; if the installer exits or crashes it restarts.
+exec /usr/bin/lumen-installer

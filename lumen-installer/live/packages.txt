@@ -1,0 +1,65 @@
+# Live installer environment package set (dnf --installroot).
+# One package per line; # comments and blank lines are ignored.
+# The kernel is NOT listed here — iso/build-live-iso.sh installs the exact
+# pinned NEVR from iso/pins.env (plus matching kernel-modules).
+
+# core userspace
+glibc-langpack-en
+tzdata
+systemd
+systemd-udev
+dbus-broker
+polkit
+util-linux
+less
+openssl
+
+# networking (installer NIC probing + target nmconnection handoff)
+NetworkManager
+iproute
+chrony
+
+# live boot + media check
+dracut-live
+isomd5sum
+
+# storage tooling used by the install engine
+gdisk
+parted
+e2fsprogs
+dosfstools
+efibootmgr
+
+# target installation
+dnf
+dnf-plugins-core
+
+# ZFS (kABI kmod; repo + version pinned in iso/pins.env)
+zfs
+kmod-zfs
+zfs-dracut
+
+# GUI stack (same as EL10 Anaconda: gnome-kiosk on Wayland + GTK4).
+# gnome-session drives the gnome-kiosk-script session (see lumen-kiosk.service).
+gnome-kiosk
+gnome-kiosk-script-session
+gnome-session
+gtk4
+mesa-dri-drivers
+xkeyboard-config
+
+# fonts (JetBrains Mono is the Quartz brand face; EPEL 10)
+jetbrains-mono-fonts
+default-fonts-core-sans
+
+# hardware enablement (kernel-modules is added by the build script at the
+# pinned kernel version)
+linux-firmware
+
+# UEFI boot binaries — also the source for the ISO's ESP image
+shim-x64
+grub2-efi-x64
+
+# Lumen packages (from the local lumen repo)
+lumen-release
+lumen-networking

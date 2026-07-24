@@ -1,0 +1,24 @@
+# lumen-installer — Quartz Systems Lumen appliance installer (GTK4/Wayland).
+#
+# Built in CI on almalinux:10 with the AppStream rust/cargo toolchain and
+# linked against the distro gtk4 — the same gtk4 the live installer
+# environment installs, so the ABI matches by construction.
+#
+# Cargo.lock is committed; iso/build-live-iso.sh builds with --locked.
+
+[package]
+name = "lumen-installer"
+version = "0.1.0"
+edition = "2021"
+description = "Quartz Systems Lumen appliance installer"
+license = "MIT"
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.9", features = ["v4_12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-channel = "2"
+
+[profile.release]
+lto = true
+strip = true

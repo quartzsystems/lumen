@@ -1,0 +1,187 @@
+/* Quartz Systems Lumen installer theme.
+ *
+ * Tokens from branding/logos/README.md:
+ *   ink        #0b0d12
+ *   green-300  #4dffb2
+ *   green-500  #00d992
+ *   green-600  #00b07a
+ *   text       #f2f3f5
+ * Dark console aesthetic (JetBrains Mono everywhere), approximating
+ * Quartz Command until the real design tokens are wired in.
+ */
+
+window {
+    background-color: #0b0d12;
+    color: #f2f3f5;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 14px;
+}
+
+label {
+    color: #f2f3f5;
+}
+
+.qz-title {
+    font-size: 26px;
+    font-weight: 700;
+    color: #4dffb2;
+}
+
+.qz-subtitle {
+    font-size: 15px;
+    color: #8b93a1;
+}
+
+.qz-step {
+    font-size: 12px;
+    color: #00d992;
+    letter-spacing: 0.15em;
+}
+
+.qz-error {
+    color: #ff6b6b;
+}
+
+.qz-hint {
+    font-size: 12px;
+    color: #8b93a1;
+}
+
+.qz-card {
+    background-color: #10141b;
+    border: 1px solid #1d2430;
+    border-radius: 8px;
+    padding: 16px;
+}
+
+button {
+    background-color: #12161d;
+    background-image: none;
+    color: #f2f3f5;
+    border: 1px solid #232a35;
+    border-radius: 6px;
+    padding: 8px 20px;
+    box-shadow: none;
+    text-shadow: none;
+}
+
+button:hover {
+    border-color: #00d992;
+}
+
+button.suggested-action {
+    background-color: #00d992;
+    color: #0b0d12;
+    font-weight: 700;
+    border-color: #00d992;
+}
+
+button.suggested-action:hover {
+    background-color: #4dffb2;
+    border-color: #4dffb2;
+}
+
+button.suggested-action:disabled {
+    background-color: #1d2430;
+    color: #566072;
+    border-color: #1d2430;
+}
+
+button.destructive-action {
+    background-color: #3d1116;
+    color: #ff6b6b;
+    border-color: #7a222c;
+}
+
+button.destructive-action:hover {
+    background-color: #7a222c;
+    color: #f2f3f5;
+}
+
+entry,
+entry.password {
+    background-color: #12161d;
+    background-image: none;
+    color: #f2f3f5;
+    border: 1px solid #232a35;
+    border-radius: 6px;
+    padding: 8px 10px;
+    caret-color: #00d992;
+}
+
+entry:focus-within {
+    border-color: #00d992;
+}
+
+list,
+listview {
+    background-color: #10141b;
+    border: 1px solid #1d2430;
+    border-radius: 8px;
+}
+
+row {
+    padding: 10px 14px;
+    border-bottom: 1px solid #161c26;
+}
+
+row:selected {
+    background-color: rgba(0, 217, 146, 0.14);
+    color: #f2f3f5;
+}
+
+checkbutton radio,
+checkbutton check {
+    border: 1px solid #3a4454;
+    background-color: #12161d;
+    background-image: none;
+}
+
+checkbutton radio:checked,
+checkbutton check:checked {
+    background-color: #00d992;
+    border-color: #00d992;
+    color: #0b0d12;
+}
+
+dropdown > button {
+    background-color: #12161d;
+    border: 1px solid #232a35;
+}
+
+popover > contents {
+    background-color: #10141b;
+    border: 1px solid #232a35;
+    color: #f2f3f5;
+}
+
+progressbar trough {
+    background-color: #12161d;
+    border: 1px solid #232a35;
+    border-radius: 4px;
+    min-height: 10px;
+}
+
+progressbar progress {
+    background-color: #00d992;
+    background-image: none;
+    border-radius: 4px;
+    min-height: 10px;
+}
+
+textview,
+textview text {
+    background-color: #0e1117;
+    color: #aeb6c2;
+    font-size: 12px;
+}
+
+scrolledwindow {
+    border: 1px solid #1d2430;
+    border-radius: 6px;
+}
+
+separator {
+    background-color: #1d2430;
+    min-height: 1px;
+}

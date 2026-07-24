@@ -1,0 +1,39 @@
+# Lumen installer kiosk: gnome-kiosk (Wayland) as a real logind session on
+# tty1, no display manager. The PAMName=login pattern (same as upstream
+# cage@.service) makes pam_systemd register the session so the compositor
+# gets seat0 and DRM access.
+#
+# The gnome-kiosk-script session (verified against EL10's
+# gnome-kiosk-script-session 49.0: no wrapper binary; the wayland session
+# desktop file launches gnome-session with the gnome-kiosk-script session)
+# starts the Kiosk compositor plus /usr/bin/gnome-kiosk-script, which
+# defers to /root/.local/bin/gnome-kiosk-script — our exec of
+# lumen-installer.
+
+[Unit]
+Description=Lumen installer kiosk (gnome-kiosk on Wayland)
+After=systemd-user-sessions.service dbus.service polkit.service lumen-nicnames.service
+Wants=lumen-nicnames.service
+Conflicts=getty@tty1.service
+Before=getty.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root
+PAMName=login
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+StandardInput=tty-fail
+UtmpIdentifier=tty1
+UtmpMode=user
+Environment=HOME=/root
+Environment=XDG_SESSION_TYPE=wayland
+Environment=GDK_BACKEND=wayland
+ExecStart=/usr/bin/dbus-run-session -- /usr/bin/gnome-session --session=gnome-kiosk-script
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=graphical.target

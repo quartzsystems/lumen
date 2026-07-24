@@ -1,165 +1,142 @@
 # Building Lumen
 
+## Overview
+
+The Lumen ISO is a **custom live installer image** — no Anaconda, no
+kickstart. It boots a minimal AlmaLinux 10 live environment that auto-starts
+`lumen-installer` (Rust, GTK4, Quartz-styled) under `gnome-kiosk` on
+Wayland, which installs the appliance onto a **ZFS boot drive**
+(see [lumen-installer/README.md](../lumen-installer/README.md)).
+
+Pipeline (`iso/build-live-iso.sh`, entry point `make iso`):
+
+1. verify the upstream AlmaLinux 10 minimal ISO's SHA-256
+2. extract its on-media `Minimal` repo (the offline install source) and
+   **gate**: the repo's kernel must equal `KERNEL_NEVR` in `iso/pins.env`
+3. build the Lumen RPMs; mirror the pinned OpenZFS EL10 kABI subset from
+   `ZFS_REPO_URL`; `createrepo_c` the combined `lumen` repo
+4. **gate**: the full target package set must resolve against *only* the
+   two on-media repos (catches offline-completeness regressions)
+5. `cargo build --release` the installer (AppStream rust, distro gtk4)
+6. `lumen-installer/live/build-live.sh`: `dnf --installroot` live rootfs
+   (pinned kernel + ZFS + kiosk + GTK4), **gate**: `modprobe --dry-run zfs`
+   proves the kABI kmod resolves against the pinned kernel, chrooted
+   `dracut` (dmsquash-live) initramfs, zstd squashfs
+7. assemble a **UEFI-only** ISO: fresh ESP FAT image built with
+   `mkfs.vfat` + `mtools` (shim + signed GRUB taken from the live rootfs
+   RPMs), `xorrisofs` with the ESP as an appended GPT partition,
+   `implantisomd5` (the "verify media" menu entry / `rd.live.check`)
+
+Everything runs as root in an **unprivileged** `almalinux:10` container:
+chroot and `mknod` only — no loop devices, no mounts, no `--privileged`.
+
 ## Prerequisites
 
-Build host: **AlmaLinux 10 x86_64** (bare metal, VM, or container — the ISO
-step is best done on a host or privileged container, see
-[CI limitations](#ci-limitations)).
-
 ```sh
-dnf install rpm-build rpmdevtools rpmlint createrepo_c pykickstart \
-            xorriso mtools isomd5sum cpio make
+dnf config-manager --set-enabled crb    # gtk4-devel lives in CRB
+dnf install rpm-build rpmdevtools rpmlint createrepo_c xorriso mtools \
+            dosfstools squashfs-tools isomd5sum kmod \
+            rust cargo rustfmt clippy gtk4-devel make
 ```
 
-- `pykickstart` provides `ksvalidator`
-- `xorriso` (also provides `xorrisofs`) does the ISO remaster
-- `mtools` edits the EFI boot image without loop mounts — the entire ISO
-  build runs unprivileged
-- `cpio` (+ `gzip`) packs the Anaconda branding overlay `images/product.img`
-- `isomd5sum` provides `implantisomd5`/`checkisomd5`
-- `rpmlint` and `shellcheck` (both from **EPEL 10**: `dnf install
-  epel-release` first) are optional, for `make lint`
+- `xorriso`/`xorrisofs` assemble the ISO; `mtools` + `dosfstools` create
+  and populate the ESP image without loop mounts
+- `squashfs-tools` (mksquashfs) packs the live rootfs
+- `kmod` provides `depmod` for the kABI gate
+- `rust`/`cargo` + `gtk4-devel` build the installer (AppStream toolchain —
+  deliberately not rustup, so the compiler comes from the same repo
+  snapshot as the runtime libraries)
+- `rpmlint` and `shellcheck` (EPEL 10) are optional, for `make lint`
 
 ## RPMs
 
 ```sh
-make rpms       # -> dist/rpms/*.rpm (noarch + src)
+make rpms       # -> dist/rpms/*.rpm (lumen-release, -logos, -networking)
 ```
 
-`packages/build-rpms.sh` stages sources from `branding/` into a scratch
-rpmbuild tree under `build/rpmbuild/` and injects the version from the
-top-level `VERSION` file via `--define "lumen_version ..."`. Both specs keep
-a fallback default so a bare `rpmbuild -bb packages/<spec>` (or a mock
-build) also works; `VERSION` remains the source of truth for releases.
+`packages/build-rpms.sh` stages sources from `branding/` and
+`lumen-networking/` into a scratch rpmbuild tree and injects the version
+from `VERSION` via `--define "lumen_version ..."`.
 
-Mock example:
-
-```sh
-mock -r almalinux-10-x86_64 --spec packages/lumen-release.spec \
-     --sources build/rpmbuild/SOURCES --define "lumen_version $(cat VERSION)"
-```
+`lumen-networking` ships `lumen-nicnames`: deterministic `nic0…nicN` names
+(PCI order) via systemd `.link` files. The live environment runs it with
+`--apply` before NetworkManager so the installer already shows the final
+names; the installer runs it against the target so the installed system
+matches. Re-run it after adding/replacing NICs — existing MAC pins are
+never renumbered.
 
 ## ISO
 
-1. Download the upstream AlmaLinux 10 x86_64 **minimal** ISO and its official
-   `CHECKSUM` file from <https://almalinux.org/get-almalinux/>.
-2. Build:
-
 ```sh
-make iso UPSTREAM_ISO=~/isos/AlmaLinux-10-latest-x86_64-minimal.iso \
+make iso UPSTREAM_ISO=~/isos/AlmaLinux-10.2-x86_64-minimal.iso \
          UPSTREAM_SHA256=<sha256 from the official CHECKSUM file>
 ```
 
 Alternatively put the hash in `<iso path>.sha256` and omit `UPSTREAM_SHA256`.
-The build **fails loudly** if the checksum is absent or mismatched, or if any
-required tool (`xorriso`, `createrepo_c`, `rpmbuild`, `ksvalidator`, `cpio`,
-...) is missing.
+The build **fails loudly** on checksum mismatch, missing tools, or any of
+the three gates above.
 
-The script then:
+### Version pins — update together
 
-- builds the RPMs and creates a `lumen` repo directory (`createrepo_c`),
-- renders `iso/lumen.ks.in` (stamps `@LUMEN_VERSION@` / `@LUMEN_BUILD_DATE@`
-  into `%post`) and validates it with `ksvalidator -v RHEL10`,
-- extracts the ISO tree, rewrites the grub configs (volume label `LUMEN`,
-  `inst.ks=`, `inst.profile=lumen`), re-brands the grub config inside the
-  appended EFI boot partition via `mtools`, and rebuilds with `xorrisofs`
-  using the same boot recipe as the upstream media (verified against
-  `xorriso -report_el_torito as_mkisofs`),
-- packs the Anaconda branding overlay `images/product.img` (gzipped cpio
-  with the Lumen profile, stylesheet, and sidebar logo from
-  `branding/anaconda/`; Anaconda's dracut module unpacks it over the
-  installer runtime automatically),
-- implants the media checksum (`implantisomd5`) and writes
-  `dist/lumen-<version>-x86_64.iso` plus a `.sha256` file.
+- `iso/upstream.env` — upstream ISO URL + SHA-256 (from the official
+  CHECKSUM file)
+- `iso/pins.env` — `KERNEL_NEVR` (must equal the kernel in that ISO's
+  Minimal repo; the gate prints the actual media kernel on mismatch, so a
+  failed build tells you the correct value), `ZFS_REPO_URL` (**point-release
+  path**, e.g. `epel/10.2/kmod/`), `ZFS_SERIES`
 
-### Why not mkksiso?
+Moving to a new AlmaLinux point release means updating both files in one
+commit — and checking that OpenZFS has published kABI kmods for that point
+release first ([they can lag](https://github.com/openzfs/zfs/issues/17966)).
 
-lorax 40.x's `mkksiso` fails on AlmaLinux/RHEL 10 media with
-`xorriso : SORRY : Cannot enable EL Torito boot image #2 because it is not
-a data file in the ISO filesystem`: EL10 ISOs keep the EFI boot image only
-in an appended GPT partition, which mkksiso's `-boot_image any replay`
-invocation cannot re-enable. It also requires root for loop mounts
-(`mkefiboot`). The manual remaster in `iso/build-iso.sh` avoids both
-problems and verifies the result (both El Torito entries, volid,
-`checkisomd5`). Revisit if a fixed lorax lands in EL10.
+### Installed system layout (UEFI-only, ZFS-only)
 
-### The installer
+GPT: 1 GiB ESP + 2 GiB ext4 `/boot` + remainder ZFS pool `rpool`
+(`ashift=12`, lz4, `xattr=sa`, `acltype=posixacl`), root dataset
+`rpool/ROOT/lumen` (`bootfs`). Stock EL10 shim/GRUB2 from the RPMs (no
+`grub2-install`); dracut's `zfs` module imports the pool
+(`root=zfs:rpool/ROOT/lumen`); `/etc/hostid` is copied from the live env
+(the pool creator) into the target and the pool is exported before reboot,
+so the first import never needs force. `/etc/dracut.conf.d/zfs.conf` keeps
+the zfs module in every future initramfs, and `/etc/kernel/cmdline` carries
+the root argument for future kernel installs. First boot relabels for
+SELinux (`.autorelabel`) — allow a few minutes.
 
-The ISO boots the branded **graphical Anaconda installer** (the upstream
-minimal ISO's stage2 already contains the GUI, so no lorax rebuild is
-needed). The kickstart is deliberately partial: it preseeds everything
-that is appliance policy and leaves exactly four decisions to the
-operator —
-
-- **root password** (mandatory — `rootpw` is omitted from the kickstart),
-- **installation destination** (mandatory — pick the boot drive; automatic
-  LVM partitioning is the preselected scheme),
-- **network** (pick the management NIC, DHCP or static, in the
-  Network & Host Name spoke; hostname defaults to `lumen`),
-- **time zone** (prefilled `Etc/UTC`, changeable).
-
-The user-creation and software-selection spokes are hidden by the Anaconda
-profile (`branding/anaconda/lumen-profile.conf`): the appliance is
-root-only at install time and the package set (`@core` + `lumen-release`,
-no GUI) is fixed, with SELinux enforcing, firewalld allowing SSH only, and
-`chronyd`/`sshd` enabled.
-
-### First boot
-
-Log in as `root` with the password chosen in the installer (console or
-SSH — the firewall allows SSH by default). There is no baked-in default
-password; images built before the interactive installer landed used
-`root` / `lumen`, pre-expired.
+**Secure Boot must be disabled**: zfs.ko is unsigned. The installer checks
+firmware state and refuses with a clear message otherwise.
 
 ## CI
 
-The GitHub Actions release workflow (tag push `v*`) builds the RPMs and the
-ISO in unprivileged `almalinux:10` containers and attaches everything to
-the release. Because the remaster needs no loop mounts (see above), no
-`--privileged` container options are required. The upstream AlmaLinux ISO
-is pinned by URL + SHA-256 in `iso/upstream.env` and cached between runs
-with `actions/cache`; update that file (both values together, from the
-official CHECKSUM) to move to a new upstream point release.
+- **CI workflow**: shellcheck; RPMs + rpmlint (almalinux:10 container);
+  installer job (cargo fmt/clippy/test against distro gtk4).
+- **ISO workflow** (`workflow_dispatch`, or `workflow_call` from the
+  release workflow on tag push): builds the ISO in an unprivileged
+  container, then the **boot-smoke** job boots it on the runner host with
+  QEMU/KVM + OVMF (hosted runners expose `/dev/kvm`) and waits for the
+  `LUMEN-INSTALLER-READY` marker the installer writes to the serial
+  console — an end-to-end proof that kernel → dracut → squashfs → logind →
+  gnome-kiosk → GTK app all work. The serial log is uploaded as an
+  artifact either way.
+- The upstream ISO is cached keyed on `iso/upstream.env`.
 
-An ISO build can also be kicked off manually: Actions tab → **ISO** →
-*Run workflow* (`workflow_dispatch` on `.github/workflows/iso.yml`). Manual
-runs upload the ISO + `.sha256` as a workflow artifact named `lumen-iso`
-(14-day retention) instead of attaching to a release. The release workflow
-reuses the same job via `workflow_call`, so the two paths cannot drift.
+## Notes, conventions, and known gaps
 
-## Notes and conventions
-
-- **Architecture**: AlmaLinux 10 standard x86_64 targets the x86-64-v3
-  microarchitecture level. AlmaLinux also publishes an `x86_64_v2` variant of
-  AlmaLinux 10 — if Lumen ever needs to support older CPUs (pre-Haswell era),
-  an `x86_64_v2` ISO/RPM variant can be added; for now Lumen targets standard
-  x86_64 (v3) only.
-- **`/etc/issue` has no ASCII art** on purpose: agetty interprets
-  backslash escapes (`\r`, `\m`, ...) in `/etc/issue`, which would mangle the
-  ASCII mark. The art lives in `/etc/motd` (printed verbatim);
-  `/etc/issue` carries the plain-text brand line.
-- **`/etc/motd` uses ANSI color**: it renders the full-color Lumen lockup
-  (256-color ANSI art supplied by branding). The template
-  (`branding/release/motd.in`) keeps a readable `@ESC@` token in place of
-  the escape byte; the spec substitutes the real byte at build time. The
-  art is ~120 columns wide, so it wraps on consoles narrower than that,
-  and on a terminal without color support the escape codes may show
-  literally — acceptable for an appliance whose consoles are modern
-  TTYs/SSH clients.
-- **File ownership**: `/etc/os-release`, `/etc/issue` and `/etc/motd` are
-  owned by `almalinux-release`/`setup`, so `lumen-release` ships its content
-  under `/usr/share/lumen-release/` and applies it in `%post` (and restores
-  stock content on erase). Consequence: `rpm -V almalinux-release setup`
-  reports those files as modified — expected on a branded appliance.
-- **rpmlint** (2.8.0, EL10): both specs and the built RPMs pass with **no
-  errors**. Expected warnings:
-  - `dangerous-command-in-%post` / `%postun` (`mv`, `ln`) — deliberate, see
-    file-ownership note above;
-  - `non-conffile-in-etc /etc/lumen-release` — intentional: the file is
-    version data, not admin-editable config;
-  - `no-documentation` / `no-%check-section` — nothing to ship or test yet;
-  - possible `incoherent-version-in-changelog` when building a version other
-    than the changelog's latest entry (the version is macro-injected).
-- **Kickstart `%post` stamp**: the appended `build <version> (<date>)` line
-  makes `rpm -V lumen-release` flag `/etc/lumen-release` as modified;
-  accepted for appliance images.
+- **Architecture**: AlmaLinux 10 standard x86_64 targets x86-64-v3. An
+  `x86_64_v2` variant can be added later if pre-Haswell hardware matters.
+- **Verified against EL10 containers** (2026-07): rust 1.92 + gtk4 4.16
+  (CRB), gnome-kiosk 49 + script session (started via
+  `gnome-session --session=gnome-kiosk-script`), jetbrains-mono-fonts
+  (EPEL 10), rpmlint zero-error, installer clippy/test clean.
+- **First pipeline-run verifications still open**: chrooted dracut without
+  /proc in the CI container, dnf4 flag syntax for `--repofrompath`/
+  `download`/`repoquery --qf`, xorrisofs UEFI-only El Torito form, OpenZFS
+  library subpackage names in the download glob.
+- **TODO(security)**: pin and verify the OpenZFS RPM signing key at mirror
+  time (today: HTTPS + version pins + the kABI gate).
+- `/etc/issue` has no ASCII art on purpose (agetty escape handling);
+  `/etc/motd` carries the ANSI-color lockup. `/etc/os-release`, `issue`,
+  `motd` are applied via `lumen-release` `%post` (files owned by
+  `almalinux-release`/`setup`), so `rpm -V` flags them — expected.
+- **rpmlint**: specs and RPMs pass with no errors; expected warnings are
+  documented in the spec comments (`dangerous-command-in-%post`,
+  `non-conffile-in-etc`, `no-documentation`).

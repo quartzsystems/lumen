@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# lumen-nicnames — deterministic NIC names (nic0..nicN) for Lumen.
+#
+# Enumerates physical ethernet interfaces, orders them by PCI address, and
+# writes one systemd link file per NIC:
+#
+#   <root>/etc/systemd/network/70-lumen-nic<N>.link
+#     [Match] PermanentMACAddress=<mac>  ->  [Link] Name=nic<N>
+#
+# Existing MAC->nic<N> pins are preserved: NICs added later get the next
+# free index, so adding/replacing hardware never renames survivors. The
+# .link files take effect when udev (re)processes the devices — i.e. on the
+# next boot for an installed system.
+#
+# Usage:
+#   lumen-nicnames [--root DIR]   write link files under DIR (default /)
+#   lumen-nicnames --apply        additionally rename the running kernel's
+#                                 interfaces in place (live installer
+#                                 environment; must run before
+#                                 NetworkManager configures anything)
+set -euo pipefail
+
+usage() { echo "usage: lumen-nicnames [--root DIR] [--apply]" >&2; }
+die()   { echo "lumen-nicnames: $*" >&2; exit 1; }
+
+ROOT="/"
+APPLY=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --root)  ROOT="${2:?--root needs a value}"; shift 2 ;;
+        --apply) APPLY=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage; die "unknown argument: $1" ;;
+    esac
+done
+[ -d "$ROOT" ] || die "no such root: $ROOT"
+LINKDIR="${ROOT%/}/etc/systemd/network"
+
+# --- enumerate physical ethernet NICs, ordered by PCI address ---------------
+# Sort key is the resolved sysfs device path: fixed-width lowercase-hex PCI
+# addresses sort correctly lexically, and nested buses (virtio on PCI) keep
+# their parent's position.
+mapfile -t nics < <(
+    for path in /sys/class/net/*; do
+        dev="$(basename "$path")"
+        [ -e "$path/device" ] || continue            # physical devices only
+        [ "$(cat "$path/type")" = "1" ] || continue  # ethernet only
+        mac="$(cat "$path/address")"
+        [ -n "$mac" ] && [ "$mac" != "00:00:00:00:00:00" ] || continue
+        printf '%s %s %s\n' "$(readlink -f "$path/device")" "$mac" "$dev"
+    done | LC_ALL=C sort
+)
+[ "${#nics[@]}" -gt 0 ] || die "no physical ethernet interfaces found"
+
+# --- load existing MAC -> index pins ----------------------------------------
+declare -A mac_to_idx used_idx
+for f in "$LINKDIR"/70-lumen-nic*.link; do
+    [ -e "$f" ] || continue
+    idx="$(basename "$f")"; idx="${idx#70-lumen-nic}"; idx="${idx%.link}"
+    case "$idx" in *[!0-9]*|'') continue ;; esac
+    mac="$(sed -n 's/^PermanentMACAddress=//p' "$f" | head -n1 | tr 'A-F' 'a-f')"
+    [ -n "$mac" ] || continue
+    mac_to_idx["$mac"]="$idx"
+    used_idx["$idx"]=1
+done
+
+# --- assign indices: keep pins, give new NICs the next free index -----------
+next_free() {
+    local i=0
+    while [ -n "${used_idx[$i]:-}" ]; do i=$((i + 1)); done
+    echo "$i"
+}
+declare -A dev_to_idx
+for entry in "${nics[@]}"; do
+    read -r _ mac dev <<<"$entry"
+    mac="$(tr 'A-F' 'a-f' <<<"$mac")"
+    if [ -z "${mac_to_idx[$mac]:-}" ]; then
+        idx="$(next_free)"
+        mac_to_idx["$mac"]="$idx"
+        used_idx["$idx"]=1
+    fi
+    dev_to_idx["$dev"]="${mac_to_idx[$mac]}"
+done
+
+# --- write the link files -----------------------------------------------------
+mkdir -p "$LINKDIR"
+for entry in "${nics[@]}"; do
+    read -r _ mac dev <<<"$entry"
+    mac="$(tr 'A-F' 'a-f' <<<"$mac")"
+    idx="${dev_to_idx[$dev]}"
+    cat > "$LINKDIR/70-lumen-nic$idx.link" <<EOF
+# Written by lumen-nicnames. MAC pin is authoritative; do not renumber.
+[Match]
+PermanentMACAddress=$mac
+
+[Link]
+Name=nic$idx
+EOF
+    echo "nic$idx: $mac ($dev)"
+done
+
+# --- optionally rename the running interfaces in place ----------------------
+# Two passes via temporary names so an existing nic<N> can never collide
+# with a rename target. Interfaces are left down; NetworkManager (started
+# after this tool in the live environment) brings them up as needed.
+if [ "$APPLY" = 1 ]; then
+    [ "${ROOT%/}" = "" ] || die "--apply only makes sense with --root /"
+    for dev in "${!dev_to_idx[@]}"; do
+        [ "$dev" != "nic${dev_to_idx[$dev]}" ] || continue
+        ip link set "$dev" down
+        ip link set "$dev" name "lumen-tmp${dev_to_idx[$dev]}"
+    done
+    for dev in "${!dev_to_idx[@]}"; do
+        [ "$dev" != "nic${dev_to_idx[$dev]}" ] || continue
+        ip link set "lumen-tmp${dev_to_idx[$dev]}" name "nic${dev_to_idx[$dev]}"
+    done
+fi

@@ -1,10 +1,16 @@
-# ISO build — runs fully unprivileged (see docs/build.md).
+# ISO build — custom live installer ISO, runs without --privileged (chroot
+# and mknod only; no loop devices). See docs/build.md.
 #
 # Two entry points:
 #   - workflow_dispatch: manual run from the Actions tab; the ISO is
 #     uploaded as a workflow artifact (14-day retention).
 #   - workflow_call: invoked by release.yml on tag push with
 #     attach-to-release: true; the ISO is attached to the GitHub release.
+#
+# The boot-smoke job boots the freshly built ISO in QEMU/KVM (hosted
+# runners expose /dev/kvm) with OVMF and waits for the installer's
+# LUMEN-INSTALLER-READY marker on the serial console — an end-to-end check
+# of kernel -> dracut -> squashfs -> logind -> gnome-kiosk -> GTK app.
 name: ISO
 
 on:
@@ -23,8 +29,20 @@ jobs:
     container: almalinux:10
     steps:
       - name: Install build dependencies
-        run: dnf -y install rpm-build rpmdevtools createrepo_c pykickstart xorriso mtools isomd5sum cpio gzip findutils make git-core
+        run: |
+          dnf -y install dnf-plugins-core epel-release
+          dnf config-manager --set-enabled crb
+          dnf -y install rpm-build rpmdevtools createrepo_c xorriso mtools \
+            dosfstools squashfs-tools isomd5sum kmod \
+            rust cargo gtk4-devel make git-core
       - uses: actions/checkout@v4
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            build/cargo-target
+          key: cargo-iso-${{ hashFiles('lumen-installer/app/Cargo.toml') }}
       - name: Restore cached upstream ISO
         uses: actions/cache@v4
         with:
@@ -49,7 +67,6 @@ jobs:
             dist/*.iso
             dist/*.iso.sha256
       - name: Upload ISO as workflow artifact
-        if: ${{ !inputs.attach-to-release }}
         uses: actions/upload-artifact@v4
         with:
           name: lumen-iso
@@ -58,3 +75,49 @@ jobs:
             dist/*.iso.sha256
           if-no-files-found: error
           retention-days: 14
+
+  boot-smoke:
+    name: Boot smoke test (QEMU/OVMF)
+    needs: iso
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install QEMU + OVMF
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 ovmf
+      - uses: actions/download-artifact@v4
+        with:
+          name: lumen-iso
+      - name: Boot ISO and wait for installer marker
+        run: |
+          iso="$(ls lumen-*.iso | head -n1)"
+          cp /usr/share/OVMF/OVMF_VARS_4M.fd vars.fd
+          qemu-system-x86_64 -enable-kvm -m 4096 -smp 2 -machine q35 -cpu host \
+            -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
+            -drive if=pflash,format=raw,file=vars.fd \
+            -device virtio-vga \
+            -drive file="$iso",media=cdrom,readonly=on \
+            -display none -serial file:serial.log &
+          qemu_pid=$!
+          ok=
+          for _ in $(seq 1 60); do
+            if grep -q "LUMEN-INSTALLER-READY" serial.log 2>/dev/null; then
+              ok=1
+              break
+            fi
+            sleep 10
+          done
+          kill "$qemu_pid" 2>/dev/null || true
+          if [ -z "$ok" ]; then
+            echo "::error::installer never came up; last serial output:"
+            tail -100 serial.log || true
+            exit 1
+          fi
+          echo "Installer came up OK."
+      - name: Upload serial log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-smoke-serial
+          path: serial.log
+          if-no-files-found: ignore

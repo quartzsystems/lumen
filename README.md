@@ -8,30 +8,35 @@
 **Light-weight KVM orchestration for AlmaLinux.**
 
 Lumen is a KVM hypervisor platform by [Quartz Systems](https://www.quartzsystems.net).
-At this stage the repository contains the **appliance ISO build system and
-branding base**: a minimal AlmaLinux 10 install with Quartz Systems / Lumen
-branding. Hypervisor components (libvirt, QEMU, orchestration) land later.
+At this stage the repository contains the **appliance ISO with a custom
+graphical installer**: a minimal AlmaLinux 10 system installed onto a **ZFS
+boot drive** by `lumen-installer`, a Rust/GTK4 wizard with Quartz styling.
+Hypervisor components (libvirt, QEMU, orchestration) land later.
 
 ## Repository layout
 
 ```
 VERSION            Single source of truth for the Lumen version
-Makefile           make rpms | make iso | make lint | make clean
-iso/               Kickstart + ISO build tooling (mkksiso)
+Makefile           make rpms | installer | iso | test | lint | clean
+lumen-installer/   Rust GUI installer (app/) + live environment (live/)
+lumen-networking/  lumen-nicnames: deterministic nic0..nicN naming
+iso/               ISO build pipeline + version pins (upstream.env, pins.env)
 branding/          Release files, MOTD/issue, os-release additions, artwork
-packages/          RPM spec files (lumen-release, lumen-logos)
+packages/          RPM specs (lumen-release, lumen-logos, lumen-networking)
 docs/              Build and design documentation
-.github/           CI (RPM build + release on tag push)
+.github/           CI (RPMs, Rust, ISO + QEMU boot smoke test)
 ```
 
 ## Prerequisites
 
-Building is supported on **AlmaLinux 10 x86_64**; an unprivileged container
-works for both the RPMs and the ISO:
+Building is supported on **AlmaLinux 10 x86_64**; a container works — root
+inside it, but no `--privileged`, loop devices, or mounts needed:
 
 ```sh
-dnf install rpm-build rpmdevtools rpmlint createrepo_c pykickstart \
-            xorriso mtools isomd5sum make
+dnf config-manager --set-enabled crb
+dnf install rpm-build rpmdevtools rpmlint createrepo_c xorriso mtools \
+            dosfstools squashfs-tools isomd5sum kmod \
+            rust cargo rustfmt clippy gtk4-devel make
 ```
 
 Optional for linting shell scripts: `shellcheck` (EPEL).
@@ -44,50 +49,51 @@ Optional for linting shell scripts: `shellcheck` (EPEL).
 make rpms
 ```
 
-Builds `lumen-release` and `lumen-logos` as noarch RPMs into `dist/rpms/`.
-The version is read from the top-level `VERSION` file.
+Builds `lumen-release`, `lumen-logos`, and `lumen-networking` as noarch
+RPMs into `dist/rpms/`. The version comes from the top-level `VERSION` file.
 
 ### 2. ISO
 
-Download the upstream AlmaLinux 10 x86_64 **minimal** ISO and its official
-`CHECKSUM` file from <https://almalinux.org/get-almalinux/>, then:
+Download the upstream AlmaLinux 10 x86_64 **minimal** ISO pinned in
+`iso/upstream.env` (its on-media `Minimal` repo becomes the offline install
+source), then:
 
 ```sh
-make iso UPSTREAM_ISO=/path/to/AlmaLinux-10-latest-x86_64-minimal.iso \
+make iso UPSTREAM_ISO=/path/to/AlmaLinux-10.2-x86_64-minimal.iso \
          UPSTREAM_SHA256=<sha256 from the official CHECKSUM file>
 ```
 
-This verifies the upstream ISO checksum, builds the Lumen RPMs, embeds the
-kickstart and a local `lumen` package repo into the ISO, sets the volume
-label to `LUMEN`, and produces `dist/lumen-<version>-x86_64.iso` plus a
-`.sha256` file. The remaster runs fully unprivileged (xorriso + mtools; no
-loop mounts) — see [docs/build.md](docs/build.md) for details and for why
-`mkksiso` is not used.
-
-Instead of passing `UPSTREAM_SHA256` on the command line you can place the
-expected checksum in a file next to the ISO named `<iso>.sha256`.
+This builds the Rust installer, assembles a live installer environment
+(squashfs + dracut), mirrors a pinned OpenZFS EL10 subset, and produces a
+**UEFI-only** `dist/lumen-<version>-x86_64.iso` (+ `.sha256`). Hard build
+gates keep the kernel pin, the ZFS kABI kmod, and offline dependency
+resolution honest — see [docs/build.md](docs/build.md).
 
 ### 3. Validation
 
 ```sh
-make lint          # rpmlint on specs, shellcheck on scripts
-make ks-validate   # ksvalidator against the RHEL10 profile
+make test    # installer engine unit tests (headless)
+make lint    # shellcheck, rpmlint, cargo fmt/clippy
 ```
 
 ## Installing the appliance
 
-Boot the generated ISO; the branded graphical installer asks for the four
-operator decisions — root password, boot drive, management NIC (DHCP or
-static), and time zone — and the embedded kickstart fixes everything else
-(minimal package set, SELinux enforcing, firewalld with SSH only, chronyd
-enabled, hostname `lumen`). Log in as `root` with the password chosen in
-the installer. See [docs/build.md](docs/build.md).
+Boot the ISO (UEFI, **Secure Boot disabled** — zfs.ko is unsigned); the
+Quartz-styled installer asks exactly four questions: root password, time
+zone, management NIC (DHCP or static), and the boot drive. NICs are named
+`nic0…nicN` (PCI order) in the installer and identically on the installed
+system. The chosen drive is erased: EFI system partition + ext4 `/boot` +
+ZFS pool `rpool` holding the OS root dataset. Everything else is fixed
+appliance policy: minimal package set, SELinux enforcing (first boot
+relabels), firewalld with SSH only, chronyd enabled, hostname `lumen`.
+Log in as `root` with the password chosen in the installer.
 
 ## Versioning
 
 `VERSION` at the repo root is the single source of truth. It is consumed by
-the RPM specs (via a macro the Makefile defines), the kickstart `%post`
-version stamp, and the ISO file name. Tag releases as `v<version>`.
+the RPM specs (via a macro the build defines), the installer build stamp,
+and the ISO file name. Upstream/kernel/ZFS pins live in `iso/upstream.env`
+and `iso/pins.env` and must move together. Tag releases as `v<version>`.
 
 ## License
 

@@ -33,8 +33,8 @@ cp "$REPO_ROOT"/branding/release/lumen-release.in \
    "$REPO_ROOT"/branding/logos/png/lumen-lockup-light-bg.png \
    "$REPO_ROOT"/branding/logos/png/lumen-mark-1024.png \
    "$REPO_ROOT"/branding/logos/README.md \
-   "$REPO_ROOT"/branding/anaconda/lumen-profile.conf \
    "$REPO_ROOT"/branding/plymouth/lumen.plymouth \
+   "$REPO_ROOT"/lumen-networking/nicnames/lumen-nicnames \
    "$TOPDIR/SOURCES/"
 
 for spec in "$REPO_ROOT"/packages/*.spec; do
