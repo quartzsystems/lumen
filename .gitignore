@@ -1,0 +1,15 @@
+# Build outputs
+/build/
+/dist/
+*.iso
+*.iso.sha256
+*.rpm
+
+# rpmbuild working trees
+/rpmbuild/
+
+# Editor / OS noise
+*.swp
+*~
+.DS_Store
+Thumbs.db

@@ -1,0 +1,57 @@
+# Lumen appliance kickstart — minimal AlmaLinux 10 (x86_64).
+#
+# This is a template: @LUMEN_VERSION@ and @LUMEN_BUILD_DATE@ are replaced by
+# iso/build-iso.sh before the kickstart is embedded with mkksiso. The
+# placeholders appear only inside %post, so ksvalidator can validate this
+# file as-is (make ks-validate).
+
+text
+reboot
+
+# Install from the boot media; "lumen" is the local RPM repo that
+# iso/build-iso.sh adds to the ISO root (mounted at /run/install/repo).
+cdrom
+repo --name=lumen --baseurl=file:///run/install/repo/lumen
+
+lang en_US.UTF-8
+keyboard --vckeymap=us
+timezone Etc/UTC --utc
+
+network --bootproto=dhcp --device=link --activate --hostname=lumen
+
+# Wipe and auto-partition the target disk.
+zerombr
+clearpart --all --initlabel
+autopart --type=lvm
+bootloader --timeout=1
+
+selinux --enforcing
+firewall --enabled --service=ssh
+services --enabled=chronyd,sshd,firewalld
+
+# Default credential for first boot; pre-expired in %post so the operator
+# must set a real password at first login (console or SSH).
+rootpw --plaintext lumen
+
+%packages
+@core
+chrony
+firewalld
+openssh-server
+lumen-release
+# TODO(hypervisor): the KVM stack lands here in a later milestone, e.g.:
+#   libvirt-daemon-kvm
+#   qemu-kvm
+#   libvirt-client
+#   swtpm
+#   edk2-ovmf
+%end
+
+%post --log=/root/lumen-ks-post.log
+# Stamp the image build metadata into /etc/lumen-release (the file itself is
+# installed by the lumen-release RPM; this appends the per-image build line).
+echo "build @LUMEN_VERSION@ (@LUMEN_BUILD_DATE@)" >> /etc/lumen-release
+
+# Force a root password change at first login.
+chage -d 0 root
+%end

@@ -1,0 +1,14 @@
+# Plymouth boot splash theme stub for Quartz Systems Lumen.
+#
+# NOT YET ACTIVE. Staged by lumen-logos under
+# /usr/share/lumen-logos/plymouth/ for later boot-splash branding work.
+# To activate, install as /usr/share/plymouth/themes/lumen/lumen.plymouth
+# together with the theme assets and run plymouth-set-default-theme.
+
+[Plymouth Theme]
+Name=Lumen
+Description=Quartz Systems Lumen boot splash (placeholder)
+ModuleName=two-step
+
+[two-step]
+ImageDir=/usr/share/plymouth/themes/lumen

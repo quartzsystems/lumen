@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck packages/build-rpms.sh iso/build-iso.sh
+
+  rpms:
+    name: RPMs + kickstart (AlmaLinux 10)
+    runs-on: ubuntu-latest
+    container: almalinux:10
+    steps:
+      - name: Install build dependencies
+        run: |
+          dnf -y install epel-release   # rpmlint lives in EPEL on EL10
+          dnf -y install rpm-build rpmdevtools rpmlint pykickstart make git-core
+      - uses: actions/checkout@v4
+      - name: Build RPMs
+        run: make rpms
+      - name: rpmlint (specs + built RPMs)
+        run: rpmlint packages/*.spec dist/rpms/*.rpm
+      - name: Validate kickstart
+        run: make ks-validate
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lumen-rpms
+          path: dist/rpms/

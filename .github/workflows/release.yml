@@ -1,0 +1,57 @@
+# Release workflow: on tag push (v*), build the Lumen RPMs in an
+# almalinux:10 container and attach them + checksums to a GitHub release.
+#
+# The ISO is NOT built in CI: mkksiso must update boot configs inside the
+# EFI boot image when the volume label changes, which can fall back to
+# mkefiboot/loop mounts — unavailable in unprivileged GitHub-hosted runner
+# containers. Build the ISO locally with `make iso` (see docs/build.md) and
+# upload it to the release manually if desired.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release-rpms:
+    name: Build + publish RPMs (AlmaLinux 10)
+    runs-on: ubuntu-latest
+    container: almalinux:10
+    steps:
+      - name: Install build dependencies
+        run: |
+          dnf -y install epel-release   # rpmlint lives in EPEL on EL10
+          dnf -y install rpm-build rpmdevtools rpmlint pykickstart make git-core
+      - uses: actions/checkout@v4
+      - name: Verify tag matches VERSION
+        run: |
+          ver="$(cat VERSION)"
+          if [ "v$ver" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match VERSION $ver"
+            exit 1
+          fi
+      - name: Build RPMs
+        run: make rpms
+      - name: rpmlint (specs + built RPMs)
+        run: rpmlint packages/*.spec dist/rpms/*.rpm
+      - name: Validate kickstart
+        run: make ks-validate
+      - name: Generate checksums
+        run: |
+          cd dist/rpms
+          sha256sum ./*.rpm > SHA256SUMS
+      - name: Create release with artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/rpms/*.rpm
+            dist/rpms/SHA256SUMS
+          body: |
+            Lumen ${{ github.ref_name }} — RPM artifacts.
+
+            The appliance ISO is built locally (`make iso`, see
+            docs/build.md); CI publishes RPMs only because the ISO
+            remaster may need privileged loop mounts.

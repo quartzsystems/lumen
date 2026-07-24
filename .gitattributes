@@ -1,0 +1,6 @@
+# Everything this repo ships targets Linux: force LF in the working tree
+# too, so files built from a Windows checkout (e.g. via a Docker mount)
+# never pick up CRLF.
+* text=auto eol=lf
+*.png binary
+*.iso binary
