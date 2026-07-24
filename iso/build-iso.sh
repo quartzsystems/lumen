@@ -91,7 +91,7 @@ fi
 echo "    OK: $actual"
 
 # --- build RPMs and the local 'lumen' repo --------------------------------
-"$REPO_ROOT/packages/build-rpms.sh"
+bash "$REPO_ROOT/packages/build-rpms.sh"
 
 WORK="$REPO_ROOT/build/iso"
 rm -rf "$WORK"

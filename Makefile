@@ -16,12 +16,14 @@ SPECS   := packages/lumen-release.spec packages/lumen-logos.spec
 
 all: rpms
 
+# Scripts are invoked via bash so builds work even if a checkout loses the
+# executable bits (easy to do when developing on Windows).
 rpms:
-	packages/build-rpms.sh
+	bash packages/build-rpms.sh
 
 iso:
 	UPSTREAM_ISO="$(UPSTREAM_ISO)" UPSTREAM_SHA256="$(UPSTREAM_SHA256)" \
-		iso/build-iso.sh
+		bash iso/build-iso.sh
 
 ks-validate:
 	ksvalidator -v RHEL10 iso/lumen.ks.in
