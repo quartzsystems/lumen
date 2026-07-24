@@ -9,8 +9,9 @@
 /rpmbuild/
 
 # cargo (make targets build into build/cargo-target; this covers plain
-# `cargo build` runs inside the app directory)
+# `cargo build` runs inside the crate directories)
 lumen-installer/app/target/
+lumen-controlplane/target/
 
 # Editor / OS noise
 *.swp

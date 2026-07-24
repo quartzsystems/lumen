@@ -1,0 +1,7 @@
+#%PAM-1.0
+# PAM service for the Lumen control plane's built-in "lumen" realm.
+# Installed to /etc/pam.d/lumen-controlplane by packaging. Delegates to the
+# EL system-auth stack so faillock/shadow policy applies to web sign-ins
+# exactly as it does to console logins.
+auth     include  system-auth
+account  include  system-auth

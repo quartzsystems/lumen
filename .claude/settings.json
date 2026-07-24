@@ -3,11 +3,5 @@
     "commit": "",
     "pr": "",
     "sessionUrl": false
-  },
-  "permissions": {
-    "deny": [
-      "Bash(git commit:*)",
-      "Bash(git push:*)"
-    ]
   }
 }

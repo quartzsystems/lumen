@@ -16,16 +16,29 @@ Hypervisor components (libvirt, QEMU, orchestration) land later.
 ## Repository layout
 
 ```
-VERSION            Single source of truth for the Lumen version
-Makefile           make rpms | installer | iso | test | lint | clean
-lumen-installer/   Rust GUI installer (app/) + live environment (live/)
-lumen-networking/  lumen-nicnames: deterministic nic0..nicN naming
-iso/               ISO build pipeline + version pins (upstream.env, pins.env)
-branding/          Release files, MOTD/issue, os-release additions, artwork
-packages/          RPM specs (lumen-release, lumen-logos, lumen-networking)
-docs/              Build and design documentation
-.github/           CI (RPMs, Rust, ISO + QEMU boot smoke test)
+VERSION              Single source of truth for the Lumen version
+Makefile             make rpms | installer | controlplane | webui | iso | test | lint
+lumen-installer/     Rust GUI installer (app/) + live environment (live/)
+lumen-controlplane/  Rust (axum) control plane: auth API + web UI server on :8443
+lumen-webui/         Next.js/TypeScript/Tailwind web console (login page)
+lumen-networking/    lumen-nicnames: deterministic nic0..nicN naming
+iso/                 ISO build pipeline + version pins (upstream.env, pins.env)
+branding/            Release files, MOTD/issue, os-release additions, artwork
+packages/            RPM specs (lumen-release, lumen-logos, lumen-networking)
+docs/                Build and design documentation
+.github/             CI (RPMs, Rust, web UI, ISO + QEMU boot smoke test)
 ```
+
+## Control plane & web UI
+
+`lumen-controlplane` (Rust/axum) serves the management surface on
+**https://\<host\>:8443**: the REST auth API plus the static `lumen-webui`
+export (Next.js + Tailwind, Quartz design system) — no Node.js on the
+appliance. Sign-in goes through pluggable **realms**; the built-in
+`lumen` realm is the OS's own authentication (PAM → the accounts created
+by the installer, i.e. root today). See
+[docs/controlplane.md](docs/controlplane.md) for the architecture and the
+development workflow.
 
 ## Prerequisites
 
