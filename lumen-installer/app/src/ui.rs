@@ -105,26 +105,98 @@ thread_local! {
 
 // --- layout helpers ---------------------------------------------------------
 
+mod logo {
+    //! Full-resolution logo texture behind a fixed logical size.
+    //!
+    //! GtkPicture sizes itself to the paintable's intrinsic size, so handing
+    //! it the full 808x288 texture renders huge, while pre-scaling to a 40px
+    //! bitmap bakes in a blurry logo (bilinear pixbuf downscaling, stretched
+    //! again on scaled displays). This paintable reports the small layout
+    //! size but snapshots the full-resolution texture, so GSK filters it for
+    //! the actual output scale at render time.
+
+    use gtk::subclass::prelude::*;
+    use gtk::{gdk, glib, graphene, gsk, prelude::*};
+
+    mod imp {
+        use super::*;
+        use std::cell::{Cell, OnceCell};
+
+        #[derive(Default)]
+        pub struct LogoPaintable {
+            pub texture: OnceCell<gdk::Texture>,
+            pub height: Cell<i32>,
+        }
+
+        #[glib::object_subclass]
+        impl ObjectSubclass for LogoPaintable {
+            const NAME: &'static str = "LumenLogoPaintable";
+            type Type = super::LogoPaintable;
+            type Interfaces = (gdk::Paintable,);
+        }
+
+        impl ObjectImpl for LogoPaintable {}
+
+        impl PaintableImpl for LogoPaintable {
+            fn flags(&self) -> gdk::PaintableFlags {
+                gdk::PaintableFlags::SIZE | gdk::PaintableFlags::CONTENTS
+            }
+
+            fn intrinsic_height(&self) -> i32 {
+                self.height.get()
+            }
+
+            fn intrinsic_width(&self) -> i32 {
+                let texture = self.texture.get().unwrap();
+                self.height.get() * texture.width() / texture.height()
+            }
+
+            fn intrinsic_aspect_ratio(&self) -> f64 {
+                let texture = self.texture.get().unwrap();
+                f64::from(texture.width()) / f64::from(texture.height())
+            }
+
+            fn snapshot(&self, snapshot: &gdk::Snapshot, width: f64, height: f64) {
+                let Some(texture) = self.texture.get() else {
+                    return;
+                };
+                let snapshot = snapshot.downcast_ref::<gtk::Snapshot>().unwrap();
+                snapshot.append_scaled_texture(
+                    texture,
+                    gsk::ScalingFilter::Trilinear,
+                    &graphene::Rect::new(0.0, 0.0, width as f32, height as f32),
+                );
+            }
+        }
+    }
+
+    glib::wrapper! {
+        pub struct LogoPaintable(ObjectSubclass<imp::LogoPaintable>)
+            @implements gdk::Paintable;
+    }
+
+    impl LogoPaintable {
+        pub fn new(texture: gdk::Texture, height: i32) -> Self {
+            let obj: Self = glib::Object::new();
+            obj.imp().texture.set(texture).unwrap();
+            obj.imp().height.set(height);
+            obj
+        }
+    }
+}
+
 /// Lumen lockup (dark-background PNG compiled into the binary), the same
-/// height on every page. The pixbuf is scaled at load time because
-/// GtkPicture's natural size is the paintable's intrinsic size —
-/// size_request only raises the minimum, so a full-size texture renders
-/// huge regardless.
+/// height on every page. The texture stays at full resolution — LogoPaintable
+/// gives it a 40px intrinsic size and lets the renderer downsample per
+/// output scale, keeping the logo sharp.
 fn lumen_lockup() -> Option<gtk::Picture> {
     const HEIGHT: i32 = 40;
     let bytes = glib::Bytes::from_static(include_bytes!(
         "../../../branding/logos/png/lumen-lockup-dark-bg.png"
     ));
-    let stream = gtk::gio::MemoryInputStream::from_bytes(&bytes);
-    let pixbuf =
-        gtk::gdk_pixbuf::Pixbuf::from_stream(&stream, gtk::gio::Cancellable::NONE).ok()?;
-    let width = HEIGHT * pixbuf.width() / pixbuf.height();
-    let scaled = pixbuf.scale_simple(width, HEIGHT, gtk::gdk_pixbuf::InterpType::Bilinear)?;
-    // for_pixbuf is soft-deprecated in 4.12 but is the only in-tree path
-    // from a scaled pixbuf to a paintable.
-    #[allow(deprecated)]
-    let texture = gtk::gdk::Texture::for_pixbuf(&scaled);
-    let picture = gtk::Picture::for_paintable(&texture);
+    let texture = gtk::gdk::Texture::from_bytes(&bytes).ok()?;
+    let paintable = logo::LogoPaintable::new(texture, HEIGHT);
+    let picture = gtk::Picture::for_paintable(&paintable);
     picture.set_halign(gtk::Align::Start);
     Some(picture)
 }
@@ -262,9 +334,7 @@ fn page_welcome(stack: &gtk::Stack) -> gtk::Box {
     }
 
     // "Quartz Systems Lumen release 0.1.0" -> "Quartz Systems Lumen 0.1.0".
-    let subtitle = gtk::Label::new(Some(
-        &sysinfo::lumen_version().replace(" release ", " "),
-    ));
+    let subtitle = gtk::Label::new(Some(&sysinfo::lumen_version().replace(" release ", " ")));
     subtitle.add_css_class("qz-subtitle");
     subtitle.set_halign(gtk::Align::Start);
     subtitle.set_margin_top(16);
@@ -836,7 +906,9 @@ fn page_disk(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
                 return;
             }
             if topology == PoolTopology::Single && selected.len() != 1 {
-                error.set_text("Single disk uses exactly one drive — pick a RAID layout for several.");
+                error.set_text(
+                    "Single disk uses exactly one drive — pick a RAID layout for several.",
+                );
                 return;
             }
             if selected.len() < topology.min_disks() {
@@ -907,10 +979,7 @@ fn summary_rows(d: &Draft) -> Vec<(String, String)> {
             },
         ));
     }
-    rows.push((
-        "ZFS pool".into(),
-        format!("rpool — {}", d.topology.label()),
-    ));
+    rows.push(("ZFS pool".into(), format!("rpool — {}", d.topology.label())));
     rows.push((
         if d.disk_labels.len() == 1 {
             "Drive".into()
