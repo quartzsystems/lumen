@@ -1,0 +1,55 @@
+# lumen-controlplane — the Lumen hypervisor control plane.
+#
+# One daemon serves everything on :8443 (TLS): the REST API under /api and
+# the static lumen-webui export everywhere else — no Node.js on the
+# appliance. Built in CI on almalinux:10 with the AppStream rust/cargo
+# toolchain (pam-devel provides the libpam headers the `pam` crate links).
+#
+# Cargo.lock is committed; release builds use --locked.
+
+[package]
+name = "lumen-controlplane"
+version = "0.1.0"
+edition = "2021"
+description = "Lumen control plane: authentication API + web UI server"
+license = "MIT"
+
+[dependencies]
+axum = "0.8"
+# Typed cookie jar for the httpOnly session cookie.
+axum-extra = { version = "0.10", features = ["cookie"] }
+# TLS listener. no-provider + rustls/ring below keeps aws-lc (and its cmake
+# build dependency) out of the EL10 CI containers.
+axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "trace"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+async-trait = "0.1"
+# Session tickets: HS256 JWT in an httpOnly cookie (same model as Quartz
+# Command), secret minted on first boot and persisted in the state dir.
+jsonwebtoken = "9"
+rand = "0.8"
+# The built-in "lumen" realm authenticates local OS users through libpam via
+# a minimal in-tree FFI (src/realm/pam_ffi.rs) — the published pam crates all
+# run bindgen (libclang) at build time, which we keep out of the appliance
+# and CI toolchains. Linking needs pam-devel (EL) / libpam0g-dev (Debian).
+libc = "0.2"
+# Self-signed TLS certificate minted on first boot when none is configured.
+rcgen = { version = "0.13", features = ["pem"] }
+# Cookie Max-Age durations (the cookie crate's time type).
+time = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
+tempfile = "3"
+
+[profile.release]
+lto = true
+strip = true

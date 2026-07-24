@@ -61,14 +61,15 @@ done
 # --- required tools ----------------------------------------------------------
 missing=()
 for tool in xorriso xorrisofs mcopy mmd mkfs.vfat mksquashfs createrepo_c \
-            rpmbuild cargo dnf depmod implantisomd5 truncate sha256sum sed \
+            rpmbuild cargo npm dnf depmod implantisomd5 truncate sha256sum sed \
             awk dd cut; do
     command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
 done
 if [ "${#missing[@]}" -gt 0 ]; then
     die "missing required tools: ${missing[*]}
   install with: dnf install xorriso mtools dosfstools squashfs-tools \\
-      createrepo_c rpm-build rust cargo gtk4-devel isomd5sum kmod"
+      createrepo_c rpm-build rust cargo gtk4-devel pam-devel nodejs npm \\
+      isomd5sum kmod"
 fi
 
 # --- upstream ISO + checksum verification ------------------------------------
@@ -118,7 +119,9 @@ fi
 # --- lumen repo: our RPMs + pinned OpenZFS subset -----------------------------
 bash "$REPO_ROOT/packages/build-rpms.sh"
 mkdir -p "$TREE/lumen"
-cp "$REPO_ROOT"/dist/rpms/*.noarch.rpm "$TREE/lumen/"
+# noarch branding/tooling + the x86_64 controlplane (SRPMs stay out).
+cp "$REPO_ROOT"/dist/rpms/*.noarch.rpm "$REPO_ROOT"/dist/rpms/*.x86_64.rpm \
+   "$TREE/lumen/"
 
 echo "==> Mirroring OpenZFS $ZFS_SERIES kABI subset from $ZFS_REPO_URL"
 zfs_dl="$WORK/zfs-download"
@@ -179,7 +182,7 @@ resolve_out="$(dnf --assumeno --installroot="$resolve_root" --releasever=10 \
         grub2-efi-x64 shim-x64 grub2-tools grubby efibootmgr \
         e2fsprogs dosfstools NetworkManager chrony firewalld openssh-server \
         policycoreutils selinux-policy-targeted \
-        lumen-release lumen-networking 2>&1)"
+        lumen-release lumen-networking lumen-controlplane 2>&1)"
 set -e
 # --assumeno exits nonzero after successfully resolving; a printed
 # transaction summary is the actual success signal.

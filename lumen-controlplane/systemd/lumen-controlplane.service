@@ -1,0 +1,30 @@
+[Unit]
+Description=Lumen control plane (web UI + API on :8443)
+Documentation=https://github.com/quartzsystems/lumen
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/sbin/lumen-controlplane
+Restart=on-failure
+RestartSec=2
+
+# Root is required: the built-in "lumen" realm verifies credentials against
+# the OS through PAM (pam_unix reads /etc/shadow directly). State (session
+# secret, auto-minted TLS material) lives under /var/lib.
+StateDirectory=lumen-controlplane
+StateDirectoryMode=0700
+Environment=LUMEN_CP_STATE_DIR=/var/lib/lumen-controlplane
+
+# Hardening — the daemon only needs its state dir writable. NoNewPrivileges
+# is deliberately absent: PAM stacks (faillock, audit) may need privilege
+# transitions.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+
+[Install]
+WantedBy=multi-user.target

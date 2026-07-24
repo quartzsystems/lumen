@@ -39,7 +39,8 @@ chroot and `mknod` only — no loop devices, no mounts, no `--privileged`.
 dnf config-manager --set-enabled crb    # gtk4-devel lives in CRB
 dnf install rpm-build rpmdevtools rpmlint createrepo_c xorriso mtools \
             dosfstools squashfs-tools isomd5sum kmod \
-            rust cargo rustfmt clippy gtk4-devel make
+            rust cargo rustfmt clippy gtk4-devel pam-devel \
+            nodejs npm systemd-rpm-macros make
 ```
 
 - `xorriso`/`xorrisofs` assemble the ISO; `mtools` + `dosfstools` create
@@ -49,17 +50,24 @@ dnf install rpm-build rpmdevtools rpmlint createrepo_c xorriso mtools \
 - `rust`/`cargo` + `gtk4-devel` build the installer (AppStream toolchain —
   deliberately not rustup, so the compiler comes from the same repo
   snapshot as the runtime libraries)
+- `pam-devel` links the controlplane's built-in realm against libpam;
+  `nodejs`/`npm` build the web UI static export
 - `rpmlint` and `shellcheck` (EPEL 10) are optional, for `make lint`
 
 ## RPMs
 
 ```sh
-make rpms       # -> dist/rpms/*.rpm (lumen-release, -logos, -networking)
+make rpms       # -> dist/rpms/*.rpm (lumen-release, -logos, -networking,
+                #                     -controlplane)
 ```
 
 `packages/build-rpms.sh` stages sources from `branding/` and
 `lumen-networking/` into a scratch rpmbuild tree and injects the version
-from `VERSION` via `--define "lumen_version ..."`.
+from `VERSION` via `--define "lumen_version ..."`. For
+`lumen-controlplane` it first compiles the daemon (cargo, `--locked`) and
+the web UI export (npm) — network-touching steps that can't run inside
+rpmbuild — then packages the prebuilt artifacts together with the PAM
+service, systemd unit, and firewalld service definition.
 
 `lumen-networking` ships `lumen-nicnames`: deterministic `nic0…nicN` names
 (PCI order) via systemd `.link` files. The live environment runs it with

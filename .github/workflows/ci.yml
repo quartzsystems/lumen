@@ -23,9 +23,12 @@ jobs:
     container: almalinux:10
     steps:
       - name: Install build dependencies
+        # rust/pam-devel/nodejs: build-rpms.sh compiles lumen-controlplane
+        # and the web UI export before packaging them.
         run: |
           dnf -y install epel-release   # rpmlint lives in EPEL on EL10
-          dnf -y install rpm-build rpmdevtools rpmlint make git-core
+          dnf -y install rpm-build rpmdevtools rpmlint make git-core \
+            rust cargo pam-devel nodejs npm systemd-rpm-macros
       - uses: actions/checkout@v4
       - name: Build RPMs
         run: make rpms
@@ -63,4 +66,54 @@ jobs:
           cargo clippy --manifest-path lumen-installer/app/Cargo.toml \
             --target-dir build/cargo-target -- -D warnings
       - name: Tests
-        run: make test
+        run: |
+          cargo test --manifest-path lumen-installer/app/Cargo.toml \
+            --target-dir build/cargo-target
+
+  controlplane:
+    name: Control plane (Rust, AlmaLinux 10)
+    runs-on: ubuntu-latest
+    container: almalinux:10
+    steps:
+      - name: Install Rust toolchain + libpam headers
+        # pam-devel: the built-in "lumen" realm links libpam directly.
+        run: |
+          dnf -y install rust cargo rustfmt clippy pam-devel make git-core
+      - uses: actions/checkout@v4
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            build/cargo-target-cp
+          key: cargo-cp-${{ hashFiles('lumen-controlplane/Cargo.lock') }}
+      - name: Format
+        run: cargo fmt --manifest-path lumen-controlplane/Cargo.toml --check
+      - name: Clippy
+        run: |
+          cargo clippy --manifest-path lumen-controlplane/Cargo.toml \
+            --all-targets --target-dir build/cargo-target-cp -- -D warnings
+      - name: Tests
+        run: |
+          cargo test --manifest-path lumen-controlplane/Cargo.toml \
+            --target-dir build/cargo-target-cp
+
+  webui:
+    name: Web UI (Next.js)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: lumen-webui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: lumen-webui/package-lock.json
+      - name: Install
+        run: npm ci
+      - name: Type check
+        run: npm run typecheck
+      - name: Build (static export)
+        run: npm run build

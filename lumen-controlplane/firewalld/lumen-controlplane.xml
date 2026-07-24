@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<service>
+  <short>Lumen Control Plane</short>
+  <description>Lumen management web console and API over TLS on TCP port 8443.</description>
+  <port protocol="tcp" port="8443"/>
+</service>

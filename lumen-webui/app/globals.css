@@ -1,0 +1,125 @@
+@import "tailwindcss";
+
+/* =========================================================================
+   Quartz Systems — Design Tokens (shared with Quartz Command)
+   Dark-first system. All semantic vars map to base scales. Component
+   classes (tables, badges, KPI cards, …) get ported from Quartz Command
+   as the console views that need them land.
+   ========================================================================= */
+
+:root {
+  /* ---------- Brand ---------- */
+  --qz-green-50:  #e6fff4;
+  --qz-green-100: #b3ffde;
+  --qz-green-200: #80ffc8;
+  --qz-green-300: #4dffb2;
+  --qz-green-400: #1aff9c;
+  --qz-green-500: #00d992;
+  --qz-green-600: #00b07a;
+  --qz-green-700: #008760;
+  --qz-green-800: #005e44;
+  --qz-green-900: #003528;
+
+  /* ---------- Neutrals (dark-first) ---------- */
+  --qz-ink-0:   #0b0d12;
+  --qz-ink-1:   #0f1117;
+  --qz-ink-2:   #161920;
+  --qz-ink-3:   #1a1d26;
+  --qz-ink-4:   #1d2029;
+  --qz-ink-5:   #252830;
+  --qz-ink-6:   #2f323c;
+  --qz-ink-7:   #41454f;
+  --qz-ink-8:   #6b6f7a;
+  --qz-ink-9:   #a2a6b0;
+  --qz-ink-10:  #d7d9de;
+  --qz-ink-11:  #f2f3f5;
+
+  /* ---------- Semantic — surfaces ---------- */
+  --qz-bg:               var(--qz-ink-1);
+  --qz-bg-elevated:      var(--qz-ink-2);
+  --qz-surface:          var(--qz-ink-2);
+  --qz-surface-raised:   var(--qz-ink-4);
+  --qz-surface-sunken:   var(--qz-ink-0);
+  --qz-input-bg:         var(--qz-ink-3);
+
+  /* ---------- Semantic — borders ---------- */
+  --qz-border:           var(--qz-ink-5);
+  --qz-border-strong:    var(--qz-ink-6);
+  --qz-border-subtle:    #1f222b;
+  --qz-divider:          #1c1f28;
+
+  /* ---------- Semantic — text ---------- */
+  --qz-fg:               var(--qz-ink-11);
+  --qz-fg-1:             var(--qz-ink-11);
+  --qz-fg-2:             var(--qz-ink-10);
+  --qz-fg-3:             var(--qz-ink-9);
+  --qz-fg-4:             var(--qz-ink-8);
+  --qz-fg-on-accent:     #062014;
+  --qz-fg-on-danger:     #ffffff;
+
+  /* ---------- Semantic — interaction ---------- */
+  --qz-accent:           var(--qz-green-500);
+  --qz-accent-hover:     var(--qz-green-400);
+  --qz-accent-press:     var(--qz-green-600);
+  --qz-accent-soft:      color-mix(in oklab, var(--qz-green-500) 14%, transparent);
+  --qz-accent-border:    color-mix(in oklab, var(--qz-green-500) 38%, transparent);
+  --qz-focus-ring:       0 0 0 2px var(--qz-bg), 0 0 0 4px var(--qz-green-500);
+
+  /* ---------- Status ---------- */
+  --qz-success: #00d992;
+  --qz-warn:    #f5b243;
+  --qz-danger:  #ff5d6c;
+  --qz-info:    #4fb3ff;
+  --qz-success-soft: color-mix(in oklab, var(--qz-success) 16%, transparent);
+  --qz-warn-soft:    color-mix(in oklab, var(--qz-warn) 16%, transparent);
+  --qz-danger-soft:  color-mix(in oklab, var(--qz-danger) 16%, transparent);
+  --qz-info-soft:    color-mix(in oklab, var(--qz-info) 16%, transparent);
+
+  /* ---------- Type ---------- */
+  --qz-font-sans:    "Manrope", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --qz-font-mono:    "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  --qz-font-display: "Manrope", ui-sans-serif, system-ui, sans-serif;
+
+  /* ---------- Shadows / elevation ---------- */
+  --qz-shadow-1: 0 1px 0 0 rgba(0,0,0,0.4), 0 1px 2px rgba(0,0,0,0.3);
+  --qz-shadow-2: 0 4px 12px rgba(0,0,0,0.35), 0 1px 2px rgba(0,0,0,0.45);
+  --qz-shadow-3: 0 12px 28px rgba(0,0,0,0.45), 0 2px 6px rgba(0,0,0,0.5);
+  --qz-shadow-glow: 0 0 0 1px var(--qz-accent-border), 0 6px 28px color-mix(in oklab, var(--qz-green-500) 22%, transparent);
+  --qz-inset-line: inset 0 1px 0 rgba(255,255,255,0.04);
+
+  /* ---------- Motion ---------- */
+  --qz-ease-out:    cubic-bezier(0.22, 0.61, 0.36, 1);
+  --qz-ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --qz-ease-snap:   cubic-bezier(0.2, 0.9, 0.2, 1);
+  --qz-dur-1: 120ms;
+  --qz-dur-2: 180ms;
+  --qz-dur-3: 260ms;
+}
+
+@theme inline {
+  --color-background: var(--qz-bg);
+  --color-foreground: var(--qz-fg-2);
+  --font-sans: var(--qz-font-sans);
+  --font-mono: var(--qz-font-mono);
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body, #__next { height: 100%; }
+
+body {
+  background: var(--qz-bg);
+  color: var(--qz-fg-2);
+  font-family: var(--qz-font-sans);
+  font-size: 15px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  /* Render native controls (select popovers, scrollbars, etc.) in dark mode. */
+  color-scheme: dark;
+}
+
+/* --- Scrollbars --- */
+::-webkit-scrollbar { width: 10px; }
+::-webkit-scrollbar-thumb { background: var(--qz-ink-5); border-radius: 999px; }
+::-webkit-scrollbar-track { background: transparent; }
