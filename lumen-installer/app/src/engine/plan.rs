@@ -4,7 +4,7 @@
 //! printed with --print-plan and unit-tested without touching hardware.
 
 use super::{Action, Step};
-use crate::config::{BuildPins, InstallConfig, NetworkConfig, PoolTopology};
+use crate::config::{BuildPins, InstallConfig, NetworkConfig};
 
 /// Target root while installing.
 pub const TARGET: &str = "/mnt/sysroot";
@@ -176,8 +176,17 @@ pub fn build_plan(cfg: &InstallConfig, pins: &BuildPins) -> Vec<Step> {
 
     steps.push(Step {
         title: "Install packages (offline, from media)".into(),
-        actions: vec![sh(format!(
-            "dnf -y --installroot={TARGET} --releasever=10 \
+        actions: vec![
+            // kernel-core %posttrans runs kernel-install, which derives its
+            // entry token from /etc/machine-id and quietly writes no BLS
+            // entry when the id is missing — and dnf --installroot never
+            // creates one. Seed it first so the kernel package can register
+            // /boot/loader/entries/<machine-id>-<kver>.conf.
+            sh(format!(
+                "mkdir -p {TARGET}/etc && systemd-machine-id-setup --root={TARGET}"
+            )),
+            sh(format!(
+                "dnf -y --installroot={TARGET} --releasever=10 \
              --disablerepo='*' \
              --repofrompath=media,{MEDIA}/Minimal \
              --repofrompath=lumen,{MEDIA}/lumen \
@@ -189,7 +198,8 @@ pub fn build_plan(cfg: &InstallConfig, pins: &BuildPins) -> Vec<Step> {
              e2fsprogs dosfstools \
              NetworkManager chrony firewalld openssh-server \
              lumen-release lumen-networking"
-        ))],
+            )),
+        ],
     });
 
     steps.push(Step {
@@ -281,13 +291,31 @@ pub fn build_plan(cfg: &InstallConfig, pins: &BuildPins) -> Vec<Step> {
             // firmware-settings entry). The menu is BLS-driven anyway, so
             // write a static config that loads the BLS entries from /boot.
             //
-            // kernel-install ran during the package step with no /proc in
-            // the target, so it could not see that /boot is its own
-            // filesystem: entry paths come out /boot/-prefixed, but blscfg
-            // resolves them against the /boot fs root. Normalize them (the
-            // ls doubles as a gate that entries exist at all).
+            // kernel-install ran during the package step in a degraded
+            // environment (no /proc in the target), so its output cannot be
+            // trusted: entry paths come out /boot/-prefixed (blscfg resolves
+            // them against the /boot fs root), and on some hosts it declines
+            // to write an entry — or copy the kernel image — at all, leaving
+            // an unbootable target. Write the BLS entry ourselves when it is
+            // missing, then normalize the paths either way.
             sh(format!(
-                "ls {TARGET}/boot/loader/entries/*.conf >/dev/null && \
+                "kver=$(chroot {TARGET} rpm -q --qf '%{{VERSION}}-%{{RELEASE}}.%{{ARCH}}\\n' kernel-core | head -n1) && \
+                 mkdir -p {TARGET}/boot/loader/entries && \
+                 if ! ls {TARGET}/boot/loader/entries/*.conf >/dev/null 2>&1; then \
+                     [ -e {TARGET}/boot/vmlinuz-\"$kver\" ] || \
+                         cp {TARGET}/usr/lib/modules/\"$kver\"/vmlinuz {TARGET}/boot/vmlinuz-\"$kver\"; \
+                     token=$(cat {TARGET}/etc/machine-id 2>/dev/null); \
+                     [ -n \"$token\" ] || token=lumen; \
+                     {{ printf 'title Lumen (%s)\\n' \"$kver\"; \
+                        printf 'version %s\\n' \"$kver\"; \
+                        printf 'linux /vmlinuz-%s\\n' \"$kver\"; \
+                        printf 'initrd /initramfs-%s.img\\n' \"$kver\"; \
+                        printf 'options {root_arg}\\n'; \
+                        printf 'grub_users $grub_users\\n'; \
+                        printf 'grub_arg --unrestricted\\n'; \
+                        printf 'grub_class kernel\\n'; \
+                     }} > {TARGET}/boot/loader/entries/\"$token\"-\"$kver\".conf; \
+                 fi && \
                  sed -i -e 's|^linux /boot/|linux /|' -e 's|^initrd /boot/|initrd /|' \
                      {TARGET}/boot/loader/entries/*.conf"
             )),
@@ -356,6 +384,7 @@ pub fn build_plan(cfg: &InstallConfig, pins: &BuildPins) -> Vec<Step> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::PoolTopology;
 
     fn test_cfg() -> InstallConfig {
         InstallConfig {
@@ -417,7 +446,13 @@ mod tests {
         cfg.topology = PoolTopology::Mirror;
         let plan = build_plan(&cfg, &BuildPins::default());
         let argv = find_zpool_create(&plan);
-        let tail: Vec<&str> = argv.iter().rev().take(3).rev().map(String::as_str).collect();
+        let tail: Vec<&str> = argv
+            .iter()
+            .rev()
+            .take(3)
+            .rev()
+            .map(String::as_str)
+            .collect();
         assert_eq!(tail, ["mirror", "/dev/sda3", "/dev/nvme0n1p3"]);
         // Both disks are partitioned; boot filesystems only on the first.
         let shells: Vec<&str> = plan
@@ -438,7 +473,9 @@ mod tests {
             })
             .collect();
         assert_eq!(mkfs.len(), 2);
-        assert!(mkfs.iter().all(|argv| argv.last().unwrap().starts_with("/dev/sda")));
+        assert!(mkfs
+            .iter()
+            .all(|argv| argv.last().unwrap().starts_with("/dev/sda")));
     }
 
     #[test]
@@ -447,7 +484,13 @@ mod tests {
         cfg.disks = vec!["/dev/sda".into(), "/dev/sdb".into(), "/dev/sdc".into()];
         cfg.topology = PoolTopology::Raidz1;
         let argv = find_zpool_create(&build_plan(&cfg, &BuildPins::default()));
-        let tail: Vec<&str> = argv.iter().rev().take(4).rev().map(String::as_str).collect();
+        let tail: Vec<&str> = argv
+            .iter()
+            .rev()
+            .take(4)
+            .rev()
+            .map(String::as_str)
+            .collect();
         assert_eq!(tail, ["raidz1", "/dev/sda3", "/dev/sdb3", "/dev/sdc3"]);
     }
 
@@ -476,13 +519,58 @@ mod tests {
             lumen_version: "0.1.0".into(),
         };
         let plan = build_plan(&test_cfg(), &pins);
-        let dnf_step = &plan[3];
-        let Action::Shell(script) = &dnf_step.actions[0] else {
-            panic!("expected shell dnf action");
-        };
+        let script = plan
+            .iter()
+            .flat_map(|s| &s.actions)
+            .find_map(|a| match a {
+                Action::Shell(s) if s.contains("dnf -y --installroot") => Some(s),
+                _ => None,
+            })
+            .expect("plan must contain the dnf install action");
         assert!(script.contains("kernel-6.12.0-211.7.3.el10_2"));
         assert!(script.contains("kmod-zfs"));
         assert!(script.contains("--disablerepo='*'"));
+    }
+
+    #[test]
+    fn machine_id_is_seeded_before_package_install() {
+        let plan = build_plan(&test_cfg(), &BuildPins::default());
+        let shells: Vec<&str> = plan
+            .iter()
+            .flat_map(|s| &s.actions)
+            .filter_map(|a| match a {
+                Action::Shell(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        let seed = shells
+            .iter()
+            .position(|s| s.contains("systemd-machine-id-setup"))
+            .expect("plan must seed the target machine-id");
+        let dnf = shells
+            .iter()
+            .position(|s| s.contains("dnf -y --installroot"))
+            .expect("plan must contain the dnf install action");
+        assert!(seed < dnf, "machine-id must be seeded before dnf runs");
+    }
+
+    #[test]
+    fn bls_entry_is_written_when_kernel_install_skipped_it() {
+        let plan = build_plan(&test_cfg(), &BuildPins::default());
+        let script = plan
+            .iter()
+            .flat_map(|s| &s.actions)
+            .find_map(|a| match a {
+                Action::Shell(s) if s.contains("/boot/loader/entries") => Some(s),
+                _ => None,
+            })
+            .expect("plan must handle BLS entries");
+        // Fallback entry generation, not just a hard existence gate.
+        assert!(script.contains("if ! ls"));
+        assert!(script.contains("grub_arg --unrestricted"));
+        assert!(script.contains("root=zfs:rpool/ROOT/lumen"));
+        // Kernel image installed if kernel-install skipped that too.
+        assert!(script.contains("/usr/lib/modules/"));
     }
 
     #[test]
