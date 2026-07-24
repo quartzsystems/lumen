@@ -23,9 +23,12 @@ jobs:
     container: almalinux:10
     steps:
       - name: Install build dependencies
+        # rust/pam-devel/nodejs: build-rpms.sh compiles lumen-controlplane
+        # and the web UI export before packaging them.
         run: |
           dnf -y install epel-release   # rpmlint lives in EPEL on EL10
-          dnf -y install rpm-build rpmdevtools rpmlint make git-core
+          dnf -y install rpm-build rpmdevtools rpmlint make git-core \
+            rust cargo pam-devel nodejs npm systemd-rpm-macros
       - uses: actions/checkout@v4
       - name: Build RPMs
         run: make rpms

@@ -109,5 +109,16 @@ in for PAM, so no OS accounts are touched); `make lint` adds
 fmt/clippy. CI builds both components on every push (`controlplane` and
 `webui` jobs in `.github/workflows/ci.yml`).
 
-Packaging (RPMs for the daemon + export, systemd unit, firewalld port)
-comes with the hypervisor integration work.
+## Appliance integration
+
+`make rpms` packages the daemon, the web UI export, the PAM service, the
+systemd unit, and a firewalld service definition into the
+**lumen-controlplane** RPM (see `packages/lumen-controlplane.spec`; the
+binary and export are compiled by `packages/build-rpms.sh` before
+rpmbuild, since cargo/npm need the network). The ISO pipeline ships the
+RPM in the on-media `lumen` repo and the offline-resolve gate covers it;
+the installer adds it to the target package set, enables
+`lumen-controlplane.service`, and opens 8443 via
+`firewall-offline-cmd --add-service=lumen-controlplane`. First boot of an
+installed appliance therefore serves the console at
+`https://<management-ip>:8443` with no manual steps.

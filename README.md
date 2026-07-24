@@ -49,7 +49,8 @@ inside it, but no `--privileged`, loop devices, or mounts needed:
 dnf config-manager --set-enabled crb
 dnf install rpm-build rpmdevtools rpmlint createrepo_c xorriso mtools \
             dosfstools squashfs-tools isomd5sum kmod \
-            rust cargo rustfmt clippy gtk4-devel make
+            rust cargo rustfmt clippy gtk4-devel pam-devel \
+            nodejs npm systemd-rpm-macros make
 ```
 
 Optional for linting shell scripts: `shellcheck` (EPEL).
@@ -62,8 +63,9 @@ Optional for linting shell scripts: `shellcheck` (EPEL).
 make rpms
 ```
 
-Builds `lumen-release`, `lumen-logos`, and `lumen-networking` as noarch
-RPMs into `dist/rpms/`. The version comes from the top-level `VERSION` file.
+Builds `lumen-release`, `lumen-logos`, and `lumen-networking` (noarch)
+plus `lumen-controlplane` (x86_64: management daemon + web UI export)
+into `dist/rpms/`. The version comes from the top-level `VERSION` file.
 
 ### 2. ISO
 
@@ -102,8 +104,11 @@ zone, management NIC (DHCP or static), and the boot drive. NICs are named
 system. The chosen drive is erased: EFI system partition + ext4 `/boot` +
 ZFS pool `rpool` holding the OS root dataset. Everything else is fixed
 appliance policy: minimal package set, SELinux enforcing (labeled at
-install time), firewalld with SSH only, chronyd enabled, hostname `lumen`.
-Log in as `root` with the password chosen in the installer.
+install time), firewalld with SSH and the management console only,
+chronyd enabled, hostname `lumen`. Log in as `root` with the password
+chosen in the installer — on the console at **https://\<ip\>:8443**
+(self-signed certificate; the built-in Lumen realm authenticates the
+appliance's own accounts) or over SSH.
 
 ## Versioning
 

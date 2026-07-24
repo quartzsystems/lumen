@@ -34,7 +34,8 @@ jobs:
           dnf config-manager --set-enabled crb
           dnf -y install rpm-build rpmdevtools createrepo_c xorriso mtools \
             dosfstools squashfs-tools isomd5sum kmod \
-            rust cargo gtk4-devel make git-core
+            rust cargo gtk4-devel pam-devel nodejs npm systemd-rpm-macros \
+            make git-core
       - uses: actions/checkout@v4
       - name: Cache cargo
         uses: actions/cache@v4
@@ -42,7 +43,8 @@ jobs:
           path: |
             ~/.cargo/registry
             build/cargo-target
-          key: cargo-iso-${{ hashFiles('lumen-installer/app/Cargo.toml') }}
+            build/cargo-target-cp
+          key: cargo-iso-${{ hashFiles('lumen-installer/app/Cargo.toml', 'lumen-controlplane/Cargo.lock') }}
       - name: Restore cached upstream ISO
         uses: actions/cache@v4
         with:

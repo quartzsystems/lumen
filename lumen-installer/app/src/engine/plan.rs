@@ -198,7 +198,7 @@ pub fn build_plan(cfg: &InstallConfig, pins: &BuildPins) -> Vec<Step> {
              e2fsprogs dosfstools \
              NetworkManager chrony firewalld openssh-server \
              policycoreutils selinux-policy-targeted \
-             lumen-release lumen-networking"
+             lumen-release lumen-networking lumen-controlplane"
             )),
         ],
     });
@@ -251,7 +251,14 @@ pub fn build_plan(cfg: &InstallConfig, pins: &BuildPins) -> Vec<Step> {
             // run from the live env (which sees /sys) against the target.
             sh(format!("/usr/sbin/lumen-nicnames --root {TARGET}")),
             sh(format!(
-                "systemctl --root={TARGET} enable NetworkManager chronyd sshd firewalld"
+                "systemctl --root={TARGET} enable NetworkManager chronyd sshd firewalld \
+                 lumen-controlplane"
+            )),
+            // Open the management console port (8443). firewalld isn't
+            // running in the target, so edit its permanent config offline;
+            // the service definition ships in lumen-controlplane.
+            sh(format!(
+                "chroot {TARGET} firewall-offline-cmd --add-service=lumen-controlplane"
             )),
         ],
     });
@@ -685,6 +692,39 @@ mod tests {
             )
         });
         assert!(found, "plan must write the ESP grub.cfg stub");
+    }
+
+    #[test]
+    fn controlplane_is_installed_enabled_and_reachable() {
+        let plan = build_plan(&test_cfg(), &BuildPins::default());
+        let shells: Vec<&str> = plan
+            .iter()
+            .flat_map(|s| &s.actions)
+            .filter_map(|a| match a {
+                Action::Shell(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        // In the offline package set…
+        assert!(shells
+            .iter()
+            .any(|s| s.contains("dnf -y --installroot") && s.contains("lumen-controlplane")));
+        // …enabled at boot…
+        assert!(shells
+            .iter()
+            .any(|s| s.contains("systemctl --root") && s.contains("lumen-controlplane")));
+        // …and reachable: the console port must be opened in firewalld's
+        // permanent config, after the package that ships the service
+        // definition is installed.
+        let dnf = shells
+            .iter()
+            .position(|s| s.contains("dnf -y --installroot"))
+            .expect("plan must install packages");
+        let fw = shells
+            .iter()
+            .position(|s| s.contains("firewall-offline-cmd --add-service=lumen-controlplane"))
+            .expect("plan must open the console port");
+        assert!(dnf < fw, "firewall edit needs the installed service file");
     }
 
     #[test]
