@@ -178,6 +178,7 @@ resolve_out="$(dnf --assumeno --installroot="$resolve_root" --releasever=10 \
     install @core "$KERNEL_NEVR" zfs kmod-zfs zfs-dracut \
         grub2-efi-x64 shim-x64 grub2-tools grubby efibootmgr \
         e2fsprogs dosfstools NetworkManager chrony firewalld openssh-server \
+        policycoreutils selinux-policy-targeted \
         lumen-release lumen-networking 2>&1)"
 set -e
 # --assumeno exits nonzero after successfully resolving; a printed
