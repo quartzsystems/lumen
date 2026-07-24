@@ -5,7 +5,7 @@
   </picture>
 </p>
 
-**Light-weight KVM orchestration for AlmaLinux.**
+**Lumen — a KVM hypervisor built to illuminate your machines.**
 
 Lumen is a KVM hypervisor platform by [Quartz Systems](https://www.quartzsystems.net).
 At this stage the repository contains the **appliance ISO with a custom
