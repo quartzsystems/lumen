@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# NetworkManager dispatcher hook: re-render the console banner whenever an
+# interface gains or loses addresses, so the banner always shows the current
+# management IP (DHCP renews/moves included).
+case "$2" in
+    up|down|dhcp4-change|dhcp6-change)
+        exec /usr/sbin/lumen-console-banner
+        ;;
+esac
+exit 0

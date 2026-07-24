@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import * as api from "@/lib/authClient";
 import type { RealmInfo } from "@/lib/authClient";
@@ -37,9 +37,8 @@ function EyeIcon({ off }: { off?: boolean }) {
   );
 }
 
-/// Chevron for the realm dropdown (the native indicator is hidden so the
-/// select matches the text inputs).
-function ChevronIcon() {
+/// Chevron for the realm dropdown.
+function ChevronIcon({ open }: { open?: boolean }) {
   return (
     <svg
       width="14"
@@ -51,9 +50,157 @@ function ChevronIcon() {
       strokeLinecap="round"
       strokeLinejoin="round"
       aria-hidden="true"
+      style={{
+        transform: open ? "rotate(180deg)" : undefined,
+        transition: "transform var(--qz-dur-2) var(--qz-ease-out)",
+      }}
     >
       <path d="m6 9 6 6 6-6" />
     </svg>
+  );
+}
+
+/// Check mark on the selected realm option.
+function CheckIcon() {
+  return (
+    <svg
+      width="13"
+      height="13"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M20 6 9 17l-5-5" />
+    </svg>
+  );
+}
+
+/// Custom realm dropdown. A native <select>'s popup takes the OS widget
+/// theme and can't be styled to the Quartz dark tokens, so the listbox is
+/// drawn by hand: same field styling as the text inputs, options on a
+/// raised dark surface. Keyboard: arrows move, Enter/Space select, Escape
+/// closes.
+function RealmSelect({
+  realms,
+  value,
+  onChange,
+}: {
+  realms: RealmInfo[];
+  value: string;
+  onChange: (id: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [active, setActive] = useState(0);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const selected = realms.find((r) => r.id === value);
+
+  // Close when clicking anywhere outside the control.
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (e: PointerEvent) => {
+      if (!rootRef.current?.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    return () => document.removeEventListener("pointerdown", onPointerDown);
+  }, [open]);
+
+  const openList = () => {
+    setActive(Math.max(0, realms.findIndex((r) => r.id === value)));
+    setOpen(true);
+  };
+
+  const choose = (id: string) => {
+    onChange(id);
+    setOpen(false);
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (!open) {
+      if (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        openList();
+      }
+      return;
+    }
+    if (e.key === "Escape") {
+      setOpen(false);
+    } else if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setActive((i) => Math.min(i + 1, realms.length - 1));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setActive((i) => Math.max(i - 1, 0));
+    } else if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      if (realms[active]) choose(realms[active].id);
+    } else if (e.key === "Tab") {
+      setOpen(false);
+    }
+  };
+
+  return (
+    <div className="relative" ref={rootRef}>
+      <button
+        type="button"
+        onClick={() => (open ? setOpen(false) : openList())}
+        onKeyDown={handleKeyDown}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        className="w-full rounded-md px-3 py-[10px] text-[13px] text-left text-[var(--qz-fg-1)] outline-none transition-colors cursor-pointer flex items-center justify-between"
+        style={{
+          background: "var(--qz-input-bg)",
+          border: `1px solid ${open ? "var(--qz-accent)" : "var(--qz-border)"}`,
+        }}
+        onFocus={(e) => (e.currentTarget.style.borderColor = "var(--qz-accent)")}
+        onBlur={(e) => {
+          if (!open) e.currentTarget.style.borderColor = "var(--qz-border)";
+        }}
+      >
+        <span>{selected?.name ?? value}</span>
+        <span className="text-[var(--qz-fg-4)]">
+          <ChevronIcon open={open} />
+        </span>
+      </button>
+
+      {open && (
+        <ul
+          role="listbox"
+          aria-label="Realm"
+          className="absolute left-0 right-0 z-10 mt-1 m-0 p-1 list-none rounded-md overflow-hidden"
+          style={{
+            background: "var(--qz-surface-raised)",
+            border: "1px solid var(--qz-border-strong)",
+            boxShadow: "var(--qz-shadow-2)",
+          }}
+        >
+          {realms.map((r, i) => (
+            <li
+              key={r.id}
+              role="option"
+              aria-selected={r.id === value}
+              onPointerEnter={() => setActive(i)}
+              onClick={() => choose(r.id)}
+              className="rounded px-2 py-[8px] text-[13px] cursor-pointer flex items-center justify-between transition-colors"
+              style={{
+                background: i === active ? "var(--qz-accent-soft)" : "transparent",
+                color: r.id === value ? "var(--qz-fg-1)" : "var(--qz-fg-2)",
+              }}
+            >
+              <span>{r.name}</span>
+              {r.id === value && (
+                <span style={{ color: "var(--qz-accent)" }}>
+                  <CheckIcon />
+                </span>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
   );
 }
 
@@ -184,28 +331,7 @@ export function LoginForm() {
 
           <div>
             <label className="block text-[12px] text-[var(--qz-fg-3)] mb-[6px]">Realm</label>
-            <div className="relative">
-              <select
-                value={realm}
-                onChange={(e) => setRealm(e.target.value)}
-                className={`${inputBase} appearance-none pr-10 cursor-pointer`}
-                style={{
-                  background: "var(--qz-input-bg)",
-                  border: "1px solid var(--qz-border)",
-                }}
-                onFocus={(e) => (e.currentTarget.style.borderColor = "var(--qz-accent)")}
-                onBlur={(e) => (e.currentTarget.style.borderColor = "var(--qz-border)")}
-              >
-                {realms.map((r) => (
-                  <option key={r.id} value={r.id}>
-                    {r.name}
-                  </option>
-                ))}
-              </select>
-              <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[var(--qz-fg-4)] pointer-events-none">
-                <ChevronIcon />
-              </span>
-            </div>
+            <RealmSelect realms={realms} value={realm} onChange={setRealm} />
           </div>
 
           {error && (

@@ -252,7 +252,7 @@ pub fn build_plan(cfg: &InstallConfig, pins: &BuildPins) -> Vec<Step> {
             sh(format!("/usr/sbin/lumen-nicnames --root {TARGET}")),
             sh(format!(
                 "systemctl --root={TARGET} enable NetworkManager chronyd sshd firewalld \
-                 lumen-controlplane"
+                 lumen-controlplane lumen-console-banner"
             )),
             // Open the management console port (8443). firewalld isn't
             // running in the target, so edit its permanent config offline;
@@ -709,10 +709,11 @@ mod tests {
         assert!(shells
             .iter()
             .any(|s| s.contains("dnf -y --installroot") && s.contains("lumen-controlplane")));
-        // …enabled at boot…
-        assert!(shells
-            .iter()
-            .any(|s| s.contains("systemctl --root") && s.contains("lumen-controlplane")));
+        // …enabled at boot, together with the console banner that surfaces
+        // the console's address on the pre-login screen…
+        assert!(shells.iter().any(|s| s.contains("systemctl --root")
+            && s.contains("lumen-controlplane")
+            && s.contains("lumen-console-banner")));
         // …and reachable: the console port must be opened in firewalld's
         // permanent config, after the package that ships the service
         // definition is installed.

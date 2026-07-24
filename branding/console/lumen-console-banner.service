@@ -1,0 +1,16 @@
+[Unit]
+Description=Render the Lumen console banner with the current address
+Documentation=https://github.com/quartzsystems/lumen
+# network.target, not -online: the login prompt must never wait out a DHCP
+# timeout. If the lease lands later, the NetworkManager dispatcher hook
+# re-renders the banner with the address.
+After=network.target
+Before=getty.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/lumen-console-banner
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
