@@ -205,7 +205,12 @@ pub fn build_plan(cfg: &InstallConfig, pins: &BuildPins) -> Vec<Step> {
             ]),
             Action::WriteFile {
                 path: format!("{TARGET}/etc/hostname"),
-                contents: "lumen\n".into(),
+                contents: format!("{}\n", cfg.hostname),
+                mode: 0o644,
+            },
+            Action::WriteFile {
+                path: format!("{TARGET}/etc/vconsole.conf"),
+                contents: format!("KEYMAP={}\n", cfg.keymap),
                 mode: 0o644,
             },
             Action::WriteFile {
@@ -257,6 +262,18 @@ pub fn build_plan(cfg: &InstallConfig, pins: &BuildPins) -> Vec<Step> {
             sh(format!(
                 "chroot {TARGET} grub2-mkconfig -o /boot/grub2/grub.cfg"
             )),
+            // The signed grubx64.efi has prefix /EFI/almalinux baked in and
+            // loads $prefix/grub.cfg from the ESP. Anaconda normally writes
+            // that stub; dnf --installroot does not — without it GRUB drops
+            // to the shell. The stub chains to the real config on /boot.
+            sh(format!(
+                "boot_uuid=$(blkid -s UUID -o value {boot}) && \
+                 {{ printf 'search --no-floppy --fs-uuid --set=dev %s\\n' \"$boot_uuid\"; \
+                    printf 'set prefix=($dev)/grub2\\n'; \
+                    printf 'export $prefix\\n'; \
+                    printf 'configfile $prefix/grub.cfg\\n'; \
+                 }} > {TARGET}/boot/efi/EFI/almalinux/grub.cfg"
+            )),
             sh(format!(
                 "chroot {TARGET} grubby --update-kernel=ALL --args='{root_arg}'"
             )),
@@ -293,10 +310,33 @@ mod tests {
         InstallConfig {
             root_password_hash: "$6$s$h".into(),
             timezone: "America/New_York".into(),
+            keymap: "us".into(),
+            hostname: "lumen01.example.lan".into(),
             nic: "nic0".into(),
             network: NetworkConfig::Dhcp,
             disk: "/dev/sda".into(),
         }
+    }
+
+    #[test]
+    fn hostname_and_keymap_reach_the_target() {
+        let plan = build_plan(&test_cfg(), &BuildPins::default());
+        let files: Vec<(&str, &str)> = plan
+            .iter()
+            .flat_map(|s| &s.actions)
+            .filter_map(|a| match a {
+                Action::WriteFile { path, contents, .. } => {
+                    Some((path.as_str(), contents.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(files
+            .iter()
+            .any(|(p, c)| p.ends_with("/etc/hostname") && c.trim() == "lumen01.example.lan"));
+        assert!(files
+            .iter()
+            .any(|(p, c)| p.ends_with("/etc/vconsole.conf") && c.trim() == "KEYMAP=us"));
     }
 
     #[test]
@@ -331,6 +371,20 @@ mod tests {
         assert!(script.contains("kernel-6.12.0-211.7.3.el10_2"));
         assert!(script.contains("kmod-zfs"));
         assert!(script.contains("--disablerepo='*'"));
+    }
+
+    #[test]
+    fn esp_stub_chains_to_boot_grub2() {
+        let plan = build_plan(&test_cfg(), &BuildPins::default());
+        let found = plan.iter().flat_map(|s| &s.actions).any(|a| {
+            matches!(
+                a,
+                Action::Shell(s)
+                    if s.contains("/boot/efi/EFI/almalinux/grub.cfg")
+                    && s.contains("configfile")
+            )
+        });
+        assert!(found, "plan must write the ESP grub.cfg stub");
     }
 
     #[test]

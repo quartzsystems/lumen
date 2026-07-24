@@ -9,11 +9,32 @@ pub struct InstallConfig {
     pub root_password_hash: String,
     /// IANA zone name, e.g. "America/New_York" or "UTC".
     pub timezone: String,
+    /// Console keymap for the installed system (/etc/vconsole.conf).
+    pub keymap: String,
+    /// Hostname or FQDN, e.g. "lumen01.example.lan".
+    pub hostname: String,
     /// Management NIC name as shown in the live env (nic0..nicN).
     pub nic: String,
     pub network: NetworkConfig,
     /// Whole-disk target device path, e.g. "/dev/sda" or "/dev/nvme0n1".
     pub disk: String,
+}
+
+/// Accepts a dotted-quad netmask ("255.255.240.0") or a bare prefix
+/// length ("20") and returns the prefix, rejecting non-contiguous masks.
+pub fn parse_netmask(text: &str) -> Option<u8> {
+    let text = text.trim();
+    if let Ok(prefix) = text.parse::<u8>() {
+        return (1..=32).contains(&prefix).then_some(prefix);
+    }
+    let mask: std::net::Ipv4Addr = text.parse().ok()?;
+    let bits = u32::from(mask);
+    let prefix = bits.count_ones() as u8;
+    if prefix == 0 || prefix > 32 {
+        return None;
+    }
+    let expected = u32::MAX << (32 - prefix);
+    (bits == expected).then_some(prefix)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,10 +100,25 @@ mod tests {
     }
 
     #[test]
+    fn netmask_parsing() {
+        assert_eq!(parse_netmask("255.255.255.0"), Some(24));
+        assert_eq!(parse_netmask("255.255.240.0"), Some(20));
+        assert_eq!(parse_netmask("255.255.255.255"), Some(32));
+        assert_eq!(parse_netmask("24"), Some(24));
+        assert_eq!(parse_netmask("255.0.255.0"), None); // non-contiguous
+        assert_eq!(parse_netmask("0.0.0.0"), None);
+        assert_eq!(parse_netmask("0"), None);
+        assert_eq!(parse_netmask("33"), None);
+        assert_eq!(parse_netmask("garbage"), None);
+    }
+
+    #[test]
     fn config_json_roundtrip() {
         let cfg = InstallConfig {
             root_password_hash: "$6$salt$hash".into(),
             timezone: "UTC".into(),
+            keymap: "us".into(),
+            hostname: "lumen01.example.lan".into(),
             nic: "nic0".into(),
             network: NetworkConfig::Static {
                 cidr: "192.168.10.5/24".into(),

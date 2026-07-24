@@ -1,128 +1,177 @@
 /* Quartz Systems Lumen installer theme.
  *
- * Tokens from branding/logos/README.md:
- *   ink        #0b0d12
- *   green-300  #4dffb2
- *   green-500  #00d992
- *   green-600  #00b07a
- *   text       #f2f3f5
- * Dark console aesthetic (JetBrains Mono everywhere), approximating
- * Quartz Command until the real design tokens are wired in.
+ * Faithful to the Quartz design system (quartz-command
+ * frontend/app/globals.css — shared with QuartzFire):
+ *   bg #0f1117 (ink-1)      surface #161920 (ink-2)   raised #1d2029 (ink-4)
+ *   input #1a1d26 (ink-3)   border #252830 (ink-5)    strong #2f323c (ink-6)
+ *   fg-1 #f2f3f5  fg-2 #d7d9de  fg-3 #a2a6b0  fg-4 #6b6f7a
+ *   accent #00d992  hover #1aff9c  press #00b07a  on-accent #062014
+ *   danger #ff5d6c  divider #1c1f28  subtle-border #1f222b
+ * Type: Manrope for body/titles, JetBrains Mono for eyebrows/labels/
+ * values (mono-uppercase labels are uppercased in code — GTK has no
+ * text-transform). Radii: 10px cards, 12px modals, 6px controls.
+ * GTK4 CSS has no box-shadow/color-mix; soft mixes are precomputed rgba.
  */
 
+/* Route GTK's stock accent to Quartz green so built-in focus rings,
+ * selections, switches, etc. never fall back to Adwaita blue. */
+@define-color accent_color #00d992;
+@define-color accent_bg_color #00d992;
+@define-color accent_fg_color #062014;
+
 window {
-    background-color: #0b0d12;
-    color: #f2f3f5;
-    font-family: "JetBrains Mono", monospace;
-    font-size: 14px;
+    background-color: #0f1117;
+    color: #d7d9de;
+    font-family: "Manrope", "Noto Sans", sans-serif;
+    font-size: 15px;
 }
 
 label {
+    color: #d7d9de;
+}
+
+/* Focus outlines: always green, never theme blue. */
+* {
+    outline-color: rgba(0, 217, 146, 0.85);
+    outline-offset: 2px;
+}
+
+/* Text selection inside entries/textviews (accent-soft). */
+selection {
+    background-color: rgba(0, 217, 146, 0.30);
     color: #f2f3f5;
 }
 
+/* Eyebrow / step indicator: mono uppercase label, fg-4. */
+.qz-step {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    color: #6b6f7a;
+}
+
 .qz-title {
-    font-size: 26px;
-    font-weight: 700;
-    color: #4dffb2;
+    font-size: 24px;
+    font-weight: 800;
+    letter-spacing: -0.2px;
+    color: #f2f3f5;
 }
 
 .qz-subtitle {
-    font-size: 15px;
-    color: #8b93a1;
-}
-
-.qz-step {
-    font-size: 12px;
-    color: #00d992;
-    letter-spacing: 0.15em;
+    font-size: 13px;
+    color: #a2a6b0;
 }
 
 .qz-error {
-    color: #ff6b6b;
+    font-size: 13px;
+    color: #ff5d6c;
 }
 
 .qz-hint {
     font-size: 12px;
-    color: #8b93a1;
+    color: #a2a6b0;
 }
 
+/* Card = .surface: ink-2, border ink-5, radius 10. */
 .qz-card {
-    background-color: #10141b;
-    border: 1px solid #1d2430;
-    border-radius: 8px;
-    padding: 16px;
+    background-color: #161920;
+    border: 1px solid #252830;
+    border-radius: 10px;
+    padding: 18px;
 }
 
+/* Buttons: rounded-md (6px), semibold 13px, 8px/14px padding, 140ms.
+ * Default button = Quartz "secondary". */
 button {
-    background-color: #12161d;
+    background-color: #1d2029;
     background-image: none;
     color: #f2f3f5;
-    border: 1px solid #232a35;
+    font-size: 13px;
+    font-weight: 600;
+    border: 1px solid #252830;
     border-radius: 6px;
-    padding: 8px 20px;
+    padding: 8px 14px;
     box-shadow: none;
     text-shadow: none;
+    transition: background-color 140ms, border-color 140ms, color 140ms;
 }
 
 button:hover {
-    border-color: #00d992;
+    background-color: #262932;
 }
 
+button:disabled {
+    background-color: #1a1d26;
+    color: #6b6f7a;
+    border-color: #1f222b;
+}
+
+/* Quartz "primary". */
 button.suggested-action {
     background-color: #00d992;
-    color: #0b0d12;
-    font-weight: 700;
-    border-color: #00d992;
+    color: #062014;
+    border-color: transparent;
 }
 
 button.suggested-action:hover {
-    background-color: #4dffb2;
-    border-color: #4dffb2;
+    background-color: #1aff9c;
+}
+
+button.suggested-action:active {
+    background-color: #00b07a;
 }
 
 button.suggested-action:disabled {
-    background-color: #1d2430;
-    color: #566072;
-    border-color: #1d2430;
+    background-color: #1d2029;
+    color: #6b6f7a;
+    border-color: #1f222b;
 }
 
+/* Quartz "danger": solid, white text. */
 button.destructive-action {
-    background-color: #3d1116;
-    color: #ff6b6b;
-    border-color: #7a222c;
+    background-color: #ff5d6c;
+    color: #ffffff;
+    border-color: transparent;
 }
 
 button.destructive-action:hover {
-    background-color: #7a222c;
-    color: #f2f3f5;
+    background-color: #ff7583;
 }
 
-entry,
-entry.password {
-    background-color: #12161d;
+entry {
+    background-color: #1a1d26;
     background-image: none;
     color: #f2f3f5;
-    border: 1px solid #232a35;
+    font-size: 13px;
+    border: 1px solid #2f323c;
     border-radius: 6px;
     padding: 8px 10px;
     caret-color: #00d992;
+    transition: border-color 140ms;
 }
 
 entry:focus-within {
     border-color: #00d992;
+    outline-color: rgba(0, 217, 146, 0.85);
+}
+
+entry:disabled,
+label:disabled {
+    opacity: 0.4;
 }
 
 list,
 listview {
-    background-color: #10141b;
-    border: 1px solid #1d2430;
-    border-radius: 8px;
+    background-color: #161920;
+    border: 1px solid #252830;
+    border-radius: 10px;
 }
 
 row {
-    padding: 10px 14px;
-    border-bottom: 1px solid #161c26;
+    padding: 12px 14px;
+    font-size: 13px;
+    border-bottom: 1px solid #1c1f28;
 }
 
 row:selected {
@@ -130,34 +179,60 @@ row:selected {
     color: #f2f3f5;
 }
 
+row:hover {
+    background-color: rgba(255, 255, 255, 0.04);
+}
+
+checkbutton {
+    font-size: 13px;
+}
+
 checkbutton radio,
 checkbutton check {
-    border: 1px solid #3a4454;
-    background-color: #12161d;
+    border: 1px solid #2f323c;
+    background-color: #1a1d26;
     background-image: none;
+    transition: background-color 120ms, border-color 120ms;
+}
+
+checkbutton radio:hover,
+checkbutton check:hover {
+    border-color: #6b6f7a;
 }
 
 checkbutton radio:checked,
 checkbutton check:checked {
     background-color: #00d992;
     border-color: #00d992;
-    color: #0b0d12;
+    color: #062014;
+}
+
+checkbutton:focus-visible,
+dropdown > button:focus-visible,
+row:focus-visible {
+    outline-color: rgba(0, 217, 146, 0.85);
 }
 
 dropdown > button {
-    background-color: #12161d;
-    border: 1px solid #232a35;
+    background-color: #1a1d26;
+    border: 1px solid #2f323c;
+    font-weight: 400;
+}
+
+dropdown > button:hover {
+    background-color: #20242e;
 }
 
 popover > contents {
-    background-color: #10141b;
-    border: 1px solid #232a35;
+    background-color: #161920;
+    border: 1px solid #252830;
+    border-radius: 10px;
     color: #f2f3f5;
 }
 
 progressbar trough {
-    background-color: #12161d;
-    border: 1px solid #232a35;
+    background-color: #1a1d26;
+    border: 1px solid #252830;
     border-radius: 4px;
     min-height: 10px;
 }
@@ -171,17 +246,74 @@ progressbar progress {
 
 textview,
 textview text {
-    background-color: #0e1117;
-    color: #aeb6c2;
+    background-color: #0b0d12;
+    color: #a2a6b0;
+    font-family: "JetBrains Mono", monospace;
     font-size: 12px;
 }
 
 scrolledwindow {
-    border: 1px solid #1d2430;
+    border: 1px solid #1f222b;
     border-radius: 6px;
 }
 
+scrollbar slider {
+    background-color: #252830;
+    border-radius: 999px;
+}
+
 separator {
-    background-color: #1d2430;
+    background-color: #1c1f28;
     min-height: 1px;
+}
+
+/* Quartz modal: ink-0, border ink-5, radius 12 (ModalShell). */
+window.qz-dialog {
+    background-color: #0b0d12;
+    border: 1px solid #252830;
+    border-radius: 12px;
+}
+
+/* ModalHeader title: 17px bold fg-1. */
+.qz-dialog-title {
+    font-size: 17px;
+    font-weight: 700;
+    letter-spacing: -0.2px;
+    color: #f2f3f5;
+}
+
+/* Summary table (qz-table): mono uppercase keys (uppercased in code),
+ * 13px values, divider row borders. */
+.qz-summary {
+    background-color: #161920;
+    border: 1px solid #252830;
+    border-radius: 10px;
+}
+
+.qz-summary row {
+    padding: 12px 14px;
+    border-bottom: 1px solid #1c1f28;
+}
+
+.qz-summary-key {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    color: #6b6f7a;
+}
+
+.qz-summary-value {
+    font-size: 13px;
+    color: #d7d9de;
+}
+
+/* Progress details expander. */
+.qz-details {
+    margin-top: 8px;
+}
+
+.qz-details > label {
+    font-size: 13px;
+    color: #a2a6b0;
 }

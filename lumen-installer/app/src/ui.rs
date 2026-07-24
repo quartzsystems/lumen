@@ -1,8 +1,9 @@
-//! GTK4 wizard: welcome -> root password -> time zone -> network -> disk
-//! -> summary -> progress -> done. Linear flow over a GtkStack; state
-//! collected into `Draft`, converted to an InstallConfig on confirm.
+//! GTK4 wizard: welcome -> root password -> location & time zone ->
+//! management network -> boot drive -> summary -> progress -> done.
+//! Linear flow over a GtkStack; state collected into `Draft`, converted to
+//! an InstallConfig when the operator confirms the summary.
 
-use crate::config::{BuildPins, InstallConfig, NetworkConfig};
+use crate::config::{parse_netmask, BuildPins, InstallConfig, NetworkConfig};
 use crate::engine;
 use crate::sysinfo;
 
@@ -14,16 +15,22 @@ use std::rc::Rc;
 use std::str::FromStr;
 
 const PAGES: [&str; 8] = [
-    "welcome", "password", "timezone", "network", "disk", "summary", "progress", "done",
+    "welcome", "password", "location", "network", "disk", "summary", "progress", "done",
 ];
 
 #[derive(Default)]
 struct Draft {
     password: String,
+    country: String,
     timezone: String,
+    keymap_label: String,
+    keymap: String,
     nic: String,
+    hostname: String,
     dhcp: bool,
-    cidr: String,
+    ip: String,
+    netmask: String,
+    prefix: u8,
     gateway: String,
     dns: Vec<String>,
     disk: String,
@@ -52,7 +59,11 @@ pub fn build(app: &gtk::Application) {
 
     let draft = Rc::new(RefCell::new(Draft {
         dhcp: true,
+        country: "Other (UTC)".into(),
         timezone: "UTC".into(),
+        keymap_label: "English (US)".into(),
+        keymap: "us".into(),
+        hostname: "lumen".into(),
         ..Default::default()
     }));
 
@@ -63,10 +74,9 @@ pub fn build(app: &gtk::Application) {
 
     stack.add_named(&page_welcome(&stack), Some(PAGES[0]));
     stack.add_named(&page_password(&stack, &draft), Some(PAGES[1]));
-    stack.add_named(&page_timezone(&stack, &draft), Some(PAGES[2]));
+    stack.add_named(&page_location(&stack, &draft), Some(PAGES[2]));
     stack.add_named(&page_network(&stack, &draft), Some(PAGES[3]));
     stack.add_named(&page_disk(&stack, &draft), Some(PAGES[4]));
-    // summary/progress/done need the window for dialogs.
     stack.add_named(&page_summary(&stack, &draft, &window), Some(PAGES[5]));
 
     let progress = ProgressPage::new();
@@ -89,12 +99,31 @@ thread_local! {
 
 // --- layout helpers ---------------------------------------------------------
 
+/// Lumen lockup (dark-background PNG compiled into the binary).
+fn lumen_lockup(height: i32) -> Option<gtk::Picture> {
+    let bytes = glib::Bytes::from_static(include_bytes!(
+        "../../../branding/logos/png/lumen-lockup-dark-bg.png"
+    ));
+    let texture = gtk::gdk::Texture::from_bytes(&bytes).ok()?;
+    let picture = gtk::Picture::for_paintable(&texture);
+    picture.set_can_shrink(true);
+    picture.set_halign(gtk::Align::Start);
+    // Source is 808x288; keep the aspect ratio.
+    picture.set_size_request(height * 808 / 288, height);
+    Some(picture)
+}
+
 fn shell(step: &str, title: &str, subtitle: &str) -> (gtk::Box, gtk::Box, gtk::Box) {
     let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    outer.set_margin_top(48);
+    outer.set_margin_top(40);
     outer.set_margin_bottom(32);
     outer.set_margin_start(96);
     outer.set_margin_end(96);
+
+    if let Some(logo) = lumen_lockup(30) {
+        logo.set_margin_bottom(28);
+        outer.append(&logo);
+    }
 
     let step_label = gtk::Label::new(Some(step));
     step_label.add_css_class("qz-step");
@@ -129,7 +158,15 @@ fn shell(step: &str, title: &str, subtitle: &str) -> (gtk::Box, gtk::Box, gtk::B
 }
 
 fn nav_button(label: &str, suggested: bool) -> gtk::Button {
-    let button = gtk::Button::with_label(label);
+    let button = gtk::Button::new();
+    // The ◂/▸ glyphs render tiny in JetBrains Mono; scale them up
+    // relative to the label text.
+    let markup = glib::markup_escape_text(label)
+        .replace('◂', "<span size=\"x-large\">◂</span>")
+        .replace('▸', "<span size=\"x-large\">▸</span>");
+    let text = gtk::Label::new(None);
+    text.set_markup(&markup);
+    button.set_child(Some(&text));
     if suggested {
         button.add_css_class("suggested-action");
     }
@@ -138,6 +175,30 @@ fn nav_button(label: &str, suggested: bool) -> gtk::Button {
 
 fn go(stack: &gtk::Stack, page: &str) {
     stack.set_visible_child_name(page);
+}
+
+/// DropDown over plain strings with type-to-search enabled.
+fn string_dropdown(items: &[&str]) -> gtk::DropDown {
+    let dd = gtk::DropDown::from_strings(items);
+    dd.set_enable_search(true);
+    dd.set_expression(Some(&gtk::PropertyExpression::new(
+        gtk::StringObject::static_type(),
+        gtk::Expression::NONE,
+        "string",
+    )));
+    dd
+}
+
+fn set_strings(dd: &gtk::DropDown, items: &[String]) {
+    let refs: Vec<&str> = items.iter().map(String::as_str).collect();
+    dd.set_model(Some(&gtk::StringList::new(&refs)));
+    dd.set_selected(0);
+}
+
+fn form_label(text: &str) -> gtk::Label {
+    let label = gtk::Label::new(Some(text));
+    label.set_halign(gtk::Align::Start);
+    label
 }
 
 fn list_row(title: &str, subtitle: &str) -> gtk::ListBoxRow {
@@ -154,17 +215,61 @@ fn list_row(title: &str, subtitle: &str) -> gtk::ListBoxRow {
     row
 }
 
+fn valid_hostname(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 253
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+}
+
 // --- pages -------------------------------------------------------------------
 
 fn page_welcome(stack: &gtk::Stack) -> gtk::Box {
-    let (outer, content, footer) = shell(
-        "QUARTZ SYSTEMS",
-        "Lumen",
-        &format!(
-            "{} — hypervisor appliance installer",
-            sysinfo::lumen_version()
-        ),
-    );
+    let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    outer.set_margin_top(72);
+    outer.set_margin_bottom(32);
+    outer.set_margin_start(96);
+    outer.set_margin_end(96);
+
+    let eyebrow = gtk::Label::new(Some("QUARTZ SYSTEMS"));
+    eyebrow.add_css_class("qz-step");
+    eyebrow.set_halign(gtk::Align::Start);
+    eyebrow.set_margin_bottom(16);
+    outer.append(&eyebrow);
+
+    match lumen_lockup(84) {
+        Some(logo) => outer.append(&logo),
+        None => {
+            let title = gtk::Label::new(Some("Lumen"));
+            title.add_css_class("qz-title");
+            title.set_halign(gtk::Align::Start);
+            outer.append(&title);
+        }
+    }
+
+    let subtitle = gtk::Label::new(Some(&format!(
+        "{} — hypervisor appliance installer",
+        sysinfo::lumen_version()
+    )));
+    subtitle.add_css_class("qz-subtitle");
+    subtitle.set_halign(gtk::Align::Start);
+    subtitle.set_margin_top(16);
+    subtitle.set_margin_bottom(24);
+    outer.append(&subtitle);
+
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.set_vexpand(true);
+    outer.append(&content);
+
+    let footer = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    footer.set_halign(gtk::Align::End);
+    footer.set_margin_top(24);
+    outer.append(&footer);
 
     let mut blocker: Option<&str> = None;
     if !sysinfo::is_uefi() {
@@ -184,7 +289,7 @@ fn page_welcome(stack: &gtk::Stack) -> gtk::Box {
     } else {
         let blurb = gtk::Label::new(Some(
             "This wizard installs Lumen onto a single disk: root password, \
-             time zone, management network, and the target drive. The target \
+             location, management network, and the target drive. The target \
              drive is formatted with ZFS (rpool) and completely erased.",
         ));
         blurb.set_wrap(true);
@@ -225,19 +330,15 @@ fn page_password(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
     let form = gtk::Box::new(gtk::Orientation::Vertical, 8);
     form.add_css_class("qz-card");
     form.set_halign(gtk::Align::Start);
-    form.set_size_request(480, -1);
-    let l1 = gtk::Label::new(Some("Password"));
-    l1.set_halign(gtk::Align::Start);
-    let l2 = gtk::Label::new(Some("Confirm password"));
-    l2.set_halign(gtk::Align::Start);
-    form.append(&l1);
+    form.set_size_request(520, -1);
+    form.append(&form_label("Password"));
     form.append(&entry);
-    form.append(&l2);
+    form.append(&form_label("Confirm password"));
     form.append(&confirm);
     form.append(&hint);
     content.append(&form);
 
-    let back = gtk::Button::with_label("◂ Back");
+    let back = nav_button("◂ Back", false);
     let next = nav_button("Next ▸", true);
     next.set_sensitive(false);
 
@@ -278,7 +379,7 @@ fn page_password(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
         let entry = entry.clone();
         next.connect_clicked(move |_| {
             draft.borrow_mut().password = entry.text().to_string();
-            go(&stack, "timezone");
+            go(&stack, "location");
         });
     }
     footer.append(&back);
@@ -286,74 +387,56 @@ fn page_password(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
     outer
 }
 
-fn page_timezone(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
+fn page_location(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
     let (outer, content, footer) = shell(
         "STEP 2 OF 4",
-        "Time zone",
-        "The appliance clock is NTP-synchronized (chrony); pick the local zone.",
+        "Location and time zone",
+        "Selecting a country narrows the time zone list. The keyboard layout \
+         applies to the installed system's console.",
     );
 
-    let zones = Rc::new(sysinfo::timezones());
-    let mut regions: Vec<String> = Vec::new();
-    for (region, _) in zones.iter() {
-        if !regions.contains(region) {
-            regions.push(region.clone());
-        }
-    }
-    let regions = Rc::new(regions);
+    let countries = Rc::new(sysinfo::countries());
+    let country_names: Vec<&str> = countries.iter().map(|c| c.name.as_str()).collect();
+    let country_dd = string_dropdown(&country_names);
+    let zone_dd = string_dropdown(&["UTC"]);
+    let keymap_labels: Vec<&str> = sysinfo::keymaps().iter().map(|(label, _)| *label).collect();
+    let keymap_dd = string_dropdown(&keymap_labels);
 
-    let region_strs: Vec<&str> = regions.iter().map(String::as_str).collect();
-    let region_dd = gtk::DropDown::from_strings(&region_strs);
-    let zone_dd = gtk::DropDown::from_strings(&["UTC"]);
-    // Zone names shown for the currently selected region.
-    let current: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(vec!["UTC".into()]));
+    // Zones offered for the currently selected country.
+    let current_zones: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(vec!["UTC".into()]));
 
     let refresh_zones = {
-        let zones = zones.clone();
-        let regions = regions.clone();
+        let countries = countries.clone();
         let zone_dd = zone_dd.clone();
-        let current = current.clone();
-        move |region_index: u32| {
-            let region = &regions[region_index as usize];
-            let names: Vec<String> = zones
-                .iter()
-                .filter(|(r, _)| r == region)
-                .map(|(_, tz)| tz.clone())
-                .collect();
-            let display: Vec<String> = names
-                .iter()
-                .map(|tz| {
-                    tz.split_once('/')
-                        .map_or(tz.clone(), |(_, city)| city.replace('_', " "))
-                })
-                .collect();
-            let display_refs: Vec<&str> = display.iter().map(String::as_str).collect();
-            zone_dd.set_model(Some(&gtk::StringList::new(&display_refs)));
-            zone_dd.set_selected(0);
-            *current.borrow_mut() = names;
+        let current_zones = current_zones.clone();
+        move |country_index: u32| {
+            // Only the selected country's zones are offered.
+            let Some(country) = countries.get(country_index as usize) else {
+                return;
+            };
+            set_strings(&zone_dd, &country.zones);
+            *current_zones.borrow_mut() = country.zones.clone();
         }
     };
     refresh_zones(0);
     {
         let refresh_zones = refresh_zones.clone();
-        region_dd.connect_selected_notify(move |dd| refresh_zones(dd.selected()));
+        country_dd.connect_selected_notify(move |dd| refresh_zones(dd.selected()));
     }
 
     let form = gtk::Box::new(gtk::Orientation::Vertical, 8);
     form.add_css_class("qz-card");
     form.set_halign(gtk::Align::Start);
-    form.set_size_request(480, -1);
-    let l1 = gtk::Label::new(Some("Region"));
-    l1.set_halign(gtk::Align::Start);
-    let l2 = gtk::Label::new(Some("Zone"));
-    l2.set_halign(gtk::Align::Start);
-    form.append(&l1);
-    form.append(&region_dd);
-    form.append(&l2);
+    form.set_size_request(520, -1);
+    form.append(&form_label("Country"));
+    form.append(&country_dd);
+    form.append(&form_label("Time zone"));
     form.append(&zone_dd);
+    form.append(&form_label("Keyboard layout"));
+    form.append(&keymap_dd);
     content.append(&form);
 
-    let back = gtk::Button::with_label("◂ Back");
+    let back = nav_button("◂ Back", false);
     let next = nav_button("Next ▸", true);
     {
         let stack = stack.clone();
@@ -362,12 +445,30 @@ fn page_timezone(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
     {
         let stack = stack.clone();
         let draft = draft.clone();
+        let countries = countries.clone();
+        let country_dd = country_dd.clone();
         let zone_dd = zone_dd.clone();
-        let current = current.clone();
+        let keymap_dd = keymap_dd.clone();
+        let current_zones = current_zones.clone();
         next.connect_clicked(move |_| {
-            let names = current.borrow();
-            let index = zone_dd.selected() as usize;
-            draft.borrow_mut().timezone = names.get(index).cloned().unwrap_or_else(|| "UTC".into());
+            let mut d = draft.borrow_mut();
+            if let Some(country) = countries.get(country_dd.selected() as usize) {
+                d.country = country.name.clone();
+            }
+            {
+                let zones = current_zones.borrow();
+                d.timezone = zones
+                    .get(zone_dd.selected() as usize)
+                    .cloned()
+                    .unwrap_or_else(|| "UTC".into());
+            }
+            let (label, code) = sysinfo::keymaps()
+                .get(keymap_dd.selected() as usize)
+                .copied()
+                .unwrap_or(("English (US)", "us"));
+            d.keymap_label = label.into();
+            d.keymap = code.into();
+            drop(d);
             go(&stack, "network");
         });
     }
@@ -380,123 +481,170 @@ fn page_network(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
     let (outer, content, footer) = shell(
         "STEP 3 OF 4",
         "Management network",
-        "Pick the NIC used for appliance management and how it gets an address. \
-         NIC names are final: the installed system uses the same nic0…nicN names.",
+        "The interface used to manage this appliance. NIC names are final: \
+         the installed system uses the same nic0…nicN names.",
     );
 
     let nics: Rc<RefCell<Vec<sysinfo::Nic>>> = Rc::new(RefCell::new(Vec::new()));
-    let list = gtk::ListBox::new();
-    list.set_selection_mode(gtk::SelectionMode::Single);
+    let nic_dd = string_dropdown(&["(scanning…)"]);
 
     let populate = {
-        let list = list.clone();
+        let nic_dd = nic_dd.clone();
         let nics = nics.clone();
         move || {
-            while let Some(child) = list.first_child() {
-                list.remove(&child);
-            }
             let found = sysinfo::nics();
-            for nic in &found {
-                let speed = match nic.speed_mbps {
-                    Some(mbps) => format!("{mbps} Mb/s"),
-                    None => "-".into(),
-                };
-                let state = if nic.link_up { "link up" } else { "no link" };
-                list.append(&list_row(
-                    &nic.name,
-                    &format!("{} · {state} · {speed}", nic.mac),
-                ));
-            }
+            let labels: Vec<String> = found
+                .iter()
+                .map(|nic| {
+                    let state = if nic.link_up {
+                        match nic.speed_mbps {
+                            Some(mbps) => format!("link up · {mbps} Mb/s"),
+                            None => "link up".into(),
+                        }
+                    } else {
+                        "no link".to_string()
+                    };
+                    let driver = if nic.driver.is_empty() {
+                        "unknown driver"
+                    } else {
+                        nic.driver.as_str()
+                    };
+                    format!("{} · {} · {state} · {driver}", nic.name, nic.mac)
+                })
+                .collect();
+            set_strings(&nic_dd, &labels);
             *nics.borrow_mut() = found;
-            list.select_row(list.row_at_index(0).as_ref());
         }
     };
     populate();
 
-    let refresh = gtk::Button::with_label("Rescan");
+    let rescan = gtk::Button::with_label("Rescan");
     {
         let populate = populate.clone();
-        refresh.connect_clicked(move |_| populate());
+        rescan.connect_clicked(move |_| populate());
     }
+
+    let hostname_entry = gtk::Entry::new();
+    hostname_entry.set_text("lumen");
+    hostname_entry.set_placeholder_text(Some("hostname or FQDN, e.g. lumen01.example.lan"));
 
     let dhcp_radio = gtk::CheckButton::with_label("DHCP");
     dhcp_radio.set_active(true);
     let static_radio = gtk::CheckButton::with_label("Static");
     static_radio.set_group(Some(&dhcp_radio));
+    let mode_box = gtk::Box::new(gtk::Orientation::Horizontal, 24);
+    mode_box.append(&dhcp_radio);
+    mode_box.append(&static_radio);
 
-    let cidr_entry = gtk::Entry::new();
-    cidr_entry.set_placeholder_text(Some("address/prefix, e.g. 192.168.10.5/24"));
+    let ip_entry = gtk::Entry::new();
+    ip_entry.set_placeholder_text(Some("e.g. 192.168.10.5"));
+    let netmask_entry = gtk::Entry::new();
+    netmask_entry.set_placeholder_text(Some("e.g. 255.255.255.0 (or prefix length)"));
     let gateway_entry = gtk::Entry::new();
-    gateway_entry.set_placeholder_text(Some("gateway, e.g. 192.168.10.1"));
+    gateway_entry.set_placeholder_text(Some("e.g. 192.168.10.1"));
     let dns_entry = gtk::Entry::new();
-    dns_entry.set_placeholder_text(Some("DNS servers, comma-separated (optional)"));
+    dns_entry.set_placeholder_text(Some("e.g. 192.168.10.1 (comma-separated for several)"));
 
-    let static_form = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    static_form.append(&cidr_entry);
-    static_form.append(&gateway_entry);
-    static_form.append(&dns_entry);
-    static_form.set_sensitive(false);
+    // Everything except the hostname greys out while DHCP is selected.
+    let static_grid = gtk::Grid::new();
+    static_grid.set_row_spacing(8);
+    static_grid.set_column_spacing(16);
+    for (row, (label, entry)) in [
+        ("IP address", &ip_entry),
+        ("Netmask", &netmask_entry),
+        ("Gateway", &gateway_entry),
+        ("DNS server", &dns_entry),
+    ]
+    .iter()
+    .enumerate()
     {
-        let static_form = static_form.clone();
-        static_radio.connect_toggled(move |radio| static_form.set_sensitive(radio.is_active()));
+        static_grid.attach(&form_label(label), 0, row as i32, 1, 1);
+        entry.set_hexpand(true);
+        static_grid.attach(*entry, 1, row as i32, 1, 1);
+    }
+    let dhcp_hint = gtk::Label::new(Some(
+        "DHCP assigns the address, gateway, and DNS automatically.",
+    ));
+    dhcp_hint.add_css_class("qz-hint");
+    dhcp_hint.set_halign(gtk::Align::Start);
+
+    static_grid.set_sensitive(false);
+    {
+        let static_grid = static_grid.clone();
+        let dhcp_hint = dhcp_hint.clone();
+        static_radio.connect_toggled(move |radio| {
+            static_grid.set_sensitive(radio.is_active());
+            dhcp_hint.set_visible(!radio.is_active());
+        });
     }
 
     let error = gtk::Label::new(None);
     error.add_css_class("qz-error");
     error.set_halign(gtk::Align::Start);
 
-    let mode_box = gtk::Box::new(gtk::Orientation::Horizontal, 24);
-    mode_box.append(&dhcp_radio);
-    mode_box.append(&static_radio);
+    let form = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    form.add_css_class("qz-card");
+    form.set_halign(gtk::Align::Start);
+    form.set_size_request(680, -1);
+    form.append(&form_label("Management interface"));
+    let nic_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    nic_dd.set_hexpand(true);
+    nic_row.append(&nic_dd);
+    nic_row.append(&rescan);
+    form.append(&nic_row);
+    form.append(&form_label("Hostname (FQDN)"));
+    form.append(&hostname_entry);
+    form.append(&mode_box);
+    form.append(&dhcp_hint);
+    form.append(&static_grid);
+    form.append(&error);
+    content.append(&form);
 
-    let card = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    card.add_css_class("qz-card");
-    let scroll = gtk::ScrolledWindow::new();
-    scroll.set_child(Some(&list));
-    scroll.set_min_content_height(180);
-    card.append(&scroll);
-    card.append(&refresh);
-    card.append(&mode_box);
-    card.append(&static_form);
-    card.append(&error);
-    content.append(&card);
-
-    let back = gtk::Button::with_label("◂ Back");
+    let back = nav_button("◂ Back", false);
     let next = nav_button("Next ▸", true);
     {
         let stack = stack.clone();
-        back.connect_clicked(move |_| go(&stack, "timezone"));
+        back.connect_clicked(move |_| go(&stack, "location"));
     }
     {
         let stack = stack.clone();
         let draft = draft.clone();
-        let list = list.clone();
         let nics = nics.clone();
+        let nic_dd = nic_dd.clone();
+        let hostname_entry = hostname_entry.clone();
         let dhcp_radio = dhcp_radio.clone();
-        let cidr_entry = cidr_entry.clone();
+        let ip_entry = ip_entry.clone();
+        let netmask_entry = netmask_entry.clone();
         let gateway_entry = gateway_entry.clone();
         let dns_entry = dns_entry.clone();
         let error = error.clone();
         next.connect_clicked(move |_| {
-            let Some(row) = list.selected_row() else {
-                error.set_text("Select a NIC.");
-                return;
-            };
             let nics = nics.borrow();
-            let Some(nic) = nics.get(row.index() as usize) else {
-                error.set_text("Select a NIC.");
+            let Some(nic) = nics.get(nic_dd.selected() as usize) else {
+                error.set_text("Select a management interface.");
                 return;
             };
+            let hostname = hostname_entry.text().trim().to_string();
+            if !valid_hostname(&hostname) {
+                error.set_text("Invalid hostname (letters, digits, dashes, dot-separated).");
+                return;
+            }
             let mut d = draft.borrow_mut();
             d.nic = nic.name.clone();
+            d.hostname = hostname;
             d.dhcp = dhcp_radio.is_active();
             if !d.dhcp {
-                let cidr = cidr_entry.text().trim().to_string();
-                let gateway = gateway_entry.text().trim().to_string();
-                if !valid_cidr(&cidr) {
-                    error.set_text("Invalid address/prefix (expected a.b.c.d/nn).");
+                let ip = ip_entry.text().trim().to_string();
+                if Ipv4Addr::from_str(&ip).is_err() {
+                    error.set_text("Invalid IP address.");
                     return;
                 }
+                let netmask = netmask_entry.text().trim().to_string();
+                let Some(prefix) = parse_netmask(&netmask) else {
+                    error.set_text("Invalid netmask (e.g. 255.255.255.0 or 24).");
+                    return;
+                };
+                let gateway = gateway_entry.text().trim().to_string();
                 if Ipv4Addr::from_str(&gateway).is_err() {
                     error.set_text("Invalid gateway address.");
                     return;
@@ -511,7 +659,9 @@ fn page_network(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
                     error.set_text("Invalid DNS server address.");
                     return;
                 }
-                d.cidr = cidr;
+                d.ip = ip;
+                d.netmask = netmask;
+                d.prefix = prefix;
                 d.gateway = gateway;
                 d.dns = dns;
             }
@@ -573,10 +723,10 @@ fn page_disk(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
     };
     populate();
 
-    let refresh = gtk::Button::with_label("Rescan");
+    let rescan = gtk::Button::with_label("Rescan");
     {
         let populate = populate.clone();
-        refresh.connect_clicked(move |_| populate());
+        rescan.connect_clicked(move |_| populate());
     }
 
     let error = gtk::Label::new(None);
@@ -589,11 +739,11 @@ fn page_disk(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
     scroll.set_child(Some(&list));
     scroll.set_min_content_height(220);
     card.append(&scroll);
-    card.append(&refresh);
+    card.append(&rescan);
     card.append(&error);
     content.append(&card);
 
-    let back = gtk::Button::with_label("◂ Back");
+    let back = nav_button("◂ Back", false);
     let next = nav_button("Review ▸", true);
     {
         let stack = stack.clone();
@@ -629,7 +779,7 @@ fn page_disk(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
                     }
                 );
             }
-            // The summary page rebuilds its text when it becomes visible.
+            // The summary page rebuilds its rows when it becomes visible.
             go(&stack, "summary");
         });
     }
@@ -638,33 +788,39 @@ fn page_disk(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
     outer
 }
 
-fn summary_text(d: &Draft) -> String {
-    let network = if d.dhcp {
-        format!("{} — DHCP", d.nic)
+fn summary_rows(d: &Draft) -> Vec<(String, String)> {
+    let mut rows = vec![
+        ("Filesystem".into(), "ZFS (pool \"rpool\")".into()),
+        ("Disk".into(), d.disk_label.clone()),
+        ("Country".into(), d.country.clone()),
+        ("Time zone".into(), d.timezone.clone()),
+        (
+            "Keyboard".into(),
+            format!("{} ({})", d.keymap_label, d.keymap),
+        ),
+        ("Management interface".into(), d.nic.clone()),
+        ("Hostname".into(), d.hostname.clone()),
+    ];
+    if d.dhcp {
+        rows.push(("Network".into(), "DHCP".into()));
     } else {
-        format!(
-            "{} — static {} via {}{}",
-            d.nic,
-            d.cidr,
-            d.gateway,
+        rows.push(("IP address".into(), format!("{}/{}", d.ip, d.prefix)));
+        rows.push(("Netmask".into(), d.netmask.clone()));
+        rows.push(("Gateway".into(), d.gateway.clone()));
+        rows.push((
+            "DNS server".into(),
             if d.dns.is_empty() {
-                String::new()
+                "—".into()
             } else {
-                format!(", DNS {}", d.dns.join(", "))
-            }
-        )
-    };
-    format!(
-        "Root password   set ({} characters)\n\
-         Time zone       {}\n\
-         Network         {}\n\
-         Boot drive      {}\n\n\
-         Layout: 1 GiB EFI + 2 GiB /boot (ext4) + rest ZFS pool \"rpool\"",
-        d.password.len(),
-        d.timezone,
-        network,
-        d.disk_label,
-    )
+                d.dns.join(", ")
+            },
+        ));
+    }
+    rows.push((
+        "Root password".into(),
+        format!("set ({} characters)", d.password.len()),
+    ));
+    rows
 }
 
 fn page_summary(
@@ -674,29 +830,52 @@ fn page_summary(
 ) -> gtk::Box {
     let (outer, content, footer) = shell(
         "REVIEW",
-        "Ready to install",
-        "Nothing has been written yet. Installation erases the selected drive.",
+        "Summary",
+        "Verify the configuration. Nothing has been written yet — installation \
+         starts only after confirmation and erases the selected drive.",
     );
 
-    let label = gtk::Label::new(None);
-    label.set_halign(gtk::Align::Start);
-    label.add_css_class("qz-card");
-    label.set_selectable(false);
-    content.append(&label);
+    let table = gtk::ListBox::new();
+    table.set_selection_mode(gtk::SelectionMode::None);
+    table.add_css_class("qz-summary");
+    content.append(&table);
 
-    // Keep the label reachable for refresh_summary without custom properties:
-    // rebuild the text every time the page becomes visible instead.
+    // Rebuild the table every time the page becomes visible.
     {
-        let label = label.clone();
+        let table = table.clone();
         let draft = draft.clone();
         stack.connect_visible_child_name_notify(move |stack| {
-            if stack.visible_child_name().as_deref() == Some("summary") {
-                label.set_text(&summary_text(&draft.borrow()));
+            if stack.visible_child_name().as_deref() != Some("summary") {
+                return;
+            }
+            while let Some(child) = table.first_child() {
+                table.remove(&child);
+            }
+            for (key, value) in summary_rows(&draft.borrow()) {
+                let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 16);
+                // Mono-uppercase key column, matching the Quartz table
+                // header style (GTK CSS has no text-transform).
+                let key_label = gtk::Label::new(Some(&key.to_uppercase()));
+                key_label.add_css_class("qz-summary-key");
+                key_label.set_halign(gtk::Align::Start);
+                key_label.set_valign(gtk::Align::Center);
+                key_label.set_size_request(260, -1);
+                let value_label = gtk::Label::new(Some(&value));
+                value_label.add_css_class("qz-summary-value");
+                value_label.set_halign(gtk::Align::Start);
+                value_label.set_wrap(true);
+                value_label.set_hexpand(true);
+                row_box.append(&key_label);
+                row_box.append(&value_label);
+                let row = gtk::ListBoxRow::new();
+                row.set_activatable(false);
+                row.set_child(Some(&row_box));
+                table.append(&row);
             }
         });
     }
 
-    let back = gtk::Button::with_label("◂ Back");
+    let back = nav_button("◂ Back", false);
     {
         let stack = stack.clone();
         back.connect_clicked(move |_| go(&stack, "disk"));
@@ -709,22 +888,7 @@ fn page_summary(
         let draft = draft.clone();
         let window = window.clone();
         install.connect_clicked(move |_| {
-            let disk_label = draft.borrow().disk_label.clone();
-            let dialog = gtk::AlertDialog::builder()
-                .modal(true)
-                .message("Erase disk and install Lumen?")
-                .detail(format!("ALL DATA on {disk_label} will be destroyed."))
-                .buttons(["Cancel", "Erase & Install"])
-                .cancel_button(0)
-                .default_button(0)
-                .build();
-            let stack = stack.clone();
-            let draft = draft.clone();
-            dialog.choose(Some(&window), gtk::gio::Cancellable::NONE, move |result| {
-                if result == Ok(1) {
-                    start_install(&stack, &draft.borrow());
-                }
-            });
+            confirm_erase(&window, &stack, &draft);
         });
     }
     footer.append(&back);
@@ -732,11 +896,69 @@ fn page_summary(
     outer
 }
 
+/// Quartz-styled destructive confirmation (GtkAlertDialog brings the stock
+/// theme's light chrome, so this is a plain undecorated modal instead).
+fn confirm_erase(window: &gtk::ApplicationWindow, stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) {
+    let dialog = gtk::Window::builder()
+        .transient_for(window)
+        .modal(true)
+        .decorated(false)
+        .resizable(false)
+        .build();
+    dialog.add_css_class("qz-dialog");
+
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    body.set_margin_top(28);
+    body.set_margin_bottom(24);
+    body.set_margin_start(32);
+    body.set_margin_end(32);
+
+    let title = gtk::Label::new(Some("Erase disk and install Lumen?"));
+    title.add_css_class("qz-dialog-title");
+    title.set_halign(gtk::Align::Start);
+    let detail = gtk::Label::new(Some(&format!(
+        "ALL DATA on {} will be destroyed.",
+        draft.borrow().disk_label
+    )));
+    detail.add_css_class("qz-subtitle");
+    detail.set_wrap(true);
+    detail.set_halign(gtk::Align::Start);
+
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    buttons.set_halign(gtk::Align::End);
+    buttons.set_margin_top(12);
+    let cancel = gtk::Button::with_label("Cancel");
+    let erase = gtk::Button::with_label("Erase & Install");
+    erase.add_css_class("destructive-action");
+    {
+        let dialog = dialog.clone();
+        cancel.connect_clicked(move |_| dialog.close());
+    }
+    {
+        let dialog = dialog.clone();
+        let stack = stack.clone();
+        let draft = draft.clone();
+        erase.connect_clicked(move |_| {
+            dialog.close();
+            start_install(&stack, &draft.borrow());
+        });
+    }
+    buttons.append(&cancel);
+    buttons.append(&erase);
+
+    body.append(&title);
+    body.append(&detail);
+    body.append(&buttons);
+    dialog.set_child(Some(&body));
+    dialog.present();
+}
+
 struct ProgressPage {
     root: gtk::Box,
     bar: gtk::ProgressBar,
     status: gtk::Label,
     log: gtk::TextView,
+    details: gtk::Expander,
     reboot: gtk::Button,
 }
 
@@ -762,9 +984,15 @@ impl ProgressPage {
         scroll.set_vexpand(true);
         scroll.set_min_content_height(260);
 
+        // Console output collapsed by default.
+        let details = gtk::Expander::new(Some("Show details"));
+        details.set_expanded(false);
+        details.set_child(Some(&scroll));
+        details.add_css_class("qz-details");
+
         content.append(&bar);
         content.append(&status);
-        content.append(&scroll);
+        content.append(&details);
 
         let reboot = gtk::Button::with_label("Reboot");
         reboot.set_visible(false);
@@ -780,6 +1008,7 @@ impl ProgressPage {
             bar,
             status,
             log,
+            details,
             reboot,
         }
     }
@@ -797,7 +1026,7 @@ fn start_install(stack: &gtk::Stack, d: &Draft) {
         NetworkConfig::Dhcp
     } else {
         NetworkConfig::Static {
-            cidr: d.cidr.clone(),
+            cidr: format!("{}/{}", d.ip, d.prefix),
             gateway: d.gateway.clone(),
             dns: d.dns.clone(),
         }
@@ -821,6 +1050,8 @@ fn start_install(stack: &gtk::Stack, d: &Draft) {
     let cfg = InstallConfig {
         root_password_hash: hash,
         timezone: d.timezone.clone(),
+        keymap: d.keymap.clone(),
+        hostname: d.hostname.clone(),
         nic: d.nic.clone(),
         network,
         disk: d.disk.clone(),
@@ -858,6 +1089,8 @@ fn start_install(stack: &gtk::Stack, d: &Draft) {
                             engine::LOG_PATH
                         ));
                         page.status.add_css_class("qz-error");
+                        // Surface the log so the failure is visible.
+                        page.details.set_expanded(true);
                         page.reboot.set_visible(true);
                     }
                 }
@@ -891,17 +1124,4 @@ fn page_done() -> gtk::Box {
     });
     footer.append(&reboot);
     outer
-}
-
-fn valid_cidr(text: &str) -> bool {
-    match text.split_once('/') {
-        Some((addr, prefix)) => {
-            Ipv4Addr::from_str(addr).is_ok()
-                && prefix
-                    .parse::<u8>()
-                    .map(|p| (1..=32).contains(&p))
-                    .unwrap_or(false)
-        }
-        None => false,
-    }
 }

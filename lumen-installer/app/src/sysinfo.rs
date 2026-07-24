@@ -12,6 +12,14 @@ pub struct Nic {
     pub link_up: bool,
     /// Mb/s when the link is up and the driver reports it.
     pub speed_mbps: Option<u32>,
+    /// Kernel driver name (e.g. "e1000e", "vmxnet3").
+    pub driver: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct Country {
+    pub name: String,
+    pub zones: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -62,11 +70,16 @@ pub fn nics() -> Vec<Nic> {
         } else {
             None
         };
+        let driver = fs::read_link(path.join("device/driver"))
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .unwrap_or_default();
         out.push(Nic {
             name,
             mac,
             link_up,
             speed_mbps,
+            driver,
         });
     }
     out.sort_by(|a, b| natural_key(&a.name).cmp(&natural_key(&b.name)));
@@ -125,27 +138,73 @@ pub fn disks() -> Vec<Disk> {
     out
 }
 
-/// (region, zone-name) pairs from zone1970.tab, plus UTC first.
-pub fn timezones() -> Vec<(String, String)> {
-    let mut zones = vec![("UTC".to_string(), "UTC".to_string())];
-    let text = fs::read_to_string("/usr/share/zoneinfo/zone1970.tab").unwrap_or_default();
-    zones.extend(parse_zone_tab(&text));
-    zones
+/// Countries with their time zones (tzdata's iso3166.tab + zone1970.tab),
+/// sorted by name, with "Other (UTC)" first as the neutral default.
+pub fn countries() -> Vec<Country> {
+    let iso = fs::read_to_string("/usr/share/zoneinfo/iso3166.tab").unwrap_or_default();
+    let zone_tab = fs::read_to_string("/usr/share/zoneinfo/zone1970.tab").unwrap_or_default();
+    parse_countries(&iso, &zone_tab)
 }
 
-pub fn parse_zone_tab(text: &str) -> Vec<(String, String)> {
-    let mut zones: Vec<(String, String)> = text
+pub fn parse_countries(iso: &str, zone_tab: &str) -> Vec<Country> {
+    let mut code_to_name = std::collections::HashMap::new();
+    for line in iso.lines().filter(|l| !l.trim_start().starts_with('#')) {
+        if let Some((code, name)) = line.split_once('\t') {
+            code_to_name.insert(code.trim(), name.trim());
+        }
+    }
+    let mut by_name: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for line in zone_tab
         .lines()
         .filter(|l| !l.trim_start().starts_with('#'))
-        .filter_map(|l| l.split('\t').nth(2))
-        .filter_map(|tz| {
-            tz.split_once('/')
-                .map(|(region, _)| (region.to_string(), tz.to_string()))
-        })
-        .collect();
-    zones.sort();
-    zones.dedup();
-    zones
+    {
+        let mut fields = line.split('\t');
+        let (Some(codes), Some(_coords), Some(tz)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        for code in codes.split(',') {
+            if let Some(name) = code_to_name.get(code.trim()) {
+                by_name
+                    .entry((*name).to_string())
+                    .or_default()
+                    .push(tz.to_string());
+            }
+        }
+    }
+    let mut out = vec![Country {
+        name: "Other (UTC)".into(),
+        zones: vec!["UTC".into()],
+    }];
+    out.extend(by_name.into_iter().map(|(name, mut zones)| {
+        zones.sort();
+        zones.dedup();
+        Country { name, zones }
+    }));
+    out
+}
+
+/// Console keymaps offered by the installer (display label, kbd name).
+pub fn keymaps() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("English (US)", "us"),
+        ("English (UK)", "uk"),
+        ("Czech", "cz"),
+        ("Danish", "dk"),
+        ("Dutch", "nl"),
+        ("Finnish", "fi"),
+        ("French", "fr"),
+        ("German", "de"),
+        ("Italian", "it"),
+        ("Japanese", "jp106"),
+        ("Norwegian", "no"),
+        ("Polish", "pl2"),
+        ("Portuguese", "pt-latin1"),
+        ("Portuguese (Brazil)", "br-abnt2"),
+        ("Spanish", "es"),
+        ("Swedish", "sv-latin1"),
+    ]
 }
 
 pub fn is_uefi() -> bool {
@@ -232,15 +291,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn zone_tab_parsing() {
+    fn country_parsing() {
+        let iso = "# comment\nUS\tUnited States\nFR\tFrance\nAU\tAustralia\nNZ\tNew Zealand\n";
         let tab = "# comment\n\
                    US\t+404251-0740023\tAmerica/New_York\tEastern\n\
+                   US\t+340308-1181434\tAmerica/Los_Angeles\tPacific\n\
                    FR\t+4852+00220\tEurope/Paris\n\
                    AU,NZ\t-3352+15113\tAustralia/Sydney\tNSW\n";
-        let zones = parse_zone_tab(tab);
-        assert!(zones.contains(&("America".into(), "America/New_York".into())));
-        assert!(zones.contains(&("Europe".into(), "Europe/Paris".into())));
-        assert_eq!(zones.len(), 3);
+        let countries = parse_countries(iso, tab);
+        assert_eq!(countries[0].name, "Other (UTC)");
+        assert_eq!(countries[0].zones, vec!["UTC".to_string()]);
+        let us = countries
+            .iter()
+            .find(|c| c.name == "United States")
+            .unwrap();
+        assert_eq!(us.zones.len(), 2);
+        assert!(us.zones.contains(&"America/New_York".to_string()));
+        let nz = countries.iter().find(|c| c.name == "New Zealand").unwrap();
+        assert_eq!(nz.zones, vec!["Australia/Sydney".to_string()]);
+        // Sorted by name after the UTC entry.
+        assert!(countries[1].name < countries[2].name);
     }
 
     #[test]

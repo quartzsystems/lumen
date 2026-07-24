@@ -87,6 +87,12 @@ chroot "$ROOT" /sbin/modprobe --dry-run -S "$KVER" zfs \
 echo "==> Installing lumen-installer + overlay"
 install -m 0755 "$INSTALLER_BINARY" "$ROOT/usr/bin/lumen-installer"
 cp -r "$LIVE_DIR/overlay/." "$ROOT/"
+# Manrope (Quartz body face, OFL) is not packaged for EL10 — vendored in
+# branding/fonts and installed for fontconfig to pick up.
+install -D -p -m 0644 "$LIVE_DIR/../../branding/fonts/Manrope-Variable.ttf" \
+    "$ROOT/usr/share/fonts/manrope/Manrope-Variable.ttf"
+install -p -m 0644 "$LIVE_DIR/../../branding/fonts/OFL-Manrope.txt" \
+    "$ROOT/usr/share/fonts/manrope/OFL.txt"
 chmod 0755 "$ROOT/root/.local/bin/gnome-kiosk-script"
 cat > "$ROOT/etc/lumen-build.env" <<EOF
 # Stamped by lumen-installer/live/build-live.sh — read by the installer.

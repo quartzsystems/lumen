@@ -210,9 +210,25 @@ LIVEROOT="$WORK/live/rootfs"
 # --- boot configuration -------------------------------------------------------
 VOLID="LUMEN"
 CMDLINE="root=live:CDLABEL=$VOLID rd.live.image rd.live.overlay.overlayfs=1 rd.live.dir=/LiveOS selinux=0"
+# Branded menu: gfxterm + background image (gfxterm/png are built into the
+# signed EL GRUB; the font must be shipped — same as upstream Alma media).
+cp "$REPO_ROOT/branding/grub/lumen-grub-bg.png" "$TREE/EFI/BOOT/lumen-grub-bg.png"
+mkdir -p "$TREE/EFI/BOOT/fonts"
+[ -f "$LIVEROOT/usr/share/grub/unicode.pf2" ] \
+    || die "unicode.pf2 not found in live rootfs (grub2-common missing?)"
+cp "$LIVEROOT/usr/share/grub/unicode.pf2" "$TREE/EFI/BOOT/fonts/unicode.pf2"
 cat > "$TREE/EFI/BOOT/grub.cfg" <<EOF
 set default=0
 set timeout=10
+
+# Quartz-branded menu; falls back to plain text if gfxterm setup fails.
+if loadfont /EFI/BOOT/fonts/unicode.pf2; then
+    set gfxmode=1024x768,auto
+    terminal_output gfxterm
+    background_image /EFI/BOOT/lumen-grub-bg.png
+    set color_normal=light-gray/black
+    set color_highlight=black/green
+fi
 
 menuentry 'Install Lumen $VERSION' {
     linux /images/vmlinuz $CMDLINE console=ttyS0,115200 console=tty0 quiet
