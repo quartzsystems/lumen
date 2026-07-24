@@ -119,6 +119,92 @@ body {
   color-scheme: dark;
 }
 
+/* --- Surface utility --- */
+.surface {
+  background: var(--qz-surface);
+  border: 1px solid var(--qz-border);
+  border-radius: 10px;
+  box-shadow: var(--qz-inset-line);
+}
+
+/* --- KPI --- */
+.kpi-card {
+  background: var(--qz-surface);
+  border: 1px solid var(--qz-border);
+  border-radius: 10px;
+  box-shadow: var(--qz-inset-line);
+  padding: 18px;
+  min-width: 0;
+}
+.kpi-label {
+  font-family: var(--qz-font-mono);
+  font-size: 10px;
+  color: var(--qz-fg-4);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+/* --- Badge --- */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  font-family: var(--qz-font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  line-height: 1;
+}
+.badge-ok   { background: var(--qz-success-soft); border-color: color-mix(in oklab, var(--qz-success) 38%, transparent); color: var(--qz-success); }
+.badge-warn { background: var(--qz-warn-soft);    border-color: color-mix(in oklab, var(--qz-warn) 38%, transparent);    color: var(--qz-warn); }
+.badge-crit { background: var(--qz-danger-soft);  border-color: color-mix(in oklab, var(--qz-danger) 38%, transparent);  color: var(--qz-danger); }
+.badge-info { background: var(--qz-info-soft);    border-color: color-mix(in oklab, var(--qz-info) 38%, transparent);  color: var(--qz-info); }
+.badge-muted { background: var(--qz-ink-3); border-color: var(--qz-border); color: var(--qz-fg-3); }
+
+/* --- Command palette --- */
+.palette-scrim {
+  position: fixed;
+  inset: 0;
+  background: rgba(8, 9, 13, 0.55);
+  backdrop-filter: blur(8px);
+  z-index: 70;
+  display: grid;
+  place-items: start center;
+  padding-top: 16vh;
+}
+.palette {
+  width: min(620px, 92vw);
+  background: var(--qz-surface-raised);
+  border: 1px solid var(--qz-border);
+  border-radius: 12px;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.6);
+  overflow: hidden;
+}
+
+/* --- Toast --- */
+.toast {
+  position: fixed;
+  bottom: 18px;
+  right: 18px;
+  z-index: 80;
+  background: var(--qz-surface-raised);
+  border: 1px solid var(--qz-border);
+  border-left: 3px solid var(--qz-accent);
+  border-radius: 8px;
+  padding: 12px 16px;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.45);
+  font-size: 13px;
+  color: var(--qz-fg-1);
+  animation: toast-in 220ms var(--qz-ease-out);
+}
+@keyframes toast-in {
+  from { transform: translateX(20px); opacity: 0; }
+  to   { transform: none; opacity: 1; }
+}
+
 /* --- Scrollbars --- */
 ::-webkit-scrollbar { width: 10px; }
 ::-webkit-scrollbar-thumb { background: var(--qz-ink-5); border-radius: 999px; }

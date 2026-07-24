@@ -1,0 +1,175 @@
+"use client";
+
+import { ChevronDown, ChevronRight, LogOut, Search } from "lucide-react";
+import Link from "next/link";
+import { usePathname, useRouter } from "next/navigation";
+import { useEffect, useState } from "react";
+import { NAV, type NavItem } from "@/lib/nav";
+import { getCurrentUser, logout as apiLogout } from "@/lib/authClient";
+import type { AuthUserInfo } from "@/lib/authClient";
+
+/// Avatar initials — the first two letters of the username. The built-in realm
+/// authenticates OS accounts, which carry no display name.
+const userInitials = (user: AuthUserInfo): string => user.username.slice(0, 2).toUpperCase();
+
+/// Left navigation: logo, command-palette trigger, the nav tree from
+/// lib/nav.ts, and the signed-in principal with a sign-out control.
+export function Sidebar({ onOpenPalette }: { onOpenPalette: () => void }) {
+  // The export builds with trailingSlash, so normalise before comparing.
+  const pathname = (usePathname() ?? "/").replace(/\/+$/, "") || "/";
+  const router = useRouter();
+  const [user, setUser] = useState<AuthUserInfo | null>(null);
+
+  // localStorage is unavailable during prerender — read it after mount.
+  useEffect(() => {
+    setUser(getCurrentUser());
+  }, []);
+
+  // Expandable sections: open when explicitly toggled, else default-open on
+  // the active subtree.
+  const [openMenus, setOpenMenus] = useState<Record<string, boolean>>({});
+  const isOpen = (item: NavItem) => openMenus[item.id] ?? pathname.startsWith(item.href);
+
+  const logout = async () => {
+    await apiLogout();
+    router.push("/login");
+  };
+
+  const itemClass = (active: boolean) =>
+    [
+      "flex items-center gap-[10px] px-[10px] py-[8px] rounded-md text-[13.5px] font-medium border transition-all duration-[120ms] no-underline w-full text-left cursor-pointer",
+      active
+        ? "bg-[var(--qz-accent-soft)] text-[var(--qz-accent)] border-[color-mix(in_oklab,var(--qz-accent)_30%,transparent)]"
+        : "text-[var(--qz-fg-3)] border-transparent hover:text-[var(--qz-fg-1)] hover:bg-[color-mix(in_oklab,white_4%,transparent)]",
+    ].join(" ");
+
+  return (
+    <aside
+      className="flex flex-col h-full"
+      style={{
+        borderRight: "1px solid var(--qz-border)",
+        background: "var(--qz-ink-0)",
+      }}
+    >
+      {/* Logo */}
+      <div
+        className="flex items-center gap-[10px] px-4 h-14 flex-shrink-0"
+        style={{ borderBottom: "1px solid var(--qz-border)" }}
+      >
+        <img src="/logo-mark.png" alt="Quartz Systems" className="w-7 h-7 flex-shrink-0" />
+        <span
+          className="font-bold text-[var(--qz-fg-1)] text-[15px]"
+          style={{ letterSpacing: "-0.01em" }}
+        >
+          Lumen
+        </span>
+      </div>
+
+      {/* Search */}
+      <div className="px-3 py-3 flex-shrink-0">
+        <button
+          type="button"
+          onClick={onOpenPalette}
+          className="w-full flex items-center gap-2 bg-[var(--qz-input-bg)] border border-[var(--qz-border)] rounded-md px-[10px] py-[7px] cursor-pointer hover:border-[var(--qz-border-strong)] transition-colors text-left"
+        >
+          <Search size={13} className="text-[var(--qz-fg-4)] flex-shrink-0" />
+          <span
+            className="flex-1 text-[13px] text-[var(--qz-fg-4)]"
+            style={{ fontFamily: "var(--qz-font-sans)" }}
+          >
+            Search…
+          </span>
+        </button>
+      </div>
+
+      {/* Nav */}
+      <div className="flex-1 min-h-0 overflow-auto px-3 flex flex-col gap-[2px] pt-1">
+        {NAV.map((item) => {
+          const Icon = item.icon;
+
+          if (item.children) {
+            const open = isOpen(item);
+            // The parent never shows the green "active" state — only its
+            // children light up.
+            return (
+              <div key={item.id}>
+                <button
+                  type="button"
+                  onClick={() => setOpenMenus((p) => ({ ...p, [item.id]: !open }))}
+                  className={itemClass(false)}
+                >
+                  <Icon size={16} />
+                  <span className="flex-1">{item.label}</span>
+                  {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                </button>
+                {open && (
+                  <div className="flex flex-col gap-[2px] mt-[2px] ml-[26px]">
+                    {item.children.map((child) => {
+                      const active = pathname.startsWith(child.href);
+                      const ChildIcon = child.icon;
+                      return (
+                        <Link
+                          key={child.id}
+                          href={child.href}
+                          className={[
+                            "flex items-center gap-[9px] px-[10px] py-[7px] rounded-md text-[13px] font-medium border transition-all duration-[120ms] no-underline",
+                            active
+                              ? "bg-[var(--qz-accent-soft)] text-[var(--qz-accent)] border-[color-mix(in_oklab,var(--qz-accent)_30%,transparent)]"
+                              : "text-[var(--qz-fg-3)] border-transparent hover:text-[var(--qz-fg-1)] hover:bg-[color-mix(in_oklab,white_4%,transparent)]",
+                          ].join(" ")}
+                        >
+                          <ChildIcon size={15} />
+                          <span>{child.label}</span>
+                        </Link>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          }
+
+          return (
+            <Link key={item.id} href={item.href} className={itemClass(pathname.startsWith(item.href))}>
+              <Icon size={16} />
+              <span>{item.label}</span>
+            </Link>
+          );
+        })}
+      </div>
+
+      {/* Footer */}
+      <div
+        className="flex-shrink-0 px-4 py-3 flex items-center gap-[10px]"
+        style={{ borderTop: "1px solid var(--qz-border)" }}
+      >
+        <div
+          className="w-7 h-7 rounded-full grid place-items-center text-[var(--qz-fg-on-accent)] font-bold text-xs flex-shrink-0"
+          style={{
+            background: "linear-gradient(135deg, var(--qz-green-700), var(--qz-green-500))",
+          }}
+        >
+          {user ? userInitials(user) : "…"}
+        </div>
+        <div className="flex-1 min-w-0 flex flex-col">
+          <span className="text-[var(--qz-fg-1)] font-semibold text-[13px] truncate leading-tight">
+            {user?.username ?? ""}
+          </span>
+          {user && (
+            <span className="text-[var(--qz-fg-4)] text-[11px] truncate leading-tight">
+              {user.realm}
+            </span>
+          )}
+        </div>
+        <button
+          type="button"
+          title="Sign out"
+          onClick={logout}
+          className="flex-shrink-0 text-[var(--qz-fg-4)] hover:text-[var(--qz-fg-1)] transition-colors cursor-pointer bg-transparent border-0 p-0"
+        >
+          <LogOut size={15} />
+        </button>
+      </div>
+    </aside>
+  );
+}
