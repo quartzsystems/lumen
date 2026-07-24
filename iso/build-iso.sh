@@ -58,12 +58,12 @@ done
 # --- required tools: report everything missing, then fail loudly ----------
 missing=()
 for tool in xorriso xorrisofs mcopy mdel createrepo_c rpmbuild ksvalidator \
-            implantisomd5 sha256sum sed awk dd cut; do
+            implantisomd5 sha256sum sed awk dd cut cpio gzip find; do
     command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
 done
 if [ "${#missing[@]}" -gt 0 ]; then
     die "missing required tools: ${missing[*]}
-  install with: dnf install xorriso mtools createrepo_c rpm-build pykickstart isomd5sum"
+  install with: dnf install xorriso mtools createrepo_c rpm-build pykickstart isomd5sum cpio"
 fi
 
 # --- upstream ISO + checksum verification ---------------------------------
@@ -144,10 +144,13 @@ chmod -R u+w "$TREE"
 # --- brand the boot configuration -------------------------------------------
 # Point every LABEL= reference at the new volid, retitle the GRUB menu
 # entries ("Install AlmaLinux 10.x" -> "Install Lumen <version>"), and
-# append the kickstart to each kernel command line (grub2 config on the
-# ISO plus BOOT.conf copy). Titles are only touched on menuentry/submenu
-# lines so paths and kernel arguments stay intact.
-KS_ARG="inst.ks=hd:LABEL=$VOLID:/lumen.ks"
+# append the kickstart + Anaconda profile selection to each kernel command
+# line (grub2 config on the ISO plus BOOT.conf copy). inst.profile is needed
+# because the installer runtime's os-release still says AlmaLinux, so the
+# Lumen profile from product.img would never be auto-detected. Titles are
+# only touched on menuentry/submenu lines so paths and kernel arguments
+# stay intact.
+KS_ARG="inst.ks=hd:LABEL=$VOLID:/lumen.ks inst.profile=lumen"
 brand_grub_cfg() {
     sed -i \
         -e "s/$OLD_VOLID/$VOLID/g" \
@@ -174,6 +177,25 @@ for cfg in grub.cfg BOOT.conf; do
         mcopy -i "$EFIBOOT" "$WORK/efi-$cfg" "::/EFI/BOOT/$cfg"
     fi
 done
+
+# --- build the Anaconda branding overlay (images/product.img) ---------------
+# A gzipped newc cpio archive that Anaconda's dracut module automatically
+# unpacks over the installer runtime when it finds it next to the stage2
+# image — the same mechanism lorax uses for vendor branding, so no lorax
+# rebuild of the boot media is needed. It carries the Lumen profile,
+# stylesheet, and sidebar logo; the boot configs select the profile with
+# inst.profile=lumen.
+echo "==> Building Anaconda product.img"
+PRODUCT="$WORK/product"
+mkdir -p "$PRODUCT/etc/anaconda/profile.d" "$PRODUCT/usr/share/anaconda/pixmaps"
+cp "$REPO_ROOT/branding/anaconda/lumen-profile.conf" \
+   "$PRODUCT/etc/anaconda/profile.d/lumen.conf"
+cp "$REPO_ROOT/branding/anaconda/lumen.css" \
+   "$PRODUCT/usr/share/anaconda/pixmaps/lumen.css"
+cp "$REPO_ROOT/branding/logos/png/lumen-lockup-dark-bg.png" \
+   "$PRODUCT/usr/share/anaconda/pixmaps/lumen-sidebar-logo.png"
+(cd "$PRODUCT" && find . -mindepth 1 | LC_ALL=C sort | cpio --quiet -o -H newc | gzip -9) \
+    > "$TREE/images/product.img"
 
 # --- add the Lumen payload ---------------------------------------------------
 cp -r "$WORK/lumen" "$TREE/lumen"

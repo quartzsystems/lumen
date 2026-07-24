@@ -76,10 +76,12 @@ make ks-validate   # ksvalidator against the RHEL10 profile
 
 ## Installing the appliance
 
-Boot the generated ISO; the embedded kickstart performs a fully automated
-minimal install (SELinux enforcing, firewalld with SSH only, chronyd enabled,
-hostname `lumen`). The default root password is `lumen` and **must be changed
-at first login** (it is pre-expired). See [docs/build.md](docs/build.md).
+Boot the generated ISO; the branded graphical installer asks for the four
+operator decisions — root password, boot drive, management NIC (DHCP or
+static), and time zone — and the embedded kickstart fixes everything else
+(minimal package set, SELinux enforcing, firewalld with SSH only, chronyd
+enabled, hostname `lumen`). Log in as `root` with the password chosen in
+the installer. See [docs/build.md](docs/build.md).
 
 ## Versioning
 

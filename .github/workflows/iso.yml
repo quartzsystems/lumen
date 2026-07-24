@@ -23,7 +23,7 @@ jobs:
     container: almalinux:10
     steps:
       - name: Install build dependencies
-        run: dnf -y install rpm-build rpmdevtools createrepo_c pykickstart xorriso mtools isomd5sum make git-core
+        run: dnf -y install rpm-build rpmdevtools createrepo_c pykickstart xorriso mtools isomd5sum cpio gzip findutils make git-core
       - uses: actions/checkout@v4
       - name: Restore cached upstream ISO
         uses: actions/cache@v4

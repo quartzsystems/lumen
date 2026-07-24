@@ -8,13 +8,14 @@ step is best done on a host or privileged container, see
 
 ```sh
 dnf install rpm-build rpmdevtools rpmlint createrepo_c pykickstart \
-            xorriso mtools isomd5sum make
+            xorriso mtools isomd5sum cpio make
 ```
 
 - `pykickstart` provides `ksvalidator`
 - `xorriso` (also provides `xorrisofs`) does the ISO remaster
 - `mtools` edits the EFI boot image without loop mounts — the entire ISO
   build runs unprivileged
+- `cpio` (+ `gzip`) packs the Anaconda branding overlay `images/product.img`
 - `isomd5sum` provides `implantisomd5`/`checkisomd5`
 - `rpmlint` and `shellcheck` (both from **EPEL 10**: `dnf install
   epel-release` first) are optional, for `make lint`
@@ -51,19 +52,23 @@ make iso UPSTREAM_ISO=~/isos/AlmaLinux-10-latest-x86_64-minimal.iso \
 
 Alternatively put the hash in `<iso path>.sha256` and omit `UPSTREAM_SHA256`.
 The build **fails loudly** if the checksum is absent or mismatched, or if any
-required tool (`mkksiso`, `createrepo_c`, `rpmbuild`, `ksvalidator`) is
-missing.
+required tool (`xorriso`, `createrepo_c`, `rpmbuild`, `ksvalidator`, `cpio`,
+...) is missing.
 
 The script then:
 
 - builds the RPMs and creates a `lumen` repo directory (`createrepo_c`),
 - renders `iso/lumen.ks.in` (stamps `@LUMEN_VERSION@` / `@LUMEN_BUILD_DATE@`
   into `%post`) and validates it with `ksvalidator -v RHEL10`,
-- extracts the ISO tree, rewrites the grub configs (volume label `LUMEN` +
-  `inst.ks=`), re-brands the grub config inside the appended EFI boot
-  partition via `mtools`, and rebuilds with `xorrisofs` using the same
-  boot recipe as the upstream media (verified against
+- extracts the ISO tree, rewrites the grub configs (volume label `LUMEN`,
+  `inst.ks=`, `inst.profile=lumen`), re-brands the grub config inside the
+  appended EFI boot partition via `mtools`, and rebuilds with `xorrisofs`
+  using the same boot recipe as the upstream media (verified against
   `xorriso -report_el_torito as_mkisofs`),
+- packs the Anaconda branding overlay `images/product.img` (gzipped cpio
+  with the Lumen profile, stylesheet, and sidebar logo from
+  `branding/anaconda/`; Anaconda's dracut module unpacks it over the
+  installer runtime automatically),
 - implants the media checksum (`implantisomd5`) and writes
   `dist/lumen-<version>-x86_64.iso` plus a `.sha256` file.
 
@@ -78,16 +83,33 @@ invocation cannot re-enable. It also requires root for loop mounts
 problems and verifies the result (both El Torito entries, volid,
 `checkisomd5`). Revisit if a fixed lorax lands in EL10.
 
-The kickstart installs `@core` + `lumen-release` only (no GUI), with SELinux
-enforcing, firewalld allowing SSH only, `chronyd`/`sshd` enabled, and static
-hostname `lumen`.
+### The installer
+
+The ISO boots the branded **graphical Anaconda installer** (the upstream
+minimal ISO's stage2 already contains the GUI, so no lorax rebuild is
+needed). The kickstart is deliberately partial: it preseeds everything
+that is appliance policy and leaves exactly four decisions to the
+operator —
+
+- **root password** (mandatory — `rootpw` is omitted from the kickstart),
+- **installation destination** (mandatory — pick the boot drive; automatic
+  LVM partitioning is the preselected scheme),
+- **network** (pick the management NIC, DHCP or static, in the
+  Network & Host Name spoke; hostname defaults to `lumen`),
+- **time zone** (prefilled `Etc/UTC`, changeable).
+
+The user-creation and software-selection spokes are hidden by the Anaconda
+profile (`branding/anaconda/lumen-profile.conf`): the appliance is
+root-only at install time and the package set (`@core` + `lumen-release`,
+no GUI) is fixed, with SELinux enforcing, firewalld allowing SSH only, and
+`chronyd`/`sshd` enabled.
 
 ### First boot
 
-The root password is `lumen` and is **pre-expired** (`chage -d 0 root` in
-`%post`): the first console or SSH login forces a password change. Change
-this policy in `iso/lumen.ks.in` if the appliance will be provisioned
-differently.
+Log in as `root` with the password chosen in the installer (console or
+SSH — the firewall allows SSH by default). There is no baked-in default
+password; images built before the interactive installer landed used
+`root` / `lumen`, pre-expired.
 
 ## CI
 
