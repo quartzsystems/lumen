@@ -20,9 +20,11 @@ mkdir -p "$TOPDIR"/{SOURCES,BUILD,RPMS,SRPMS} "$DIST_DIR"
 
 # Stage spec sources out of branding/ into a single rpmbuild SOURCES dir.
 cp "$REPO_ROOT"/branding/release/lumen-release.in \
-   "$REPO_ROOT"/branding/release/os-release-lumen.conf \
+   "$REPO_ROOT"/branding/release/os-release-lumen.conf.in \
    "$REPO_ROOT"/branding/release/issue.in \
    "$REPO_ROOT"/branding/release/motd.in \
+   "$REPO_ROOT"/branding/grub/theme.txt \
+   "$REPO_ROOT"/branding/grub/lumen-grub-bg.png \
    "$REPO_ROOT"/branding/logos/lumen-mark.svg \
    "$REPO_ROOT"/branding/logos/lumen-mark-light-bg.svg \
    "$REPO_ROOT"/branding/logos/lumen-favicon.svg \
