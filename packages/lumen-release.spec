@@ -20,6 +20,14 @@ Source2:        issue.in
 Source3:        motd.in
 Source4:        theme.txt
 Source5:        lumen-grub-bg.png
+Source6:        lumen-console-banner
+Source7:        lumen-console-banner.service
+Source8:        50-lumen-banner
+
+# The console banner reads addresses with ip(8).
+Requires:       iproute
+%{?systemd_requires}
+BuildRequires:  systemd-rpm-macros
 
 # %%{?el10}: only pull the AlmaLinux base release package when building for
 # EL10; other build targets (future rebases) may provide their own.
@@ -31,7 +39,9 @@ Requires:       almalinux-release
 Release identification and branding files for Quartz Systems Lumen, a
 light-weight KVM orchestration appliance built on AlmaLinux. Provides the
 /etc/lumen-release version file, Lumen VARIANT keys for operating system
-identification, and branded login banner content.
+identification, branded login banner content, and the boot console banner
+that shows the appliance's host name, current address, and management
+console location.
 
 %prep
 # No source archive to unpack.
@@ -57,6 +67,12 @@ sed -e 's/@VERSION@/%{version}/g' \
 # stages these onto /boot/grub2/themes/lumen (same theme the ISO menu uses).
 install -p -m 0644 %{SOURCE4} %{buildroot}%{_datadir}/lumen-release/grub/theme.txt
 install -p -m 0644 %{SOURCE5} %{buildroot}%{_datadir}/lumen-release/grub/lumen-grub-bg.png
+# Boot console banner: renders /etc/issue and the dynamic motd fragment with
+# the current management address; re-run by the NetworkManager dispatcher
+# hook when addresses change.
+install -D -p -m 0755 %{SOURCE6} %{buildroot}%{_sbindir}/lumen-console-banner
+install -D -p -m 0644 %{SOURCE7} %{buildroot}%{_unitdir}/lumen-console-banner.service
+install -D -p -m 0755 %{SOURCE8} %{buildroot}%{_prefix}/lib/NetworkManager/dispatcher.d/50-lumen-banner
 chmod 0644 %{buildroot}%{_sysconfdir}/lumen-release \
            %{buildroot}%{_datadir}/lumen-release/os-release-lumen.conf \
            %{buildroot}%{_datadir}/lumen-release/issue \
@@ -82,7 +98,13 @@ fi
 cp -f %{_datadir}/lumen-release/issue /etc/issue
 cp -f %{_datadir}/lumen-release/motd /etc/motd
 
+%systemd_post lumen-console-banner.service
+
+%preun
+%systemd_preun lumen-console-banner.service
+
 %postun
+%systemd_postun lumen-console-banner.service
 if [ "$1" -eq 0 ]; then
     # Erase (not upgrade): restore stock identity files.
     ln -snf ../usr/lib/os-release /etc/os-release
@@ -103,9 +125,14 @@ fi
 %{_datadir}/lumen-release/motd
 %{_datadir}/lumen-release/grub/theme.txt
 %{_datadir}/lumen-release/grub/lumen-grub-bg.png
+%{_sbindir}/lumen-console-banner
+%{_unitdir}/lumen-console-banner.service
+%{_prefix}/lib/NetworkManager/dispatcher.d/50-lumen-banner
 
 %changelog
 * Fri Jul 24 2026 Quartz Systems Engineering <engineering@quartz.systems> - 0.1.0-1
+- Boot console banner: host name, current address, and console location on
+  the pre-login screen, refreshed when addresses change
 - Brand the boot banner: os-release NAME/PRETTY_NAME/ANSI_COLOR overrides
 - Ship the GRUB gfxmenu theme for the installed system's boot menu
 

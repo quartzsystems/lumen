@@ -86,6 +86,9 @@ cp "$REPO_ROOT"/branding/release/lumen-release.in \
    "$REPO_ROOT"/branding/logos/png/lumen-mark-1024.png \
    "$REPO_ROOT"/branding/logos/README.md \
    "$REPO_ROOT"/branding/plymouth/lumen.plymouth \
+   "$REPO_ROOT"/branding/console/lumen-console-banner \
+   "$REPO_ROOT"/branding/console/lumen-console-banner.service \
+   "$REPO_ROOT"/branding/console/50-lumen-banner \
    "$REPO_ROOT"/lumen-networking/nicnames/lumen-nicnames \
    "$TOPDIR/SOURCES/"
 

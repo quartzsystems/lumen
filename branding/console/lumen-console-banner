@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# lumen-console-banner — render the boot console banner with the appliance's
+# current access coordinates.
+#
+# Writes two things:
+#   /etc/issue        pre-login console: the Lumen motd art plus host name,
+#                     management address, web console URL, and the classic
+#                     kernel line (agetty renders the \r \m \l escapes)
+#   /run/motd.d/lumen post-login (pam_motd): just the access block, shown
+#                     under the static /etc/motd art for ssh and console
+#                     logins
+#
+# Runs once at boot (lumen-console-banner.service) and again from a
+# NetworkManager dispatcher hook whenever an address changes, so DHCP moves
+# keep the banner honest. agetty re-reads /etc/issue every time it redraws
+# the prompt, so updates appear without restarting the getty.
+#
+# Overridable paths are for tests only.
+set -euo pipefail
+
+SHARE="${LUMEN_SHARE:-/usr/share/lumen-release}"
+ISSUE_OUT="${LUMEN_ISSUE_OUT:-/etc/issue}"
+MOTD_D="${LUMEN_MOTD_D:-/run/motd.d}"
+# lumen-controlplane's listen port (LUMEN_CP_LISTEN default).
+PORT=8443
+
+# hostname -f for the FQDN when resolvable; fall back to the kernel node
+# name (uname is coreutils — present even where hostname(1) is not).
+fqdn="$(hostname -f 2>/dev/null || true)"
+[ -n "$fqdn" ] || fqdn="$(uname -n)"
+# First global IPv4 on an up interface — the management NIC on an appliance.
+# Best-effort by design (|| true): a failed probe must render the
+# no-address banner, never kill the script. The single awk exits itself; a
+# head(1) here would SIGPIPE the pipeline and trip pipefail.
+addr="$(ip -4 -o addr show up scope global 2>/dev/null \
+        | awk 'NR==1 { split($4, a, "/"); print a[1]; exit }' || true)"
+
+access_block() {
+    printf '    Host:         %s\n' "$fqdn"
+    if [ -n "$addr" ]; then
+        printf '    Address:      %s\n' "$addr"
+        printf '    Web console:  https://%s:%s/\n' "$addr" "$PORT"
+    else
+        printf '    Web console:  https://<management-ip>:%s/ (no address assigned yet)\n' "$PORT"
+    fi
+}
+
+# Pre-login banner: art, access block, kernel line. The motd's own trailing
+# version/URL lines double as the banner heading, so the issue template only
+# contributes its kernel escape line here.
+{
+    cat "$SHARE/motd" 2>/dev/null || printf 'Quartz Systems Lumen\n'
+    printf '\n'
+    access_block
+    printf '\n'
+    grep '^Kernel' "$SHARE/issue" 2>/dev/null || true
+    printf '\n'
+} > "$ISSUE_OUT"
+
+mkdir -p "$MOTD_D"
+{
+    printf '\n'
+    access_block
+    printf '\n'
+} > "$MOTD_D/lumen"
