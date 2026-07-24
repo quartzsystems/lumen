@@ -72,6 +72,35 @@ jobs:
           cargo test --manifest-path lumen-installer/app/Cargo.toml \
             --target-dir build/cargo-target
 
+  networking:
+    name: Networking (Rust, AlmaLinux 10)
+    runs-on: ubuntu-latest
+    container: almalinux:10
+    steps:
+      - name: Install Rust toolchain
+        # No system libraries: lumen-net talks to the system bus through
+        # pure-Rust zbus, so there is nothing to link and no NetworkManager
+        # needed. Its tests run against the in-memory backend.
+        run: dnf -y install rust cargo rustfmt clippy make git-core
+      - uses: actions/checkout@v4
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            build/cargo-target-net
+          key: cargo-net-${{ hashFiles('lumen-networking/lumen-net/Cargo.lock') }}
+      - name: Format
+        run: cargo fmt --manifest-path lumen-networking/lumen-net/Cargo.toml --check
+      - name: Clippy
+        run: |
+          cargo clippy --manifest-path lumen-networking/lumen-net/Cargo.toml \
+            --all-targets --target-dir build/cargo-target-net -- -D warnings
+      - name: Tests
+        run: |
+          cargo test --manifest-path lumen-networking/lumen-net/Cargo.toml \
+            --target-dir build/cargo-target-net
+
   controlplane:
     name: Control plane (Rust, AlmaLinux 10)
     runs-on: ubuntu-latest

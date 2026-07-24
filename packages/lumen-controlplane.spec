@@ -98,6 +98,12 @@ install -d -m 0700 %{buildroot}%{_sharedstatedir}/lumen-controlplane
 %dir %attr(0700,root,root) %{_sharedstatedir}/lumen-controlplane
 
 %changelog
+* Fri Jul 24 2026 Quartz Systems Engineering <engineering@quartz.systems> - 0.2.0-1
+- Add the network configuration interface: link aggregation, virtual
+  networks, tagged interfaces, and per-adapter settings, staged and applied
+  with an automatic revert if the operator does not confirm in time
+- Add the console views for adapters and for the network summary
+
 * Fri Jul 24 2026 Quartz Systems Engineering <engineering@quartz.systems> - 0.1.0-1
 - Initial lumen-controlplane package: management daemon, web console
   export, PAM service, systemd unit, firewalld service definition

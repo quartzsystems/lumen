@@ -26,6 +26,9 @@ struct Draft {
     keymap_label: String,
     keymap: String,
     nic: String,
+    /// The selected NIC's hardware address, pinned onto the management bridge
+    /// so the bridge does not inherit a different port's MAC later.
+    nic_mac: String,
     hostname: String,
     dhcp: bool,
     ip: String,
@@ -720,6 +723,7 @@ fn page_network(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
             }
             let mut d = draft.borrow_mut();
             d.nic = nic.name.clone();
+            d.nic_mac = nic.mac.clone();
             d.hostname = hostname;
             d.dhcp = dhcp_radio.is_active();
             if !d.dhcp {
@@ -1253,6 +1257,7 @@ fn start_install(stack: &gtk::Stack, d: &Draft) {
         keymap: d.keymap.clone(),
         hostname: d.hostname.clone(),
         nic: d.nic.clone(),
+        nic_mac: d.nic_mac.clone(),
         network,
         disks: d.disks.clone(),
         topology: d.topology,

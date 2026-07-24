@@ -12,6 +12,7 @@ use axum::Router;
 use tower_http::trace::TraceLayer;
 
 use config::Config;
+use lumen_net::NetworkService;
 use realm::RealmRegistry;
 
 /// Shared state behind every /api handler.
@@ -19,6 +20,10 @@ pub struct AppState {
     pub config: Config,
     pub jwt_secret: Vec<u8>,
     pub realms: RealmRegistry,
+    /// The networking domain. Takes its backend as a parameter the same way
+    /// the realm registry does, so tests inject the in-memory one and never
+    /// touch the runner's NetworkManager.
+    pub network: Arc<NetworkService>,
 }
 
 /// The full application router: /api plus the static web UI fallback.

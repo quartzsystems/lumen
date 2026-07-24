@@ -21,7 +21,7 @@ Makefile             make rpms | installer | controlplane | webui | iso | test |
 lumen-installer/     Rust GUI installer (app/) + live environment (live/)
 lumen-controlplane/  Rust (axum) control plane: auth API + web UI server on :8443
 lumen-webui/         Next.js/TypeScript/Tailwind web console (login + shell)
-lumen-networking/    lumen-nicnames: deterministic nic0..nicN naming
+lumen-networking/    lumen-net (bridges/bonds/VLANs) + nic0..nicN naming
 iso/                 ISO build pipeline + version pins (upstream.env, pins.env)
 branding/            Release files, MOTD/issue, os-release additions, artwork
 packages/            RPM specs (lumen-release, lumen-logos, lumen-networking)
@@ -39,6 +39,17 @@ appliance. Sign-in goes through pluggable **realms**; the built-in
 by the installer, i.e. root today). See
 [docs/controlplane.md](docs/controlplane.md) for the architecture and the
 development workflow.
+
+## Networking
+
+The console configures **bridges, bonds, VLAN interfaces, and per-adapter
+settings** through NetworkManager over the system bus. The management
+address lives on a bridge (`br0`) from the first boot, so the first
+virtual machine needs no change to it. Every change is staged, validated,
+and applied inside a **NetworkManager checkpoint that reverts itself** if
+nobody confirms it within the window — a configuration that cuts your own
+path to the node heals on its own instead of costing a trip to the rack.
+See [docs/networking.md](docs/networking.md).
 
 ## Prerequisites
 

@@ -80,6 +80,26 @@ pub fn verify_ticket(secret: &[u8], token: &str) -> Option<SessionClaims> {
     .ok()
 }
 
+/// A verified session, as an extractor. Any handler that takes one is a
+/// protected route: no valid ticket, no handler.
+pub struct Session(pub SessionClaims);
+
+impl axum::extract::FromRequestParts<std::sync::Arc<crate::AppState>> for Session {
+    type Rejection = crate::error::ApiError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &std::sync::Arc<crate::AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        use axum_extra::extract::cookie::CookieJar;
+        let jar = CookieJar::from_headers(&parts.headers);
+        jar.get(SESSION_COOKIE)
+            .and_then(|cookie| verify_ticket(&state.jwt_secret, cookie.value()))
+            .map(Session)
+            .ok_or(crate::error::ApiError::Unauthorized)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
