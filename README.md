@@ -62,9 +62,29 @@ attached to the node's bridges. libvirt is the source of truth — there is no
 database, and Lumen's own per-machine data rides inside the domain document's
 `<metadata>`, so `virsh dumpxml` shows the whole picture. Changes to a running
 machine report **what reached the guest and what waits for a restart**, using
-libvirt's own answer rather than a guess. Storage is read-only for now: pool
-creation is the one operation with no privileged daemon to delegate to. See
-[docs/compute.md](docs/compute.md).
+libvirt's own answer rather than a guess. A running machine's screen is on the
+**Console** tab, or in a window of its own — the hypervisor's own stream,
+carried over this console's connection and not interpreted on the way through.
+See [docs/compute.md](docs/compute.md).
+
+**Storage pools** are built and destroyed from the console too. The picker
+reports what is already on every disk, so the one the appliance is running from
+cannot be reformatted by accident, and a pool is built on the disk's stable
+identifier rather than on a `/dev/sdX` name that moves between boots.
+
+## The node itself
+
+**System → Authentication** manages the node's local accounts, which are the
+console's accounts: the `lumen` realm is PAM, so an account made here is an
+account at the keyboard and over SSH. **System → Maintenance** restarts and
+shuts the node down, now or at a scheduled moment held by logind rather than by
+this console.
+
+Creating an account and creating a pool are the only two operations that cannot
+happen inside the management daemon's sandbox. Neither of them loosened it —
+both are handed to **systemd**, which runs them as a transient unit outside it,
+the same way networking asks NetworkManager and machines ask the hypervisor.
+See [docs/system.md](docs/system.md).
 
 ## Prerequisites
 
@@ -134,7 +154,7 @@ Quartz-styled installer asks exactly four questions: root password, time
 zone, management NIC (DHCP or static), and the boot drive. NICs are named
 `nic0…nicN` (PCI order) in the installer and identically on the installed
 system. The chosen drive is erased: EFI system partition + ext4 `/boot` +
-ZFS pool `rpool` holding the OS root dataset. Everything else is fixed
+ZFS pool `boot` holding the OS root dataset. Everything else is fixed
 appliance policy: minimal package set, SELinux enforcing (labeled at
 install time), firewalld with SSH and the management console only,
 chronyd enabled, hostname `lumen`. Log in as `root` with the password

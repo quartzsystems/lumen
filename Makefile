@@ -23,10 +23,12 @@ SPECS   := packages/lumen-release.spec packages/lumen-logos.spec \
            packages/lumen-compute.spec
 CARGO_MANIFEST := lumen-installer/app/Cargo.toml
 CP_MANIFEST    := lumen-controlplane/Cargo.toml
-# The three domain crates are path dependencies of the control plane, not
+# The four domain crates are path dependencies of the control plane, not
 # workspace members (the manifests are independent by design — see
 # docs/networking.md and docs/compute.md), so each gets its own
-# fmt/clippy/test invocation.
+# fmt/clippy/test invocation. lumen-sys is first because it is the most basic:
+# it depends on none of the others, and lumen-zfs depends on it.
+SYS_MANIFEST   := lumen-system/lumen-sys/Cargo.toml
 NET_MANIFEST   := lumen-networking/lumen-net/Cargo.toml
 ZFS_MANIFEST   := lumen-storage/lumen-zfs/Cargo.toml
 VIRT_MANIFEST  := lumen-compute/lumen-virt/Cargo.toml
@@ -65,6 +67,8 @@ iso:
 test:
 	cargo test --manifest-path $(CARGO_MANIFEST) \
 		--target-dir build/cargo-target
+	cargo test --manifest-path $(SYS_MANIFEST) \
+		--target-dir build/cargo-target-sys
 	cargo test --manifest-path $(NET_MANIFEST) \
 		--target-dir build/cargo-target-net
 	cargo test --manifest-path $(ZFS_MANIFEST) \
@@ -80,6 +84,9 @@ lint:
 	cargo fmt --manifest-path $(CARGO_MANIFEST) --check
 	cargo clippy --manifest-path $(CARGO_MANIFEST) \
 		--target-dir build/cargo-target -- -D warnings
+	cargo fmt --manifest-path $(SYS_MANIFEST) --check
+	cargo clippy --manifest-path $(SYS_MANIFEST) --all-targets \
+		--target-dir build/cargo-target-sys -- -D warnings
 	cargo fmt --manifest-path $(NET_MANIFEST) --check
 	cargo clippy --manifest-path $(NET_MANIFEST) --all-targets \
 		--target-dir build/cargo-target-net -- -D warnings

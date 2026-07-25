@@ -1,10 +1,18 @@
 //! The storage domain's one entry point.
 //!
-//! Read-only to the console this stage — pools and what is under them — plus
-//! the one write the compute domain needs: the volume a virtual machine's disk
-//! lives on. Pool creation, import, and destroy are deliberately absent; they
-//! are the operations with no privileged daemon to delegate to, and they are
-//! what `lumen-execd` will exist for. See docs/compute.md.
+//! Pools and what is under them, the volume a virtual machine's disk lives on,
+//! and the media library — plus the two operations that build and remove a
+//! pool.
+//!
+//! Those two are the only things in this crate that cannot happen inside the
+//! control plane's sandbox: they write `/etc/zfs/zpool.cache`, which
+//! `ProtectSystem=strict` makes read-only. They are handed to systemd through
+//! [`lumen_sys::exec`] and run outside it, so the unit is unchanged. See
+//! docs/system.md.
+//!
+//! `zpool import`, `export`, `scrub`, and `replace` are still absent — not for
+//! want of a mechanism now, but because none of them is a decision this
+//! console has anything useful to add to yet.
 
 use std::sync::Arc;
 
@@ -15,10 +23,24 @@ use crate::backend::ZfsBackend;
 use crate::error::{Result, ZfsError};
 use crate::iso::{IsoLibrary, IsoStoreView, IsoUpload, IsoView};
 use crate::model::{
-    device_path, is_lumen_volume, is_reserved_leaf, valid_pool_name, Dataset, DatasetKind,
-    PoolHealth, VolumeRequest,
+    device_path, is_lumen_volume, is_reserved_leaf, valid_pool_name, BlockDevice, Dataset,
+    DatasetKind, PoolHealth, PoolRequest, VolumeRequest,
 };
 use crate::state::{hostname, StorageState};
+use crate::validate::{
+    validate_pool, Acknowledgements, PoolCreate, ValidationCode, ValidationError,
+};
+
+/// GET /api/storage/devices — what the create dialog fills its picker from.
+#[derive(Debug, Clone, Serialize)]
+pub struct DevicesResponse {
+    pub node: String,
+    pub devices: Vec<BlockDevice>,
+    /// The pool this appliance is installed on, so the console can say which
+    /// one the Remove control will not touch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_pool: Option<String>,
+}
 
 /// One row of the console's pool table. Everything a row needs is here, so
 /// rendering never needs a second round trip — the shape
@@ -98,6 +120,10 @@ pub struct StorageService {
     /// race to the same volume name.
     gate: Mutex<()>,
     isos: IsoLibrary,
+    /// The pool the appliance is installed on, which the console will not
+    /// destroy. Read once at startup — it cannot change without a reboot, and
+    /// a reboot restarts this daemon.
+    root_pool: Option<String>,
 }
 
 impl StorageService {
@@ -107,7 +133,15 @@ impl StorageService {
             node: hostname(),
             gate: Mutex::new(()),
             isos: IsoLibrary::default(),
+            root_pool: crate::state::root_pool(),
         }
+    }
+
+    /// Pretend the appliance is installed on this pool. For tests, which have
+    /// no `/proc/mounts` of their own to arrange.
+    pub fn with_root_pool(mut self, pool: Option<String>) -> Self {
+        self.root_pool = pool;
+        self
     }
 
     /// The same service with its media library somewhere else — the seam the
@@ -134,13 +168,130 @@ impl StorageService {
 
     pub async fn pools(&self) -> Result<PoolsResponse> {
         let observed = self.observe().await?;
-        let pools = observed.pools.into_iter().map(view_of).collect();
+        let pools = observed
+            .pools
+            .into_iter()
+            .map(|pool| view_of(pool, self.root_pool.as_deref()))
+            .collect();
         Ok(PoolsResponse {
             nodes: vec![NodePools {
                 node: self.node.clone(),
                 pools,
             }],
         })
+    }
+
+    // --- pools ------------------------------------------------------------
+
+    /// Every disk the node has, with what is already on each one.
+    ///
+    /// The answer the create dialog fills its picker from, and the reason it
+    /// can refuse the disk the appliance is running from rather than listing it
+    /// next to the empty ones with nothing to tell them apart.
+    pub async fn block_devices(&self) -> Result<DevicesResponse> {
+        Ok(DevicesResponse {
+            node: self.node.clone(),
+            devices: self.backend.block_devices().await?,
+            root_pool: self.root_pool.clone(),
+        })
+    }
+
+    /// Build a pool.
+    ///
+    /// Every check happens before anything is run, and there is exactly one
+    /// operation afterwards — so a rejected request leaves the node's disks
+    /// untouched, which is the only failure mode that matters here.
+    pub async fn create_pool(
+        &self,
+        request: PoolCreate,
+        ack: Acknowledgements,
+    ) -> Result<PoolView> {
+        let _guard = self.gate.lock().await;
+
+        let existing = self.observe().await.map(|s| s.pools).unwrap_or_default();
+        let devices = self.backend.block_devices().await.unwrap_or_default();
+        let errors = validate_pool(&request, &existing, &devices, ack);
+        if !errors.is_empty() {
+            return Err(ZfsError::Invalid(errors));
+        }
+
+        // Resolve each chosen disk to the stable path the node reported for it,
+        // never to whatever the request said. A pool built on `/dev/sdb` can
+        // come back after a reboot pointing at a different disk; the by-id
+        // path is the serial number and does not move.
+        let disks: Vec<String> = request
+            .disks
+            .iter()
+            .map(|chosen| {
+                devices
+                    .iter()
+                    .find(|d| &d.path == chosen || &d.kernel_path == chosen || &d.name == chosen)
+                    .map(|d| d.path.clone())
+                    .unwrap_or_else(|| chosen.clone())
+            })
+            .collect();
+
+        // Forcing is never the caller's word alone: it is only set when a disk
+        // that already has something on it was chosen *and* acknowledged, both
+        // of which the validator above has just confirmed.
+        let force = disks.iter().any(|path| {
+            devices
+                .iter()
+                .find(|d| &d.path == path)
+                .is_some_and(|d| d.in_use)
+        });
+
+        let pool = self
+            .backend
+            .create_pool(&PoolRequest {
+                name: request.name.trim().to_string(),
+                vdev: request.vdev,
+                disks,
+                ashift: request.ashift,
+                compression: request.compression,
+                autotrim: request.autotrim,
+                force,
+            })
+            .await?;
+
+        tracing::info!(pool = %pool.name, vdev = ?request.vdev, "pool created");
+        Ok(view_of(pool, self.root_pool.as_deref()))
+    }
+
+    /// Destroy one, and everything on it.
+    ///
+    /// The pool the appliance is installed on is refused outright — the same
+    /// rule the account page keeps for `root`. Nothing the console offers may
+    /// take the appliance away from the operator using it.
+    pub async fn destroy_pool(&self, name: &str, ack: Acknowledgements) -> Result<()> {
+        let _guard = self.gate.lock().await;
+        reject_bad_pool(name)?;
+
+        if self.root_pool.as_deref() == Some(name) {
+            return Err(ZfsError::Conflict(format!(
+                "\"{name}\" is the pool this appliance is installed on and cannot be destroyed \
+                 from the console."
+            )));
+        }
+        if !ack.may_lose_data {
+            return Err(ZfsError::Invalid(vec![ValidationError::new(
+                ValidationCode::UnacknowledgedDestructiveOperation,
+                None,
+                format!(
+                    "Destroying \"{name}\" removes every dataset, volume, and snapshot on it. \
+                     There is no undo. Confirm that you understand this may lose data."
+                ),
+            )]));
+        }
+        if !self.pool_exists(name).await? {
+            return Err(ZfsError::NotFound(format!(
+                "No pool named \"{name}\" on this node."
+            )));
+        }
+
+        self.backend.destroy_pool(name).await?;
+        tracing::warn!(pool = %name, "pool destroyed");
+        Ok(())
     }
 
     /// Datasets and volumes under one pool.
@@ -307,17 +458,22 @@ fn reject_outside_namespace(path: &str) -> Result<()> {
     )))
 }
 
-fn view_of(pool: crate::model::Pool) -> PoolView {
-    // Pool creation and removal arrive with the privileged executor in a later
-    // stage. Until then every pool says the same thing, in the words an
-    // operator can act on rather than as a greyed-out control with no reason.
-    let reason = Some(
-        "Pools are created and removed from the node itself for now — the console will manage \
-         them in a later release."
-            .to_string(),
-    );
+fn view_of(pool: crate::model::Pool, root_pool: Option<&str>) -> PoolView {
+    // The pool the appliance itself is running from is never destroyable from
+    // the console. Everything else is, with the acknowledgement — and this is
+    // the same rule the account page keeps for `root`: nothing offered here may
+    // take the appliance away from the operator using it.
+    let blocked = match root_pool {
+        Some(root) if root == pool.name => Some(format!(
+            "\"{}\" is the pool this appliance is installed on.",
+            pool.name
+        )),
+        _ => None,
+    };
     PoolView {
         used_percent: pool.used_percent(),
+        destroyable: blocked.is_none(),
+        destroy_blocked_reason: blocked,
         name: pool.name,
         health: pool.health,
         size: pool.size,
@@ -326,8 +482,6 @@ fn view_of(pool: crate::model::Pool) -> PoolView {
         fragmentation: pool.fragmentation,
         dedup_ratio: pool.dedup_ratio,
         read_only: pool.read_only,
-        destroyable: false,
-        destroy_blocked_reason: reason,
     }
 }
 
@@ -349,10 +503,48 @@ fn volume_view_of(dataset: Dataset) -> VolumeView {
 mod tests {
     use super::*;
     use crate::backend::mock::MockBackend;
+    use crate::model::VdevKind;
 
+    /// The appliance's own node: one pool, which it is installed on.
     fn service() -> (StorageService, Arc<MockBackend>) {
         let backend = Arc::new(MockBackend::appliance());
-        (StorageService::new(backend.clone()), backend)
+        (
+            StorageService::new(backend.clone()).with_root_pool(Some("boot".into())),
+            backend,
+        )
+    }
+
+    /// A node with disks to build a pool on: one holding the system, three
+    /// free.
+    fn node_with_disks() -> (StorageService, Arc<MockBackend>) {
+        const TB: u64 = 1_000_000_000_000;
+        let backend = Arc::new(MockBackend::appliance().with_disks(vec![
+            MockBackend::busy_disk("sda", TB),
+            MockBackend::free_disk("sdb", TB),
+            MockBackend::free_disk("sdc", TB),
+            MockBackend::free_disk("sdd", TB),
+        ]));
+        (
+            StorageService::new(backend.clone()).with_root_pool(Some("boot".into())),
+            backend,
+        )
+    }
+
+    fn pool_create(name: &str, vdev: VdevKind, disks: &[&str]) -> PoolCreate {
+        PoolCreate {
+            name: name.into(),
+            vdev,
+            disks: disks.iter().map(|d| d.to_string()).collect(),
+            ashift: None,
+            compression: crate::model::Compression::Lz4,
+            autotrim: true,
+        }
+    }
+
+    fn acknowledged() -> Acknowledgements {
+        Acknowledgements {
+            may_lose_data: true,
+        }
     }
 
     #[tokio::test]
@@ -360,39 +552,193 @@ mod tests {
         let (service, _backend) = service();
         let response = service.pools().await.unwrap();
         assert_eq!(response.nodes.len(), 1);
-        let rpool = &response.nodes[0].pools[0];
-        assert_eq!(rpool.name, "rpool");
-        assert_eq!(rpool.health, PoolHealth::Online);
-        assert!(rpool.size > 0);
-        assert_eq!(rpool.used_percent, 1);
-        // rpool exists and is visibly not destroyable, with the reason said
-        // out loud rather than left to the console to invent.
-        assert!(!rpool.destroyable);
-        assert!(rpool.destroy_blocked_reason.is_some());
+        let boot = &response.nodes[0].pools[0];
+        assert_eq!(boot.name, "boot");
+        assert_eq!(boot.health, PoolHealth::Online);
+        assert!(boot.size > 0);
+        assert_eq!(boot.used_percent, 1);
+        // This is the pool the appliance is installed on, so it is visibly not
+        // destroyable with the reason said out loud rather than left to the
+        // console to invent.
+        assert!(!boot.destroyable);
+        assert!(boot
+            .destroy_blocked_reason
+            .as_deref()
+            .unwrap()
+            .contains("installed on"));
+    }
+
+    #[tokio::test]
+    async fn a_pool_is_built_on_the_disks_that_were_chosen() {
+        let (service, backend) = node_with_disks();
+        let pool = service
+            .create_pool(
+                pool_create("tank", VdevKind::Raidz1, &["sdb", "sdc", "sdd"]),
+                Acknowledgements::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(pool.name, "tank");
+        // Not the pool the appliance runs from, so this one can be removed.
+        assert!(pool.destroyable);
+        assert!(backend.has_pool("tank"));
+
+        let built = backend.created_pools();
+        assert_eq!(built.len(), 1);
+        assert_eq!(built[0].vdev, VdevKind::Raidz1);
+        // The picker offered kernel names; what was built is the stable path,
+        // because /dev/sdb is whatever the kernel enumerated second this boot.
+        assert_eq!(
+            built[0].disks,
+            [
+                "/dev/disk/by-id/scsi-sdb",
+                "/dev/disk/by-id/scsi-sdc",
+                "/dev/disk/by-id/scsi-sdd"
+            ]
+        );
+        // Nothing was forced, because nothing needed to be.
+        assert!(!built[0].force);
+    }
+
+    /// The check the whole picker exists for.
+    #[tokio::test]
+    async fn the_disk_the_appliance_runs_from_is_refused_unless_acknowledged() {
+        let (service, backend) = node_with_disks();
+        let err = service
+            .create_pool(
+                pool_create("tank", VdevKind::Stripe, &["sda"]),
+                Acknowledgements::default(),
+            )
+            .await
+            .unwrap_err();
+
+        let ZfsError::Invalid(errors) = err else {
+            panic!("expected a validation failure");
+        };
+        assert_eq!(errors[0].code, ValidationCode::DiskInUse);
+        assert!(backend.created_pools().is_empty(), "nothing may have run");
+
+        // Acknowledged, it goes ahead — and only then is -f set.
+        service
+            .create_pool(
+                pool_create("tank", VdevKind::Stripe, &["sda"]),
+                acknowledged(),
+            )
+            .await
+            .unwrap();
+        assert!(backend.created_pools()[0].force);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_pool_never_touches_a_disk() {
+        let (service, backend) = node_with_disks();
+        // A vdev keyword for a name, two disks for a raidz2, and one of them
+        // twice.
+        let err = service
+            .create_pool(
+                pool_create("mirror", VdevKind::Raidz2, &["sdb", "sdb"]),
+                acknowledged(),
+            )
+            .await
+            .unwrap_err();
+        let ZfsError::Invalid(errors) = err else {
+            panic!("expected a validation failure");
+        };
+        assert!(errors.len() >= 3, "{errors:#?}");
+        assert!(backend.created_pools().is_empty());
+    }
+
+    /// The same rule the account page keeps for `root`: nothing the console
+    /// offers may take the appliance away from the operator using it.
+    #[tokio::test]
+    async fn the_pool_the_appliance_is_installed_on_is_never_destroyed() {
+        let (service, backend) = service();
+        let err = service
+            .destroy_pool("boot", acknowledged())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ZfsError::Conflict(_)), "{err:?}");
+        assert!(err.to_string().contains("installed on"), "{err}");
+        assert!(backend.has_pool("boot"), "it must still be there");
+    }
+
+    #[tokio::test]
+    async fn destroying_a_pool_needs_the_acknowledgement() {
+        let (service, backend) = node_with_disks();
+        service
+            .create_pool(
+                pool_create("tank", VdevKind::Mirror, &["sdb", "sdc"]),
+                Acknowledgements::default(),
+            )
+            .await
+            .unwrap();
+
+        let err = service
+            .destroy_pool("tank", Acknowledgements::default())
+            .await
+            .unwrap_err();
+        let ZfsError::Invalid(errors) = err else {
+            panic!("expected a validation failure");
+        };
+        assert_eq!(
+            errors[0].code,
+            ValidationCode::UnacknowledgedDestructiveOperation
+        );
+        assert!(backend.has_pool("tank"));
+
+        service.destroy_pool("tank", acknowledged()).await.unwrap();
+        assert!(!backend.has_pool("tank"));
+    }
+
+    #[tokio::test]
+    async fn destroying_a_pool_that_is_not_there_is_a_not_found() {
+        let (service, _backend) = service();
+        assert!(matches!(
+            service
+                .destroy_pool("tank", acknowledged())
+                .await
+                .unwrap_err(),
+            ZfsError::NotFound(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_picker_reports_what_is_already_on_each_disk() {
+        let (service, _backend) = node_with_disks();
+        let response = service.block_devices().await.unwrap();
+        assert_eq!(response.root_pool.as_deref(), Some("boot"));
+
+        let sda = response.devices.iter().find(|d| d.name == "sda").unwrap();
+        assert!(sda.in_use);
+        assert_eq!(sda.used_by.as_deref(), Some("mounted at /"));
+
+        let sdb = response.devices.iter().find(|d| d.name == "sdb").unwrap();
+        assert!(!sdb.in_use);
     }
 
     #[tokio::test]
     async fn creating_a_disk_makes_the_namespace_on_the_way_past() {
         let (service, backend) = service();
         let dataset = service
-            .create_volume("rpool", "vm-101-disk-0", 8_589_934_592, Some(16_384))
+            .create_volume("boot", "vm-101-disk-0", 8_589_934_592, Some(16_384))
             .await
             .unwrap();
-        assert_eq!(dataset.name, "rpool/lumen/vm-101-disk-0");
+        assert_eq!(dataset.name, "boot/lumen/vm-101-disk-0");
         assert_eq!(dataset.volsize, Some(8_589_934_592));
-        assert!(backend.has_dataset("rpool/lumen"));
+        assert!(backend.has_dataset("boot/lumen"));
         assert_eq!(
             service.device_path(&dataset.name),
-            "/dev/zvol/rpool/lumen/vm-101-disk-0"
+            "/dev/zvol/boot/lumen/vm-101-disk-0"
         );
 
         // …and it shows up under the pool, with the pool root itself left out.
-        let volumes = service.volumes("rpool").await.unwrap();
-        assert!(!volumes.volumes.iter().any(|v| v.name == "rpool"));
+        let volumes = service.volumes("boot").await.unwrap();
+        assert!(!volumes.volumes.iter().any(|v| v.name == "boot"));
         let disk = volumes
             .volumes
             .iter()
-            .find(|v| v.name == "rpool/lumen/vm-101-disk-0")
+            .find(|v| v.name == "boot/lumen/vm-101-disk-0")
             .expect("the disk is listed");
         assert!(disk.lumen_managed);
         assert_eq!(disk.kind, DatasetKind::Volume);
@@ -401,27 +747,27 @@ mod tests {
     #[tokio::test]
     async fn a_destroy_outside_the_namespace_is_refused_before_it_reaches_the_box() {
         let (service, backend) = service();
-        for path in ["rpool", "rpool/lumen", "rpool/data/important", "../etc"] {
+        for path in ["boot", "boot/lumen", "boot/data/important", "../etc"] {
             let err = service.destroy_volume(path).await.unwrap_err();
             assert!(matches!(err, ZfsError::Conflict(_)), "{path}: {err:?}");
         }
         // Nothing was removed on the way to being refused.
-        assert!(backend.has_dataset("rpool"));
+        assert!(backend.has_dataset("boot"));
     }
 
     #[tokio::test]
     async fn a_disk_can_be_created_and_removed_again() {
         let (service, backend) = service();
-        let free_before = service.free_space("rpool").await.unwrap();
+        let free_before = service.free_space("boot").await.unwrap();
         let dataset = service
-            .create_volume("rpool", "vm-100-disk-0", 1_073_741_824, None)
+            .create_volume("boot", "vm-100-disk-0", 1_073_741_824, None)
             .await
             .unwrap();
-        assert!(service.free_space("rpool").await.unwrap() < free_before);
+        assert!(service.free_space("boot").await.unwrap() < free_before);
 
         service.destroy_volume(&dataset.name).await.unwrap();
         assert!(!backend.has_dataset(&dataset.name));
-        assert_eq!(service.free_space("rpool").await.unwrap(), free_before);
+        assert_eq!(service.free_space("boot").await.unwrap(), free_before);
     }
 
     #[tokio::test]
@@ -433,13 +779,13 @@ mod tests {
         ));
         assert_eq!(service.free_space("tank").await.unwrap(), 0);
         assert!(!service.pool_exists("tank").await.unwrap());
-        assert!(service.pool_exists("rpool").await.unwrap());
+        assert!(service.pool_exists("boot").await.unwrap());
     }
 
     #[tokio::test]
     async fn a_pool_name_that_is_really_a_path_never_reaches_the_backend() {
         let (service, _backend) = service();
-        for pool in ["rpool/lumen", "-rf", "", ".."] {
+        for pool in ["boot/lumen", "-rf", "", ".."] {
             assert!(service.volumes(pool).await.is_err(), "{pool}");
             assert!(service
                 .create_volume(pool, "vm-1-disk-0", 1024, None)
@@ -470,16 +816,16 @@ mod tests {
         assert!(before.images.is_empty());
 
         // The dataset is created on the pool, and the directory now exists.
-        let created = service.create_iso_store("rpool").await.unwrap();
-        assert!(backend.has_dataset("rpool/lumen/iso"));
+        let created = service.create_iso_store("boot").await.unwrap();
+        assert!(backend.has_dataset("boot/lumen/iso"));
         // The mock creates the dataset but not the directory — exactly the
         // "made on the box, not yet visible here" case the view exists for.
         assert!(!created.ready);
-        std::fs::create_dir_all(root.join("rpool")).unwrap();
+        std::fs::create_dir_all(root.join("boot")).unwrap();
         assert!(service.isos().await.unwrap().stores[0].ready);
 
         let mut upload = service
-            .begin_iso_upload("rpool", "almalinux-10.iso")
+            .begin_iso_upload("boot", "almalinux-10.iso")
             .await
             .unwrap();
         upload.write(b"CD001").await.unwrap();
@@ -488,13 +834,13 @@ mod tests {
         let after = service.isos().await.unwrap();
         assert_eq!(after.images.len(), 1);
         assert_eq!(after.images[0].name, "almalinux-10.iso");
-        let path = service.iso_path("rpool", "almalinux-10.iso").unwrap();
+        let path = service.iso_path("boot", "almalinux-10.iso").unwrap();
         assert_eq!(after.images[0].path, path);
         assert!(service.iso_exists(&path).await.unwrap());
         assert!(!service.iso_exists("/etc/passwd").await.unwrap());
 
         service
-            .delete_iso("rpool", "almalinux-10.iso")
+            .delete_iso("boot", "almalinux-10.iso")
             .await
             .unwrap();
         assert!(service.isos().await.unwrap().images.is_empty());
@@ -507,14 +853,14 @@ mod tests {
     #[tokio::test]
     async fn the_media_library_cannot_be_destroyed_as_a_disk() {
         let (service, backend) = service();
-        backend.ensure_iso_store("rpool").await.unwrap();
-        let err = service.destroy_volume("rpool/lumen/iso").await.unwrap_err();
+        backend.ensure_iso_store("boot").await.unwrap();
+        let err = service.destroy_volume("boot/lumen/iso").await.unwrap_err();
         assert!(matches!(err, ZfsError::Conflict(_)), "{err:?}");
-        assert!(backend.has_dataset("rpool/lumen/iso"));
+        assert!(backend.has_dataset("boot/lumen/iso"));
         // Nor created as one, which would put a machine's disk where the
         // media lives.
         assert!(service
-            .create_volume("rpool", "iso", 1024, None)
+            .create_volume("boot", "iso", 1024, None)
             .await
             .is_err());
     }
@@ -523,7 +869,7 @@ mod tests {
     async fn a_zero_sized_volume_is_refused() {
         let (service, _backend) = service();
         assert!(service
-            .create_volume("rpool", "vm-101-disk-0", 0, None)
+            .create_volume("boot", "vm-101-disk-0", 0, None)
             .await
             .is_err());
     }

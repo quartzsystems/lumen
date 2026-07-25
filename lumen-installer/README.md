@@ -42,9 +42,9 @@ live/       live installer environment (squashfs) build
 |-----------|---------|-------------------------------------------|
 | 1 (ESP)   | 1 GiB   | shim + GRUB2 (RPM-provided, no grub2-install) |
 | 2         | 2 GiB   | ext4 `/boot` (kernels + initramfs)        |
-| 3         | rest    | ZFS pool `rpool`, root dataset `rpool/ROOT/lumen` |
+| 3         | rest    | ZFS pool `boot`, root dataset `boot/ROOT/lumen` |
 
-dracut's `zfs` module imports rpool at boot (`root=zfs:rpool/ROOT/lumen`);
+dracut's `zfs` module imports boot at boot (`root=zfs:boot/ROOT/lumen`);
 `/etc/hostid` is copied from the live env (pool creator) into the target so
 the import never needs force. The pool is cleanly exported before reboot.
 Secure Boot must be **disabled** (zfs.ko is unsigned); the installer checks

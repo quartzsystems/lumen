@@ -285,6 +285,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "lumen-sys"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "zbus",
+]
+
+[[package]]
 name = "lumen-virt"
 version = "0.3.0"
 dependencies = [
@@ -307,6 +320,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "lumen-sys",
  "serde",
  "serde_json",
  "tokio",

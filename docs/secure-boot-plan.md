@@ -62,7 +62,7 @@ Boot support == getting one module-signing key trusted.
 ## Acceptance
 
 - ISO boots with SB enabled after MOK enrollment; installer creates
-  rpool (zfs.ko loads under lockdown).
+  boot (zfs.ko loads under lockdown).
 - Installed system boots with SB enabled end-to-end; `mokutil
   --test-key` confirms enrollment; kmod update via dnf still loads.
 - SB-off path unchanged.

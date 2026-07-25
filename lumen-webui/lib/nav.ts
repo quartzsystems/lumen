@@ -4,15 +4,20 @@ import {
   Cable,
   Gauge,
   HardDrive,
+  KeyRound,
+  Layers,
   LayoutDashboard,
   Network,
   Route,
   Server,
+  ServerCog,
   Settings,
   Share2,
   Shield,
+  SlidersHorizontal,
   Spline,
   Waypoints,
+  Wrench,
   type LucideIcon,
 } from "lucide-react";
 
@@ -58,8 +63,27 @@ export const NAV: NavItem[] = [
     ],
   },
   { id: "storage", label: "Storage", icon: HardDrive, href: "/storage" },
-  { id: "infrastructure", label: "Infrastructure", icon: Server, href: "/infrastructure" },
-  { id: "system", label: "System", icon: Settings, href: "/system" },
+  {
+    id: "infrastructure",
+    label: "Infrastructure",
+    icon: Server,
+    href: "/infrastructure",
+    children: [
+      { id: "clusters", label: "Clusters", href: "/infrastructure/clusters", icon: Layers },
+      { id: "nodes",    label: "Nodes",    href: "/infrastructure/nodes",    icon: ServerCog },
+    ],
+  },
+  {
+    id: "system",
+    label: "System",
+    icon: Settings,
+    href: "/system",
+    children: [
+      { id: "general", label: "General", href: "/system/general", icon: SlidersHorizontal },
+      { id: "authentication", label: "Authentication", href: "/system/authentication", icon: KeyRound },
+      { id: "maintenance", label: "Maintenance", href: "/system/maintenance", icon: Wrench },
+    ],
+  },
 ];
 
 /// Where a section's index route sends the visitor. The static export can't

@@ -103,17 +103,28 @@ async fn harness(tag: &str) -> Harness {
     // The media library and the guest database both live under this test's own
     // temporary root, so nothing here reads or writes what the machine running
     // the tests actually has.
-    let storage =
-        Arc::new(StorageService::new(zfs_backend.clone()).with_iso_root(state_dir.0.join("iso")));
+    let storage = Arc::new(
+        StorageService::new(zfs_backend.clone())
+            .with_iso_root(state_dir.0.join("iso"))
+            // The pretend appliance is installed on boot, so it is the one
+            // pool the console will not destroy. Stated rather than read off
+            // the machine running the tests, which has no pools at all.
+            .with_root_pool(Some("boot".into())),
+    );
     let virt = Arc::new(
         VirtService::new(virt_backend.clone(), storage.clone(), network.clone())
             .with_osinfo_root(state_dir.0.join("osinfo")),
     );
 
+    let sys = Arc::new(lumen_sys::SysService::new(
+        Arc::new(lumen_sys::backend::mock::MockPower::appliance()),
+        Arc::new(lumen_sys::exec::MockExec::new()),
+    ));
     let router = app(Arc::new(AppState {
         config,
         jwt_secret: TICKET_SECRET.to_vec(),
         realms: RealmRegistry::new().register(Box::new(MockRealm)),
+        sys,
         network,
         storage,
         virt,
@@ -209,13 +220,35 @@ impl Harness {
         self.call("DELETE", path, None).await
     }
 
+    /// A well-formed WebSocket handshake, so the console route's own checks
+    /// are what answers rather than the upgrade extractor rejecting a request
+    /// that was never an upgrade in the first place.
+    async fn handshake(&self, path: &str) -> (StatusCode, serde_json::Value) {
+        let request = Request::builder()
+            .method("GET")
+            .uri(path)
+            .header(header::COOKIE, &self.cookie)
+            .header(header::CONNECTION, "Upgrade")
+            .header(header::UPGRADE, "websocket")
+            .header(header::SEC_WEBSOCKET_VERSION, "13")
+            // Any 16 bytes, base64. Nothing checks its contents.
+            .header(header::SEC_WEBSOCKET_KEY, "dGhlIHNhbXBsZSBub25jZQ==")
+            .body(Body::empty())
+            .unwrap();
+        let response = self.router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
     /// Define the machine every test below starts from: one disk, one adapter.
     async fn create_web01(&self) -> serde_json::Value {
         let (status, vm) = self
             .post(
                 "/api/vms",
                 r#"{"name":"web01","vcpus":2,"memory_mib":4096,
-                    "disks":[{"pool":"rpool","size_gib":32}],
+                    "disks":[{"pool":"boot","size_gib":32}],
                     "nics":[{"bridge":"br0"}]}"#,
             )
             .await;
@@ -243,7 +276,7 @@ async fn create_start_shutdown_delete() {
     assert_eq!(vm["disks"][0]["id"], "vda");
     assert_eq!(
         vm["disks"][0]["source"],
-        "/dev/zvol/rpool/lumen/vm-100-disk-0"
+        "/dev/zvol/boot/lumen/vm-100-disk-0"
     );
     assert_eq!(vm["nics"][0]["bridge"], "br0");
     assert_eq!(vm["nics"][0]["id"], "52:54:00:00:64:00");
@@ -256,7 +289,7 @@ async fn create_start_shutdown_delete() {
     assert!(vm["actions"]["shutdown"]["reason"].as_str().is_some());
 
     // The volume really exists.
-    assert!(h.zfs.has_dataset("rpool/lumen/vm-100-disk-0"));
+    assert!(h.zfs.has_dataset("boot/lumen/vm-100-disk-0"));
 
     let (status, started) = h.post("/api/vms/100/start", "{}").await;
     assert_eq!(status, StatusCode::OK, "{started}");
@@ -280,8 +313,8 @@ async fn create_start_shutdown_delete() {
     assert!(!h.virt.is_defined("web01"));
     // The default keeps the data, and says where it still is.
     assert_eq!(removed["removed_volumes"].as_array().unwrap().len(), 0);
-    assert_eq!(removed["kept_volumes"][0], "rpool/lumen/vm-100-disk-0");
-    assert!(h.zfs.has_dataset("rpool/lumen/vm-100-disk-0"));
+    assert_eq!(removed["kept_volumes"][0], "boot/lumen/vm-100-disk-0");
+    assert!(h.zfs.has_dataset("boot/lumen/vm-100-disk-0"));
 }
 
 // --- the acknowledgement paths ----------------------------------------------
@@ -332,7 +365,7 @@ async fn destroying_the_disks_is_refused_without_the_acknowledgement() {
     );
     // Nothing happened on the way to being refused.
     assert!(h.virt.is_defined("web01"));
-    assert!(h.zfs.has_dataset("rpool/lumen/vm-100-disk-0"));
+    assert!(h.zfs.has_dataset("boot/lumen/vm-100-disk-0"));
 
     let (status, removed) = h
         .call(
@@ -342,8 +375,8 @@ async fn destroying_the_disks_is_refused_without_the_acknowledgement() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{removed}");
-    assert_eq!(removed["removed_volumes"][0], "rpool/lumen/vm-100-disk-0");
-    assert!(!h.zfs.has_dataset("rpool/lumen/vm-100-disk-0"));
+    assert_eq!(removed["removed_volumes"][0], "boot/lumen/vm-100-disk-0");
+    assert!(!h.zfs.has_dataset("boot/lumen/vm-100-disk-0"));
 }
 
 #[tokio::test]
@@ -402,12 +435,12 @@ async fn a_disk_larger_than_the_pool_is_refused_before_a_volume_is_made() {
     let (status, body) = h
         .post(
             "/api/vms",
-            r#"{"name":"big","disks":[{"pool":"rpool","size_gib":8192}]}"#,
+            r#"{"name":"big","disks":[{"pool":"boot","size_gib":8192}]}"#,
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["errors"][0]["code"], "disk_exceeds_pool");
-    assert!(h.zfs.datasets_snapshot().iter().all(|d| d.name == "rpool"));
+    assert!(h.zfs.datasets_snapshot().iter().all(|d| d.name == "boot"));
 }
 
 #[tokio::test]
@@ -440,13 +473,13 @@ async fn a_disk_can_be_attached_and_detached_through_the_api() {
     let (status, attached) = h
         .post(
             "/api/vms/100/disks",
-            r#"{"pool":"rpool","size_gib":16,"bus":"virtio-scsi"}"#,
+            r#"{"pool":"boot","size_gib":16,"bus":"virtio-scsi"}"#,
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{attached}");
     assert_eq!(attached["vm"]["disks"].as_array().unwrap().len(), 2);
     assert_eq!(attached["vm"]["disks"][1]["id"], "sda");
-    assert!(h.zfs.has_dataset("rpool/lumen/vm-100-disk-1"));
+    assert!(h.zfs.has_dataset("boot/lumen/vm-100-disk-1"));
     // The machine is stopped, so nothing is waiting on a restart.
     assert!(attached["pending_reboot"].as_array().unwrap().is_empty());
 
@@ -459,7 +492,7 @@ async fn a_disk_can_be_attached_and_detached_through_the_api() {
         .await;
     assert_eq!(status, StatusCode::OK, "{detached}");
     assert_eq!(detached["vm"]["disks"].as_array().unwrap().len(), 1);
-    assert!(!h.zfs.has_dataset("rpool/lumen/vm-100-disk-1"));
+    assert!(!h.zfs.has_dataset("boot/lumen/vm-100-disk-1"));
 }
 
 #[tokio::test]
@@ -564,14 +597,18 @@ async fn pools_are_listed_read_only_and_grouped_by_node() {
     let response = h.get("/api/storage/pools").await;
     let nodes = response["nodes"].as_array().unwrap();
     assert_eq!(nodes.len(), 1);
-    let rpool = &nodes[0]["pools"][0];
-    assert_eq!(rpool["name"], "rpool");
-    assert_eq!(rpool["health"], "online");
-    assert!(rpool["size"].as_u64().unwrap() > 0);
-    assert!(rpool["used_percent"].as_u64().is_some());
-    // rpool is visibly not destroyable, and the reason is said out loud.
-    assert_eq!(rpool["destroyable"], false);
-    assert!(rpool["destroy_blocked_reason"].as_str().is_some());
+    let boot = &nodes[0]["pools"][0];
+    assert_eq!(boot["name"], "boot");
+    assert_eq!(boot["health"], "online");
+    assert!(boot["size"].as_u64().unwrap() > 0);
+    assert!(boot["used_percent"].as_u64().is_some());
+    // This is the pool the appliance is installed on, so it is visibly not
+    // destroyable and the reason is said out loud.
+    assert_eq!(boot["destroyable"], false);
+    assert!(boot["destroy_blocked_reason"]
+        .as_str()
+        .unwrap()
+        .contains("installed on"));
 }
 
 #[tokio::test]
@@ -579,35 +616,46 @@ async fn a_machines_disks_show_up_under_its_pool() {
     let h = harness("volumes").await;
     h.create_web01().await;
 
-    let response = h.get("/api/storage/pools/rpool/volumes").await;
-    assert_eq!(response["pool"], "rpool");
+    let response = h.get("/api/storage/pools/boot/volumes").await;
+    assert_eq!(response["pool"], "boot");
     let volumes = response["volumes"].as_array().unwrap();
     let disk = volumes
         .iter()
-        .find(|v| v["name"] == "rpool/lumen/vm-100-disk-0")
+        .find(|v| v["name"] == "boot/lumen/vm-100-disk-0")
         .expect("the machine's disk is listed");
     assert_eq!(disk["kind"], "volume");
     assert_eq!(disk["lumen_managed"], true);
     // The pool's own root is not a row anyone came here to look at.
-    assert!(!volumes.iter().any(|v| v["name"] == "rpool"));
+    assert!(!volumes.iter().any(|v| v["name"] == "boot"));
 
     let (status, _) = h.call("GET", "/api/storage/pools/tank/volumes", None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
-/// There is no pool-creation endpoint at this stage, and there must not be one
-/// by accident. See docs/compute.md.
+/// A volume is created *for a machine* and never on its own, so there is no
+/// route that makes one directly — and there must not be one by accident. The
+/// pool routes are exercised in tests/system_flow.rs.
 #[tokio::test]
-async fn there_is_no_way_to_create_or_destroy_a_pool() {
-    let h = harness("no-pool-writes").await;
+async fn a_volume_is_only_ever_reached_through_the_machine_it_belongs_to() {
+    let h = harness("no-volume-writes").await;
     for (method, path) in [
-        ("POST", "/api/storage/pools"),
-        ("DELETE", "/api/storage/pools/rpool"),
-        ("POST", "/api/storage/pools/rpool/volumes"),
+        ("POST", "/api/storage/pools/boot/volumes"),
+        ("DELETE", "/api/storage/pools/boot/volumes/vm-100-disk-0"),
     ] {
         let (status, _) = h.call(method, path, Some("{}")).await;
         assert_ne!(status, StatusCode::OK, "{method} {path} must not exist");
     }
+
+    // And the pool the appliance is installed on is refused even with the
+    // acknowledgement — see tests/system_flow.rs for the rest of the story.
+    let (status, body) = h
+        .call(
+            "DELETE",
+            "/api/storage/pools/boot",
+            Some(r#"{"i_understand_this_may_lose_data":true}"#),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
 }
 
 // --- clustering placeholders -------------------------------------------------
@@ -633,6 +681,88 @@ async fn a_request_for_another_node_is_refused_clearly() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+// --- the console viewer -------------------------------------------------------
+
+/// A machine that is not running has no screen, and the console is told so in
+/// words rather than by a viewer that opens and immediately goes grey.
+#[tokio::test]
+async fn the_console_is_offered_only_while_the_machine_is_running() {
+    let h = harness("console").await;
+    let vm = h.create_web01().await;
+
+    // The row already carries the answer, so a disabled control explains
+    // itself without asking anything.
+    assert_eq!(vm["actions"]["console"]["allowed"], false);
+    let reason = vm["actions"]["console"]["reason"].as_str().unwrap();
+    assert!(reason.contains("no console"), "{reason}");
+
+    let (status, body) = h.call("GET", "/api/vms/100/console", None).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], reason);
+
+    // Started, it says where to connect — and the path is the same origin the
+    // console is already on, so the session cookie is the only credential.
+    let (status, _) = h.post("/api/vms/100/start", "{}").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let console = h.get("/api/vms/100/console").await;
+    assert_eq!(console["vmid"], 100);
+    assert_eq!(console["name"], "web01");
+    assert_eq!(console["protocol"], "vnc");
+    assert_eq!(
+        console["socket"],
+        "/var/lib/libvirt/qemu/lumen-100-vnc.sock"
+    );
+    assert_eq!(console["websocket"], "/api/vms/100/console/ws");
+
+    // The running row agrees with it, so the console never has to reconcile
+    // two answers about the same machine.
+    let running = h.get("/api/vms/100").await;
+    assert_eq!(running["actions"]["console"]["allowed"], true);
+    assert_eq!(running["vnc_socket"], console["socket"]);
+}
+
+#[tokio::test]
+async fn the_console_of_a_machine_that_is_not_there_is_a_not_found() {
+    let h = harness("console-missing").await;
+    let (status, body) = h.call("GET", "/api/vms/404/console", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+/// A stopped machine is refused while the request is still HTTP, so the reason
+/// is a status and a sentence rather than a close code nobody can act on.
+///
+/// This is the whole argument for checking everything before calling
+/// `on_upgrade`: once the handshake completes there is no way left to say why.
+#[tokio::test]
+async fn the_console_stream_refuses_a_stopped_machine_before_upgrading() {
+    let h = harness("console-stream").await;
+    h.create_web01().await;
+
+    let (status, body) = h.handshake("/api/vms/100/console/ws").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("no console"),
+        "{body}"
+    );
+
+    // Started, the same request gets past the machine check and stops at the
+    // next one — the transport. That is the order the handler documents: the
+    // question about the machine is answered before the question about the
+    // connection, so a switched-off machine is never told it sent the wrong
+    // kind of request.
+    let (status, _) = h.post("/api/vms/100/start", "{}").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = h.handshake("/api/vms/100/console/ws").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let error = body["error"].as_str().unwrap();
+    assert!(
+        error.contains("WebSocket") && error.contains("web01"),
+        "{error}"
+    );
+}
+
 // --- authentication ----------------------------------------------------------
 
 #[tokio::test]
@@ -649,12 +779,14 @@ async fn every_machine_and_storage_route_requires_a_session() {
         ("POST", "/api/vms/100/stop"),
         ("POST", "/api/vms/100/reboot"),
         ("POST", "/api/vms/100/reset"),
+        ("GET", "/api/vms/100/console"),
+        ("GET", "/api/vms/100/console/ws"),
         ("POST", "/api/vms/100/disks"),
         ("DELETE", "/api/vms/100/disks/vda"),
         ("POST", "/api/vms/100/nics"),
         ("DELETE", "/api/vms/100/nics/52:54:00:00:64:00"),
         ("GET", "/api/storage/pools"),
-        ("GET", "/api/storage/pools/rpool/volumes"),
+        ("GET", "/api/storage/pools/boot/volumes"),
     ] {
         let request = Request::builder()
             .method(method)
@@ -688,21 +820,21 @@ async fn an_image_is_uploaded_and_a_machine_boots_it() {
     let before = h.get("/api/storage/iso").await;
     assert!(before["images"].as_array().unwrap().is_empty());
     let store = &before["stores"][0];
-    assert_eq!(store["storage"], "rpool");
+    assert_eq!(store["storage"], "boot");
     assert_eq!(store["ready"], false);
     assert!(store["reason"].as_str().unwrap().contains("zfs create"));
 
     // Making it creates the dataset. The mock does not mount anything, so the
     // directory is made here the way the mount would have.
-    let (status, _) = h.post("/api/storage/iso/rpool", "").await;
+    let (status, _) = h.post("/api/storage/iso/boot", "").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(h.zfs.has_dataset("rpool/lumen/iso"));
-    std::fs::create_dir_all(h._state_dir.0.join("iso/rpool")).unwrap();
+    assert!(h.zfs.has_dataset("boot/lumen/iso"));
+    std::fs::create_dir_all(h._state_dir.0.join("iso/boot")).unwrap();
 
     // Upload. The body is the file itself.
     let (status, body) = h
         .put_bytes(
-            "/api/storage/iso/rpool/almalinux-10.iso",
+            "/api/storage/iso/boot/almalinux-10.iso",
             b"CD001 pretend media",
         )
         .await;
@@ -713,12 +845,12 @@ async fn an_image_is_uploaded_and_a_machine_boots_it() {
     let images = listed["images"].as_array().unwrap();
     assert_eq!(images.len(), 1);
     assert_eq!(images[0]["name"], "almalinux-10.iso");
-    assert_eq!(images[0]["storage"], "rpool");
+    assert_eq!(images[0]["storage"], "boot");
 
     // The same name twice is refused rather than overwriting an image a
     // machine may already be booting.
     let (status, _) = h
-        .put_bytes("/api/storage/iso/rpool/almalinux-10.iso", b"different")
+        .put_bytes("/api/storage/iso/boot/almalinux-10.iso", b"different")
         .await;
     assert_eq!(status, StatusCode::CONFLICT);
 
@@ -729,8 +861,8 @@ async fn an_image_is_uploaded_and_a_machine_boots_it() {
             r#"{"name":"win01","vcpus":2,"memory_mib":4096,
                 "os_id":"http://microsoft.com/win/11",
                 "boot_order":["cdrom","disk"],
-                "cdroms":[{"storage":"rpool","image":"almalinux-10.iso"}],
-                "disks":[{"pool":"rpool","size_gib":32}],
+                "cdroms":[{"storage":"boot","image":"almalinux-10.iso"}],
+                "disks":[{"pool":"boot","size_gib":32}],
                 "nics":[{"bridge":"br0"}]}"#,
         )
         .await;
@@ -749,7 +881,7 @@ async fn an_image_is_uploaded_and_a_machine_boots_it() {
     let (status, _) = h
         .post(
             "/api/vms",
-            r#"{"name":"web02","cdroms":[{"storage":"rpool","image":"nothere.iso"}]}"#,
+            r#"{"name":"web02","cdroms":[{"storage":"boot","image":"nothere.iso"}]}"#,
         )
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -757,12 +889,12 @@ async fn an_image_is_uploaded_and_a_machine_boots_it() {
     let (status, _) = h
         .post(
             "/api/vms",
-            r#"{"name":"web03","cdroms":[{"storage":"rpool","image":"../../etc/passwd.iso"}]}"#,
+            r#"{"name":"web03","cdroms":[{"storage":"boot","image":"../../etc/passwd.iso"}]}"#,
         )
         .await;
     assert_eq!(status, StatusCode::CONFLICT);
 
-    let (status, _) = h.delete("/api/storage/iso/rpool/almalinux-10.iso").await;
+    let (status, _) = h.delete("/api/storage/iso/boot/almalinux-10.iso").await;
     assert_eq!(status, StatusCode::OK);
     assert!(h.get("/api/storage/iso").await["images"]
         .as_array()

@@ -10,7 +10,7 @@ use async_trait::async_trait;
 
 use crate::backend::ZfsBackend;
 use crate::error::{Result, ZfsError};
-use crate::model::{Dataset, Pool, VolumeRequest};
+use crate::model::{BlockDevice, Dataset, Pool, PoolRequest, VolumeRequest};
 
 pub struct UnavailableBackend {
     reason: String,
@@ -37,6 +37,18 @@ impl ZfsBackend for UnavailableBackend {
         self.error()
     }
     async fn datasets(&self, _pool: &str) -> Result<Vec<Dataset>> {
+        self.error()
+    }
+    /// The one call that still answers. Reading `/sys/block` needs no storage
+    /// software at all, and a node whose tools are missing is exactly where an
+    /// operator wants to see what disks it has.
+    async fn block_devices(&self) -> Result<Vec<BlockDevice>> {
+        Ok(crate::devices::list(&crate::devices::DeviceRoots::default()).await)
+    }
+    async fn create_pool(&self, _request: &PoolRequest) -> Result<Pool> {
+        self.error()
+    }
+    async fn destroy_pool(&self, _name: &str) -> Result<()> {
         self.error()
     }
     async fn create_volume(&self, _request: &VolumeRequest) -> Result<Dataset> {

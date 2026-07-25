@@ -29,7 +29,15 @@ Source3:        lumen-controlplane.service
 Source4:        lumen-controlplane.xml
 
 Requires:       pam
+# systemd is not only what starts this daemon. Two operations cannot happen
+# inside its sandbox — creating a local account, and creating or removing a
+# storage pool — so they are handed to systemd, which runs them as a unit of
+# its own outside that sandbox. See docs/system.md.
 Requires:       systemd
+# The account tools those two paths hand over: useradd, usermod, userdel, and
+# chpasswd. Present on every install, and named because the daemon runs them
+# by absolute path.
+Requires:       shadow-utils
 %{?systemd_requires}
 BuildRequires:  systemd-rpm-macros
 

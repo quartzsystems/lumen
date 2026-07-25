@@ -1,7 +1,7 @@
 # Lumen compute & storage
 
 The first virtual machine that boots: domain lifecycle through libvirt, disks
-on zvols under `rpool`, a three-column console, and the Virtual Machines pages.
+on zvols under `boot`, a three-column console, and the Virtual Machines pages.
 
 ```
 lumen-compute/
@@ -175,9 +175,14 @@ The middle line is the important one, and it cuts both ways:
   `zpool.cache` would fail. That is precisely `zpool create`, `import`, and
   `export`.
 
-Which is why pool operations are out of scope and `lumen-execd` will exist.
-The console's Storage page says so in those words rather than offering a
-button that cannot work.
+Which is why pool operations could not be done from inside this daemon, and why
+this document originally said `lumen-execd` would exist to do them.
+
+**It does not, and it will not.** systemd already is that process:
+`zpool create` and `zpool destroy` are handed to it and run as a transient unit
+outside this namespace, so the two operations work and the sandbox is
+unchanged. See [docs/system.md](system.md) for the full argument and for the
+one other operation that needed it.
 
 **Still to confirm on hardware:** creating a zvol from the running service on a
 real node with real pools. This environment has no ZFS kernel module (the
@@ -452,6 +457,8 @@ entry carrying `code`, `vm`, `field`, and `message`.
 | DELETE | `/api/vms/:vmid/disks/:id` | Detach; destroys the volume only if asked |
 | POST | `/api/vms/:vmid/nics` | Attach an adapter |
 | DELETE | `/api/vms/:vmid/nics/:id` | Detach it (`:id` is the hardware address) |
+| GET | `/api/vms/:vmid/console` | Where the console is, or why there is none |
+| GET | `/api/vms/:vmid/console/ws` | The console stream (a WebSocket) |
 | GET | `/api/vms/next-id` | The identifier a machine created now would get |
 | GET | `/api/vms/cpu-models` | Processor models this node can run |
 | GET | `/api/vms/os-catalog` | Guest operating systems this node knows |
@@ -542,6 +549,158 @@ cannot name a path; `VirtService::resolve_media` asks the storage domain to
 build one and then checks the file is actually there, because a machine defined
 against media that is not present boots to a firmware prompt with nothing to
 explain it.
+
+---
+
+## The console viewer
+
+Every machine has carried `<graphics type='vnc' socket='…'/>` since the first
+one was defined, precisely so this stage would be additive: nothing had to be
+redefined, and a machine created before the viewer existed has a console the
+moment the viewer does.
+
+### The control plane is a pipe, not a VNC proxy
+
+`lumen-virt` answers **whether a machine has a screen and where** —
+`VirtService::console` — and `src/api/console.rs` carries the bytes. That split
+falls out of the same rule as everywhere else: a UNIX socket is not a domain
+concept and a WebSocket is not one either, so neither belongs in the
+virtualization crate, and *where a machine's console is* is not an HTTP
+question, so it does not belong in the handler.
+
+Nothing between the two ends interprets the stream. The hypervisor speaks RFB
+on one side, the viewer speaks RFB on the other, and the handler moves 32 KiB
+at a time in each direction. Terminating the protocol in the middle — the
+obvious alternative — would mean a second implementation of something the
+hypervisor already implements correctly, a second place for it to be wrong, and
+a second thing to keep current for no gain: the socket already carries exactly
+the stream the viewer wants.
+
+### The socket is read from the machine's document, not computed
+
+`domain_xml::vnc_socket_of` reads `<graphics>`'s `socket` attribute, preferring
+the `<listen>` child the hypervisor adds on the way back out, because that is
+the hypervisor's own answer rather than the one it was given.
+`vnc_socket_path(vmid)` is only the fallback. A machine somebody edited with
+`virsh`, or one defined by an older version of this appliance, has its socket
+where it has it — and a viewer that connected to the *predicted* path would
+fail with an operating-system error and nothing to explain it.
+
+### `ProtectSystem=strict` needed no relaxation here either
+
+**Reproduced, not assumed.** The console socket lives under
+`/var/lib/libvirt/qemu`, which `ProtectSystem=strict` makes read-only inside
+the unit's namespace. Connecting to a UNIX socket needs write permission on
+its inode, so the question is real. The kernel's answer is that `sb_permission`
+refuses `MAY_WRITE` on a read-only superblock only for regular files,
+directories, and symlinks — a socket inode is none of those:
+
+```console
+$ mount --bind /srv/qemu /mnt/ro && mount -o remount,ro,bind /mnt/ro
+$ findmnt -no OPTIONS /mnt/ro
+ro,relatime,…
+$ echo x > /mnt/ro/probe
+bash: /mnt/ro/probe: Read-only file system
+$ python3 -c "…connect('/mnt/ro/lumen-100-vnc.sock')…"
+CONNECTED, banner = b'RFB 003.008\n'
+```
+
+So `lumen-controlplane.service` is unchanged, and `/var/lib/lumen/iso` remains
+the only relaxation on it. If a future kernel ever changes that, the fix is one
+line — `ReadWritePaths=-/var/lib/libvirt/qemu` — and the symptom would be every
+console failing at `connect` with `EROFS`, which is unmistakable.
+
+### There is no console ticket
+
+Other appliances mint a single-use ticket for the viewer because their console
+is served by a second process on a second port, where the session cookie does
+not reach. Lumen's console is the **same origin** as the page that opened it —
+one daemon, one port — so the upgrade request carries the same httpOnly cookie
+every other call does and the `Session` extractor checks it the same way. A
+second credential would be a second thing to expire, leak, and explain.
+
+What that leaves is the one protection a normal request gets for free and a
+WebSocket does not: a handshake is exempt from the same-origin policy — no
+preflight, no CORS — so a page on another origin can open one and the browser
+will attach the operator's cookie. `same_origin` compares `Origin` against
+`Host` by hand, and it is the only route on the appliance that needs to. A
+**missing** `Origin` is allowed and that is not a hole: browsers always send
+it, so its absence means no browser sent the request, and forgery needs a
+victim's browser to be the one making it. The check is skipped in the
+plain-HTTP development mode, where the browser's origin is Next's dev server
+and the `Host` is the control plane behind its proxy.
+
+### Everything that can be said in words is said before the upgrade
+
+Once a handshake completes, the only thing left to report is a close code, and
+`1006` is not something an operator can act on. So the session, the origin,
+whether the machine is running, whether the request can become a WebSocket at
+all, and whether the socket answers are all settled while it is still an HTTP
+request with a sentence in it.
+
+That order is why `WebSocketUpgrade` arrives as a `Result` rather than as a
+plain extractor: an extractor rejects the request before the handler body runs,
+which would answer "this is not a WebSocket" to somebody whose actual problem
+is that their machine is switched off.
+
+`GET /api/vms/:vmid/console` exists for the same reason one step earlier — the
+console asks before it connects, so an expired session or a machine that
+stopped is the sentence it actually is rather than a viewer that flickers and
+goes grey.
+
+### noVNC, and why a dependency here and not elsewhere
+
+**Chosen: `@novnc/novnc` 1.7, MPL-2.0.** It is what `virt-manager`'s web
+counterparts, Cockpit, oVirt, and every other hypervisor console in this class
+use.
+
+This tree is deliberately short of dependencies — the PAM layer is an in-tree
+FFI, `lumen-zfs` shells out rather than binding `libzfs`, and the guest
+catalogue reads libosinfo's *files* rather than linking its library. Each of
+those was a choice not to take on a code generator or an unstable ABI for a
+small amount of work. RFB is the opposite shape: a client is Raw, CopyRect,
+RRE, Hextile, Tight, TightPNG, ZRLE, and JPEG decoders, cursor handling, and a
+keyboard map from browser key events to X keysyms — thousands of lines of
+protocol that is only correct once it has met real hypervisors. Writing that
+here would be the mistake the other three decisions avoided, not a repeat of
+them.
+
+It costs one `dependencies` entry, no build step of its own, and it is loaded
+by a dynamic `import()` inside the viewer's effect — so it is a chunk the
+export only fetches when somebody opens a console, and the prerender pass never
+evaluates a module that touches `window`.
+
+### What the viewer offers
+
+`components/vm/VmConsole.tsx` is two pieces: the section, which decides whether
+there is a screen at all, and `ConsoleScreen`, which is the screen. The
+detached window (`/console/?vm=101`) renders the second one and nothing else —
+a window somebody opened to watch a machine boot should not spend its width on
+a sidebar.
+
+- **Fit** scales the guest's screen to the frame. On by default; off shows it at
+  full size. `resizeSession` is deliberately **not** enabled: asking the guest
+  to match the browser window means a resolution that changes when somebody
+  drags a corner, and an installer mid-repaint does not enjoy that.
+- **Watch only** stops input reaching the guest — for looking at a machine
+  somebody else is working on.
+- **Ctrl+Alt+Del**, which is the whole reason a console has a toolbar.
+- **Full screen** takes the frame, toolbar included, because the way back out
+  and Ctrl+Alt+Del are on it.
+- A connection that ends is said **over** the last frame rather than instead of
+  it: a guest that just crashed drew something, and the last frame is often the
+  whole of the diagnosis.
+
+There is no automatic reconnect. A machine that stopped should say so and wait,
+rather than a viewer quietly retrying against a socket that is not coming back.
+
+### Out of scope, deliberately
+
+The **serial** console. `<console type='pty'>` is on every machine and a
+terminal over the same transport is a small addition, but it is a different
+thing to look at — a text stream with its own scrollback — rather than another
+button on this one. `ConsoleProtocol` is an enumeration with one value today so
+that adding it does not change the shape of anything above it.
 
 ---
 
@@ -652,8 +811,9 @@ requires a `<Suspense>` boundary or the export fails at prerender with an
 opaque error — `VirtualMachinesPage` is the boundary and `VirtualMachines` is
 the component behind it.
 
-Console, Snapshots, Backups, and Tasks render as stubs in the existing
-`StubPage` voice.
+Snapshots, Backups, and Tasks render as stubs in the existing `StubPage` voice.
+Console is the viewer described above. The detached window lives at `/console`,
+outside the `(console)` route group so it inherits no chrome.
 
 ### Create Virtual Machine: tabs, not a wizard
 
@@ -702,14 +862,14 @@ curl -sk -c "$JAR" -X POST "$HOST/api/auth/login" \
 curl -sk -b "$JAR" "$HOST/api/storage/pools" |
   jq '.nodes[].pools[] | {name, health, free, used_percent}'
 
-# 3. Define a machine: 2 processors, 4 GiB, a 32 GiB disk on rpool, on br0.
+# 3. Define a machine: 2 processors, 4 GiB, a 32 GiB disk on boot, on br0.
 curl -sk -b "$JAR" -X POST "$HOST/api/vms" \
      -H 'Content-Type: application/json' \
      -d '{"name":"web01","vcpus":2,"memory_mib":4096,
-          "disks":[{"pool":"rpool","size_gib":32}],
+          "disks":[{"pool":"boot","size_gib":32}],
           "nics":[{"bridge":"br0"}]}' | jq '{vmid, name, state, disks, nics}'
 # The volume it created:
-#   /dev/zvol/rpool/lumen/vm-100-disk-0
+#   /dev/zvol/boot/lumen/vm-100-disk-0
 
 #    A rejected machine answers 400 with the codes the console pins to fields:
 curl -sk -b "$JAR" -X POST "$HOST/api/vms" \
@@ -733,10 +893,21 @@ curl -sk -b "$JAR" -X PATCH "$HOST/api/vms/100" \
   jq '.pending_reboot'
 # [ "firmware (takes effect when the machine restarts)" ]
 
+# 5b. Where its console is. The stream itself is a WebSocket on the same
+#     origin, so the browser's cookie is the only credential it needs.
+curl -sk -b "$JAR" "$HOST/api/vms/100/console" | jq
+# { "vmid": 100, "name": "web01", "protocol": "vnc",
+#   "socket": "/var/lib/libvirt/qemu/lumen-100-vnc.sock",
+#   "websocket": "/api/vms/100/console/ws" }
+
+#    A machine that is not running has no console, and says so:
+curl -sk -b "$JAR" "$HOST/api/vms/101/console" | jq -r .error
+# "web02" is not running, so it has no console.
+
 # 6. Another disk, and take it away again with its volume.
 curl -sk -b "$JAR" -X POST "$HOST/api/vms/100/disks" \
      -H 'Content-Type: application/json' \
-     -d '{"pool":"rpool","size_gib":16,"bus":"virtio-scsi"}' | jq '.vm.disks'
+     -d '{"pool":"boot","size_gib":16,"bus":"virtio-scsi"}' | jq '.vm.disks'
 curl -sk -b "$JAR" -X DELETE "$HOST/api/vms/100/disks/sda" \
      -H 'Content-Type: application/json' \
      -d '{"purge_disks":true,"i_understand_this_may_lose_data":true}' | jq '.vm.disks'
@@ -754,7 +925,7 @@ curl -sk -b "$JAR" -X POST "$HOST/api/vms/100/stop" -d '{}' | jq '.errors[0].cod
 # 8. Remove it. The disks stay unless you say otherwise.
 curl -sk -b "$JAR" -X DELETE "$HOST/api/vms/100" -d '{}' |
   jq '{removed_volumes, kept_volumes}'
-# { "removed_volumes": [], "kept_volumes": ["rpool/lumen/vm-100-disk-0"] }
+# { "removed_volumes": [], "kept_volumes": ["boot/lumen/vm-100-disk-0"] }
 ```
 
 The machine is a plain domain the whole time — `virsh list --all`,
@@ -792,22 +963,22 @@ real hardware:
 
 ```sh
 # Installed by the installer, so it should already be there and readable.
-zfs list -o name,mountpoint rpool/lumen/iso
+zfs list -o name,mountpoint boot/lumen/iso
 curl -sk -b "$JAR" "$HOST/api/storage/iso" | jq '.stores'
 # -> ready: true
 
 # Now the case the design is defensive about: destroy it and make it again
 # from the console while the daemon is up.
-zfs destroy rpool/lumen/iso && systemctl restart lumen-controlplane
-curl -sk -b "$JAR" -X POST "$HOST/api/storage/iso/rpool" | jq
+zfs destroy boot/lumen/iso && systemctl restart lumen-controlplane
+curl -sk -b "$JAR" -X POST "$HOST/api/storage/iso/boot" | jq
 #    If ready is false, the reason names the restart — that is the expected
 #    conservative answer. If ready is true, the mount propagated and the
 #    console can make a library on a new pool without a restart. Record which.
 
 # Upload, and check it lands whole and under the right name.
 curl -sk -b "$JAR" -X PUT --data-binary @almalinux-10.iso \
-  "$HOST/api/storage/iso/rpool/almalinux-10.iso" | jq
-ls -l /var/lib/lumen/iso/rpool/          # no .part file left behind
+  "$HOST/api/storage/iso/boot/almalinux-10.iso" | jq
+ls -l /var/lib/lumen/iso/boot/          # no .part file left behind
 ```
 
 ### 1. Create a zvol from the running service — the one still unconfirmed
@@ -815,9 +986,9 @@ ls -l /var/lib/lumen/iso/rpool/          # no .part file left behind
 This is the claim the design rests on and the only one the reproduction above
 could not finish. Do it first.
 
-1. Console → **Virtual Machines → Create**, one 8 GiB disk on `rpool`.
+1. Console → **Virtual Machines → Create**, one 8 GiB disk on `boot`.
 2. On the node: `zfs list -t volume` must show
-   `rpool/lumen/vm-100-disk-0`, and `ls -l /dev/zvol/rpool/lumen/` must show
+   `boot/lumen/vm-100-disk-0`, and `ls -l /dev/zvol/boot/lumen/` must show
    the device node.
 3. `journalctl -u lumen-controlplane` must contain no permission error.
 4. **Then confirm the other half of the claim**, which is what keeps pool
@@ -839,17 +1010,54 @@ decision from the networking stage was right.
 
 1. Put an installer ISO on the node.
 2. Create a machine with a 32 GiB disk and one adapter on `br0`.
-3. Attach the ISO by hand for now — optical devices are not in this stage:
+3. Pick the image in the create dialog's **OS** tab, or attach one by hand:
    ```sh
    virsh attach-disk web01 /path/to.iso sdz --type cdrom --mode readonly --config
    virsh dumpxml web01 | grep -A3 cdrom
    ```
-4. Start it and install through **Console** — or, until part 2, through
-   `virt-viewer --connect qemu:///system web01`.
+4. Start it and install through **Console**.
 5. The guest must get an address over `br0` from the same network the node is
    on. Check from the guest, and check the lease from the network's side:
    the hardware address must be `52:54:00:00:64:00` for machine 100.
 6. `virsh domiflist web01` must show the adapter on `br0`.
+
+### 2b. The console, which is the one thing a mock cannot prove
+
+Tests cover the refusals and the ordering. They cannot cover a hypervisor
+actually listening on a socket, so this is the acceptance test for the viewer.
+
+```sh
+# What the machine says its console is. Must match the file on the node.
+curl -sk -b "$JAR" "$HOST/api/vms/100/console" | jq
+ls -l /var/lib/libvirt/qemu/lumen-100-vnc.sock
+
+# And the check the design rests on: the daemon is sandboxed, and the socket is
+# on a hierarchy ProtectSystem=strict made read-only. This must succeed.
+journalctl -u lumen-controlplane | grep -i 'console attached'
+```
+
+1. Open **Virtual Machines → the machine → Console** while it is running. The
+   guest's screen must appear, and typing must reach it.
+2. **Ctrl+Alt+Del** must reach the guest — the one key sequence a browser
+   cannot pass through on its own.
+3. Turn **Fit** off: the screen must go to full size with scrollbars rather
+   than being scaled. Turn **Watch only** on: typing must stop reaching the
+   guest.
+4. **Full screen**, then leave it with Escape. The toolbar must come back and
+   the connection must survive both.
+5. **Detach**. A window with nothing but the screen in it must open, titled
+   with the machine's name, and both viewers must work at once — the hypervisor
+   shares one console between clients.
+6. Stop the machine with the console open. The viewer must say the connection
+   ended and keep the last frame; going back to **Console** must then show the
+   backend's own "is not running, so it has no console" with a Start control
+   rather than a failed connection.
+7. `journalctl -u lumen-controlplane` must show `console attached` and
+   `console closed` and **no** permission error. An `EROFS` here would mean the
+   read-only-mount reasoning above is wrong on this kernel — say so in this
+   document and add the `ReadWritePaths=` line.
+8. Sign out in another tab, then reconnect the console: it must say the session
+   expired and send you to the login page, not hang.
 
 ### 3. Reboot the host
 
@@ -865,7 +1073,7 @@ decision from the networking stage was right.
 ### 4. Delete, and check what went with it
 
 1. Delete the machine with **Also destroy its disks** left **off**.
-2. `zfs list -t volume` must still show `rpool/lumen/vm-100-disk-0`, and the
+2. `zfs list -t volume` must still show `boot/lumen/vm-100-disk-0`, and the
    toast must have said where it is.
 3. Recreate a machine, then delete it with the switch **on** and the
    acknowledgement ticked. The volume must be gone.
@@ -932,10 +1140,11 @@ hypervisor is down needs the console more than usual.
 
 ## Out of scope for this stage
 
-The console viewer (part 2 — the VNC device is already defined on every
-machine, so that part is purely additive). `zpool create`, `import`, `destroy`,
-and `lumen-execd` (part 3). Snapshots, backups, migration, templates, cloning,
-clustering, high availability, resource pools, and per-machine permissions.
+`zpool import`, `export`, `scrub`, and `replace` — create and destroy are in,
+through the mechanism [docs/system.md](system.md) describes. The serial
+console, for the reason above. Snapshots, backups, migration, templates,
+cloning, clustering, high availability, resource pools, and per-machine
+permissions.
 
-In the console, only **Virtual Machines** (Overview, Hardware, Options) and
-**Storage** are implemented. Console, Snapshots, Backups, and Tasks are stubs.
+In the console, **Virtual Machines** (Overview, Console, Hardware, Options) and
+**Storage** are implemented. Snapshots, Backups, and Tasks are stubs.

@@ -537,14 +537,14 @@ mod tests {
         assert_eq!(config.next_disk_target(DiskBus::VirtioBlk), "vda");
         config
             .disks
-            .push(disk("vda", "/dev/zvol/rpool/lumen/vm-101-disk-0"));
+            .push(disk("vda", "/dev/zvol/boot/lumen/vm-101-disk-0"));
         assert_eq!(config.next_disk_target(DiskBus::VirtioBlk), "vdb");
         // A different bus gets its own prefix…
         assert_eq!(config.next_disk_target(DiskBus::VirtioScsi), "sda");
         // …but the two non-virtio buses share one, so they must not collide.
         config
             .disks
-            .push(disk("sda", "/dev/zvol/rpool/lumen/vm-101-disk-1"));
+            .push(disk("sda", "/dev/zvol/boot/lumen/vm-101-disk-1"));
         assert_eq!(config.next_disk_target(DiskBus::Sata), "sdb");
     }
 
@@ -557,10 +557,10 @@ mod tests {
         assert_eq!(config.next_disk_index(), 0);
         config
             .disks
-            .push(disk("vda", "/dev/zvol/rpool/lumen/vm-101-disk-0"));
+            .push(disk("vda", "/dev/zvol/boot/lumen/vm-101-disk-0"));
         config
             .disks
-            .push(disk("vdb", "/dev/zvol/rpool/lumen/vm-101-disk-1"));
+            .push(disk("vdb", "/dev/zvol/boot/lumen/vm-101-disk-1"));
         assert_eq!(config.next_disk_index(), 2);
 
         config.disks.retain(|d| d.id != "vda");

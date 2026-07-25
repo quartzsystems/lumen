@@ -8,6 +8,10 @@ use lumen_controlplane::{app, security, tls, AppState};
 use lumen_net::backend::nm::NmBackend;
 use lumen_net::backend::unavailable::UnavailableBackend;
 use lumen_net::NetworkService;
+use lumen_sys::backend::logind::LogindBackend;
+use lumen_sys::backend::unavailable::UnavailablePower;
+use lumen_sys::exec::{Exec, SystemdRun};
+use lumen_sys::SysService;
 use lumen_virt::backend::libvirt::LibvirtBackend;
 use lumen_virt::VirtService;
 use lumen_zfs::backend::cli::CliBackend;
@@ -35,6 +39,23 @@ async fn main() -> Result<()> {
     // realms (LDAP, OIDC, …) will be loaded and appended here.
     let realms =
         RealmRegistry::new().register(Box::new(LumenRealm::new(config.pam_service.clone())));
+
+    // The node itself, constructed first: it owns the privileged-command
+    // runner every other domain borrows. Handing a command to systemd is what
+    // lets `useradd` and `zpool create` happen at all without relaxing this
+    // unit's ProtectSystem=strict — see lumen_sys::exec and docs/system.md.
+    let exec: Arc<dyn Exec> = Arc::new(SystemdRun::new());
+    let power = match LogindBackend::connect().await {
+        Ok(backend) => Arc::new(backend) as Arc<dyn lumen_sys::PowerBackend>,
+        Err(err) => {
+            // Same policy as every other domain: an operator whose node is
+            // misbehaving needs the console more than usual, and Maintenance
+            // is not the only page on it.
+            tracing::error!("the node's login manager is unavailable: {err}");
+            Arc::new(UnavailablePower::new(err.to_string()))
+        }
+    };
+    let sys = Arc::new(SysService::new(power, exec.clone()));
 
     // Networking. The backend is NetworkManager over the system bus: it does
     // the privileged work in its own process, so the unit's ProtectSystem=
@@ -67,7 +88,7 @@ async fn main() -> Result<()> {
     // Storage. The real backend runs the supported command line, so a node
     // without the storage software swaps in the unavailable one and the
     // console comes up saying so rather than refusing to start.
-    let zfs_backend: Arc<dyn lumen_zfs::backend::ZfsBackend> = match CliBackend::probe().await {
+    let zfs_backend: Arc<dyn lumen_zfs::backend::ZfsBackend> = match CliBackend::probe(exec).await {
         Ok(backend) => Arc::new(backend),
         Err(err) => {
             tracing::error!("storage is unavailable: {err}");
@@ -114,6 +135,7 @@ async fn main() -> Result<()> {
         config,
         jwt_secret,
         realms,
+        sys,
         network,
         storage,
         virt,

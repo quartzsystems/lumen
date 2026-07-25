@@ -51,10 +51,76 @@ pub const OSINFO_NS: &str = "http://libosinfo.org/xmlns/libvirt/domain/1.0";
 const GUEST_AGENT_CHANNEL: &str = "org.qemu.guest_agent.0";
 
 /// Where a machine's console socket lives. Predictable rather than assigned by
-/// the hypervisor, so the console that part 2 adds can find it without a
-/// lookup, and so a policy rule can name it.
+/// the hypervisor, so the console viewer can find it without a lookup, and so a
+/// policy rule can name it.
 pub fn vnc_socket_path(vmid: u32) -> String {
     format!("/var/lib/libvirt/qemu/lumen-{vmid}-vnc.sock")
+}
+
+/// Where a machine's console socket actually is, according to its own document.
+///
+/// [`vnc_socket_path`] is where Lumen *puts* one, and for a machine this
+/// appliance defined the two agree. They need not: a domain someone edited with
+/// `virsh`, or one defined by an older version of this appliance, carries
+/// whatever it carries — and a viewer has to connect to the socket the
+/// hypervisor is listening on rather than to the one we would have chosen.
+///
+/// The path may sit on the `<graphics>` element, on the `<listen>` child the
+/// hypervisor adds when it hands the document back, or on both. The child wins,
+/// because it is the hypervisor's own answer rather than the one it was given.
+pub fn vnc_socket_of(xml: &str) -> Option<String> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut path: Vec<String> = Vec::new();
+    let mut in_vnc = false;
+    let mut on_element: Option<String> = None;
+    let mut on_listen: Option<String> = None;
+
+    loop {
+        let Ok(event) = reader.read_event() else {
+            break;
+        };
+        match event {
+            Event::Eof => break,
+            Event::Start(ref e) | Event::Empty(ref e) => {
+                path.push(local_name(e.name().as_ref()));
+                match path.join("/").as_str() {
+                    "domain/devices/graphics" => {
+                        // A machine may carry more than one graphics device;
+                        // only the VNC one has a socket this speaks to.
+                        in_vnc = attr(e, "type").as_deref() == Some("vnc");
+                        if in_vnc {
+                            on_element = attr(e, "socket");
+                        }
+                    }
+                    "domain/devices/graphics/listen" if in_vnc => {
+                        if attr(e, "type").as_deref() == Some("socket") {
+                            on_listen = attr(e, "socket");
+                        }
+                    }
+                    _ => {}
+                }
+                if matches!(event, Event::Empty(_)) {
+                    path.pop();
+                }
+            }
+            Event::End(_) => {
+                if path.join("/") == "domain/devices/graphics" && in_vnc {
+                    in_vnc = false;
+                }
+                path.pop();
+            }
+            _ => {}
+        }
+        if on_listen.is_some() {
+            break;
+        }
+    }
+
+    on_listen
+        .or(on_element)
+        .filter(|socket| !socket.trim().is_empty())
 }
 
 /// Everything the document carries, on the way back in.
@@ -851,7 +917,7 @@ mod tests {
             os_id: Some("http://almalinux.org/almalinux/10".into()),
             disks: vec![disk(
                 "vda",
-                "/dev/zvol/rpool/lumen/vm-101-disk-0",
+                "/dev/zvol/boot/lumen/vm-101-disk-0",
                 DiskBus::VirtioBlk,
             )],
             cdroms: Vec::new(),
@@ -898,12 +964,12 @@ mod tests {
             ("several disks on several buses", |c| {
                 c.disks.push(disk(
                     "sda",
-                    "/dev/zvol/rpool/lumen/vm-101-disk-1",
+                    "/dev/zvol/boot/lumen/vm-101-disk-1",
                     DiskBus::VirtioScsi,
                 ));
                 c.disks.push(disk(
                     "sdb",
-                    "/dev/zvol/rpool/lumen/vm-101-disk-2",
+                    "/dev/zvol/boot/lumen/vm-101-disk-2",
                     DiskBus::Sata,
                 ));
             }),
@@ -938,27 +1004,25 @@ mod tests {
             ("no recorded guest", |c| c.os_id = None),
             ("an installation drive, booting first", |c| {
                 c.cdroms
-                    .push(cdrom("sda", Some("/var/lib/lumen/iso/rpool/al10.iso")));
+                    .push(cdrom("sda", Some("/var/lib/lumen/iso/boot/al10.iso")));
                 c.boot_order = vec![BootDevice::Cdrom, BootDevice::Disk];
             }),
             ("an empty drive", |c| c.cdroms.push(cdrom("sda", None))),
             ("installation media and the driver disc", |c| {
                 c.cdroms
-                    .push(cdrom("sda", Some("/var/lib/lumen/iso/rpool/win.iso")));
-                c.cdroms.push(cdrom(
-                    "sdb",
-                    Some("/var/lib/lumen/iso/rpool/virtio-win.iso"),
-                ));
+                    .push(cdrom("sda", Some("/var/lib/lumen/iso/boot/win.iso")));
+                c.cdroms
+                    .push(cdrom("sdb", Some("/var/lib/lumen/iso/boot/virtio-win.iso")));
                 c.boot_order = vec![BootDevice::Cdrom, BootDevice::Disk];
             }),
             ("a drive alongside disks that share its prefix", |c| {
                 c.disks.push(disk(
                     "sda",
-                    "/dev/zvol/rpool/lumen/vm-101-disk-1",
+                    "/dev/zvol/boot/lumen/vm-101-disk-1",
                     DiskBus::Sata,
                 ));
                 c.cdroms
-                    .push(cdrom("sdb", Some("/var/lib/lumen/iso/rpool/al10.iso")));
+                    .push(cdrom("sdb", Some("/var/lib/lumen/iso/boot/al10.iso")));
             }),
             ("a drive named in the boot order that is not there", |c| {
                 c.boot_order = vec![BootDevice::Cdrom, BootDevice::Disk]
@@ -987,7 +1051,7 @@ mod tests {
         let mut config = sample();
         config.disks.push(disk(
             "vdb",
-            "/dev/zvol/rpool/lumen/vm-101-disk-1",
+            "/dev/zvol/boot/lumen/vm-101-disk-1",
             DiskBus::VirtioBlk,
         ));
         let normalized = config.normalized();
@@ -1043,7 +1107,7 @@ mod tests {
     <emulator>/usr/libexec/qemu-kvm</emulator>
     <disk type='block' device='disk'>
       <driver name='qemu' type='raw' cache='none' discard='unmap'/>
-      <source dev='/dev/zvol/rpool/lumen/vm-101-disk-0' index='1'/>
+      <source dev='/dev/zvol/boot/lumen/vm-101-disk-0' index='1'/>
       <backingStore/>
       <target dev='vda' bus='virtio'/>
       <boot order='1'/>
@@ -1098,7 +1162,7 @@ mod tests {
         assert_eq!(parsed.config.disks[0].id, "vda");
         assert_eq!(
             parsed.config.disks[0].source,
-            "/dev/zvol/rpool/lumen/vm-101-disk-0"
+            "/dev/zvol/boot/lumen/vm-101-disk-0"
         );
         assert!(parsed.config.disks[0].discard);
 
@@ -1134,6 +1198,48 @@ mod tests {
             vnc_socket_path(101),
             "/var/lib/libvirt/qemu/lumen-101-vnc.sock"
         );
+        // What was written is what comes back: the viewer connects to the
+        // machine's own answer rather than to the path it would have guessed.
+        assert_eq!(
+            vnc_socket_of(&xml).as_deref(),
+            Some(vnc_socket_path(101).as_str())
+        );
+    }
+
+    /// The console viewer must follow the document, not the naming rule — a
+    /// machine defined elsewhere, or edited by hand, has its socket where it
+    /// has it.
+    #[test]
+    fn the_console_socket_is_read_from_the_document_the_hypervisor_returns() {
+        // The hypervisor's own answer, on the <listen> child, wins over the
+        // attribute it was handed.
+        let both = "<domain type='kvm'><name>web01</name><devices>\
+                    <graphics type='vnc' socket='/stale.sock'>\
+                    <listen type='socket' socket='/run/live.sock'/>\
+                    </graphics></devices></domain>";
+        assert_eq!(vnc_socket_of(both).as_deref(), Some("/run/live.sock"));
+
+        // An element with no child still answers.
+        let bare = "<domain type='kvm'><name>web01</name><devices>\
+                    <graphics type='vnc' socket='/run/only.sock'/>\
+                    </devices></domain>";
+        assert_eq!(vnc_socket_of(bare).as_deref(), Some("/run/only.sock"));
+
+        // A graphics device that is not VNC is not this viewer's, and a
+        // port-listening one has no socket to speak of.
+        let spice = "<domain type='kvm'><name>web01</name><devices>\
+                     <graphics type='spice' socket='/run/spice.sock'/>\
+                     </devices></domain>";
+        assert_eq!(vnc_socket_of(spice), None);
+        let on_a_port = "<domain type='kvm'><name>web01</name><devices>\
+                         <graphics type='vnc' port='5900' listen='127.0.0.1'/>\
+                         </devices></domain>";
+        assert_eq!(vnc_socket_of(on_a_port), None);
+
+        // A machine with no graphics at all has no console, and says so rather
+        // than handing back a path nothing is listening on.
+        let headless = "<domain type='kvm'><name>web01</name><devices/></domain>";
+        assert_eq!(vnc_socket_of(headless), None);
     }
 
     /// Without this the guest never hears a shutdown request and an orderly
@@ -1150,7 +1256,7 @@ mod tests {
         assert!(!render(&config).contains("virtio-scsi"));
         config.disks.push(disk(
             "sda",
-            "/dev/zvol/rpool/lumen/vm-101-disk-1",
+            "/dev/zvol/boot/lumen/vm-101-disk-1",
             DiskBus::VirtioScsi,
         ));
         assert!(render(&config).contains("model='virtio-scsi'"));

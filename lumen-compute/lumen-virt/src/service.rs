@@ -95,11 +95,17 @@ pub struct VmActions {
     pub reboot: Action,
     pub reset: Action,
     pub delete: Action,
+    /// Whether there is a screen to look at. A machine that is not running has
+    /// no console — the hypervisor only listens on the socket for as long as
+    /// the guest exists — and the console says that rather than opening a
+    /// viewer that fails a moment later.
+    pub console: Action,
 }
 
 fn actions_for(state: DomainState, name: &str) -> VmActions {
     let running = state.is_running();
     let off_reason = format!("\"{name}\" is not running.");
+    let no_screen = format!("\"{name}\" is not running, so it has no console.");
     let on_reason = format!("\"{name}\" is already running.");
     VmActions {
         start: if running {
@@ -133,6 +139,11 @@ fn actions_for(state: DomainState, name: &str) -> VmActions {
             Action::risky()
         } else {
             Action::yes()
+        },
+        console: if running {
+            Action::yes()
+        } else {
+            Action::no(no_screen)
         },
     }
 }
@@ -175,11 +186,40 @@ pub struct VmView {
     /// Convenience the table would otherwise have to compute per row.
     pub boot_disk: Option<String>,
     pub total_disk_bytes: u64,
-    /// Where the machine's console socket is, for the viewer part 2 adds.
+    /// Where the machine's console socket is, as its own document gives it —
+    /// shown as a fact on the console page, and the thing to name in a support
+    /// conversation when a viewer will not open.
     pub vnc_socket: String,
     /// Changes that are stored but will not reach the guest until it restarts.
     pub pending_reboot: Vec<String>,
     pub actions: VmActions,
+}
+
+/// What the console viewer speaks to a machine.
+///
+/// One value today. It is named rather than assumed so that adding the serial
+/// console — a different socket carrying a different protocol on the same
+/// machine — does not change the shape of anything above this line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConsoleProtocol {
+    Vnc,
+}
+
+/// Where a machine's console is, and what is listening on it.
+///
+/// This is the whole of the virtualization domain's part in the console: it
+/// answers *whether there is a screen and where*, and the control plane
+/// carries the bytes. A UNIX socket is not a domain concept and a WebSocket is
+/// not one either — see the note in `lumen-controlplane/src/api/console.rs`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConsoleTarget {
+    pub vmid: u32,
+    pub name: String,
+    pub node: String,
+    pub protocol: ConsoleProtocol,
+    /// The UNIX socket the hypervisor is listening on for this machine.
+    pub socket: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -449,6 +489,32 @@ impl VirtService {
         Ok(self.view_of(&self.machine(vmid).await?))
     }
 
+    /// Where to find the console of a machine that has one.
+    ///
+    /// Refuses a machine that is not running rather than handing back a path:
+    /// the hypervisor listens on that socket only for as long as the guest
+    /// exists, so a viewer opened against a stopped machine would fail at
+    /// `connect` with nothing but an operating-system error to show for it.
+    /// The refusal carries the sentence `actions.console.reason` already says,
+    /// so a console that raced the machine stopping shows the same words it
+    /// would have shown had it not raced.
+    pub async fn console(&self, vmid: u32) -> Result<ConsoleTarget> {
+        let machine = self.machine(vmid).await?;
+        if !machine.observed.state.is_running() {
+            return Err(VirtError::Conflict(format!(
+                "\"{}\" is not running, so it has no console.",
+                machine.config.name
+            )));
+        }
+        Ok(ConsoleTarget {
+            vmid: machine.config.vmid,
+            name: machine.config.name.clone(),
+            node: self.node.clone(),
+            protocol: ConsoleProtocol::Vnc,
+            socket: console_socket_of(&machine.observed, machine.config.vmid),
+        })
+    }
+
     pub async fn host(&self) -> Result<HostInfo> {
         self.backend.host().await
     }
@@ -589,7 +655,7 @@ impl VirtService {
                 .map(|started| now_unix().saturating_sub(started)),
             boot_disk: config.boot_disk().map(|d| d.id.clone()),
             total_disk_bytes: config.total_disk_bytes(),
-            vnc_socket: domain_xml::vnc_socket_path(config.vmid),
+            vnc_socket: console_socket_of(observed, config.vmid),
             pending_reboot: pending,
             actions: actions_for(observed.state, &config.name),
         }
@@ -1288,6 +1354,18 @@ impl VirtService {
     }
 }
 
+/// A machine's console socket: what its own document says, and only failing
+/// that the path this appliance would have given it.
+///
+/// The fallback matters for exactly one case — a document the reader could not
+/// find a graphics element in — and it is the predictable path rather than
+/// nothing, because "connect and find out" is a better answer than "there is
+/// no console" when the machine is running and the naming rule has held since
+/// the first machine was defined.
+fn console_socket_of(observed: &ObservedDomain, vmid: u32) -> String {
+    domain_xml::vnc_socket_of(&observed.xml).unwrap_or_else(|| domain_xml::vnc_socket_path(vmid))
+}
+
 /// The dataset behind a disk's device path, if the appliance created it.
 fn volume_of(source: &str) -> Option<String> {
     let dataset = source.strip_prefix("/dev/zvol/")?;
@@ -1409,7 +1487,7 @@ mod tests {
             os_id: None,
             cdroms: Vec::new(),
             disks: vec![DiskCreate {
-                pool: "rpool".into(),
+                pool: "boot".into(),
                 size_gib: 32,
                 bus: DiskBus::VirtioBlk,
                 cache: CacheMode::None,
@@ -1435,7 +1513,7 @@ mod tests {
         assert_eq!(vm.state, DomainState::ShutOff);
         assert_eq!(vm.disks.len(), 1);
         assert_eq!(vm.disks[0].id, "vda");
-        assert_eq!(vm.disks[0].source, "/dev/zvol/rpool/lumen/vm-100-disk-0");
+        assert_eq!(vm.disks[0].source, "/dev/zvol/boot/lumen/vm-100-disk-0");
         assert_eq!(vm.nics.len(), 1);
         assert_eq!(vm.nics[0].id, generate_mac(100, 0));
         assert_eq!(vm.nics[0].bridge, "br0");
@@ -1443,13 +1521,55 @@ mod tests {
         assert_eq!(vm.vnc_socket, "/var/lib/libvirt/qemu/lumen-100-vnc.sock");
 
         // The volume really exists, and so does the domain.
-        assert!(h.zfs.has_dataset("rpool/lumen/vm-100-disk-0"));
+        assert!(h.zfs.has_dataset("boot/lumen/vm-100-disk-0"));
         assert!(h.virt.is_defined("web01"));
 
         // The controls say what can be done right now, and why not.
         assert!(vm.actions.start.allowed);
         assert!(!vm.actions.shutdown.allowed);
         assert!(vm.actions.shutdown.reason.is_some());
+    }
+
+    /// A console exists for exactly as long as the guest does, and the domain
+    /// says so rather than handing back a path nothing is listening on.
+    #[tokio::test]
+    async fn a_console_is_offered_only_while_the_machine_is_running() {
+        let h = harness("console").await;
+        let vm = h.service.create(create("web01")).await.unwrap();
+
+        assert!(!vm.actions.console.allowed);
+        assert!(
+            vm.actions
+                .console
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("no console"),
+            "{:?}",
+            vm.actions.console.reason
+        );
+        let err = h.service.console(vm.vmid).await.unwrap_err();
+        assert!(matches!(err, VirtError::Conflict(_)), "{err:?}");
+        // The refusal and the disabled control say the same thing, so a
+        // console that raced the machine stopping reads no differently.
+        assert_eq!(err.to_string(), vm.actions.console.reason.unwrap());
+
+        let running = h.service.start(vm.vmid).await.unwrap();
+        assert!(running.actions.console.allowed);
+        let target = h.service.console(vm.vmid).await.unwrap();
+        assert_eq!(target.vmid, 100);
+        assert_eq!(target.name, "web01");
+        assert_eq!(target.protocol, ConsoleProtocol::Vnc);
+        // Read out of the machine's own document, and therefore the same
+        // socket the view reports.
+        assert_eq!(target.socket, "/var/lib/libvirt/qemu/lumen-100-vnc.sock");
+        assert_eq!(target.socket, running.vnc_socket);
+
+        // A machine that is not there is a not-found, not a console.
+        assert!(matches!(
+            h.service.console(999).await.unwrap_err(),
+            VirtError::NotFound(_)
+        ));
     }
 
     #[tokio::test]
@@ -1506,8 +1626,8 @@ mod tests {
         assert!(!h.virt.is_defined("web01"));
         // The default keeps the data, and says where it still is.
         assert_eq!(removed.removed_volumes, Vec::<String>::new());
-        assert_eq!(removed.kept_volumes, vec!["rpool/lumen/vm-100-disk-0"]);
-        assert!(h.zfs.has_dataset("rpool/lumen/vm-100-disk-0"));
+        assert_eq!(removed.kept_volumes, vec!["boot/lumen/vm-100-disk-0"]);
+        assert!(h.zfs.has_dataset("boot/lumen/vm-100-disk-0"));
     }
 
     #[tokio::test]
@@ -1525,8 +1645,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(removed.removed_volumes, vec!["rpool/lumen/vm-100-disk-0"]);
-        assert!(!h.zfs.has_dataset("rpool/lumen/vm-100-disk-0"));
+        assert_eq!(removed.removed_volumes, vec!["boot/lumen/vm-100-disk-0"]);
+        assert!(!h.zfs.has_dataset("boot/lumen/vm-100-disk-0"));
     }
 
     #[tokio::test]
@@ -1547,7 +1667,7 @@ mod tests {
         }
         // Nothing happened on the way to being refused.
         assert!(h.virt.is_defined("web01"));
-        assert!(h.zfs.has_dataset("rpool/lumen/vm-100-disk-0"));
+        assert!(h.zfs.has_dataset("boot/lumen/vm-100-disk-0"));
     }
 
     #[tokio::test]
@@ -1591,7 +1711,7 @@ mod tests {
             other => panic!("expected a validation failure, got {other:?}"),
         }
         assert!(h.virt.names().is_empty());
-        assert!(!h.zfs.has_dataset("rpool/lumen/vm-100-disk-0"));
+        assert!(!h.zfs.has_dataset("boot/lumen/vm-100-disk-0"));
     }
 
     /// The volume is created before the machine is defined, so a define that
@@ -1624,7 +1744,7 @@ mod tests {
             .attach_disk(
                 vm.vmid,
                 DiskCreate {
-                    pool: "rpool".into(),
+                    pool: "boot".into(),
                     size_gib: 16,
                     bus: DiskBus::VirtioScsi,
                     cache: CacheMode::None,
@@ -1638,7 +1758,7 @@ mod tests {
         assert_eq!(updated.vm.disks[1].id, "sda");
         assert_eq!(
             updated.vm.disks[1].source,
-            "/dev/zvol/rpool/lumen/vm-100-disk-1"
+            "/dev/zvol/boot/lumen/vm-100-disk-1"
         );
         // The machine is not running, so nothing is waiting on anything.
         assert!(updated.pending_reboot.is_empty());
@@ -1657,7 +1777,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(after.vm.disks.len(), 1);
-        assert!(!h.zfs.has_dataset("rpool/lumen/vm-100-disk-1"));
+        assert!(!h.zfs.has_dataset("boot/lumen/vm-100-disk-1"));
     }
 
     #[tokio::test]
@@ -1669,7 +1789,7 @@ mod tests {
             .attach_disk(
                 vm.vmid,
                 DiskCreate {
-                    pool: "rpool".into(),
+                    pool: "boot".into(),
                     size_gib: 4096,
                     bus: DiskBus::VirtioBlk,
                     cache: CacheMode::None,
@@ -1685,7 +1805,7 @@ mod tests {
             }
             other => panic!("expected a validation failure, got {other:?}"),
         }
-        assert!(!h.zfs.has_dataset("rpool/lumen/vm-100-disk-1"));
+        assert!(!h.zfs.has_dataset("boot/lumen/vm-100-disk-1"));
     }
 
     #[tokio::test]
@@ -1987,20 +2107,20 @@ mod tests {
     #[tokio::test]
     async fn a_machine_is_defined_with_its_installation_media() {
         let h = harness("media").await;
-        seed_image(&h, "rpool", "almalinux-10.iso").await;
-        seed_image(&h, "rpool", "virtio-win.iso").await;
+        seed_image(&h, "boot", "almalinux-10.iso").await;
+        seed_image(&h, "boot", "virtio-win.iso").await;
 
         let mut request = create("win01");
         request.os_id = Some("http://microsoft.com/win/11".into());
         request.boot_order = Some(vec![BootDevice::Cdrom, BootDevice::Disk]);
         request.cdroms = vec![
             CdromCreate {
-                storage: Some("rpool".into()),
+                storage: Some("boot".into()),
                 image: Some("almalinux-10.iso".into()),
                 source: None,
             },
             CdromCreate {
-                storage: Some("rpool".into()),
+                storage: Some("boot".into()),
                 image: Some("virtio-win.iso".into()),
                 source: None,
             },
@@ -2049,14 +2169,14 @@ mod tests {
     async fn media_that_is_not_on_the_node_is_refused_before_anything_is_created() {
         let h = harness("missing-media").await;
         let cases = [
-            ("no such image", Some("rpool"), Some("nothere.iso")),
+            ("no such image", Some("boot"), Some("nothere.iso")),
             ("no such pool", Some("tank"), Some("almalinux-10.iso")),
             (
                 "a name that is a path",
-                Some("rpool"),
+                Some("boot"),
                 Some("../../etc/passwd.iso"),
             ),
-            ("a storage with no image", Some("rpool"), None),
+            ("a storage with no image", Some("boot"), None),
             ("an image with no storage", None, Some("almalinux-10.iso")),
         ];
         for (label, storage, image) in cases {
@@ -2070,7 +2190,7 @@ mod tests {
         }
         // And nothing was left behind on the way to being refused.
         assert!(h.service.list().await.unwrap().nodes[0].vms.is_empty());
-        assert!(!h.zfs.has_dataset("rpool/lumen/vm-100-disk-0"));
+        assert!(!h.zfs.has_dataset("boot/lumen/vm-100-disk-0"));
 
         // A caller trying to name a path directly is refused too — the storage
         // domain owns where media may live, and this is the only door.

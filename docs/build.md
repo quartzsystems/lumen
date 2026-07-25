@@ -124,11 +124,11 @@ the kABI gate fails the build if the aliased repo hasn't caught up).
 
 ### Installed system layout (UEFI-only, ZFS-only)
 
-GPT: 1 GiB ESP + 2 GiB ext4 `/boot` + remainder ZFS pool `rpool`
+GPT: 1 GiB ESP + 2 GiB ext4 `/boot` + remainder ZFS pool `boot`
 (`ashift=12`, lz4, `xattr=sa`, `acltype=posixacl`), root dataset
-`rpool/ROOT/lumen` (`bootfs`). Stock EL10 shim/GRUB2 from the RPMs (no
+`boot/ROOT/lumen` (`bootfs`). Stock EL10 shim/GRUB2 from the RPMs (no
 `grub2-install`); dracut's `zfs` module imports the pool
-(`root=zfs:rpool/ROOT/lumen`); `/etc/hostid` is copied from the live env
+(`root=zfs:boot/ROOT/lumen`); `/etc/hostid` is copied from the live env
 (the pool creator) into the target and the pool is exported before reboot,
 so the first import never needs force. `/etc/dracut.conf.d/zfs.conf` keeps
 the zfs module in every future initramfs, and `/etc/kernel/cmdline` carries

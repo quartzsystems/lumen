@@ -39,6 +39,18 @@ impl From<Vec<lumen_virt::ValidationError>> for Rejection {
     }
 }
 
+impl From<Vec<lumen_zfs::ValidationError>> for Rejection {
+    fn from(errors: Vec<lumen_zfs::ValidationError>) -> Self {
+        Rejection::of(errors, |e| e.message.as_str())
+    }
+}
+
+impl From<Vec<lumen_sys::ValidationError>> for Rejection {
+    fn from(errors: Vec<lumen_sys::ValidationError>) -> Self {
+        Rejection::of(errors, |e| e.message.as_str())
+    }
+}
+
 /// API error → `{ "error": "..." }` with the matching status. The web UI's
 /// client surfaces the message verbatim, so texts are user-facing.
 #[derive(Debug)]
@@ -116,14 +128,27 @@ impl From<lumen_virt::VirtError> for ApiError {
     }
 }
 
-/// The storage domain's errors. It has no validation arm: the rules worth a
-/// machine-readable code live where the disk is actually being asked for.
+/// The storage domain's errors. Its validation arm is about pools — the rules
+/// about a *volume* live where the disk is actually being asked for.
 impl From<lumen_zfs::ZfsError> for ApiError {
     fn from(err: lumen_zfs::ZfsError) -> Self {
         match err {
+            lumen_zfs::ZfsError::Invalid(errors) => ApiError::Validation(errors.into()),
             lumen_zfs::ZfsError::NotFound(message) => ApiError::NotFound(message),
             lumen_zfs::ZfsError::Conflict(message) => ApiError::Conflict(message),
             lumen_zfs::ZfsError::Backend(err) => ApiError::Internal(err),
+        }
+    }
+}
+
+/// The system domain's errors, mapped the same way.
+impl From<lumen_sys::SysError> for ApiError {
+    fn from(err: lumen_sys::SysError) -> Self {
+        match err {
+            lumen_sys::SysError::Invalid(errors) => ApiError::Validation(errors.into()),
+            lumen_sys::SysError::NotFound(message) => ApiError::NotFound(message),
+            lumen_sys::SysError::Conflict(message) => ApiError::Conflict(message),
+            lumen_sys::SysError::Backend(err) => ApiError::Internal(err),
         }
     }
 }

@@ -63,10 +63,15 @@ fn test_app() -> axum::Router {
         storage.clone(),
         network.clone(),
     ));
+    let sys = Arc::new(lumen_sys::SysService::new(
+        Arc::new(lumen_sys::backend::mock::MockPower::appliance()),
+        Arc::new(lumen_sys::exec::MockExec::new()),
+    ));
     let state = AppState {
         config,
         jwt_secret: b"test-secret-test-secret-test-secret!".to_vec(),
         realms: RealmRegistry::new().register(Box::new(MockRealm)),
+        sys,
         network,
         storage,
         virt,

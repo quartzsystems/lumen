@@ -381,7 +381,7 @@ fn page_welcome(stack: &gtk::Stack) -> gtk::Box {
         let blurb = gtk::Label::new(Some(
             "This wizard collects the root password, location, management \
              network, and target drives, then installs Lumen onto a ZFS \
-             pool (rpool) — a single drive, a mirror, or RAIDZ. All \
+             pool (boot) — a single drive, a mirror, or RAIDZ. All \
              selected drives are completely erased.",
         ));
         blurb.set_wrap(true);
@@ -772,7 +772,7 @@ fn page_disk(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
     let (outer, content, footer) = shell(
         "STEP 4 OF 4",
         "Boot Drives",
-        "Select the drives for the ZFS pool (rpool) and its layout. Every \
+        "Select the drives for the ZFS pool (boot) and its layout. Every \
          selected drive is completely erased; the first selected drive also \
          carries the EFI system partition and /boot.",
     );
@@ -983,7 +983,7 @@ fn summary_rows(d: &Draft) -> Vec<(String, String)> {
             },
         ));
     }
-    rows.push(("ZFS pool".into(), format!("rpool — {}", d.topology.label())));
+    rows.push(("ZFS pool".into(), format!("boot — {}", d.topology.label())));
     rows.push((
         if d.disk_labels.len() == 1 {
             "Drive".into()

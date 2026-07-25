@@ -74,6 +74,17 @@ impl From<lumen_zfs::ZfsError> for VirtError {
             lumen_zfs::ZfsError::NotFound(message) => VirtError::NotFound(message),
             lumen_zfs::ZfsError::Conflict(message) => VirtError::Conflict(message),
             lumen_zfs::ZfsError::Backend(err) => VirtError::Backend(err),
+            // Storage's validation arm is about *pools*, and nothing in the
+            // compute domain creates one — a machine asks for a volume. If one
+            // ever arrives here it is still a refusal with a reason in it, so
+            // it is carried through as one rather than dropped.
+            lumen_zfs::ZfsError::Invalid(errors) => VirtError::Conflict(
+                errors
+                    .iter()
+                    .map(|e| e.message.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
         }
     }
 }

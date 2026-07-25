@@ -94,14 +94,14 @@ pub fn nm_keyfiles(nic: &str, mac: &str, net: &NetworkConfig) -> (String, String
 }
 
 pub fn build_plan(cfg: &InstallConfig, pins: &BuildPins) -> Vec<Step> {
-    // Every disk gets the same ESP/boot/rpool layout so any of them can be
+    // Every disk gets the same ESP/boot/boot layout so any of them can be
     // promoted to the boot disk later, but only the first disk's ESP and
     // /boot are formatted and used.
     let boot_disk = cfg.disks[0].as_str();
     let esp = part_dev(boot_disk, 1);
     let boot = part_dev(boot_disk, 2);
     let kernel_pkg = pins.kernel_nevr.clone().unwrap_or_else(|| "kernel".into());
-    let root_arg = "root=zfs:rpool/ROOT/lumen";
+    let root_arg = "root=zfs:boot/ROOT/lumen";
     let (mgmt_bridge_keyfile, mgmt_port_keyfile) =
         nm_keyfiles(&cfg.nic, &cfg.nic_mac, &cfg.network);
 
@@ -131,7 +131,7 @@ pub fn build_plan(cfg: &InstallConfig, pins: &BuildPins) -> Vec<Step> {
             "-c2:boot",
             "-n3:0:0",
             "-t3:BF00",
-            "-c3:rpool",
+            "-c3:boot",
             disk,
         ]));
         partition_actions.push(cmd(&["partprobe", disk]));
@@ -170,7 +170,7 @@ pub fn build_plan(cfg: &InstallConfig, pins: &BuildPins) -> Vec<Step> {
         "mountpoint=none",
         "-R",
         TARGET,
-        "rpool",
+        "boot",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -193,7 +193,7 @@ pub fn build_plan(cfg: &InstallConfig, pins: &BuildPins) -> Vec<Step> {
                 "canmount=off",
                 "-o",
                 "mountpoint=none",
-                "rpool/ROOT",
+                "boot/ROOT",
             ]),
             cmd(&[
                 "zfs",
@@ -202,10 +202,10 @@ pub fn build_plan(cfg: &InstallConfig, pins: &BuildPins) -> Vec<Step> {
                 "canmount=noauto",
                 "-o",
                 "mountpoint=/",
-                "rpool/ROOT/lumen",
+                "boot/ROOT/lumen",
             ]),
-            cmd(&["zpool", "set", "bootfs=rpool/ROOT/lumen", "rpool"]),
-            cmd(&["zfs", "mount", "rpool/ROOT/lumen"]),
+            cmd(&["zpool", "set", "bootfs=boot/ROOT/lumen", "boot"]),
+            cmd(&["zfs", "mount", "boot/ROOT/lumen"]),
             sh(format!(
                 "mkdir -p {TARGET}/boot && mount {boot} {TARGET}/boot"
             )),
@@ -249,7 +249,7 @@ pub fn build_plan(cfg: &InstallConfig, pins: &BuildPins) -> Vec<Step> {
         title: "Configure system".into(),
         actions: vec![
             // hostid + zpool.cache coherence: dracut's zfs module needs both
-            // to import rpool without force at first boot.
+            // to import boot without force at first boot.
             sh(format!("cp /etc/hostid {TARGET}/etc/hostid")),
             // The root pool's installation media library, made here so a fresh
             // node can be given an image from the console without anyone
@@ -257,7 +257,7 @@ pub fn build_plan(cfg: &InstallConfig, pins: &BuildPins) -> Vec<Step> {
             // because the control plane cannot see a mount that appears after
             // its own namespace was set up — the dataset has to exist before
             // it starts, and at install time it always can.
-            sh("zfs create -p -o mountpoint=/var/lib/lumen/iso/rpool rpool/lumen/iso"),
+            sh("zfs create -p -o mountpoint=/var/lib/lumen/iso/boot boot/lumen/iso"),
             sh(format!(
                 "mkdir -p {TARGET}/etc/zfs && \
                  cp /etc/zfs/zpool.cache {TARGET}/etc/zfs/zpool.cache 2>/dev/null || true"
@@ -482,7 +482,7 @@ pub fn build_plan(cfg: &InstallConfig, pins: &BuildPins) -> Vec<Step> {
             sh(format!("umount {TARGET}/boot/efi {TARGET}/boot")),
             // A cleanly exported pool imports without force in the target's
             // initramfs; skipping this forces zpool import -f forever after.
-            cmd(&["zpool", "export", "rpool"]),
+            cmd(&["zpool", "export", "boot"]),
         ],
     });
 
@@ -677,7 +677,7 @@ mod tests {
         // Fallback entry generation, not just a hard existence gate.
         assert!(script.contains("if ! ls"));
         assert!(script.contains("grub_arg --unrestricted"));
-        assert!(script.contains("root=zfs:rpool/ROOT/lumen"));
+        assert!(script.contains("root=zfs:boot/ROOT/lumen"));
         // Kernel image installed if kernel-install skipped that too.
         assert!(script.contains("/usr/lib/modules/"));
     }
@@ -823,10 +823,10 @@ mod tests {
             .collect();
         let iso = shells
             .iter()
-            .position(|s| s.contains("rpool/lumen/iso"))
+            .position(|s| s.contains("boot/lumen/iso"))
             .expect("plan must create the media library");
         assert!(
-            shells[iso].contains("mountpoint=/var/lib/lumen/iso/rpool"),
+            shells[iso].contains("mountpoint=/var/lib/lumen/iso/boot"),
             "it must mount where the unit's ReadWritePaths names: {}",
             shells[iso]
         );

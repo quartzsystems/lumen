@@ -16,12 +16,31 @@ pub mod unavailable;
 use async_trait::async_trait;
 
 use crate::error::Result;
-use crate::model::{Dataset, Pool, VolumeRequest};
+use crate::model::{BlockDevice, Dataset, Pool, PoolRequest, VolumeRequest};
 
 #[async_trait]
 pub trait ZfsBackend: Send + Sync {
     /// Every pool imported on this node.
     async fn pools(&self) -> Result<Vec<Pool>>;
+
+    /// Every disk the node has, and what is already on each one.
+    ///
+    /// Here rather than in the service because the mock has to be able to
+    /// answer it: a test for "the console refuses to build a pool on the disk
+    /// the appliance boots from" needs a node with that disk on it.
+    async fn block_devices(&self) -> Result<Vec<BlockDevice>>;
+
+    /// Create a pool.
+    ///
+    /// The one operation in this trait that cannot happen inside the control
+    /// plane's sandbox: it writes `/etc/zfs/zpool.cache`, which
+    /// `ProtectSystem=strict` makes read-only. The real backend hands it to
+    /// systemd; see `lumen_sys::exec` for why that is the arrangement rather
+    /// than a relaxed unit.
+    async fn create_pool(&self, request: &PoolRequest) -> Result<Pool>;
+
+    /// Destroy one. Everything on it goes.
+    async fn destroy_pool(&self, name: &str) -> Result<()>;
 
     /// Filesystems and volumes under one pool, the pool's own root included.
     async fn datasets(&self, pool: &str) -> Result<Vec<Dataset>>;

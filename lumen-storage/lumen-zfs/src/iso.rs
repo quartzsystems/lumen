@@ -306,7 +306,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        std::fs::create_dir_all(root.join("rpool")).unwrap();
+        std::fs::create_dir_all(root.join("boot")).unwrap();
         (IsoLibrary::new(&root), root)
     }
 
@@ -315,23 +315,23 @@ mod tests {
         let (library, root) = library("upload");
 
         let mut upload = library
-            .begin_upload("rpool", "almalinux-10.iso")
+            .begin_upload("boot", "almalinux-10.iso")
             .await
             .unwrap();
         upload.write(b"CD001").await.unwrap();
         // Mid-upload there is a partial file and nothing the console would
         // offer as bootable media.
-        assert!(root.join("rpool/almalinux-10.iso.part").exists());
-        assert!(library.list("rpool").await.unwrap().is_empty());
+        assert!(root.join("boot/almalinux-10.iso.part").exists());
+        assert!(library.list("boot").await.unwrap().is_empty());
 
         assert_eq!(upload.finish().await.unwrap(), 5);
-        let listed = library.list("rpool").await.unwrap();
+        let listed = library.list("boot").await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].name, "almalinux-10.iso");
         assert_eq!(listed[0].size, 5);
-        assert_eq!(listed[0].storage, "rpool");
+        assert_eq!(listed[0].storage, "boot");
         assert!(listed[0].path.ends_with("almalinux-10.iso"));
-        assert!(!root.join("rpool/almalinux-10.iso.part").exists());
+        assert!(!root.join("boot/almalinux-10.iso.part").exists());
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -340,16 +340,16 @@ mod tests {
     async fn an_abandoned_upload_leaves_nothing_bootable_behind() {
         let (library, root) = library("abort");
 
-        let mut upload = library.begin_upload("rpool", "half.iso").await.unwrap();
+        let mut upload = library.begin_upload("boot", "half.iso").await.unwrap();
         upload.write(b"partial").await.unwrap();
         upload.abort().await;
-        assert!(library.list("rpool").await.unwrap().is_empty());
-        assert!(!root.join("rpool/half.iso.part").exists());
+        assert!(library.list("boot").await.unwrap().is_empty());
+        assert!(!root.join("boot/half.iso.part").exists());
 
         // And an upload with nothing in it is refused rather than published.
-        let empty = library.begin_upload("rpool", "empty.iso").await.unwrap();
+        let empty = library.begin_upload("boot", "empty.iso").await.unwrap();
         assert!(empty.finish().await.is_err());
-        assert!(library.list("rpool").await.unwrap().is_empty());
+        assert!(library.list("boot").await.unwrap().is_empty());
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -366,12 +366,12 @@ mod tests {
             "",
             "plain.txt",
         ] {
-            assert!(library.path("rpool", bad).is_err(), "{bad:?}");
-            assert!(library.delete("rpool", bad).await.is_err(), "{bad:?}");
+            assert!(library.path("boot", bad).is_err(), "{bad:?}");
+            assert!(library.delete("boot", bad).await.is_err(), "{bad:?}");
         }
         // And a pool name that is really something else is refused too.
         assert!(library.path("../etc", "ok.iso").is_err());
-        assert!(library.dir("rpool/lumen").is_err());
+        assert!(library.dir("boot/lumen").is_err());
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -379,17 +379,17 @@ mod tests {
     #[tokio::test]
     async fn the_same_name_twice_is_refused_rather_than_overwriting() {
         let (library, root) = library("dup");
-        let mut upload = library.begin_upload("rpool", "dup.iso").await.unwrap();
+        let mut upload = library.begin_upload("boot", "dup.iso").await.unwrap();
         upload.write(b"first").await.unwrap();
         upload.finish().await.unwrap();
 
-        let err = library.begin_upload("rpool", "dup.iso").await.unwrap_err();
+        let err = library.begin_upload("boot", "dup.iso").await.unwrap_err();
         assert!(matches!(err, ZfsError::Conflict(_)), "{err:?}");
-        assert_eq!(library.list("rpool").await.unwrap()[0].size, 5);
+        assert_eq!(library.list("boot").await.unwrap()[0].size, 5);
 
-        library.delete("rpool", "dup.iso").await.unwrap();
-        assert!(library.list("rpool").await.unwrap().is_empty());
-        assert!(library.delete("rpool", "dup.iso").await.is_err());
+        library.delete("boot", "dup.iso").await.unwrap();
+        assert!(library.list("boot").await.unwrap().is_empty());
+        assert!(library.delete("boot", "dup.iso").await.is_err());
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -406,7 +406,7 @@ mod tests {
         assert!(reason.contains("zfs create"), "{reason}");
         assert!(library.list("tank").await.unwrap().is_empty());
 
-        let ready = library.store("rpool").await.unwrap();
+        let ready = library.store("boot").await.unwrap();
         assert!(ready.ready);
         assert!(ready.reason.is_none());
 

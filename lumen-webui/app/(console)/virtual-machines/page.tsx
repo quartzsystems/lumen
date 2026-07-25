@@ -23,6 +23,7 @@ import { ModalFooter } from "@/components/ui/formkit";
 import { Switch } from "@/components/ui/Switch";
 import { CreateVmDialog } from "@/components/vm/CreateVmDialog";
 import { LifecycleControls } from "@/components/vm/LifecycleControls";
+import { VmConsole } from "@/components/vm/VmConsole";
 import { StateBadge, Tags } from "@/components/vm/VmBits";
 import { VmHardware } from "@/components/vm/VmHardware";
 import { VmOptions } from "@/components/vm/VmOptions";
@@ -39,9 +40,9 @@ import {
   type VmView,
 } from "@/lib/vmClient";
 
-/// The detail page's sections. Console, snapshots, backups, and tasks are
-/// stubs at this stage; they are listed anyway so the shape of the page is
-/// visible and so part 2 is purely additive.
+/// The detail page's sections. Snapshots, backups, and tasks are stubs at this
+/// stage; they are listed anyway so the shape of the page is visible and so
+/// filling them in stays purely additive.
 const SECTIONS = [
   { id: "overview", label: "Overview", icon: LayoutDashboard },
   { id: "console", label: "Console", icon: Monitor },
@@ -324,12 +325,7 @@ function VmSection({
       // values rather than the previous machine's half-edited form.
       return <VmOptions key={vm.vmid} vm={vm} busy={busy} onChanged={onChanged} />;
     case "console":
-      return (
-        <VmStubSection
-          title="The console viewer"
-          note="this machine already has a console socket defined, so nothing has to be redefined when it arrives."
-        />
-      );
+      return <VmConsole vm={vm} busy={busy} onAction={onChanged} />;
     case "snapshots":
       return (
         <VmStubSection title="Snapshots" note="taken from the pool the machine's disks live on." />
@@ -485,6 +481,10 @@ function VmTable({
       searchPlaceholder="Search machines…"
       emptyMessage="No machines on this node yet."
       onRefresh={onRefresh}
+      // Open, the one obvious lifecycle control, and the menu holding the
+      // rest. Three controls need more than the default cell, and a fixed
+      // layout will not find the room on its own.
+      actionsWidth={158}
       actions={(vm) => (
         <div className="inline-flex items-center gap-1 justify-end">
           <Button kind="ghost" size="sm" onClick={() => onOpen(vm)}>

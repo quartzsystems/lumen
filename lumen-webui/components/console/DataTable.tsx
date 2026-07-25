@@ -47,6 +47,7 @@ export function DataTable<T>({
   emptyMessage = "No rows.",
   toolbar,
   actions,
+  actionsWidth = 90,
   onRefresh,
   storageKey,
 }: {
@@ -60,6 +61,13 @@ export function DataTable<T>({
   toolbar?: React.ReactNode;
   /** Trailing per-row actions cell (e.g. edit/delete). Does not trigger row selection. */
   actions?: (row: T) => React.ReactNode;
+  /**
+   * Width (px) of the actions column. The fixed layout will not grow it to fit,
+   * so a cell holding more than one control has to say how much room it needs —
+   * otherwise its buttons overflow and the table scrolls sideways with the last
+   * one clipped.
+   */
+  actionsWidth?: number;
   /** When provided, renders a Refresh button that re-runs this in place (spinner managed here). */
   onRefresh?: () => void | Promise<void>;
   /** Namespace for persisting column layout (order/width/visibility). Falls back to the column set. */
@@ -523,7 +531,7 @@ export function DataTable<T>({
             {visibleCols.map((c) => (
               <col key={c.key} style={{ width: colWidth(c) }} />
             ))}
-            {actions && <col style={{ width: 90 }} />}
+            {actions && <col style={{ width: actionsWidth }} />}
           </colgroup>
           <thead>
             <tr>
@@ -601,7 +609,11 @@ export function DataTable<T>({
                   )}
                 </th>
               ))}
-              {actions && <th style={{ width: 90 }} className="text-right">Actions</th>}
+              {actions && (
+                <th style={{ width: actionsWidth }} className="text-right">
+                  Actions
+                </th>
+              )}
             </tr>
           </thead>
           <tbody>
@@ -643,7 +655,7 @@ export function DataTable<T>({
                     {actions && (
                       <td
                         onMouseDown={(e) => e.stopPropagation()}
-                        style={{ cursor: "default" }}
+                        style={{ cursor: "default", whiteSpace: "nowrap" }}
                         className="text-right"
                       >
                         {actions(row)}

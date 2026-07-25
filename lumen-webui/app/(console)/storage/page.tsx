@@ -1,27 +1,40 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { AlertTriangle, Info } from "lucide-react";
+import { AlertTriangle, Info, Plus, Trash2 } from "lucide-react";
 import { Page, PageBody, PageHeader } from "@/components/PageHeader";
 import { DataTable, Dash, type Column, type FilterDef } from "@/components/console/DataTable";
+import { Button } from "@/components/ui/Button";
 import { Meter } from "@/components/vm/VmBits";
+import { CreatePoolDialog, DestroyPoolDialog } from "@/components/storage/CreatePoolDialog";
 import { ApiError } from "@/lib/authClient";
+import { useConsole } from "@/lib/ConsoleContext";
 import { titleCase, titleCaseOptions } from "@/lib/labels";
-import { fetchPools, HEALTH_TONE, type PoolsResponse, type PoolView } from "@/lib/storageClient";
+import {
+  destroyPool,
+  fetchPools,
+  HEALTH_TONE,
+  type PoolsResponse,
+  type PoolView,
+} from "@/lib/storageClient";
 import { formatBytes } from "@/lib/vmClient";
 
 const POLL_MS = 10000;
 
 /// The node's storage pools.
 ///
-/// Read-only at this stage, and deliberately so: creating a pool is the one
-/// operation with no privileged daemon to delegate to, and doing it from a
-/// hardened service would mean weakening the service. There is no Create
-/// button because a button that cannot work is worse than no button — see
-/// docs/compute.md.
+/// Creating one destroys whatever was on the disks it is given, which is why
+/// the dialog behind Create reports what is already on each disk and refuses
+/// one that is spoken for without the acknowledgement. The pool this appliance
+/// is installed on is never destroyable — the backend says so, and the control
+/// carries its reason rather than being silently grey.
 export default function StoragePage() {
+  const { setToast } = useConsole();
   const [pools, setPools] = useState<PoolsResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [destroying, setDestroying] = useState<PoolView | null>(null);
+  const [busy, setBusy] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -39,9 +52,31 @@ export default function StoragePage() {
   }, [load]);
 
   useEffect(() => {
+    // Polling pauses while a dialog is open, so a refresh cannot move the
+    // picker out from under the operator mid-choice.
+    if (creating || destroying) return;
     const timer = setInterval(() => void load(), POLL_MS);
     return () => clearInterval(timer);
-  }, [load]);
+  }, [load, creating, destroying]);
+
+  const existingNames = useMemo(
+    () => (pools?.nodes ?? []).flatMap((node) => node.pools.map((pool) => pool.name)),
+    [pools],
+  );
+
+  const destroy = async (pool: PoolView, acknowledge: boolean) => {
+    setBusy(true);
+    try {
+      await destroyPool(pool.name, acknowledge);
+      setDestroying(null);
+      setToast(`${pool.name} destroyed.`);
+      await load();
+    } catch (err) {
+      setToast(err instanceof Error ? err.message : "Could not destroy the pool.");
+    } finally {
+      setBusy(false);
+    }
+  };
 
   return (
     <Page>
@@ -59,11 +94,12 @@ export default function StoragePage() {
           <div className="callout">
             <Info size={17} className="flex-shrink-0 text-[var(--qz-fg-4)] mt-[1px]" />
             <div className="text-[13px] text-[var(--qz-fg-3)]">
-              Pools are created, imported, and removed from the node itself for now. Those are the
-              operations that need privileges the management daemon deliberately does not have, so
-              they will arrive with the small privileged helper that gets them — not by loosening
-              this one. Virtual machine disks are already created from here, under each
-              pool&apos;s <span className="qz-mono">lumen</span> dataset.
+              Creating and destroying a pool are the two storage operations that cannot happen
+              inside this daemon&apos;s sandbox — they write{" "}
+              <span className="qz-mono">/etc/zfs/zpool.cache</span> — so they are handed to systemd
+              and run outside it. Nothing was loosened to make them work. Virtual machine disks are
+              created under each pool&apos;s <span className="qz-mono">lumen</span> dataset, from
+              the machine that needs them.
             </div>
           </div>
 
@@ -82,11 +118,38 @@ export default function StoragePage() {
                   {node.node}
                 </h2>
               )}
-              <PoolTable rows={node.pools} onRefresh={load} />
+              <PoolTable
+                rows={node.pools}
+                busy={busy}
+                onRefresh={load}
+                onCreate={() => setCreating(true)}
+                onDestroy={setDestroying}
+              />
             </section>
           ))}
         </div>
       </PageBody>
+
+      {creating && (
+        <CreatePoolDialog
+          existingNames={existingNames}
+          onClose={() => setCreating(false)}
+          onCreated={async (pool) => {
+            setCreating(false);
+            setToast(`${pool.name} created — ${formatBytes(pool.size)}.`);
+            await load();
+          }}
+        />
+      )}
+
+      {destroying && (
+        <DestroyPoolDialog
+          pool={destroying}
+          busy={busy}
+          onClose={() => setDestroying(null)}
+          onConfirm={(acknowledge) => destroy(destroying, acknowledge)}
+        />
+      )}
     </Page>
   );
 }
@@ -186,7 +249,19 @@ const columns: Column<PoolView>[] = [
   },
 ];
 
-function PoolTable({ rows, onRefresh }: { rows: PoolView[]; onRefresh: () => Promise<void> }) {
+function PoolTable({
+  rows,
+  busy,
+  onRefresh,
+  onCreate,
+  onDestroy,
+}: {
+  rows: PoolView[];
+  busy: boolean;
+  onRefresh: () => Promise<void>;
+  onCreate: () => void;
+  onDestroy: (pool: PoolView) => void;
+}) {
   const filters: FilterDef<PoolView>[] = useMemo(
     () => [
       {
@@ -211,6 +286,26 @@ function PoolTable({ rows, onRefresh }: { rows: PoolView[]; onRefresh: () => Pro
       searchPlaceholder="Search pools…"
       emptyMessage="No storage pools on this node."
       onRefresh={onRefresh}
+      toolbar={
+        <Button kind="primary" size="sm" icon={Plus} onClick={onCreate}>
+          Create
+        </Button>
+      }
+      actionsWidth={90}
+      actions={(pool) => (
+        // A disabled control explains itself: the backend supplies the reason,
+        // so the console and the node can never disagree about what is
+        // possible.
+        <span title={pool.destroy_blocked_reason ?? undefined}>
+          <Button
+            kind="ghost"
+            size="sm"
+            icon={Trash2}
+            disabled={busy || !pool.destroyable}
+            onClick={() => onDestroy(pool)}
+          />
+        </span>
+      )}
     />
   );
 }

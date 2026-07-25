@@ -694,6 +694,72 @@ body {
   overflow-wrap: anywhere;
 }
 
+/* --- Console viewer ---
+   The frame around a guest's screen. The screen itself is a canvas noVNC owns
+   and sizes; everything here is the box it sits in, which is why the surface
+   is nearly black — a letterboxed guest should read as unused space rather
+   than as part of the page. */
+.qz-console {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--qz-border);
+  border-radius: 10px;
+  background: var(--qz-surface-sunken);
+  overflow: hidden;
+  min-height: 0;
+}
+.qz-console-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--qz-border);
+  background: var(--qz-surface);
+}
+/* The screen. `position: relative` because noVNC positions its canvas inside,
+   and a fixed height because a canvas with none collapses to nothing. */
+.qz-console-screen {
+  position: relative;
+  flex: 1;
+  min-height: 420px;
+  background: #000;
+}
+/* Full screen means the guest's screen, not the page's: the toolbar comes with
+   it, because Ctrl-Alt-Del and the way back out are on it. */
+.qz-console:fullscreen {
+  border: 0;
+  border-radius: 0;
+  height: 100%;
+}
+.qz-console:fullscreen .qz-console-screen {
+  min-height: 0;
+}
+/* Said over the screen rather than instead of it, so a connection that drops
+   does not throw away the last thing the guest drew. */
+.qz-console-veil {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  text-align: center;
+  padding: 24px;
+  background: color-mix(in oklab, black 62%, transparent);
+  backdrop-filter: blur(2px);
+  font-size: 13px;
+  color: var(--qz-fg-2);
+}
+.qz-console-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  color: var(--qz-fg-3);
+}
+
 /* --- Scrollbars --- */
 ::-webkit-scrollbar { width: 10px; }
 ::-webkit-scrollbar-thumb { background: var(--qz-ink-5); border-radius: 999px; }

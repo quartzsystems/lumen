@@ -15,20 +15,33 @@
 //! makes it machine-readable, and a version that adds a column does not break
 //! a reader that asks for its columns by name.
 //!
-//! Nothing here needs the control plane's unit relaxed: dataset and volume
-//! operations reach the kernel through `/dev/zfs`, which `ProtectSystem=strict`
-//! does not cover. See docs/compute.md for the reproduction.
+//! Almost nothing here needs the control plane's unit relaxed: dataset and
+//! volume operations reach the kernel through `/dev/zfs`, which
+//! `ProtectSystem=strict` does not cover. See docs/compute.md for the
+//! reproduction.
+//!
+//! **Pool** operations are the exception, and the only one. `zpool create` and
+//! `zpool destroy` write `/etc/zfs/zpool.cache`, which that same setting makes
+//! read-only, so those two are handed to systemd through
+//! [`lumen_sys::exec`] and run outside the daemon's namespace. Everything else
+//! on this page is a direct `execve` from inside it. The split is exactly the
+//! set of operations that touch that one file — see docs/system.md.
 
 use std::process::Stdio;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::process::Command;
 
+use lumen_sys::exec::{Exec, Request as ExecRequest};
+
 use crate::backend::ZfsBackend;
+use crate::devices::{self, DeviceRoots};
 use crate::error::{Result, ZfsError};
 use crate::model::{
-    is_lumen_volume, is_reserved_leaf, iso_dataset, iso_mountpoint, lumen_root, valid_pool_name,
-    Dataset, DatasetKind, Pool, PoolHealth, VolumeRequest,
+    is_lumen_volume, is_reserved_leaf, iso_dataset, iso_mountpoint, lumen_root, valid_device_path,
+    valid_new_pool_name, valid_pool_name, BlockDevice, Dataset, DatasetKind, Pool, PoolHealth,
+    PoolRequest, VolumeRequest, DEFAULT_ASHIFT,
 };
 
 /// Columns asked for by name, so a release that adds one does not shift the
@@ -39,31 +52,104 @@ const DATASET_COLUMNS: &str = "name,type,used,avail,refer,volsize,volblocksize,m
 pub struct CliBackend {
     zfs: String,
     zpool: String,
-}
-
-impl Default for CliBackend {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// How a pool operation leaves the sandbox. Only the two that write
+    /// `/etc/zfs/zpool.cache` go through it.
+    exec: Arc<dyn Exec>,
+    /// Absolute, because the transient unit systemd starts has its own
+    /// environment and should not be resolving a program out of a `PATH` this
+    /// daemon happened to have.
+    zpool_path: String,
+    devices: DeviceRoots,
 }
 
 impl CliBackend {
-    pub fn new() -> Self {
+    pub fn new(exec: Arc<dyn Exec>) -> Self {
         Self {
             zfs: "zfs".into(),
             zpool: "zpool".into(),
+            exec,
+            zpool_path: "/usr/sbin/zpool".into(),
+            devices: DeviceRoots::default(),
         }
+    }
+
+    /// Read the node's disks from somewhere else, for a test.
+    pub fn with_device_roots(mut self, devices: DeviceRoots) -> Self {
+        self.devices = devices;
+        self
     }
 
     /// Confirm the tools are actually there, so a node without storage swaps
     /// in `UnavailableBackend` at startup instead of failing every request
     /// with a spawn error.
-    pub async fn probe() -> Result<Self> {
-        let backend = Self::new();
+    pub async fn probe(exec: Arc<dyn Exec>) -> Result<Self> {
+        let backend = Self::new(exec);
         backend
             .run(&backend.zpool.clone(), &["list", "-H", "-o", "name"])
             .await?;
         Ok(backend)
+    }
+
+    /// A pool command, run outside the sandbox.
+    async fn run_privileged(&self, description: String, args: Vec<String>) -> Result<()> {
+        let outcome = self
+            .exec
+            .run(ExecRequest::new(description, &self.zpool_path).args(args))
+            .await
+            .map_err(ZfsError::Backend)?;
+        if !outcome.ok() {
+            // The tool's own words. "The pool operation failed" helps nobody,
+            // and zpool's messages are unusually good.
+            return Err(ZfsError::Conflict(outcome.failure()));
+        }
+        Ok(())
+    }
+
+    /// The argument array for `zpool create`.
+    ///
+    /// Split out so it can be asserted on without a pool: this is the one
+    /// command in the tree where getting an argument wrong destroys data, and
+    /// a test that reads it is worth more than one that runs it.
+    fn create_argv(&self, request: &PoolRequest) -> Vec<String> {
+        let mut argv: Vec<String> = vec!["create".into()];
+        if request.force {
+            // Only ever set when the operator acknowledged a disk that already
+            // had something on it — the service will not build the request
+            // otherwise.
+            argv.push("-f".into());
+        }
+        argv.extend([
+            "-o".into(),
+            format!("ashift={}", request.ashift.unwrap_or(DEFAULT_ASHIFT)),
+            "-o".into(),
+            format!("autotrim={}", if request.autotrim { "on" } else { "off" }),
+            "-O".into(),
+            format!("compression={}", request.compression.as_str()),
+            // The four the installer sets on the root pool, so a pool made
+            // here behaves like the one made at install time rather than
+            // subtly differently.
+            "-O".into(),
+            "acltype=posixacl".into(),
+            "-O".into(),
+            "xattr=sa".into(),
+            "-O".into(),
+            "dnodesize=auto".into(),
+            "-O".into(),
+            "relatime=on".into(),
+            // The pool root holds nothing itself and must not appear at
+            // /<name> — a pool called "boot" mounting over /boot is precisely
+            // the accident this avoids.
+            "-O".into(),
+            "canmount=off".into(),
+            "-O".into(),
+            "mountpoint=none".into(),
+            request.name.clone(),
+        ]);
+        if let Some(keyword) = request.vdev.keyword() {
+            argv.push(keyword.into());
+        }
+        argv.extend(request.disks.iter().cloned());
+        argv
     }
 
     /// One invocation. Output is captured; a non-zero exit becomes an error
@@ -213,6 +299,63 @@ impl ZfsBackend for CliBackend {
         Ok(parse_pools(&stdout))
     }
 
+    async fn block_devices(&self) -> Result<Vec<BlockDevice>> {
+        Ok(devices::list(&self.devices).await)
+    }
+
+    async fn create_pool(&self, request: &PoolRequest) -> Result<Pool> {
+        // Checked again here as well as in the service. A backend that trusts
+        // its caller is one refactor away from not being safe, and this is the
+        // command that reformats disks.
+        if !valid_new_pool_name(&request.name) {
+            return Err(ZfsError::Conflict(format!(
+                "\"{}\" is not a usable name for a new pool.",
+                request.name
+            )));
+        }
+        if request.disks.is_empty() {
+            return Err(ZfsError::Conflict("A pool needs at least one disk.".into()));
+        }
+        for disk in &request.disks {
+            if !valid_device_path(disk) {
+                return Err(ZfsError::Conflict(format!(
+                    "\"{disk}\" is not a device this appliance will build a pool on."
+                )));
+            }
+        }
+
+        self.run_privileged(
+            format!("create the storage pool \"{}\"", request.name),
+            self.create_argv(request),
+        )
+        .await?;
+
+        // Read it back rather than assuming: the size a pool reports is the
+        // one after ZFS's own overhead, and it is never quite the number the
+        // arithmetic in the dialog predicted.
+        self.pools()
+            .await?
+            .into_iter()
+            .find(|pool| pool.name == request.name)
+            .ok_or_else(|| {
+                ZfsError::Backend(anyhow::anyhow!(
+                    "created the pool \"{}\" but it is not listed afterwards",
+                    request.name
+                ))
+            })
+    }
+
+    async fn destroy_pool(&self, name: &str) -> Result<()> {
+        reject_bad_pool(name)?;
+        // No -f: a pool with a dataset in use must fail loudly and say which,
+        // rather than being torn out from under whatever has it open.
+        self.run_privileged(
+            format!("destroy the storage pool \"{name}\""),
+            vec!["destroy".into(), name.to_string()],
+        )
+        .await
+    }
+
     async fn datasets(&self, pool: &str) -> Result<Vec<Dataset>> {
         reject_bad_pool(pool)?;
         let stdout = self
@@ -335,16 +478,17 @@ impl ZfsBackend for CliBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{Compression, VdevKind};
 
     /// Real `zpool list -H -p` output, tab separated.
     #[test]
     fn pools_parse_from_the_machine_readable_form() {
-        let stdout = "rpool\t1000204886016\t4194304\t1000200691712\t0\t1.00\tONLINE\toff\n\
+        let stdout = "boot\t1000204886016\t4194304\t1000200691712\t0\t1.00\tONLINE\toff\n\
                       tank\t2000409772032\t1000204886016\t1000204886016\t12\t1.24x\tDEGRADED\ton\n";
         let pools = parse_pools(stdout);
         assert_eq!(pools.len(), 2);
 
-        assert_eq!(pools[0].name, "rpool");
+        assert_eq!(pools[0].name, "boot");
         assert_eq!(pools[0].size, 1_000_204_886_016);
         assert_eq!(pools[0].allocated, 4_194_304);
         assert_eq!(pools[0].free, 1_000_200_691_712);
@@ -363,7 +507,7 @@ mod tests {
 
     #[test]
     fn a_column_with_nothing_in_it_reads_as_absent_not_as_zero() {
-        let stdout = "rpool\t100\t10\t90\t-\t-\tONLINE\toff\n";
+        let stdout = "boot\t100\t10\t90\t-\t-\tONLINE\toff\n";
         let pools = parse_pools(stdout);
         assert_eq!(pools[0].fragmentation, None);
         assert_eq!(pools[0].dedup_ratio, None);
@@ -371,14 +515,14 @@ mod tests {
 
     #[test]
     fn datasets_and_volumes_parse_from_one_listing() {
-        let stdout = "rpool\tfilesystem\t4194304\t1000200691712\t98304\t-\t-\t/rpool\n\
-                      rpool/lumen\tfilesystem\t98304\t1000200691712\t98304\t-\t-\tnone\n\
-                      rpool/lumen/vm-101-disk-0\tvolume\t34359738368\t1000200691712\t56\t34359738368\t16384\t-\n";
+        let stdout = "boot\tfilesystem\t4194304\t1000200691712\t98304\t-\t-\t/boot\n\
+                      boot/lumen\tfilesystem\t98304\t1000200691712\t98304\t-\t-\tnone\n\
+                      boot/lumen/vm-101-disk-0\tvolume\t34359738368\t1000200691712\t56\t34359738368\t16384\t-\n";
         let datasets = parse_datasets(stdout);
         assert_eq!(datasets.len(), 3);
 
         assert_eq!(datasets[0].kind, DatasetKind::Filesystem);
-        assert_eq!(datasets[0].mountpoint.as_deref(), Some("/rpool"));
+        assert_eq!(datasets[0].mountpoint.as_deref(), Some("/boot"));
         // "none" is not a mount point, it is the absence of one.
         assert_eq!(datasets[1].mountpoint, None);
 
@@ -388,7 +532,7 @@ mod tests {
         assert_eq!(volume.volblocksize, Some(16_384));
         assert_eq!(volume.mountpoint, None);
         assert!(volume.is_lumen_managed());
-        assert_eq!(volume.pool(), "rpool");
+        assert_eq!(volume.pool(), "boot");
     }
 
     #[test]
@@ -397,17 +541,123 @@ mod tests {
         assert!(parse_datasets("\n").is_empty());
     }
 
+    fn pool_request(vdev: VdevKind, disks: &[&str]) -> PoolRequest {
+        PoolRequest {
+            name: "tank".into(),
+            vdev,
+            disks: disks.iter().map(|d| d.to_string()).collect(),
+            ashift: None,
+            compression: Compression::Lz4,
+            autotrim: true,
+            force: false,
+        }
+    }
+
+    fn backend() -> CliBackend {
+        CliBackend::new(lumen_sys::exec::MockExec::working())
+    }
+
+    /// The one command in this tree where a wrong argument destroys data, so
+    /// it is read rather than run.
+    #[test]
+    fn a_pool_is_created_with_the_arrangement_that_was_asked_for() {
+        let argv = backend().create_argv(&pool_request(
+            VdevKind::Raidz2,
+            &[
+                "/dev/disk/by-id/a",
+                "/dev/disk/by-id/b",
+                "/dev/disk/by-id/c",
+                "/dev/disk/by-id/d",
+            ],
+        ));
+
+        // The keyword comes after the pool name and before the disks; getting
+        // that order wrong builds a stripe and says nothing.
+        let name = argv.iter().position(|a| a == "tank").unwrap();
+        let keyword = argv.iter().position(|a| a == "raidz2").unwrap();
+        let first_disk = argv.iter().position(|a| a == "/dev/disk/by-id/a").unwrap();
+        assert!(name < keyword && keyword < first_disk, "{argv:?}");
+        assert_eq!(
+            &argv[first_disk..],
+            [
+                "/dev/disk/by-id/a",
+                "/dev/disk/by-id/b",
+                "/dev/disk/by-id/c",
+                "/dev/disk/by-id/d"
+            ]
+        );
+
+        // 4 KiB sectors unless told otherwise: the value cannot be changed
+        // after creation, and a pool built at ashift=9 is slow forever.
+        assert!(argv.contains(&"ashift=12".to_string()));
+        assert!(argv.contains(&"compression=lz4".to_string()));
+        // The pool root must never mount at /<name> — a pool called "boot"
+        // appearing over /boot is exactly the accident this avoids.
+        assert!(argv.contains(&"mountpoint=none".to_string()));
+        assert!(argv.contains(&"canmount=off".to_string()));
+        // Nothing is forced unless the operator acknowledged it.
+        assert!(!argv.contains(&"-f".to_string()));
+    }
+
+    /// A stripe has no keyword — bare disks *are* the stripe — so the command
+    /// for one must not gain a stray word.
+    #[test]
+    fn a_stripe_is_bare_disks_and_nothing_else() {
+        let argv =
+            backend().create_argv(&pool_request(VdevKind::Stripe, &["/dev/sda", "/dev/sdb"]));
+        let name = argv.iter().position(|a| a == "tank").unwrap();
+        assert_eq!(&argv[name + 1..], ["/dev/sda", "/dev/sdb"]);
+        for keyword in ["mirror", "raidz1", "raidz2", "raidz3"] {
+            assert!(!argv.contains(&keyword.to_string()), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn forcing_is_only_ever_what_the_caller_asked_for() {
+        let mut request = pool_request(VdevKind::Mirror, &["/dev/sda", "/dev/sdb"]);
+        request.force = true;
+        let argv = backend().create_argv(&request);
+        assert_eq!(argv[0], "create");
+        assert_eq!(argv[1], "-f", "-f belongs immediately after the verb");
+    }
+
+    /// The backend checks again even though the service already did.
+    #[tokio::test]
+    async fn a_request_that_did_not_come_from_the_picker_is_refused_here_too() {
+        let backend = backend();
+
+        let mut named = pool_request(VdevKind::Stripe, &["/dev/sda"]);
+        named.name = "mirror".into();
+        assert!(backend.create_pool(&named).await.is_err(), "a vdev keyword");
+
+        let mut escaped = pool_request(VdevKind::Stripe, &["/etc/passwd"]);
+        escaped.name = "tank".into();
+        assert!(
+            backend.create_pool(&escaped).await.is_err(),
+            "not under /dev"
+        );
+
+        let traversal = pool_request(VdevKind::Stripe, &["/dev/../etc/passwd"]);
+        assert!(backend.create_pool(&traversal).await.is_err());
+
+        let flag = pool_request(VdevKind::Stripe, &["/dev/-rf"]);
+        assert!(backend.create_pool(&flag).await.is_err());
+
+        let empty = pool_request(VdevKind::Stripe, &[]);
+        assert!(backend.create_pool(&empty).await.is_err());
+    }
+
     /// The two guards, checked at the backend boundary as well as in the
     /// service — the destroy path is the one place a mistake is unrecoverable.
     #[test]
     fn the_backend_refuses_paths_and_pools_it_should_not_touch() {
-        assert!(reject_outside_namespace("rpool/lumen/vm-101-disk-0").is_ok());
-        assert!(reject_outside_namespace("rpool/data/important").is_err());
-        assert!(reject_outside_namespace("rpool").is_err());
+        assert!(reject_outside_namespace("boot/lumen/vm-101-disk-0").is_ok());
+        assert!(reject_outside_namespace("boot/data/important").is_err());
+        assert!(reject_outside_namespace("boot").is_err());
         // Shaped like a volume, but it is the media library.
-        assert!(reject_outside_namespace("rpool/lumen/iso").is_err());
-        assert!(reject_bad_pool("rpool").is_ok());
-        assert!(reject_bad_pool("rpool/lumen").is_err());
+        assert!(reject_outside_namespace("boot/lumen/iso").is_err());
+        assert!(reject_bad_pool("boot").is_ok());
+        assert!(reject_bad_pool("boot/lumen").is_err());
         assert!(reject_bad_pool("-rf").is_err());
     }
 }

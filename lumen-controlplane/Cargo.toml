@@ -15,6 +15,10 @@ description = "Lumen control plane: authentication API + web UI server"
 license = "MIT"
 
 [dependencies]
+# The system domain: the node's own accounts, its power state, and the
+# privileged-command runner every other domain borrows. The most basic of the
+# four — it depends on none of them, and lumen-zfs depends on it.
+lumen-sys = { path = "../lumen-system/lumen-sys" }
 # The networking domain: model, validation, planning, and the NetworkManager
 # backend. A path dependency, deliberately not a workspace member — see the
 # note at the top of lumen-networking/lumen-net/Cargo.toml.
@@ -27,7 +31,10 @@ lumen-zfs = { path = "../lumen-storage/lumen-zfs" }
 # the bindings ship generated, so bindgen and libclang stay out of the
 # toolchain exactly as they do for PAM below. See docs/compute.md.
 lumen-virt = { path = "../lumen-compute/lumen-virt" }
-axum = "0.8"
+# `ws` is the console viewer's transport: the browser's WebSocket carries the
+# hypervisor's own console stream, byte for byte, and nothing in this crate
+# interprets it. See src/api/console.rs.
+axum = { version = "0.8", features = ["ws"] }
 # Typed cookie jar for the httpOnly session cookie.
 axum-extra = { version = "0.10", features = ["cookie"] }
 # TLS listener. no-provider + rustls/ring below keeps aws-lc (and its cmake
@@ -37,9 +44,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 tokio = { version = "1", features = ["full"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["fs", "trace"] }
-# Reading an upload off the socket a chunk at a time. Already in the tree as a
-# transitive dependency of axum; named here only to make `StreamExt` usable.
-futures-util = { version = "0.3", default-features = false }
+# Reading an upload off the socket a chunk at a time, and splitting the console
+# WebSocket into its two halves. Already in the tree as a transitive dependency
+# of axum; named here only to make `StreamExt`/`SinkExt` usable.
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"

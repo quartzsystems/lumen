@@ -24,9 +24,9 @@ pub struct InstallConfig {
     pub network: NetworkConfig,
     /// Whole-disk target device paths, e.g. ["/dev/sda", "/dev/sdb"]. The
     /// first disk carries the EFI system partition and /boot; every disk
-    /// contributes its third partition to the rpool vdev.
+    /// contributes its third partition to the boot vdev.
     pub disks: Vec<String>,
-    /// vdev layout of rpool over `disks`.
+    /// vdev layout of boot over `disks`.
     pub topology: PoolTopology,
 }
 

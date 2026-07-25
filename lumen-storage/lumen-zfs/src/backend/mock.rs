@@ -14,7 +14,7 @@ use crate::backend::ZfsBackend;
 use crate::error::{Result, ZfsError};
 use crate::model::{
     is_lumen_volume, is_reserved_leaf, iso_dataset, iso_mountpoint, lumen_root, valid_pool_name,
-    Dataset, DatasetKind, Pool, PoolHealth, VolumeRequest,
+    BlockDevice, Dataset, DatasetKind, Pool, PoolHealth, PoolRequest, VolumeRequest,
 };
 
 #[derive(Debug, Default)]
@@ -24,6 +24,12 @@ struct Inner {
     /// When set, the next create fails — the "pool filled up between the
     /// check and the write" case a caller has to survive.
     fail_next_create: Option<String>,
+    /// The disks this pretend node has. Empty by default: a test that cares
+    /// about pool creation says which disks exist.
+    devices: Vec<BlockDevice>,
+    /// Every pool this backend was asked to build, with its request — so a
+    /// test can assert on the arrangement rather than on a pool existing.
+    created: Vec<PoolRequest>,
 }
 
 pub struct MockBackend {
@@ -36,7 +42,7 @@ impl MockBackend {
             inner: Mutex::new(Inner {
                 pools,
                 datasets,
-                fail_next_create: None,
+                ..Inner::default()
             }),
         }
     }
@@ -48,7 +54,7 @@ impl MockBackend {
         let allocated = 8_589_934_592; // 8 GiB, the installed system
         Self::new(
             vec![Pool {
-                name: "rpool".into(),
+                name: "boot".into(),
                 health: PoolHealth::Online,
                 size,
                 allocated,
@@ -58,12 +64,12 @@ impl MockBackend {
                 read_only: false,
             }],
             vec![Dataset {
-                name: "rpool".into(),
+                name: "boot".into(),
                 kind: DatasetKind::Filesystem,
                 used: allocated,
                 available: Some(size - allocated),
                 referenced: 98_304,
-                mountpoint: Some("/rpool".into()),
+                mountpoint: Some("/boot".into()),
                 ..Dataset::default()
             }],
         )
@@ -75,7 +81,7 @@ impl MockBackend {
         let free = 1_073_741_824; // 1 GiB
         Self::new(
             vec![Pool {
-                name: "rpool".into(),
+                name: "boot".into(),
                 health: PoolHealth::Online,
                 size,
                 allocated: size - free,
@@ -106,6 +112,56 @@ impl MockBackend {
     pub fn fail_next_create(&self, reason: impl Into<String>) {
         self.inner.lock().unwrap().fail_next_create = Some(reason.into());
     }
+
+    /// Give this pretend node some disks.
+    ///
+    /// A convenience with the shape that matters: two free disks and one the
+    /// system is running from, which is the arrangement every pool-creation
+    /// test wants to prove something about.
+    pub fn with_disks(self, devices: Vec<BlockDevice>) -> Self {
+        self.inner.lock().unwrap().devices = devices;
+        self
+    }
+
+    /// A node with two free disks and one that holds the operating system.
+    pub fn free_disk(name: &str, size: u64) -> BlockDevice {
+        BlockDevice {
+            name: name.into(),
+            path: format!("/dev/disk/by-id/scsi-{name}"),
+            kernel_path: format!("/dev/{name}"),
+            size,
+            model: Some("QEMU HARDDISK".into()),
+            serial: None,
+            rotational: false,
+            removable: false,
+            in_use: false,
+            used_by: None,
+        }
+    }
+
+    /// The disk the appliance is running from — the one a pool must never be
+    /// built on by accident.
+    pub fn busy_disk(name: &str, size: u64) -> BlockDevice {
+        BlockDevice {
+            in_use: true,
+            used_by: Some("mounted at /".into()),
+            ..Self::free_disk(name, size)
+        }
+    }
+
+    /// Every pool this backend was asked to build.
+    pub fn created_pools(&self) -> Vec<PoolRequest> {
+        self.inner.lock().unwrap().created.clone()
+    }
+
+    pub fn has_pool(&self, name: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .pools
+            .iter()
+            .any(|p| p.name == name)
+    }
 }
 
 impl Default for MockBackend {
@@ -118,6 +174,78 @@ impl Default for MockBackend {
 impl ZfsBackend for MockBackend {
     async fn pools(&self) -> Result<Vec<Pool>> {
         Ok(self.inner.lock().unwrap().pools.clone())
+    }
+
+    async fn block_devices(&self) -> Result<Vec<BlockDevice>> {
+        Ok(self.inner.lock().unwrap().devices.clone())
+    }
+
+    async fn create_pool(&self, request: &PoolRequest) -> Result<Pool> {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(reason) = inner.fail_next_create.take() {
+            return Err(ZfsError::Conflict(reason));
+        }
+        if inner.pools.iter().any(|p| p.name == request.name) {
+            return Err(ZfsError::Conflict(format!(
+                "cannot create '{}': pool already exists",
+                request.name
+            )));
+        }
+
+        // A size the arithmetic in the dialog would have predicted, so a test
+        // can check the console is not shown a number that came from nowhere.
+        let smallest = request
+            .disks
+            .iter()
+            .filter_map(|path| {
+                inner
+                    .devices
+                    .iter()
+                    .find(|d| &d.path == path || &d.kernel_path == path)
+                    .map(|d| d.size)
+            })
+            .min()
+            .unwrap_or(0);
+        let size = request.vdev.usable_bytes(request.disks.len(), smallest);
+
+        let pool = Pool {
+            name: request.name.clone(),
+            health: PoolHealth::Online,
+            size,
+            allocated: 0,
+            free: size,
+            fragmentation: Some(0),
+            dedup_ratio: Some(1.0),
+            read_only: false,
+        };
+        inner.pools.push(pool.clone());
+        inner.datasets.push(Dataset {
+            name: request.name.clone(),
+            kind: DatasetKind::Filesystem,
+            used: 0,
+            available: Some(size),
+            referenced: 98_304,
+            // Created with mountpoint=none, exactly as the real one is.
+            mountpoint: None,
+            ..Dataset::default()
+        });
+        inner.created.push(request.clone());
+        Ok(pool)
+    }
+
+    async fn destroy_pool(&self, name: &str) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.pools.iter().any(|p| p.name == name) {
+            return Err(ZfsError::NotFound(format!(
+                "No pool named \"{name}\" on this node."
+            )));
+        }
+        inner.pools.retain(|p| p.name != name);
+        let prefix = format!("{name}/");
+        inner
+            .datasets
+            .retain(|d| d.name != name && !d.name.starts_with(&prefix));
+        Ok(())
     }
 
     async fn datasets(&self, pool: &str) -> Result<Vec<Dataset>> {
@@ -283,8 +411,8 @@ mod tests {
         let backend = MockBackend::appliance();
         let before = backend.pools().await.unwrap()[0].free;
 
-        backend.ensure_namespace("rpool").await.unwrap();
-        let path = vm_disk_path("rpool", 101, 0);
+        backend.ensure_namespace("boot").await.unwrap();
+        let path = vm_disk_path("boot", 101, 0);
         let volume = backend
             .create_volume(&request(&path, 34_359_738_368))
             .await
@@ -306,13 +434,13 @@ mod tests {
     #[tokio::test]
     async fn creating_the_namespace_twice_is_success() {
         let backend = MockBackend::appliance();
-        backend.ensure_namespace("rpool").await.unwrap();
-        backend.ensure_namespace("rpool").await.unwrap();
+        backend.ensure_namespace("boot").await.unwrap();
+        backend.ensure_namespace("boot").await.unwrap();
         assert_eq!(
             backend
                 .datasets_snapshot()
                 .iter()
-                .filter(|d| d.name == "rpool/lumen")
+                .filter(|d| d.name == "boot/lumen")
                 .count(),
             1
         );
@@ -322,19 +450,19 @@ mod tests {
     async fn nothing_outside_the_namespace_can_be_created_or_destroyed() {
         let backend = MockBackend::appliance();
         assert!(backend
-            .create_volume(&request("rpool/data/important", 1024))
+            .create_volume(&request("boot/data/important", 1024))
             .await
             .is_err());
-        assert!(backend.destroy_volume("rpool/data").await.is_err());
-        assert!(backend.destroy_volume("rpool").await.is_err());
+        assert!(backend.destroy_volume("boot/data").await.is_err());
+        assert!(backend.destroy_volume("boot").await.is_err());
     }
 
     #[tokio::test]
     async fn a_volume_larger_than_the_pool_is_refused() {
         let backend = MockBackend::nearly_full();
-        backend.ensure_namespace("rpool").await.unwrap();
+        backend.ensure_namespace("boot").await.unwrap();
         let err = backend
-            .create_volume(&request(&vm_disk_path("rpool", 100, 0), 8_589_934_592))
+            .create_volume(&request(&vm_disk_path("boot", 100, 0), 8_589_934_592))
             .await
             .unwrap_err();
         assert!(matches!(err, ZfsError::Conflict(_)), "{err:?}");

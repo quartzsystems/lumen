@@ -180,8 +180,8 @@ mod tests {
 
     #[test]
     fn action_display_is_readable() {
-        let a = Action::Cmd(vec!["zpool".into(), "export".into(), "rpool".into()]);
-        assert_eq!(a.to_string(), "$ zpool export rpool");
+        let a = Action::Cmd(vec!["zpool".into(), "export".into(), "boot".into()]);
+        assert_eq!(a.to_string(), "$ zpool export boot");
         let w = Action::WriteFile {
             path: "/etc/hostname".into(),
             contents: "lumen\n".into(),

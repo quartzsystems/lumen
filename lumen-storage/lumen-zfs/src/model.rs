@@ -134,7 +134,7 @@ impl DatasetKind {
 /// One dataset or volume under a pool.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Dataset {
-    /// Full path, e.g. `rpool/lumen/vm-101-disk-0`.
+    /// Full path, e.g. `boot/lumen/vm-101-disk-0`.
     pub name: String,
     pub kind: DatasetKind,
     pub used: u64,
@@ -158,6 +158,171 @@ impl Dataset {
     /// Created by Lumen, and therefore something Lumen may remove.
     pub fn is_lumen_managed(&self) -> bool {
         is_lumen_volume(&self.name)
+    }
+}
+
+/// How a pool's disks are arranged, and therefore what it survives.
+///
+/// The five arrangements an operator actually chooses between. Anything
+/// further — several vdevs of different shapes, a separate log or cache device,
+/// a spare — is a pool built at the command line by somebody who knows exactly
+/// what they are doing, and this console does not pretend to offer it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VdevKind {
+    /// Every disk's capacity, and no redundancy at all: one disk failing takes
+    /// the pool with it.
+    #[default]
+    Stripe,
+    /// Every disk holds the same data. Survives all but one disk failing.
+    Mirror,
+    /// One disk of parity.
+    Raidz1,
+    /// Two disks of parity.
+    Raidz2,
+    /// Three disks of parity.
+    Raidz3,
+}
+
+impl VdevKind {
+    /// The word `zpool create` wants before the disk list. A stripe has none —
+    /// bare disks *are* the stripe — which is exactly why it is the dangerous
+    /// default and why the console says so out loud.
+    pub fn keyword(self) -> Option<&'static str> {
+        match self {
+            VdevKind::Stripe => None,
+            VdevKind::Mirror => Some("mirror"),
+            VdevKind::Raidz1 => Some("raidz1"),
+            VdevKind::Raidz2 => Some("raidz2"),
+            VdevKind::Raidz3 => Some("raidz3"),
+        }
+    }
+
+    /// The fewest disks this arrangement is meaningful with.
+    ///
+    /// `zpool` would accept a one-disk mirror or a two-disk raidz1; both are
+    /// legal and neither is what anybody meant.
+    pub fn min_disks(self) -> usize {
+        match self {
+            VdevKind::Stripe => 1,
+            VdevKind::Mirror => 2,
+            VdevKind::Raidz1 => 3,
+            VdevKind::Raidz2 => 4,
+            VdevKind::Raidz3 => 5,
+        }
+    }
+
+    /// How many disks may fail before the data is gone.
+    pub fn parity(self) -> usize {
+        match self {
+            VdevKind::Stripe => 0,
+            VdevKind::Mirror => 1,
+            VdevKind::Raidz1 => 1,
+            VdevKind::Raidz2 => 2,
+            VdevKind::Raidz3 => 3,
+        }
+    }
+
+    /// Bytes of the total this arrangement leaves for data, before ZFS's own
+    /// overhead. Advisory: the console shows it so a choice can be compared,
+    /// and the pool reports the real figure once it exists.
+    pub fn usable_bytes(self, disks: usize, smallest: u64) -> u64 {
+        if disks == 0 {
+            return 0;
+        }
+        match self {
+            // A mirror is as big as one disk, however many there are.
+            VdevKind::Mirror => smallest,
+            // Everything else is every disk, less the parity ones. A stripe
+            // has no parity, so this is all of them.
+            kind => smallest.saturating_mul(disks.saturating_sub(kind.parity()) as u64),
+        }
+    }
+}
+
+/// One disk the node has, as a candidate for a pool.
+///
+/// The whole point of this type is [`BlockDevice::in_use`]: creating a pool on
+/// a disk that already holds something destroys it, and the single most useful
+/// thing this console can do is refuse to offer the one the operating system is
+/// running from.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockDevice {
+    /// The kernel name — `sda`, `nvme0n1`.
+    pub name: String,
+    /// The stable path a pool should be built on: `/dev/disk/by-id/…` when the
+    /// node has one, and `/dev/<name>` only when it does not.
+    ///
+    /// This matters more than it looks. `/dev/sdb` is whatever the kernel
+    /// enumerated second this boot; a pool built on it can come back after a
+    /// reboot pointing at a different disk. The by-id path is the serial
+    /// number and does not move.
+    pub path: String,
+    /// `/dev/<name>`, for showing next to the stable path.
+    pub kernel_path: String,
+    pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial: Option<String>,
+    /// Spinning rust rather than solid state.
+    pub rotational: bool,
+    pub removable: bool,
+    /// Something is already on it. Never offered without saying what.
+    pub in_use: bool,
+    /// What is on it, in words: "mounted at /", "in pool boot", "has 3
+    /// partitions". Absent when the disk is genuinely empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_by: Option<String>,
+}
+
+/// A pool to create.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolRequest {
+    pub name: String,
+    pub vdev: VdevKind,
+    /// Absolute device paths, already resolved to the stable ones.
+    pub disks: Vec<String>,
+    /// `ashift`. `None` lets ZFS detect it, which is right for a disk that
+    /// reports its physical block size honestly and wrong for the many that do
+    /// not — hence [`DEFAULT_ASHIFT`].
+    pub ashift: Option<u8>,
+    pub compression: Compression,
+    pub autotrim: bool,
+    /// Build on a disk that already has something on it. Always paired with the
+    /// acknowledgement; see the service.
+    pub force: bool,
+}
+
+/// 4 KiB sectors, which is what every disk made this decade actually has.
+///
+/// Not detected: a great many drives still report 512-byte sectors for
+/// compatibility, and a pool built at `ashift=9` on one of them is slow
+/// forever — the value cannot be changed after creation. 12 costs a little
+/// space on a genuinely-512-byte disk and is the number every ZFS guide has
+/// recommended for a decade. The installer uses it too.
+pub const DEFAULT_ASHIFT: u8 = 12;
+
+/// The compression a new pool is created with.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Compression {
+    Off,
+    /// Fast enough to be free on any processor this appliance runs on, and it
+    /// is what the installer sets on the root pool.
+    #[default]
+    Lz4,
+    /// Better ratios, more processor. A sensible choice for bulk storage.
+    Zstd,
+}
+
+impl Compression {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Compression::Off => "off",
+            Compression::Lz4 => "lz4",
+            Compression::Zstd => "zstd",
+        }
     }
 }
 
@@ -233,7 +398,7 @@ pub fn valid_iso_name(name: &str) -> bool {
 
 /// Exactly `<pool>/lumen/<name>`: one pool component, the Lumen prefix, one
 /// leaf. This is the guard that makes `destroy_volume` safe to expose — a
-/// request naming `rpool`, `rpool/lumen`, `rpool/data/important`, or anything
+/// request naming `boot`, `boot/lumen`, `boot/data/important`, or anything
 /// with a traversal component in it is not a Lumen volume and is refused.
 pub fn is_lumen_volume(path: &str) -> bool {
     let parts: Vec<&str> = path.split('/').collect();
@@ -271,19 +436,73 @@ pub fn valid_pool_name(name: &str) -> bool {
         && !name.contains('/')
 }
 
+/// Names `zpool` itself reserves, plus the ones that would be ambiguous in the
+/// command that creates the pool.
+///
+/// `mirror`, `raidz*`, `draid*`, `spare`, `log`, `cache`, and `special` are all
+/// vdev keywords: a pool called `mirror` produces a command line where the pool
+/// name and a vdev type are the same word. `zpool` refuses them and so does
+/// this, before the command is ever built.
+const RESERVED_POOL_NAMES: [&str; 12] = [
+    "mirror", "raidz", "raidz1", "raidz2", "raidz3", "draid", "draid1", "draid2", "draid3",
+    "spare", "log", "cache",
+];
+
+/// A name for a pool this appliance is about to **create**.
+///
+/// Stricter than [`valid_pool_name`], deliberately. That one is the guard on a
+/// name arriving in a URL for a pool that already exists, and it has to accept
+/// whatever an operator built at the command line years ago. This one is a
+/// choice being made now, so it can insist on the subset that will not cause
+/// trouble later: a leading letter, and nothing that reads as a vdev keyword.
+pub fn valid_new_pool_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    name.len() <= 64
+        && first.is_ascii_alphabetic()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' || c == ':')
+        && !RESERVED_POOL_NAMES.contains(&name.to_ascii_lowercase().as_str())
+        // `zpool` reads a leading c[0-9] as a Solaris controller name.
+        && !(first == 'c' && name.chars().nth(1).is_some_and(|c| c.is_ascii_digit()))
+}
+
+/// A device path this appliance will hand to `zpool create`.
+///
+/// Absolute, under `/dev`, one clean path with no traversal and nothing that
+/// could be read as a flag. The operator picks from a list the node produced,
+/// so this is defence against a request that did not come from that list rather
+/// than against a typo.
+pub fn valid_device_path(path: &str) -> bool {
+    path.starts_with("/dev/")
+        && path.len() <= 255
+        && !path.contains("..")
+        && !path.ends_with('/')
+        && !path
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace() || c == '\0')
+        && path
+            .split('/')
+            .skip(1)
+            .all(|part| !part.is_empty() && !part.starts_with('-'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn a_vm_disk_lands_under_the_lumen_prefix() {
-        assert_eq!(vm_disk_path("rpool", 101, 0), "rpool/lumen/vm-101-disk-0");
-        assert!(is_lumen_volume(&vm_disk_path("rpool", 101, 0)));
+        assert_eq!(vm_disk_path("boot", 101, 0), "boot/lumen/vm-101-disk-0");
+        assert!(is_lumen_volume(&vm_disk_path("boot", 101, 0)));
         assert_eq!(
-            device_path("rpool/lumen/vm-101-disk-0"),
-            "/dev/zvol/rpool/lumen/vm-101-disk-0"
+            device_path("boot/lumen/vm-101-disk-0"),
+            "/dev/zvol/boot/lumen/vm-101-disk-0"
         );
-        assert_eq!(lumen_root("rpool"), "rpool/lumen");
+        assert_eq!(lumen_root("boot"), "boot/lumen");
     }
 
     /// The guard that stands between a destroy request and the operator's own
@@ -291,27 +510,27 @@ mod tests {
     #[test]
     fn only_a_lumen_volume_is_destroyable() {
         for allowed in [
-            "rpool/lumen/vm-101-disk-0",
+            "boot/lumen/vm-101-disk-0",
             "tank/lumen/vm-100-disk-3",
-            "rpool/lumen/anything",
+            "boot/lumen/anything",
         ] {
             assert!(is_lumen_volume(allowed), "{allowed} should be destroyable");
         }
         for refused in [
-            "rpool",
-            "rpool/lumen",
-            "rpool/data",
-            "rpool/data/important",
-            "rpool/lumen/vm-101-disk-0/child",
-            "rpool/lumen/../data",
-            "rpool/../tank/lumen/x",
-            "rpool/lumen/vm-101-disk-0@snapshot",
-            "rpool/lumen/",
-            "/rpool/lumen/x",
+            "boot",
+            "boot/lumen",
+            "boot/data",
+            "boot/data/important",
+            "boot/lumen/vm-101-disk-0/child",
+            "boot/lumen/../data",
+            "boot/../tank/lumen/x",
+            "boot/lumen/vm-101-disk-0@snapshot",
+            "boot/lumen/",
+            "/boot/lumen/x",
             "",
-            "rpool/notlumen/x",
+            "boot/notlumen/x",
             "-rf/lumen/x",
-            "rpool/lumen/-rf",
+            "boot/lumen/-rf",
         ] {
             assert!(
                 !is_lumen_volume(refused),
@@ -325,13 +544,13 @@ mod tests {
     /// disk could name the library and take every ISO on the node with it.
     #[test]
     fn the_media_library_is_reserved_furniture_not_a_volume() {
-        assert_eq!(iso_dataset("rpool"), "rpool/lumen/iso");
-        assert_eq!(iso_mountpoint("rpool"), "/var/lib/lumen/iso/rpool");
-        assert!(is_lumen_volume("rpool/lumen/iso"), "shape-wise it matches");
-        assert!(is_reserved_leaf("rpool/lumen/iso"));
-        assert!(!is_reserved_leaf("rpool/lumen/vm-100-disk-0"));
-        assert!(!is_reserved_leaf("rpool/lumen/iso/nested"));
-        assert!(!is_reserved_leaf("rpool/iso"));
+        assert_eq!(iso_dataset("boot"), "boot/lumen/iso");
+        assert_eq!(iso_mountpoint("boot"), "/var/lib/lumen/iso/boot");
+        assert!(is_lumen_volume("boot/lumen/iso"), "shape-wise it matches");
+        assert!(is_reserved_leaf("boot/lumen/iso"));
+        assert!(!is_reserved_leaf("boot/lumen/vm-100-disk-0"));
+        assert!(!is_reserved_leaf("boot/lumen/iso/nested"));
+        assert!(!is_reserved_leaf("boot/iso"));
     }
 
     #[test]
@@ -360,11 +579,11 @@ mod tests {
 
     #[test]
     fn pool_names_that_are_really_something_else_are_refused() {
-        assert!(valid_pool_name("rpool"));
+        assert!(valid_pool_name("boot"));
         assert!(valid_pool_name("tank-1"));
         assert!(!valid_pool_name(""));
         assert!(!valid_pool_name(".."));
-        assert!(!valid_pool_name("rpool/lumen"));
+        assert!(!valid_pool_name("boot/lumen"));
         assert!(!valid_pool_name("-rf"), "must not look like a flag");
         assert!(!valid_pool_name("a\nb"));
         assert!(!valid_pool_name("$(reboot)"));
@@ -391,21 +610,103 @@ mod tests {
         assert!(!PoolHealth::Online.needs_attention());
     }
 
+    /// A name being chosen now can insist on the subset that will not cause
+    /// trouble, which the guard on an existing pool's name cannot.
+    #[test]
+    fn a_new_pool_name_may_not_be_a_word_the_command_already_uses() {
+        for allowed in ["tank", "boot", "vmdata", "pool-1", "a.b:c"] {
+            assert!(valid_new_pool_name(allowed), "{allowed}");
+        }
+        for refused in [
+            "",
+            "mirror",
+            "RAIDZ2",
+            "spare",
+            "log",
+            "cache",
+            "1tank",
+            "c0t0d0",
+            "-rf",
+            "has space",
+            "has/slash",
+            "$(reboot)",
+            &"x".repeat(65),
+        ] {
+            assert!(!valid_new_pool_name(refused), "{refused:?} must be refused");
+        }
+        // The looser guard still accepts a pool somebody made years ago.
+        assert!(valid_pool_name("my pool"));
+        assert!(!valid_new_pool_name("my pool"));
+    }
+
+    #[test]
+    fn a_device_is_an_absolute_path_under_dev_and_nothing_else() {
+        for allowed in [
+            "/dev/sda",
+            "/dev/nvme0n1",
+            "/dev/disk/by-id/nvme-Samsung_SSD_990_PRO_2TB_S7DPNJ0X",
+        ] {
+            assert!(valid_device_path(allowed), "{allowed}");
+        }
+        for refused in [
+            "",
+            "sda",
+            "/etc/passwd",
+            "/dev/../etc/passwd",
+            "/dev/",
+            "/dev/-rf",
+            "/dev/sd a",
+            "/dev//sda",
+        ] {
+            assert!(!valid_device_path(refused), "{refused:?} must be refused");
+        }
+    }
+
+    /// The number an operator compares arrangements by, and the one they are
+    /// most likely to get wrong in their head.
+    #[test]
+    fn an_arrangement_says_what_it_costs_and_what_it_survives() {
+        const TB: u64 = 1_000_000_000_000;
+
+        // Four 1 TB disks, four ways.
+        assert_eq!(VdevKind::Stripe.usable_bytes(4, TB), 4 * TB);
+        assert_eq!(VdevKind::Stripe.parity(), 0);
+        assert_eq!(VdevKind::Mirror.usable_bytes(4, TB), TB, "however many");
+        assert_eq!(VdevKind::Raidz1.usable_bytes(4, TB), 3 * TB);
+        assert_eq!(VdevKind::Raidz2.usable_bytes(4, TB), 2 * TB);
+
+        // The floors are the point where the arrangement stops meaning
+        // anything, not the point where zpool refuses.
+        assert_eq!(VdevKind::Stripe.min_disks(), 1);
+        assert_eq!(VdevKind::Mirror.min_disks(), 2);
+        assert_eq!(VdevKind::Raidz1.min_disks(), 3);
+        assert_eq!(VdevKind::Raidz3.min_disks(), 5);
+
+        // A stripe is bare disks, which is exactly why it is the risky one.
+        assert_eq!(VdevKind::Stripe.keyword(), None);
+        assert_eq!(VdevKind::Raidz2.keyword(), Some("raidz2"));
+
+        // No disks is no space, rather than an underflow into an enormous
+        // number.
+        assert_eq!(VdevKind::Raidz2.usable_bytes(0, TB), 0);
+        assert_eq!(VdevKind::Raidz2.usable_bytes(1, TB), 0);
+    }
+
     #[test]
     fn a_dataset_knows_its_pool_and_whether_lumen_made_it() {
         let ours = Dataset {
-            name: "rpool/lumen/vm-101-disk-0".into(),
+            name: "boot/lumen/vm-101-disk-0".into(),
             kind: DatasetKind::Volume,
             ..Dataset::default()
         };
-        assert_eq!(ours.pool(), "rpool");
+        assert_eq!(ours.pool(), "boot");
         assert!(ours.is_lumen_managed());
 
         let theirs = Dataset {
-            name: "rpool/data".into(),
+            name: "boot/data".into(),
             ..Dataset::default()
         };
-        assert_eq!(theirs.pool(), "rpool");
+        assert_eq!(theirs.pool(), "boot");
         assert!(!theirs.is_lumen_managed());
     }
 }

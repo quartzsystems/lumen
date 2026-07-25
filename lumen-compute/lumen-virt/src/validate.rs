@@ -494,7 +494,7 @@ mod tests {
             },
             bridges: vec!["br0".into()],
             bridges_known: true,
-            pools: vec![("rpool".into(), 512 * 1024 * 1024 * 1024)],
+            pools: vec![("boot".into(), 512 * 1024 * 1024 * 1024)],
             pools_known: true,
             existing: vec![(100, "db01".into())],
         }
@@ -510,7 +510,7 @@ mod tests {
             disks: vec![VmDisk {
                 id: "vda".into(),
                 bus: DiskBus::VirtioBlk,
-                source: "/dev/zvol/rpool/lumen/vm-101-disk-0".into(),
+                source: "/dev/zvol/boot/lumen/vm-101-disk-0".into(),
                 size: 34_359_738_368,
                 cache: CacheMode::None,
                 discard: true,
@@ -620,7 +620,7 @@ mod tests {
                 "two disks on the same target",
                 |c| {
                     let mut second = c.disks[0].clone();
-                    second.source = "/dev/zvol/rpool/lumen/vm-101-disk-1".into();
+                    second.source = "/dev/zvol/boot/lumen/vm-101-disk-1".into();
                     c.disks.push(second);
                 },
                 ValidationCode::DuplicateDevice,
@@ -655,7 +655,7 @@ mod tests {
     #[test]
     fn a_disk_larger_than_the_pool_is_refused_before_anything_is_created() {
         let planned = vec![PlannedDisk {
-            pool: "rpool".into(),
+            pool: "boot".into(),
             size: 1024 * 1024 * 1024 * 1024, // 1 TiB into 512 GiB
         }];
         let errors = validate(&baseline(), &planned, &facts());
@@ -667,11 +667,11 @@ mod tests {
     fn disks_on_one_pool_are_measured_together() {
         let planned = vec![
             PlannedDisk {
-                pool: "rpool".into(),
+                pool: "boot".into(),
                 size: 400 * 1024 * 1024 * 1024,
             },
             PlannedDisk {
-                pool: "rpool".into(),
+                pool: "boot".into(),
                 size: 400 * 1024 * 1024 * 1024,
             },
         ];

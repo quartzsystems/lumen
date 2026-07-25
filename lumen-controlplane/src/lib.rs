@@ -13,6 +13,7 @@ use tower_http::trace::TraceLayer;
 
 use config::Config;
 use lumen_net::NetworkService;
+use lumen_sys::SysService;
 use lumen_virt::VirtService;
 use lumen_zfs::StorageService;
 use realm::RealmRegistry;
@@ -26,6 +27,10 @@ pub struct AppState {
     pub config: Config,
     pub jwt_secret: Vec<u8>,
     pub realms: RealmRegistry,
+    /// The node itself: its local accounts and its power state. The most basic
+    /// domain, and the one that owns the privileged-command runner the storage
+    /// domain borrows for `zpool create`.
+    pub sys: Arc<SysService>,
     /// Bridges, bonds, VLAN interfaces.
     pub network: Arc<NetworkService>,
     /// Pools, datasets, and the volumes a machine's disks live on.

@@ -94,10 +94,15 @@ async fn harness(tag: &str) -> Harness {
         network.clone(),
     ));
 
+    let sys = Arc::new(lumen_sys::SysService::new(
+        Arc::new(lumen_sys::backend::mock::MockPower::appliance()),
+        Arc::new(lumen_sys::exec::MockExec::new()),
+    ));
     let router = app(Arc::new(AppState {
         config,
         jwt_secret: TICKET_SECRET.to_vec(),
         realms: RealmRegistry::new().register(Box::new(MockRealm)),
+        sys,
         network,
         storage,
         virt,

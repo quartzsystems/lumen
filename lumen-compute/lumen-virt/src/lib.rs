@@ -46,6 +46,6 @@ pub use model::{
     Firmware, NicModel, VmCdrom, VmConfig, VmDisk, VmNic, CDROM_BUS, FIRST_VMID, LAST_VMID,
 };
 pub use osinfo::{OsCatalog, OsFamily, OsVariant, OSINFO_DB_ROOT, WINDOWS_FAMILY};
-pub use service::VirtService;
+pub use service::{ConsoleProtocol, ConsoleTarget, VirtService};
 pub use state::{DomainRuntime, DomainState, HostInfo, ObservedDomain};
 pub use validate::{Acknowledgements, ValidationCode, ValidationError};

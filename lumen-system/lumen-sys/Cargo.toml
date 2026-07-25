@@ -1,0 +1,53 @@
+# lumen-sys — the Lumen system domain: the node itself.
+#
+# Local accounts, the node's power state, and the one thing every other domain
+# needs and none of them should own: a way to run a privileged command that has
+# to happen OUTSIDE this daemon's sandbox (src/exec.rs).
+#
+# A library crate, not a daemon: it compiles into lumen-controlplane the same
+# way lumen-net and lumen-zfs do. It is deliberately NOT a workspace member —
+# the Lumen manifests are independent by design and the Makefile drives each
+# with its own --manifest-path/--target-dir pair. See the note at the top of
+# lumen-networking/lumen-net/Cargo.toml.
+#
+# This is the most basic domain in the tree, so it depends on none of the
+# others and lumen-zfs depends on it: creating a pool is a privileged command
+# on the node before it is anything to do with storage.
+#
+# Nothing here links a system library. Accounts are created by handing typed
+# argument arrays to the shadow-utils command line — never an interpolated
+# shell string — which is the same discipline lumen-zfs settled on and which
+# keeps bindgen and libclang out of the toolchain.
+
+[package]
+name = "lumen-sys"
+version = "0.1.0"
+edition = "2021"
+description = "Lumen system: local accounts, node power, and privileged execution"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+async-trait = "0.1"
+# "process" is the privileged runner's: argv arrays handed to execve with no
+# shell in the path, and a pipe for the one secret that must never reach a
+# command line. "fs" reads the account database.
+tokio = { version = "1", features = [
+    "process",
+    "fs",
+    "io-util",
+    "sync",
+    "time",
+    "rt",
+    "macros",
+] }
+tracing = "0.1"
+# System-bus client, for logind. default-features = false + "tokio" keeps
+# async-io (and a second reactor) out of the control plane, which is already
+# tokio-driven — the same reasoning as lumen-net's.
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

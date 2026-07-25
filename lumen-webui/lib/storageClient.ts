@@ -1,8 +1,8 @@
 import { apiFetch } from "@/lib/authClient";
 
-// Typed view of /api/storage, modelled on lib/networkClient.ts. Read-only at
-// this stage: pools are created and removed from the node itself until the
-// privileged executor lands. See docs/compute.md.
+// Typed view of /api/storage, modelled on lib/networkClient.ts. Field names
+// mirror lumen-zfs's serde output exactly, so the wire format is the only
+// contract between the two.
 
 export type PoolHealth =
   | "online"
@@ -27,10 +27,55 @@ export interface PoolView {
   fragmentation: number | null;
   dedup_ratio: number | null;
   read_only: boolean;
-  /// Always false at this stage; the reason is supplied rather than left to
-  /// the console to invent.
+  /// False for the pool this appliance is installed on; the reason is supplied
+  /// rather than left to the console to invent.
   destroyable: boolean;
   destroy_blocked_reason: string | null;
+}
+
+/// How a pool's disks are arranged, and therefore what it survives.
+export type VdevKind = "stripe" | "mirror" | "raidz1" | "raidz2" | "raidz3";
+
+export type Compression = "off" | "lz4" | "zstd";
+
+/// One disk the node has, as a candidate for a pool.
+///
+/// `in_use` is the field this type exists for: `zpool create` destroys
+/// whatever was on the disks it is given, and a picker that cannot tell the
+/// empty ones from the one the appliance is running from is a picker that will
+/// eventually be used to reformat the wrong disk.
+export interface BlockDevice {
+  name: string;
+  /// The stable path a pool should be built on — `/dev/disk/by-id/…` when the
+  /// node has one. `/dev/sdb` is whatever the kernel enumerated second this
+  /// boot, and a pool built on it can come back pointing at a different disk.
+  path: string;
+  kernel_path: string;
+  size: number;
+  model?: string;
+  serial?: string;
+  rotational: boolean;
+  removable: boolean;
+  in_use: boolean;
+  /// What is on it, in words — "mounted at /", "3 partitions".
+  used_by?: string;
+}
+
+export interface DevicesResponse {
+  node: string;
+  devices: BlockDevice[];
+  /// The pool this appliance is installed on, which is never destroyed here.
+  root_pool?: string;
+}
+
+export interface PoolCreate {
+  name: string;
+  vdev: VdevKind;
+  disks: string[];
+  ashift?: number;
+  compression?: Compression;
+  autotrim?: boolean;
+  i_understand_this_may_lose_data?: boolean;
 }
 
 export interface NodePools {
@@ -90,6 +135,67 @@ export interface IsosResponse {
 }
 
 export const fetchPools = (): Promise<PoolsResponse> => apiFetch<PoolsResponse>("/storage/pools");
+
+/// Every disk the node has, and what is already on each. Read only when the
+/// create dialog opens — scanning `/sys/block` is work the pool table should
+/// not pay for.
+export const fetchDevices = (): Promise<DevicesResponse> =>
+  apiFetch<DevicesResponse>("/storage/devices");
+
+export const createPool = (body: PoolCreate): Promise<PoolView> =>
+  apiFetch<PoolView>("/storage/pools", { method: "POST", body: JSON.stringify(body) });
+
+export const destroyPool = (pool: string, acknowledge: boolean): Promise<unknown> =>
+  apiFetch(`/storage/pools/${encodeURIComponent(pool)}`, {
+    method: "DELETE",
+    body: JSON.stringify({ i_understand_this_may_lose_data: acknowledge }),
+  });
+
+/// What an arrangement costs and what it survives, computed the same way the
+/// backend does so the dialog's estimate and the pool's real size are not two
+/// different stories.
+export const VDEV_INFO: Record<
+  VdevKind,
+  { label: string; minDisks: number; parity: number; note: string }
+> = {
+  stripe: {
+    label: "Stripe",
+    minDisks: 1,
+    parity: 0,
+    note: "Every disk's capacity, and no redundancy at all — one disk failing takes the pool with it.",
+  },
+  mirror: {
+    label: "Mirror",
+    minDisks: 2,
+    parity: 1,
+    note: "Every disk holds the same data. Survives all but one disk failing.",
+  },
+  raidz1: {
+    label: "RAID-Z1",
+    minDisks: 3,
+    parity: 1,
+    note: "One disk of parity. Survives one disk failing.",
+  },
+  raidz2: {
+    label: "RAID-Z2",
+    minDisks: 4,
+    parity: 2,
+    note: "Two disks of parity. Survives two disks failing.",
+  },
+  raidz3: {
+    label: "RAID-Z3",
+    minDisks: 5,
+    parity: 3,
+    note: "Three disks of parity. Survives three disks failing.",
+  },
+};
+
+/// Bytes an arrangement leaves for data, before ZFS's own overhead.
+export const usableBytes = (vdev: VdevKind, disks: number, smallest: number): number => {
+  if (disks === 0) return 0;
+  if (vdev === "mirror") return smallest;
+  return smallest * Math.max(0, disks - VDEV_INFO[vdev].parity);
+};
 
 export const fetchIsos = (): Promise<IsosResponse> => apiFetch<IsosResponse>("/storage/iso");
 

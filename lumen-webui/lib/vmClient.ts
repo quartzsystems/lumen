@@ -115,6 +115,25 @@ export interface VmActions {
   reboot: Action;
   reset: Action;
   delete: Action;
+  /// Whether there is a screen to look at. A machine that is not running has
+  /// no console, and the reason says so.
+  console: Action;
+}
+
+/// Where a machine's console is, and what speaks it. Read before opening the
+/// stream: a WebSocket that fails can only answer with a close code, and a
+/// close code is not something an operator can act on.
+export interface ConsoleInfo {
+  vmid: number;
+  name: string;
+  node: string;
+  protocol: "vnc";
+  /// The UNIX socket the hypervisor is listening on. Shown as a fact, and the
+  /// thing to name in a support conversation.
+  socket: string;
+  /// The path the browser opens, same origin as this page — so the session
+  /// cookie is the only credential and there is no ticket to mint.
+  websocket: string;
 }
 
 /// One row of the machine table, and the whole of the detail page. Everything
@@ -319,6 +338,22 @@ export const attachNic = (vmid: number, body: NicCreate): Promise<VmUpdateRespon
 
 export const detachNic = (vmid: number, id: string): Promise<VmUpdateResponse> =>
   del<VmUpdateResponse>(`/vms/${vmid}/nics/${encodeURIComponent(id)}`);
+
+// --- the console viewer ------------------------------------------------------
+
+export const fetchConsole = (vmid: number): Promise<ConsoleInfo> =>
+  apiFetch<ConsoleInfo>(`/vms/${vmid}/console`);
+
+/// The absolute URL of the console stream.
+///
+/// Built from the page's own origin rather than from anything configured: the
+/// control plane serves this page and the API on one port, so the console is
+/// always `wss://` to the same host — which is exactly what keeps the httpOnly
+/// session cookie first-party on the upgrade request.
+export const consoleUrl = (path: string): string => {
+  const { protocol, host } = window.location;
+  return `${protocol === "https:" ? "wss" : "ws"}://${host}${path}`;
+};
 
 // --- display helpers ---------------------------------------------------------
 

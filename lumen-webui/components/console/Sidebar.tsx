@@ -8,6 +8,7 @@ import { NAV, type NavItem } from "@/lib/nav";
 import { SidebarVms } from "@/components/console/SidebarVms";
 import { getCurrentUser, logout as apiLogout } from "@/lib/authClient";
 import type { AuthUserInfo } from "@/lib/authClient";
+import { useVmsOptional } from "@/lib/VmContext";
 
 /// Avatar initials — the first two letters of the username. The built-in realm
 /// authenticates OS accounts, which carry no display name.
@@ -20,6 +21,9 @@ export function Sidebar({ onOpenPalette }: { onOpenPalette: () => void }) {
   const pathname = (usePathname() ?? "/").replace(/\/+$/, "") || "/";
   const router = useRouter();
   const [user, setUser] = useState<AuthUserInfo | null>(null);
+  // Which machine is open, if any. Only used to decide whether the Virtual
+  // Machines item is itself the destination — see below.
+  const openVm = useVmsOptional()?.selected ?? null;
 
   // localStorage is unavailable during prerender — read it after mount.
   useEffect(() => {
@@ -130,7 +134,11 @@ export function Sidebar({ onOpenPalette }: { onOpenPalette: () => void }) {
             );
           }
 
-          const active = pathname.startsWith(item.href);
+          // A machine that is open is the destination, and its own row below
+          // says so. Lighting the parent as well would claim two places at
+          // once — the same reason a section with children never lights up.
+          const active =
+            pathname.startsWith(item.href) && !(item.id === "virtual-machines" && openVm !== null);
           const link = (
             <Link key={item.id} href={item.href} className={itemClass(active)}>
               <Icon size={16} />

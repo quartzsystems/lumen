@@ -92,12 +92,41 @@ distinction, and a copy-pasteable `curl` walkthrough):
 | `/api/vms/:vmid/disks/:id`              | DELETE | Detach; destroys the volume only if asked    |
 | `/api/vms/:vmid/nics`                   | POST   | Attach an adapter                            |
 | `/api/vms/:vmid/nics/:id`               | DELETE | Detach it (`:id` is the hardware address)    |
+| `/api/vms/:vmid/console`                | GET    | Where the console is, or why there is none   |
+| `/api/vms/:vmid/console/ws`             | GET    | The console stream — a WebSocket             |
 | `/api/storage/pools`                    | GET    | Pools, grouped by node                       |
+| `/api/storage/pools`                    | POST   | Build a pool                                 |
+| `/api/storage/pools/:pool`              | DELETE | Destroy one, and everything on it            |
+| `/api/storage/devices`                  | GET    | Every disk, and what is already on each      |
 | `/api/storage/pools/:pool/volumes`      | GET    | Datasets and volumes under a pool            |
 
-Pool creation, import, and destroy have no endpoint: they are the operations
-that need privileges this daemon deliberately does not have. See
-[docs/compute.md](compute.md).
+The node itself (all require a session; see [docs/system.md](system.md) for the
+model, the privileged-execution mechanism, and a `curl` walkthrough):
+
+| Endpoint                                | Method | Purpose                                     |
+| --------------------------------------- | ------ | ------------------------------------------- |
+| `/api/system/users`                     | GET    | Every local account, and what may be done to each |
+| `/api/system/users`                     | POST   | Create one                                   |
+| `/api/system/users/:name`               | GET    | One account                                  |
+| `/api/system/users/:name`               | PATCH  | Change one; absent fields are left alone     |
+| `/api/system/users/:name`               | DELETE | Remove one; `remove_home` off by default     |
+| `/api/system/power`                     | GET    | Uptime, the node's clock, anything scheduled |
+| `/api/system/power`                     | POST   | Restart or shut down — now, or at `at`       |
+| `/api/system/power`                     | DELETE | Call off whatever is scheduled               |
+
+A volume still has no endpoint of its own: one is created *for a machine*, so
+it is reached through `/api/vms/:vmid/disks`. A pool is not created for
+anything, which is why it lives under storage.
+
+Creating an account and creating a pool are the only two operations that
+cannot happen inside this daemon's sandbox. Neither of them relaxed it — both
+are handed to systemd, which runs them as a transient unit outside it. See
+[docs/system.md](system.md).
+
+`/api/vms/:vmid/console/ws` is the only WebSocket on the appliance. It is the
+same origin as the console that opens it, so the session cookie is the only
+credential — and because a handshake is exempt from the same-origin policy, it
+is also the only route that checks `Origin` by hand.
 
 Errors are `{ "error": "<user-facing text>" }`. Login failures are a
 uniform 401 regardless of cause, so responses don't leak whether an

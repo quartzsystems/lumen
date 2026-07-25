@@ -1,7 +1,9 @@
 pub mod auth;
+pub mod console;
 pub mod network;
 pub mod request;
 pub mod storage;
+pub mod system;
 pub mod vms;
 
 use std::sync::Arc;
@@ -67,15 +69,36 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/vms/{vmid}/stop", post(vms::stop))
         .route("/api/vms/{vmid}/reboot", post(vms::reboot))
         .route("/api/vms/{vmid}/reset", post(vms::reset))
+        // The console viewer. The first says where to connect and why not when
+        // there is nowhere; the second is the stream itself. Both are GETs,
+        // because an upgrade request is one — see src/api/console.rs.
+        .route("/api/vms/{vmid}/console", get(console::info))
+        .route("/api/vms/{vmid}/console/ws", get(console::attach))
         .route("/api/vms/{vmid}/disks", post(vms::attach_disk))
         .route("/api/vms/{vmid}/disks/{id}", delete(vms::detach_disk))
         .route("/api/vms/{vmid}/nics", post(vms::attach_nic))
         .route("/api/vms/{vmid}/nics/{id}", delete(vms::detach_nic))
-        // Storage. The pools are read-only — the one volume write is reached
-        // through a machine's disks, because a volume is created for a
-        // machine. The media library is not: an operator has to be able to put
-        // an installation image on the node from the console.
+        // The node itself: its local accounts, and its power state. Every
+        // account route passes the session's own principal down, which is what
+        // lets the domain refuse to lock the operator out of their own console
+        // — see src/api/system.rs.
+        .route("/api/system/users", get(system::users))
+        .route("/api/system/users", post(system::create_user))
+        .route("/api/system/users/{name}", get(system::user))
+        .route("/api/system/users/{name}", patch(system::update_user))
+        .route("/api/system/users/{name}", delete(system::delete_user))
+        .route("/api/system/power", get(system::power))
+        .route("/api/system/power", post(system::set_power))
+        .route("/api/system/power", delete(system::cancel_power))
+        // Storage. The one volume write is reached through a machine's disks,
+        // because a volume is created for a machine; a pool is not created for
+        // anything, so it lives here. The media library is here too: an
+        // operator has to be able to put an installation image on the node
+        // from the console.
         .route("/api/storage/pools", get(storage::pools))
+        .route("/api/storage/pools", post(storage::create_pool))
+        .route("/api/storage/pools/{pool}", delete(storage::destroy_pool))
+        .route("/api/storage/devices", get(storage::devices))
         .route("/api/storage/pools/{pool}/volumes", get(storage::volumes))
         .route("/api/storage/iso", get(storage::isos))
         .route("/api/storage/iso/{pool}", post(storage::create_iso_store))

@@ -1,10 +1,10 @@
 //! Storage endpoints.
 //!
-//! Read-only at this stage. The one write the storage domain has — the volume
-//! a machine's disk lives on — is reached through `/api/vms/{vmid}/disks`,
-//! because a volume is created for a machine and never on its own. Pool
-//! creation, import, and destroy have no endpoint at all yet; see
-//! docs/compute.md for why they wait for a privileged executor.
+//! The volume a machine's disk lives on is reached through
+//! `/api/vms/{vmid}/disks` rather than from here, because a volume is created
+//! *for a machine* and never on its own. Pools are the opposite: they are a
+//! decision about the node's own disks, so they are created and destroyed from
+//! here.
 //!
 //! Thin by design, and every route takes the [`Session`] extractor.
 
@@ -15,12 +15,33 @@ use axum::extract::{Path, State};
 use axum::Json;
 use futures_util::StreamExt;
 
-use lumen_zfs::service::{IsosResponse, PoolsResponse, VolumesResponse};
-use lumen_zfs::IsoStoreView;
+use lumen_zfs::service::{DevicesResponse, IsosResponse, PoolView, PoolsResponse, VolumesResponse};
+use lumen_zfs::{Acknowledgements, IsoStoreView, PoolCreate};
 
+use crate::api::request::{body, required_body, Body};
 use crate::error::ApiError;
 use crate::security::Session;
 use crate::AppState;
+
+/// DELETE /api/storage/pools/{pool}.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DestroyPoolRequest {
+    #[serde(default)]
+    i_understand_this_may_lose_data: bool,
+}
+
+/// POST /api/storage/pools — the acknowledgement rides alongside the pool.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreatePoolRequest {
+    #[serde(flatten)]
+    pool: PoolCreate,
+    /// Needed only when a chosen disk already has something on it. The
+    /// validator says which, and says what is on it.
+    #[serde(default)]
+    i_understand_this_may_lose_data: bool,
+}
 
 /// GET /api/storage/pools — pools, grouped by node.
 pub async fn pools(
@@ -28,6 +49,63 @@ pub async fn pools(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<PoolsResponse>, ApiError> {
     Ok(Json(state.storage.pools().await?))
+}
+
+/// GET /api/storage/devices — every disk the node has, and what is on each.
+///
+/// The answer the create dialog fills its picker from. It is a separate route
+/// from the pool listing because it is a different question — "what could a
+/// pool be built on" rather than "what pools are there" — and because reading
+/// `/sys/block` is work no page that only wants the pool table should pay for.
+pub async fn devices(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<DevicesResponse>, ApiError> {
+    Ok(Json(state.storage.block_devices().await?))
+}
+
+/// POST /api/storage/pools — build one.
+///
+/// The most destructive request this API accepts: it reformats every disk it is
+/// given. Every check happens before anything runs, so a rejected request
+/// leaves the node's disks exactly as they were.
+pub async fn create_pool(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    raw: Body,
+) -> Result<Json<PoolView>, ApiError> {
+    let request: CreatePoolRequest = required_body(raw)?;
+    Ok(Json(
+        state
+            .storage
+            .create_pool(
+                request.pool,
+                Acknowledgements {
+                    may_lose_data: request.i_understand_this_may_lose_data,
+                },
+            )
+            .await?,
+    ))
+}
+
+/// DELETE /api/storage/pools/{pool} — destroy one, and everything on it.
+pub async fn destroy_pool(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    Path(pool): Path<String>,
+    raw: Body,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let request: DestroyPoolRequest = body(raw)?;
+    state
+        .storage
+        .destroy_pool(
+            &pool,
+            Acknowledgements {
+                may_lose_data: request.i_understand_this_may_lose_data,
+            },
+        )
+        .await?;
+    Ok(Json(serde_json::json!({ "pool": pool })))
 }
 
 /// GET /api/storage/pools/{pool}/volumes — datasets and volumes under a pool.
