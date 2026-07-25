@@ -68,9 +68,18 @@ done
 if [ "${#missing[@]}" -gt 0 ]; then
     die "missing required tools: ${missing[*]}
   install with: dnf install xorriso mtools dosfstools squashfs-tools \\
-      createrepo_c rpm-build rust cargo gtk4-devel pam-devel nodejs npm \\
-      isomd5sum kmod"
+      createrepo_c rpm-build rust cargo gtk4-devel pam-devel libvirt-devel \\
+      pkgconf-pkg-config nodejs npm isomd5sum kmod"
 fi
+
+# The control plane links libpam and libvirt, and it is built well into this
+# run (via packages/build-rpms.sh). Check the libraries up front so a missing
+# dev package fails here rather than after the upstream ISO download, the
+# offline dependency resolution, and a full release compile.
+[ -e /usr/include/security/pam_appl.h ] \
+    || die "libpam headers not found (dnf install pam-devel)"
+pkg-config --exists libvirt 2>/dev/null \
+    || die "libvirt client library not found (dnf install libvirt-devel pkgconf-pkg-config)"
 
 # --- upstream ISO + checksum verification ------------------------------------
 [ -n "$UPSTREAM_ISO" ] || { usage >&2; die "--upstream-iso is required"; }

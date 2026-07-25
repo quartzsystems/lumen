@@ -24,6 +24,15 @@ for tool in rpmbuild cargo npm; do
     command -v "$tool" >/dev/null 2>&1 \
         || die "$tool not found (dnf install rpm-build rust cargo pam-devel libvirt-devel nodejs npm)"
 done
+
+# The two libraries the control plane links are checked here, not left to the
+# linker: without them cargo compiles happily for several minutes (virt-sys
+# ships generated bindings, so no header is needed to *build*) and then dies
+# in ld on undefined references to virConnectOpen &c. Fail in seconds instead.
+[ -e /usr/include/security/pam_appl.h ] \
+    || die "libpam headers not found (dnf install pam-devel)"
+pkg-config --exists libvirt 2>/dev/null \
+    || die "libvirt client library not found (dnf install libvirt-devel pkgconf-pkg-config)"
 [ -n "$VERSION" ] || die "VERSION file is empty"
 
 rm -rf "$TOPDIR"

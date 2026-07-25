@@ -29,12 +29,19 @@ jobs:
     container: almalinux:10
     steps:
       - name: Install build dependencies
+        # pam-devel and libvirt-devel are both needed to LINK the control
+        # plane, which this build compiles on the way to the RPMs: the
+        # built-in realm links libpam and the compute domain links the
+        # hypervisor's client library (see docs/compute.md). virt-sys ships
+        # generated bindings, so libvirt-devel brings no code generator —
+        # but without it the link fails on virConnectOpen &c.
         run: |
           dnf -y install dnf-plugins-core epel-release
           dnf config-manager --set-enabled crb
           dnf -y install rpm-build rpmdevtools createrepo_c xorriso mtools \
             dosfstools squashfs-tools isomd5sum kmod \
-            rust cargo gtk4-devel pam-devel nodejs npm systemd-rpm-macros \
+            rust cargo gtk4-devel pam-devel libvirt-devel \
+            pkgconf-pkg-config nodejs npm systemd-rpm-macros \
             make git-core
       - uses: actions/checkout@v4
       - name: Cache cargo

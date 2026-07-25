@@ -40,6 +40,7 @@ dnf config-manager --set-enabled crb    # gtk4-devel lives in CRB
 dnf install rpm-build rpmdevtools rpmlint createrepo_c xorriso mtools \
             dosfstools squashfs-tools isomd5sum kmod \
             rust cargo rustfmt clippy gtk4-devel pam-devel \
+            libvirt-devel pkgconf-pkg-config \
             nodejs npm systemd-rpm-macros make
 ```
 
@@ -50,7 +51,12 @@ dnf install rpm-build rpmdevtools rpmlint createrepo_c xorriso mtools \
 - `rust`/`cargo` + `gtk4-devel` build the installer (AppStream toolchain —
   deliberately not rustup, so the compiler comes from the same repo
   snapshot as the runtime libraries)
-- `pam-devel` links the controlplane's built-in realm against libpam;
+- `pam-devel` links the controlplane's built-in realm against libpam, and
+  `libvirt-devel` links its compute domain against the hypervisor's client
+  library — both are link-time only, and neither pulls a code generator in
+  (the libvirt bindings ship generated; see docs/compute.md). Miss either and
+  cargo compiles for minutes before `ld` fails on undefined references, so
+  `build-rpms.sh` and `build-live-iso.sh` check for them up front.
   `nodejs`/`npm` build the web UI static export
 - `rpmlint` and `shellcheck` (EPEL 10) are optional, for `make lint`
 

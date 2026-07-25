@@ -23,9 +23,15 @@ jobs:
     container: almalinux:10
     steps:
       - name: Install build dependencies
+        # Same set as ci.yml's rpms job: build-rpms.sh compiles
+        # lumen-controlplane and the web UI export before packaging them, and
+        # the control plane links both libpam and the hypervisor's client
+        # library.
         run: |
           dnf -y install epel-release   # rpmlint lives in EPEL on EL10
-          dnf -y install rpm-build rpmdevtools rpmlint make git-core
+          dnf -y install rpm-build rpmdevtools rpmlint make git-core \
+            rust cargo pam-devel libvirt-devel pkgconf-pkg-config \
+            nodejs npm systemd-rpm-macros
       - uses: actions/checkout@v4
       - name: Verify tag matches VERSION
         run: |
