@@ -74,6 +74,11 @@ export function TextInput({
   inputMode?: "numeric" | "text";
 }) {
   const base = mono ? monoSt : inputSt;
+  // A value that is shown but cannot be changed should not behave like
+  // somewhere to type: no tab stop, no text caret, and no accent border on
+  // click. It stays a real input so the value can still be selected and
+  // copied — an interface name is something operators paste elsewhere.
+  const inert = !!readOnly || !!disabled;
   return (
     <input
       id={id}
@@ -82,11 +87,14 @@ export function TextInput({
       disabled={disabled}
       autoFocus={autoFocus}
       inputMode={inputMode}
+      tabIndex={inert ? -1 : undefined}
       onChange={(e) => onChange(e.target.value)}
       placeholder={placeholder}
-      className={`${inputCls} disabled:opacity-70 read-only:opacity-70`}
+      className={`${inputCls} disabled:opacity-70 read-only:opacity-70 ${
+        inert ? "cursor-default caret-transparent" : ""
+      }`.trim()}
       style={invalid ? (mono ? monoInvalidSt : invalidSt) : base}
-      onFocus={focusBorder}
+      onFocus={inert ? undefined : focusBorder}
       onBlur={(e) => {
         e.currentTarget.style.borderColor = invalid ? "var(--qz-danger)" : "var(--qz-border)";
       }}

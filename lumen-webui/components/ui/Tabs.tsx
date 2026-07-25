@@ -36,7 +36,12 @@ export function Tabs({
   return (
     <div
       role="tablist"
-      className={`flex items-center gap-1 border-b border-[var(--qz-border)] overflow-x-auto ${className}`.trim()}
+      // Wraps rather than scrolls. A scrolling tab bar hides tabs behind a
+      // scrollbar the moment the labels outgrow their container — and because
+      // `overflow-x` alone also turns the vertical axis into a scroll box, the
+      // 1px the active tab's underline hangs below the border was enough to
+      // raise a second, vertical scrollbar over the tabs.
+      className={`flex flex-wrap items-center gap-1 border-b border-[var(--qz-border)] ${className}`.trim()}
     >
       {items.map((it) => {
         const active = value === it.value;

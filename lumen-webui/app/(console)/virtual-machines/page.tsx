@@ -195,6 +195,9 @@ function VirtualMachines() {
             ? (selected.description ?? `Machine ${selected.vmid} on ${selected.node}.`)
             : "Machines defined on this node, and the disks and adapters they run on."
         }
+        // Creating is a control on the list, not on the page: it belongs in
+        // the table's toolbar next to Columns and Refresh, the way Interfaces
+        // has it. The header keeps what acts on the machine that is open.
         actions={
           selected ? (
             <div className="flex items-center gap-2">
@@ -210,11 +213,7 @@ function VirtualMachines() {
                 </Button>
               </span>
             </div>
-          ) : (
-            <Button kind="primary" icon={Plus} onClick={() => setCreating(true)}>
-              Create
-            </Button>
-          )
+          ) : undefined
         }
       />
 
@@ -263,6 +262,11 @@ function VirtualMachines() {
                     <VmTable
                       rows={node.vms}
                       busy={busy}
+                      toolbar={
+                        <Button kind="primary" size="sm" icon={Plus} onClick={() => setCreating(true)}>
+                          Create
+                        </Button>
+                      }
                       onRefresh={refresh}
                       onOpen={(vm) => go(vm.vmid)}
                       onAction={afterAction}
@@ -433,12 +437,14 @@ const columns: Column<VmView>[] = [
 function VmTable({
   rows,
   busy,
+  toolbar,
   onRefresh,
   onOpen,
   onAction,
 }: {
   rows: VmView[];
   busy: boolean;
+  toolbar?: React.ReactNode;
   onRefresh: () => Promise<void>;
   onOpen: (vm: VmView) => void;
   onAction: (message: string) => Promise<void>;
@@ -473,6 +479,7 @@ function VmTable({
       rows={rows}
       columns={columns}
       filters={filters}
+      toolbar={toolbar}
       rowId={(vm) => String(vm.vmid)}
       storageKey="virtual-machines"
       searchPlaceholder="Search machines…"

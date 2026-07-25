@@ -12,8 +12,15 @@
 #
 # Runs once at boot (lumen-console-banner.service) and again from a
 # NetworkManager dispatcher hook whenever an address changes, so DHCP moves
-# keep the banner honest. agetty re-reads /etc/issue every time it redraws
-# the prompt, so updates appear without restarting the getty.
+# keep the banner honest.
+#
+# agetty reads /etc/issue once, when it draws the login prompt. The boot run
+# almost always loses the race with DHCP and renders the no-address banner;
+# rewriting the file when the lease lands does not touch what is already on
+# the screen, so an untouched console would sit there advertising
+# <management-ip> for the rest of its uptime. Hence redraw(): when the
+# rendered banner actually changes, restart the gettys nobody is logged in
+# on so they pick it up.
 #
 # Overridable paths are for tests only.
 set -euo pipefail
@@ -21,6 +28,9 @@ set -euo pipefail
 SHARE="${LUMEN_SHARE:-/usr/share/lumen-release}"
 ISSUE_OUT="${LUMEN_ISSUE_OUT:-/etc/issue}"
 MOTD_D="${LUMEN_MOTD_D:-/run/motd.d}"
+# Set to 0 to render only, leaving the gettys alone (tests, and the offline
+# installer chroot where there is no running systemd to talk to).
+REDRAW="${LUMEN_REDRAW_GETTY:-1}"
 # lumen-controlplane's listen port (LUMEN_CP_LISTEN default).
 PORT=8443
 
@@ -28,12 +38,28 @@ PORT=8443
 # name (uname is coreutils — present even where hostname(1) is not).
 fqdn="$(hostname -f 2>/dev/null || true)"
 [ -n "$fqdn" ] || fqdn="$(uname -n)"
-# First global IPv4 on an up interface — the management NIC on an appliance.
-# Best-effort by design (|| true): a failed probe must render the
-# no-address banner, never kill the script. The single awk exits itself; a
-# head(1) here would SIGPIPE the pipeline and trip pipefail.
-addr="$(ip -4 -o addr show up scope global 2>/dev/null \
-        | awk 'NR==1 { split($4, a, "/"); print a[1]; exit }' || true)"
+# The address an operator can actually reach this box on: the one on the
+# interface carrying the default route, which on an appliance whose NIC is a
+# bridge port is the bridge, not the port. Falling back to the first global
+# IPv4 covers a box routed statically or not routed at all.
+#
+# Best-effort by design (|| true): a failed probe must render the no-address
+# banner, never kill the script. The single awk exits itself; a head(1) here
+# would SIGPIPE the pipeline and trip pipefail.
+addr_on() {
+    ip -4 -o addr show "$@" scope global 2>/dev/null \
+        | awk 'NR==1 { split($4, a, "/"); print a[1]; exit }' || true
+}
+
+dev="$(ip -4 route show default 2>/dev/null \
+       | awk 'NR==1 { for (i = 1; i < NF; i++) if ($i == "dev") { print $(i+1); exit } }' || true)"
+addr=""
+if [ -n "$dev" ]; then
+    addr="$(addr_on dev "$dev")"
+fi
+if [ -z "$addr" ]; then
+    addr="$(addr_on up)"
+fi
 
 access_block() {
     printf '    Host:         %s\n' "$fqdn"
@@ -45,9 +71,43 @@ access_block() {
     fi
 }
 
+# Restart the gettys that are sitting on a login prompt, so the banner they
+# already painted is replaced by the one just rendered. Anything with a user
+# logged in on it is left alone — a banner refresh is not worth killing a
+# session over; that console picks the new banner up when its user logs out.
+redraw() {
+    [ "$REDRAW" = 1 ] || return 0
+    [ -d /run/systemd/system ] || return 0            # not booted under systemd
+    command -v systemctl >/dev/null 2>&1 || return 0
+
+    units="$(systemctl list-units --state=active --no-legend --plain \
+             'getty@*.service' 'serial-getty@*.service' 2>/dev/null \
+             | awk '{ print $1 }' || true)"
+    for unit in $units; do
+        # Is this console still showing a login prompt? agetty execs login(1)
+        # the moment someone types a user name, so the unit's main process
+        # being agetty is the question, asked exactly. utmp would be the
+        # obvious way to ask and is the wrong one: systemd 257 dropped utmp
+        # support, so who(1) can report an empty list on a box with sessions
+        # on every tty — and an empty list here means killing them.
+        pid="$(systemctl show -p MainPID --value "$unit" 2>/dev/null || true)"
+        case "$pid" in
+            ''|0|*[!0-9]*) continue ;;
+        esac
+        [ "$(cat "/proc/$pid/comm" 2>/dev/null || true)" = agetty ] || continue
+        systemctl try-restart "$unit" >/dev/null 2>&1 || true
+    done
+}
+
 # Pre-login banner: art, access block, kernel line. The motd's own trailing
 # version/URL lines double as the banner heading, so the issue template only
 # contributes its kernel escape line here.
+#
+# Rendered aside and moved into place, so an unchanged banner costs nothing
+# and a changed one lands atomically rather than being read half-written by
+# an agetty redrawing at that moment.
+issue_tmp="$(mktemp "${ISSUE_OUT}.XXXXXX")"
+trap 'rm -f "$issue_tmp"' EXIT
 {
     cat "$SHARE/motd" 2>/dev/null || printf 'Quartz Systems Lumen\n'
     printf '\n'
@@ -55,7 +115,15 @@ access_block() {
     printf '\n'
     grep '^Kernel' "$SHARE/issue" 2>/dev/null || true
     printf '\n'
-} > "$ISSUE_OUT"
+} > "$issue_tmp"
+
+if cmp -s "$issue_tmp" "$ISSUE_OUT" 2>/dev/null; then
+    rm -f "$issue_tmp"
+else
+    chmod 0644 "$issue_tmp"
+    mv -f "$issue_tmp" "$ISSUE_OUT"
+    redraw
+fi
 
 mkdir -p "$MOTD_D"
 {

@@ -439,8 +439,10 @@ export function CreateVmDialog({
     set(key, value);
   };
 
+  // Wide enough for all eight tabs on one row with room for the marks that
+  // appear on them, and for the two-column tab bodies underneath.
   return (
-    <ModalShell onClose={onClose} maxWidth={640}>
+    <ModalShell onClose={onClose} maxWidth={760}>
       <ModalHeader
         title="Create Virtual Machine"
         subtitle="The machine is defined on this node as soon as you finish."
@@ -877,17 +879,31 @@ function OsTab({
     <>
       <div className="grid gap-4" style={{ gridTemplateColumns: "1fr 1fr" }}>
         <div className="flex flex-col gap-4">
-          <label className="flex items-center gap-[10px] cursor-pointer select-none">
-            <input
-              type="radio"
-              checked={draft.useMedia}
-              onChange={() => set("useMedia", true)}
-              style={{ accentColor: "var(--qz-accent)" }}
-            />
-            <span className="text-[13px] text-[var(--qz-fg-2)]">
-              Use CD/DVD disc image file (iso)
-            </span>
-          </label>
+          {/* The two answers to "what does this machine boot from" sit
+              together; the storage and image that only matter to the first
+              of them follow underneath. */}
+          <div className="flex flex-col gap-[10px]">
+            <label className="flex items-center gap-[10px] cursor-pointer select-none">
+              <input
+                type="radio"
+                checked={draft.useMedia}
+                onChange={() => set("useMedia", true)}
+                style={{ accentColor: "var(--qz-accent)" }}
+              />
+              <span className="text-[13px] text-[var(--qz-fg-2)]">
+                Use CD/DVD disc image file (iso)
+              </span>
+            </label>
+            <label className="flex items-center gap-[10px] cursor-pointer select-none">
+              <input
+                type="radio"
+                checked={!draft.useMedia}
+                onChange={() => set("useMedia", false)}
+                style={{ accentColor: "var(--qz-accent)" }}
+              />
+              <span className="text-[13px] text-[var(--qz-fg-2)]">Do not use any media</span>
+            </label>
+          </div>
           <div className={draft.useMedia ? "" : "opacity-40 pointer-events-none"}>
             <Field label="Storage" htmlFor="vm-media-storage">
               <SelectInput
@@ -923,16 +939,6 @@ function OsTab({
               </Field>
             </div>
           </div>
-
-          <label className="flex items-center gap-[10px] cursor-pointer select-none">
-            <input
-              type="radio"
-              checked={!draft.useMedia}
-              onChange={() => set("useMedia", false)}
-              style={{ accentColor: "var(--qz-accent)" }}
-            />
-            <span className="text-[13px] text-[var(--qz-fg-2)]">Do not use any media</span>
-          </label>
         </div>
 
         <div className="flex flex-col gap-4">

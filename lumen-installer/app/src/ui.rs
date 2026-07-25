@@ -425,7 +425,7 @@ fn page_password(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
     form.set_size_request(520, -1);
     form.append(&form_label("Password"));
     form.append(&entry);
-    form.append(&form_label("Confirm password"));
+    form.append(&form_label("Confirm Password"));
     form.append(&confirm);
     form.append(&hint);
     content.append(&form);
@@ -524,7 +524,7 @@ fn page_location(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
     form.append(&country_dd);
     form.append(&form_label("Time Zone"));
     form.append(&zone_dd);
-    form.append(&form_label("Keyboard layout"));
+    form.append(&form_label("Keyboard Layout"));
     form.append(&keymap_dd);
     content.append(&form);
 
@@ -642,10 +642,10 @@ fn page_network(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
     static_grid.set_row_spacing(8);
     static_grid.set_column_spacing(16);
     for (row, (label, entry)) in [
-        ("IP address", &ip_entry),
+        ("IP Address", &ip_entry),
         ("Netmask", &netmask_entry),
         ("Gateway", &gateway_entry),
-        ("DNS server", &dns_entry),
+        ("DNS Server", &dns_entry),
     ]
     .iter()
     .enumerate()
@@ -678,7 +678,7 @@ fn page_network(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
     form.add_css_class("qz-card");
     form.set_halign(gtk::Align::Start);
     form.set_size_request(680, -1);
-    form.append(&form_label("Management interface"));
+    form.append(&form_label("Management Interface"));
     let nic_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     nic_dd.set_hexpand(true);
     nic_row.append(&nic_dd);
@@ -876,7 +876,7 @@ fn page_disk(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
     scroll.set_min_content_height(220);
     card.append(&scroll);
     card.append(&rescan);
-    card.append(&form_label("Pool layout"));
+    card.append(&form_label("Pool Layout"));
     card.append(&topology_dd);
     card.append(&topology_hint);
     card.append(&error);
