@@ -4,8 +4,9 @@
 #
 #   1. verify the upstream AlmaLinux 10 minimal ISO (source of the on-media
 #      Minimal repo and the kernel pin)
-#   2. build the Lumen RPMs; mirror the pinned OpenZFS EL10 subset; create
-#      the local 'lumen' repo
+#   2. build the Lumen RPMs; mirror the pinned OpenZFS EL10 subset and
+#      everything else the media lacks (dnf resolves the target set against
+#      the media to decide what that is); create the local 'lumen' repo
 #   3. cargo-build lumen-installer (gtk4-rs, AppStream toolchain)
 #   4. build the live rootfs -> dracut dmsquash-live initramfs -> squashfs
 #      (lumen-installer/live/build-live.sh)
@@ -43,6 +44,22 @@ VERSION="$(tr -d '[:space:]' < "$REPO_ROOT/VERSION")"
 if [ -z "${KERNEL_NEVR:-}" ] || [ -z "${ZFS_REPO_URL:-}" ] || [ -z "${ZFS_SERIES:-}" ]; then
     die "iso/pins.env is missing KERNEL_NEVR / ZFS_REPO_URL / ZFS_SERIES"
 fi
+if [ -z "${ALMA_BASEOS_URL:-}" ] || [ -z "${ALMA_APPSTREAM_URL:-}" ]; then
+    die "iso/pins.env is missing ALMA_BASEOS_URL / ALMA_APPSTREAM_URL"
+fi
+
+# The package set the installed target gets. It is used twice: once to work
+# out what has to be mirrored onto the media, and once by the offline gate
+# that proves the media can deliver it. One list, so the two cannot drift.
+TARGET_PACKAGES=(
+    @core "$KERNEL_NEVR" zfs kmod-zfs zfs-dracut
+    grub2-efi-x64 shim-x64 grub2-tools grubby efibootmgr
+    e2fsprogs dosfstools NetworkManager chrony firewalld openssh-server
+    policycoreutils selinux-policy-targeted
+    libvirt-daemon-kvm qemu-kvm edk2-ovmf
+    lumen-release lumen-networking lumen-storage lumen-compute
+    lumen-controlplane
+)
 
 UPSTREAM_ISO="${UPSTREAM_ISO:-}"
 UPSTREAM_SHA256="${UPSTREAM_SHA256:-}"
@@ -152,77 +169,87 @@ for rpm in "$zfs_dl"/*.rpm; do
 done
 mv "$zfs_dl"/*.rpm "$TREE/lumen/"
 
-# ZFS userland dependencies the Minimal media repo lacks (see pins.env).
-# Pulled from the build container's AlmaLinux repos — the almalinux:10
-# container tracks the same point-release stream the upstream ISO pin
-# targets (the kernel-pin gate forces both pins to move together).
-if [ -n "${MEDIA_EXTRA_PACKAGES:-}" ]; then
-    echo "==> Mirroring AlmaLinux extras: $MEDIA_EXTRA_PACKAGES"
-    extra_dl="$WORK/alma-extra-download"
-    mkdir -p "$extra_dl"
-    # shellcheck disable=SC2086 # intentional word splitting of the package list
-    dnf download --quiet --destdir "$extra_dl" $MEDIA_EXTRA_PACKAGES \
-        || die "AlmaLinux extras download failed"
-
-    echo "==> Gate: AlmaLinux extras RPM signatures"
-    alma_key="/etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-10"
-    [ -r "$alma_key" ] || die "AlmaLinux GPG key not found at $alma_key (not building on AlmaLinux 10?)"
-    rpmkeys --import "$alma_key"
-    for rpm in "$extra_dl"/*.rpm; do
-        sig="$(rpmkeys --checksig "$rpm")"
-        grep -q "signatures OK" <<<"$sig" \
-            || die "RPM signature check failed: $sig"
-    done
-    mv "$extra_dl"/*.rpm "$TREE/lumen/"
-fi
-
-# The virtualization stack. It lives in AppStream, so none of it is on the
-# minimal media, and its dependency closure is far too long to list by hand
-# (see pins.env). Resolve the closure, subtract what the media already
-# carries, and mirror the remainder — so the ISO grows by what is genuinely
-# missing rather than by a second copy of half of BaseOS.
-if [ -n "${MEDIA_VIRT_PACKAGES:-}" ]; then
-    echo "==> Resolving the virtualization closure: $MEDIA_VIRT_PACKAGES"
-    virt_dl="$WORK/virt-download"
-    mkdir -p "$virt_dl"
-
-    # Everything the media already has, by name.
-    dnf repoquery --quiet --disablerepo='*' \
-        --repofrompath="media,$TREE/Minimal" --setopt=media.gpgcheck=0 \
-        --qf '%{name}' --available 2>/dev/null | LC_ALL=C sort -u > "$WORK/on-media.txt"
-
-    # Everything the stack needs, by name, transitively.
-    # shellcheck disable=SC2086 # intentional word splitting of the package list
-    dnf repoquery --quiet --qf '%{name}' --resolve --recursive --requires \
-        $MEDIA_VIRT_PACKAGES 2>/dev/null | LC_ALL=C sort -u > "$WORK/virt-closure.txt"
-    # shellcheck disable=SC2086 # intentional word splitting of the package list
-    printf '%s\n' $MEDIA_VIRT_PACKAGES >> "$WORK/virt-closure.txt"
-    LC_ALL=C sort -u -o "$WORK/virt-closure.txt" "$WORK/virt-closure.txt"
-
-    # comm needs both sides in the same collation, hence LC_ALL=C throughout.
-    LC_ALL=C comm -23 "$WORK/virt-closure.txt" "$WORK/on-media.txt" >"$WORK/virt-missing.txt"
-    missing_count="$(wc -l < "$WORK/virt-missing.txt")"
-    [ "$missing_count" -gt 0 ] \
-        || die "the virtualization closure resolved to nothing — is the build container's AppStream repo enabled?"
-    echo "==> Mirroring $missing_count packages the media lacks"
-
-    # xargs rather than one invocation: the list is long enough to matter.
-    xargs -a "$WORK/virt-missing.txt" -r dnf download --quiet --destdir "$virt_dl" \
-        || die "virtualization download failed"
-
-    echo "==> Gate: virtualization RPM signatures"
-    alma_key="/etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-10"
-    [ -r "$alma_key" ] || die "AlmaLinux GPG key not found at $alma_key (not building on AlmaLinux 10?)"
-    rpmkeys --import "$alma_key"
-    for rpm in "$virt_dl"/*.rpm; do
-        sig="$(rpmkeys --checksig "$rpm")"
-        grep -q "signatures OK" <<<"$sig" \
-            || die "RPM signature check failed: $sig"
-    done
-    mv "$virt_dl"/*.rpm "$TREE/lumen/"
-fi
-
 echo "==> Creating lumen repo"
+createrepo_c --quiet "$TREE/lumen"
+
+# --- mirroring what the media lacks -------------------------------------------
+# The Minimal media carries a slice of BaseOS only: no virtualization stack
+# (AppStream), and not all of the ZFS userland's tail either. The missing
+# packages are mirrored into the lumen repo — but *which* packages, and at
+# which builds, is dnf's answer, not a list kept by hand.
+#
+# One transaction resolves the whole target set against media + lumen +
+# AlmaLinux, and everything it picks that the media cannot supply is
+# mirrored. Two properties matter, and both are why this is a real
+# depsolve rather than a `repoquery --requires` walk subtracted by name:
+#
+#   - Version, not just name. The media is frozen at the point release the
+#     ISO was cut from while the AlmaLinux repos keep moving, so the newest
+#     build of a package the media lacks routinely requires the *exact*
+#     build of one the media has, one z-stream bump later
+#     (iptables-nft -> iptables-libs = ..., systemd-container -> systemd =
+#     ...). Subtracting by name mirrors one half of such a pair and leaves
+#     the other behind, which the offline gate then rejects.
+#   - media.priority=1 makes dnf prefer the media's build of anything the
+#     media carries, so the solver reaches for the older, matching build of
+#     the missing half instead of dragging a z-stream upgrade of half of
+#     BaseOS onto the ISO. AlmaLinux keeps the superseded builds, so that
+#     solution normally exists; where it does not, the solver upgrades both
+#     halves and mirrors both, which is equally consistent, just larger.
+echo "==> Resolving what the media lacks (full target set)"
+mirror_root="$WORK/mirror-root"
+mirror_dl="$WORK/mirror-download"
+rm -rf "$mirror_root" "$mirror_dl"
+mkdir -p "$mirror_root" "$mirror_dl"
+set +e
+mirror_out="$(dnf -y --installroot="$mirror_root" --releasever=10 --downloadonly \
+    --disablerepo='*' \
+    --repofrompath="media,$TREE/Minimal" --repofrompath="lumen,$TREE/lumen" \
+    --setopt=media.gpgcheck=0 --setopt=lumen.gpgcheck=0 \
+    --setopt=media.priority=1 --setopt=lumen.priority=1 \
+    --repofrompath="alma-baseos,$ALMA_BASEOS_URL" --setopt=alma-baseos.gpgcheck=0 \
+    --repofrompath="alma-appstream,$ALMA_APPSTREAM_URL" --setopt=alma-appstream.gpgcheck=0 \
+    install "${TARGET_PACKAGES[@]}" 2>&1)"
+mirror_rc=$?
+set -e
+[ "$mirror_rc" -eq 0 ] || {
+    echo "$mirror_out" | tail -40 >&2
+    die "the target package set does not resolve against the media plus AlmaLinux —
+  the pins in iso/pins.env and the upstream ISO have drifted apart."
+}
+
+# Only the two AlmaLinux repos are downloaded from: dnf uses local file://
+# repos in place, so nothing the media or the lumen repo already supplies is
+# cached here. The name check below is belt and braces on that — an RPM's
+# file name is its exact NVRA.
+find "$mirror_root" -name '*.rpm' -exec mv -t "$mirror_dl" -n {} + 2>/dev/null || true
+find "$TREE/Minimal" "$TREE/lumen" -name '*.rpm' -printf '%f\n' \
+    | LC_ALL=C sort -u > "$WORK/on-media.txt"
+for rpm in "$mirror_dl"/*.rpm; do
+    [ -e "$rpm" ] || continue
+    if grep -qxF -- "${rpm##*/}" "$WORK/on-media.txt"; then
+        rm -f "$rpm"
+    fi
+done
+mirror_count="$(find "$mirror_dl" -name '*.rpm' | wc -l)"
+[ "$mirror_count" -gt 0 ] \
+    || die "nothing to mirror — the media cannot possibly already carry the
+  virtualization stack, so the resolve above did not fetch what it resolved."
+echo "==> Mirroring $mirror_count packages the media lacks"
+
+echo "==> Gate: mirrored RPM signatures"
+alma_key="/etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-10"
+[ -r "$alma_key" ] || die "AlmaLinux GPG key not found at $alma_key (not building on AlmaLinux 10?)"
+rpmkeys --import "$alma_key"
+for rpm in "$mirror_dl"/*.rpm; do
+    sig="$(rpmkeys --checksig "$rpm")"
+    grep -q "signatures OK" <<<"$sig" \
+        || die "RPM signature check failed: $sig"
+done
+mv "$mirror_dl"/*.rpm "$TREE/lumen/"
+rm -rf "$mirror_root"
+
+echo "==> Re-creating lumen repo with the mirrored packages"
 createrepo_c --quiet "$TREE/lumen"
 
 echo "==> Gate: target package set resolves offline (media repos only)"
@@ -233,13 +260,7 @@ resolve_out="$(dnf --assumeno --installroot="$resolve_root" --releasever=10 \
     --disablerepo='*' \
     --repofrompath="media,$TREE/Minimal" --repofrompath="lumen,$TREE/lumen" \
     --setopt=media.gpgcheck=0 --setopt=lumen.gpgcheck=0 \
-    install @core "$KERNEL_NEVR" zfs kmod-zfs zfs-dracut \
-        grub2-efi-x64 shim-x64 grub2-tools grubby efibootmgr \
-        e2fsprogs dosfstools NetworkManager chrony firewalld openssh-server \
-        policycoreutils selinux-policy-targeted \
-        libvirt-daemon-kvm qemu-kvm edk2-ovmf \
-        lumen-release lumen-networking lumen-storage lumen-compute \
-        lumen-controlplane 2>&1)"
+    install "${TARGET_PACKAGES[@]}" 2>&1)"
 set -e
 # --assumeno exits nonzero after successfully resolving; a printed
 # transaction summary is the actual success signal.

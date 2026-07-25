@@ -14,10 +14,12 @@ Pipeline (`iso/build-live-iso.sh`, entry point `make iso`):
 2. extract its on-media `Minimal` repo (the offline install source) and
    **gate**: the repo's kernel must equal `KERNEL_NEVR` in `iso/pins.env`
 3. build the Lumen RPMs; mirror the pinned OpenZFS EL10 kABI subset from
-   `ZFS_REPO_URL` plus the AlmaLinux extras the media repo lacks
-   (`MEDIA_EXTRA_PACKAGES` — zfs userland requires sysstat); every
-   mirrored RPM is signature-checked; `createrepo_c` the combined
-   `lumen` repo
+   `ZFS_REPO_URL`; then resolve the whole target package set against the
+   media plus `ALMA_BASEOS_URL`/`ALMA_APPSTREAM_URL` and mirror everything
+   dnf picks that the media cannot supply — the ZFS userland's tail and the
+   entire virtualization stack, which is AppStream and so absent from a
+   minimal ISO. Every mirrored RPM is signature-checked; `createrepo_c` the
+   combined `lumen` repo
 4. **gate**: the full target package set must resolve against *only* the
    two on-media repos (catches offline-completeness regressions)
 5. `cargo build --release` the installer (AppStream rust, distro gtk4)
@@ -103,7 +105,17 @@ the three gates above.
   (**major-version path** `epel/10/kmod/`, server-side aliased to the
   point release OpenZFS currently targets; plain http — the host serves no
   https, and integrity comes from RPM signatures against the pinned key in
-  `iso/keys/`), `ZFS_SERIES`
+  `iso/keys/`), `ZFS_SERIES`, and `ALMA_BASEOS_URL`/`ALMA_APPSTREAM_URL`
+  (where everything the media lacks is mirrored from)
+
+The media is a **frozen** point-release snapshot; the AlmaLinux repos keep
+moving underneath it. So the mirror step resolves against the media with
+`media.priority=1` and mirrors dnf's answer, rather than mirroring the
+newest build of each name it finds missing: the newest build of a package
+the media lacks tends to require the *exact* build of one the media has,
+one z-stream bump later (`iptables-nft` → `iptables-libs = …`,
+`systemd-container` → `systemd = …`), and mirroring one half of such a pair
+is what the offline gate then rejects.
 
 Moving to a new AlmaLinux point release means updating both files in one
 commit — and checking that OpenZFS has published kABI kmods for that point
