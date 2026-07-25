@@ -2,7 +2,7 @@
 //!
 //! `lumen-controlplane.service` runs with `ProtectSystem=strict`, which makes
 //! the whole file system hierarchy read-only apart from `/dev`, `/proc`,
-//! `/sys`, `/run`, and the two directories the unit names. That is what makes
+//! `/sys`, and the directories the unit names. That is what makes
 //! the daemon safe to expose on a network, and it is deliberately not relaxed:
 //! docs/compute.md works through why machine and volume operations need no
 //! relaxation at all.
@@ -218,15 +218,12 @@ impl SystemdRun {
         argv.extend(request.args.iter().cloned());
         argv
     }
-}
 
-#[async_trait]
-impl Exec for SystemdRun {
-    async fn run(&self, request: Request) -> anyhow::Result<Outcome> {
-        tracing::info!(command = %request.display(), "running outside the sandbox");
-
+    /// One attempt: start `systemd-run`, feed it its input, and collect what it
+    /// said.
+    async fn attempt(&self, request: &Request) -> anyhow::Result<Outcome> {
         let mut child = Command::new(&self.program)
-            .args(self.argv(&request))
+            .args(self.argv(request))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -253,12 +250,70 @@ impl Exec for SystemdRun {
         }
 
         let output = child.wait_with_output().await?;
-        let outcome = Outcome {
+        Ok(Outcome {
             status: output.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        };
+        })
+    }
+}
+
+/// systemd-run complaining that it could not reach PID 1, as opposed to the
+/// command complaining about the job.
+///
+/// `--pipe` hands the command systemd-run's own standard error, so both arrive
+/// on one stream with nothing but the wording to tell them apart. These are the
+/// shapes systemd-run uses when it never got as far as starting anything, and
+/// the distinction is worth drawing: "Failed to start transient service unit:
+/// Connection reset by peer" reported as though `zpool` had said it sends an
+/// operator to go and look at their disks, when the thing to look at is the
+/// path between this daemon and systemd.
+fn systemd_refused(stderr: &str) -> Option<&str> {
+    const SHAPES: [&str; 5] = [
+        "Failed to start transient",
+        "Failed to enqueue",
+        "Failed to connect to bus",
+        "Failed to create bus connection",
+        "Failed to set up transient service",
+    ];
+    stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| SHAPES.iter().any(|shape| line.starts_with(shape)))
+}
+
+#[async_trait]
+impl Exec for SystemdRun {
+    async fn run(&self, request: Request) -> anyhow::Result<Outcome> {
+        tracing::info!(command = %request.display(), "running outside the sandbox");
+
+        let mut outcome = self.attempt(&request).await?;
+
+        // PID 1 drops every connection on its private socket when it
+        // re-executes, and `systemctl daemon-reload` is enough to do it — so an
+        // operation that happened to land in that window failed for a reason
+        // that was already over before the message was printed. One retry. The
+        // second failure is a real one and is reported as such, and the command
+        // has not run at this point, so there is nothing to have run twice.
+        if !outcome.ok() && systemd_refused(&outcome.stderr).is_some() {
+            tracing::warn!(
+                command = %request.display(),
+                reason = %outcome.failure(),
+                "systemd would not start the unit; trying once more"
+            );
+            outcome = self.attempt(&request).await?;
+        }
+
         if !outcome.ok() {
+            if let Some(refusal) = systemd_refused(&outcome.stderr) {
+                return Err(anyhow::anyhow!(
+                    "could not {}: systemd would not start it — {refusal}. This appliance hands \
+                     the few commands its sandbox forbids to systemd, so this is a failure to \
+                     reach PID 1 rather than a failure of the command itself. `systemctl status \
+                     lumen-controlplane` and `journalctl -u lumen-controlplane` say more.",
+                    request.description
+                ));
+            }
             tracing::warn!(
                 command = %request.display(),
                 status = outcome.status,
@@ -670,6 +725,26 @@ mod tests {
             stderr: String::new(),
         };
         assert_eq!(quiet.failure(), "the command failed with status 4");
+    }
+
+    /// `--pipe` puts systemd-run's complaints and the command's on one stream,
+    /// and an operator sent to check their disks over a bus failure has been
+    /// sent to the wrong place.
+    #[test]
+    fn systemds_own_refusal_is_not_mistaken_for_the_commands() {
+        assert_eq!(
+            systemd_refused("Failed to start transient service unit: Connection reset by peer\n"),
+            Some("Failed to start transient service unit: Connection reset by peer")
+        );
+        assert!(systemd_refused("Failed to connect to bus: No such file or directory").is_some());
+
+        // What `zpool` and `useradd` say is theirs, and stays theirs.
+        assert_eq!(systemd_refused("cannot create 'tank': no such pool"), None);
+        assert_eq!(
+            systemd_refused("useradd: user 'alice' already exists"),
+            None
+        );
+        assert_eq!(systemd_refused(""), None);
     }
 
     #[tokio::test]

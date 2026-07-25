@@ -10,14 +10,15 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::body::Body as AxumBody;
+use axum::extract::{Path, Query, State};
 use axum::Json;
 
 use lumen_virt::service::{
     DiskCreate, NicCreate, VmCreate, VmDeleteResponse, VmPatch, VmUpdateResponse, VmView,
     VmsResponse,
 };
-use lumen_virt::{Acknowledgements, CpuModels, OsCatalog};
+use lumen_virt::{Acknowledgements, CpuModels, OsCatalog, PushedFile, MAX_GUEST_FILE_BYTES};
 
 use crate::api::request::{body, node_only, required_body, Body};
 use crate::error::ApiError;
@@ -251,4 +252,43 @@ pub async fn detach_nic(
 ) -> Result<Json<VmUpdateResponse>, ApiError> {
     node_only(raw)?;
     Ok(Json(state.virt.detach_nic(vmid, &id).await?))
+}
+
+/// Where a pushed file is going, inside the guest.
+#[derive(Debug, serde::Deserialize)]
+pub struct PushTarget {
+    path: String,
+}
+
+/// PUT /api/vms/{vmid}/files?path=/root/thing — copy a file into a guest.
+///
+/// The body is the file itself, exactly as `upload_iso` takes an installation
+/// image, and for the same reason: there is one field, its name is already in
+/// the query, and a form encoding would put a parser between the socket and the
+/// bytes for no benefit.
+///
+/// Unlike that one it is **buffered**, not streamed, and the route caps it at
+/// [`MAX_GUEST_FILE_BYTES`]. The guest agent takes a file as a series of
+/// base64-encoded messages rather than as a stream, so there is nothing to
+/// stream into — see `lumen_virt::VirtService::push_file` for why that makes
+/// this the wrong road for anything large, and what the right one is.
+pub async fn push_file(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    Path(vmid): Path<u32>,
+    Query(target): Query<PushTarget>,
+    body: AxumBody,
+) -> Result<Json<PushedFile>, ApiError> {
+    let contents = axum::body::to_bytes(body, MAX_GUEST_FILE_BYTES)
+        .await
+        .map_err(|err| {
+            ApiError::BadRequest(format!(
+                "That file could not be read, or is larger than the {} MiB a guest agent will \
+                 take: {err}",
+                MAX_GUEST_FILE_BYTES / (1024 * 1024)
+            ))
+        })?;
+    Ok(Json(
+        state.virt.push_file(vmid, &target.path, &contents).await?,
+    ))
 }

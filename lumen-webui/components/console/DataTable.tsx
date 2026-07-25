@@ -27,6 +27,12 @@ export interface FilterDef<T> {
   label: string;
   options: { value: string; label: string }[];
   predicate: (row: T, value: string) => boolean;
+  /**
+   * The option selected when the table first renders. Defaults to All, which is
+   * right for most tables — set it where the complete list is mostly noise and
+   * the operator would immediately narrow it themselves.
+   */
+  initial?: string;
 }
 
 const ALL = "__all__";
@@ -85,7 +91,13 @@ export function DataTable<T>({
       setRefreshing(false);
     }
   };
-  const [filterValues, setFilterValues] = useState<Record<string, string>>({});
+  // Seeded once from the filter definitions, not kept in step with them: this
+  // is where the table starts, and after that it is the operator's choice.
+  const [filterValues, setFilterValues] = useState<Record<string, string>>(() =>
+    Object.fromEntries(
+      filters.filter((f) => f.initial).map((f) => [f.key, f.initial as string]),
+    ),
+  );
   const [sortKey, setSortKey] = useState<string | null>(null);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
   const [selected, setSelected] = useState<Set<string>>(new Set());

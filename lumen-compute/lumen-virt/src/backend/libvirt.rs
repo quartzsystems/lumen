@@ -396,6 +396,45 @@ impl VirtBackend for LibvirtBackend {
         })
         .await
     }
+
+    async fn guest_agent(&self, name: &str, command: &str) -> Result<String> {
+        let command = command.to_string();
+        self.with_domain(name, move |domain| {
+            // The timeout is in seconds and is deliberately short. A guest
+            // whose agent is installed but wedged must not hold a blocking
+            // thread indefinitely, and every command this appliance sends is
+            // one the agent answers immediately or not at all.
+            domain.qemu_agent_command(&command, GUEST_AGENT_TIMEOUT_SECS, 0)
+        })
+        .await
+        .map_err(explain_agent_failure)
+    }
+}
+
+/// How long to wait for a guest's agent, in seconds.
+const GUEST_AGENT_TIMEOUT_SECS: i32 = 10;
+
+/// The hypervisor's words about an agent, in the operator's.
+///
+/// This is the one call whose failure is usually not about the node at all:
+/// almost every time, the guest simply has no `qemu-guest-agent` running, and
+/// the hypervisor reports that as "Guest agent is not responding" — true, and
+/// unactionable unless you already know what a guest agent is. The distinction
+/// matters enough to name: nothing is wrong with the machine, something is
+/// missing inside it.
+fn explain_agent_failure(err: VirtError) -> VirtError {
+    let said = err.to_string();
+    let no_agent = said.contains("not responding")
+        || said.contains("not connected")
+        || said.contains("QEMU guest agent is not available");
+    if !no_agent {
+        return err;
+    }
+    VirtError::Conflict(format!(
+        "This machine's guest agent did not answer ({said}). Copying a file in needs \
+         qemu-guest-agent installed and running inside the guest — on this appliance's own \
+         images it is there, and on a guest installed from other media it usually is not."
+    ))
 }
 
 #[cfg(test)]

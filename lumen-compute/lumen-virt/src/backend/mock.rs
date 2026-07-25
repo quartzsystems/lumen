@@ -60,6 +60,17 @@ struct Inner {
     /// What `start` records as the start time. Fixed rather than read from a
     /// clock, so an uptime assertion is not a race.
     now: u64,
+    /// Whether the guests here have an agent that answers. A guest somebody
+    /// installed from their own media usually has none, so "no agent" is an
+    /// ordinary state a test asks for rather than a failure to simulate.
+    agent_answers: bool,
+    /// Files the agent currently has open, by handle: where it is going, and
+    /// what has arrived so far.
+    agent_open: BTreeMap<i64, (String, Vec<u8>)>,
+    /// What actually landed inside the guest, by path — the thing a test about
+    /// pushing a file in wants to look at.
+    guest_files: BTreeMap<String, Vec<u8>>,
+    next_agent_handle: i64,
 }
 
 pub struct MockBackend {
@@ -88,8 +99,24 @@ impl MockBackend {
                 refuse_live: None,
                 next_uuid: 1,
                 now: 1_785_000_000,
+                agent_answers: true,
+                agent_open: BTreeMap::new(),
+                guest_files: BTreeMap::new(),
+                next_agent_handle: 1000,
             }),
         }
+    }
+
+    /// A node whose guests have no agent in them — the ordinary case for a
+    /// machine somebody installed themselves.
+    pub fn without_guest_agent(self) -> Self {
+        self.inner.lock().unwrap().agent_answers = false;
+        self
+    }
+
+    /// What a file pushed into a guest actually contains, on the other side.
+    pub fn guest_file(&self, path: &str) -> Option<Vec<u8>> {
+        self.inner.lock().unwrap().guest_files.get(path).cloned()
     }
 
     /// Make every live change fail, so the service has to report the change as
@@ -440,6 +467,80 @@ impl VirtBackend for MockBackend {
         entry.started_at = started;
         Ok(())
     }
+
+    /// A fake rather than a mock: it applies the three file commands to an
+    /// in-memory guest, so the round trip the service actually performs —
+    /// open, write in chunks, close — is the thing under test rather than a
+    /// record of three calls having been made.
+    async fn guest_agent(&self, name: &str, command: &str) -> Result<String> {
+        let mut inner = self.inner.lock().unwrap();
+        {
+            // The machine has to be there and be up, exactly as on a real node:
+            // there is no agent to talk to in a machine that is switched off.
+            let entry = inner.entry(name)?;
+            if !entry.state.is_running() {
+                return Err(VirtError::Conflict(format!("\"{name}\" is not running.")));
+            }
+        }
+        if !inner.agent_answers {
+            return Err(VirtError::Conflict(format!(
+                "This machine's guest agent did not answer. Copying a file in needs \
+                 qemu-guest-agent installed and running inside \"{name}\"."
+            )));
+        }
+
+        let request: serde_json::Value = serde_json::from_str(command).map_err(|err| {
+            VirtError::Backend(anyhow::anyhow!("not a guest agent command: {err}"))
+        })?;
+        let execute = request
+            .get("execute")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let arguments = request.get("arguments").cloned().unwrap_or_default();
+        let argument = |key: &str| arguments.get(key).cloned().unwrap_or_default();
+
+        match execute.as_str() {
+            "guest-file-open" => {
+                let path = argument("path").as_str().unwrap_or_default().to_string();
+                let handle = inner.next_agent_handle;
+                inner.next_agent_handle += 1;
+                inner.agent_open.insert(handle, (path, Vec::new()));
+                Ok(format!("{{\"return\": {handle}}}"))
+            }
+            "guest-file-write" => {
+                let handle = argument("handle").as_i64().unwrap_or(-1);
+                let encoded = argument("buf-b64").as_str().unwrap_or_default().to_string();
+                let bytes = base64_decode(&encoded)?;
+                let written = bytes.len();
+                let open = inner.agent_open.get_mut(&handle).ok_or_else(|| {
+                    VirtError::Conflict(format!("no file is open on handle {handle}."))
+                })?;
+                open.1.extend_from_slice(&bytes);
+                Ok(format!(
+                    "{{\"return\": {{\"count\": {written}, \"eof\": false}}}}"
+                ))
+            }
+            "guest-file-close" => {
+                let handle = argument("handle").as_i64().unwrap_or(-1);
+                let (path, contents) = inner.agent_open.remove(&handle).ok_or_else(|| {
+                    VirtError::Conflict(format!("no file is open on handle {handle}."))
+                })?;
+                inner.guest_files.insert(path, contents);
+                Ok("{\"return\": {}}".to_string())
+            }
+            other => Err(VirtError::Conflict(format!(
+                "the mock guest agent does not implement \"{other}\"."
+            ))),
+        }
+    }
+}
+
+fn base64_decode(encoded: &str) -> Result<Vec<u8>> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|err| VirtError::Backend(anyhow::anyhow!("the agent was sent bad base64: {err}")))
 }
 
 #[cfg(test)]

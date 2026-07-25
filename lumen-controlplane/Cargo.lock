@@ -750,6 +750,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
  "lumen-net",
  "lumen-zfs",
  "quick-xml",

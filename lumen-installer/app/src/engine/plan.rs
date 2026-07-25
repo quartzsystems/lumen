@@ -273,6 +273,27 @@ pub fn build_plan(cfg: &InstallConfig, pins: &BuildPins) -> Vec<Step> {
                 "echo 'root:{}' | chroot {TARGET} chpasswd -e",
                 cfg.root_password_hash
             )),
+            // EL10 ships `PermitRootLogin prohibit-password`, which means the
+            // password just set above works at the keyboard and in the console
+            // and nowhere else — `ssh root@node` asks, refuses, and says
+            // nothing about why. On a general-purpose server that default is
+            // right; on an appliance whose documented recovery path is "log in
+            // as root" it is a promise the image does not keep.
+            //
+            // A drop-in rather than an edit of sshd_config: the stock file
+            // stays the distribution's, this is one file that says one thing,
+            // and an operator who wants the default back deletes it. It sorts
+            // after 50-redhat.conf, and for this keyword sshd takes the first
+            // value it reads — hence the low number.
+            Action::WriteFile {
+                path: format!("{TARGET}/etc/ssh/sshd_config.d/01-lumen-root.conf"),
+                contents: "# Lumen: root is this appliance's recovery account, and recovery over\n\
+                           # the network is the point of it. Delete this file to return to the\n\
+                           # distribution's default of key-only root login.\n\
+                           PermitRootLogin yes\n"
+                    .into(),
+                mode: 0o600,
+            },
             cmd(&[
                 "ln",
                 "-sfn",

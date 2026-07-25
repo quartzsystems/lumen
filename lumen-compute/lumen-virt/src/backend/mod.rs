@@ -115,4 +115,18 @@ pub trait VirtBackend: Send + Sync {
     /// when the machine stops. Used for the start time an uptime is measured
     /// from; see [`crate::domain_xml::live_metadata`].
     async fn set_live_metadata(&self, name: &str, metadata_xml: &str) -> Result<()>;
+
+    /// Ask the guest's own agent to do something, and hand back its reply.
+    ///
+    /// `command` is one QEMU guest agent request as JSON — `{"execute": …,
+    /// "arguments": {…}}` — and the answer is the JSON it sends back. Nothing
+    /// here interprets either: the caller composes the request and reads the
+    /// reply, because the agent's vocabulary is the agent's and not something
+    /// this trait should mirror.
+    ///
+    /// This is the one call in the trait that depends on software *inside* the
+    /// guest. A machine without `qemu-guest-agent` running is not broken and is
+    /// not a hypervisor failure — it simply cannot be asked, and the refusal
+    /// says so in those words rather than in the hypervisor's.
+    async fn guest_agent(&self, name: &str, command: &str) -> Result<String>;
 }

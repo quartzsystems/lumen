@@ -149,39 +149,60 @@ export default function MaintenancePage() {
             </Facts>
           </Panel>
 
-          <Panel title="Restart">
-            <div className="flex flex-col gap-4">
-              <p className="text-[13px] text-[var(--qz-fg-3)] m-0">
-                Every virtual machine on this node stops with it. Machines with{" "}
-                <strong>Start on boot</strong> turned on come back by themselves; the rest have to be
-                started again. This console is unreachable until the node is up.
-              </p>
-              <div className="flex items-center gap-2 flex-wrap">
-                <Button kind="danger" icon={RotateCw} disabled={busy} onClick={() => setConfirming("reboot")}>
-                  Restart now
-                </Button>
-                <Button
-                  kind="secondary"
-                  icon={CalendarClock}
-                  disabled={busy}
-                  onClick={() => setScheduling(true)}
-                >
-                  Schedule…
-                </Button>
+          {/* One card, because restarting and shutting down are one decision
+              made in one place — two cards read as two unrelated features and
+              put the more destructive of the pair further down the page. Each
+              still keeps its own sentence next to its own button: the
+              difference between them is the whole point. */}
+          <Panel title="Power options">
+            <div className="flex flex-col gap-5">
+              <div className="flex flex-col gap-3">
+                <div className="text-[13px] font-semibold text-[var(--qz-fg-1)]">Restart</div>
+                <p className="text-[13px] text-[var(--qz-fg-3)] m-0">
+                  Every virtual machine on this node stops with it. Machines with{" "}
+                  <strong>Start on boot</strong> turned on come back by themselves; the rest have to
+                  be started again. This console is unreachable until the node is up.
+                </p>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <Button
+                    kind="danger"
+                    icon={RotateCw}
+                    disabled={busy}
+                    onClick={() => setConfirming("reboot")}
+                  >
+                    Restart Now
+                  </Button>
+                  <Button
+                    kind="secondary"
+                    icon={CalendarClock}
+                    disabled={busy}
+                    onClick={() => setScheduling(true)}
+                  >
+                    Schedule…
+                  </Button>
+                </div>
               </div>
-            </div>
-          </Panel>
 
-          <Panel title="Shut down">
-            <div className="flex flex-col gap-4">
-              <p className="text-[13px] text-[var(--qz-fg-3)] m-0">
-                The node powers off and stays off. Bringing it back needs somebody at the machine, or
-                out-of-band management if this node has any — there is nothing this console can do
-                once it is off.
-              </p>
-              <Button kind="danger" icon={Power} disabled={busy} onClick={() => setConfirming("power_off")}>
-                Shut down now
-              </Button>
+              <div style={{ borderTop: "1px solid var(--qz-border)" }} />
+
+              <div className="flex flex-col gap-3">
+                <div className="text-[13px] font-semibold text-[var(--qz-fg-1)]">Shut down</div>
+                <p className="text-[13px] text-[var(--qz-fg-3)] m-0">
+                  The node powers off and stays off. Bringing it back needs somebody at the machine,
+                  or out-of-band management if this node has any — there is nothing this console can
+                  do once it is off.
+                </p>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <Button
+                    kind="danger"
+                    icon={Power}
+                    disabled={busy}
+                    onClick={() => setConfirming("power_off")}
+                  >
+                    Shut Down Now
+                  </Button>
+                </div>
+              </div>
             </div>
           </Panel>
         </div>
@@ -301,7 +322,7 @@ function ConfirmPowerDialog({
           saving={working}
           disabled={!confirmed}
           savingLabel="Sending…"
-          submitLabel={reboot ? "Restart now" : "Shut down now"}
+          submitLabel={reboot ? "Restart Now" : "Shut Down Now"}
           onSubmit={run}
         />
       </div>

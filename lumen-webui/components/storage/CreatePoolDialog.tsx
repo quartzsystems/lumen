@@ -123,7 +123,11 @@ export function CreatePoolDialog({
   const duplicate = existingNames.some((existing) => existing === name.trim());
 
   return (
-    <ModalShell onClose={onClose}>
+    // Wider than the default: a disk row carries a name, a size, a model, and
+    // up to two badges, and at 520 the model is the part that gets truncated —
+    // which is exactly the part an operator uses to tell two identical-looking
+    // disks apart before reformatting one of them.
+    <ModalShell onClose={onClose} maxWidth={680}>
       <ModalHeader
         title="Create a storage pool"
         subtitle="Every disk chosen is reformatted. There is no undo."

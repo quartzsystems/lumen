@@ -344,6 +344,36 @@ export const detachNic = (vmid: number, id: string): Promise<VmUpdateResponse> =
 export const fetchConsole = (vmid: number): Promise<ConsoleInfo> =>
   apiFetch<ConsoleInfo>(`/vms/${vmid}/console`);
 
+// --- files into a guest ------------------------------------------------------
+
+/// What came back after a file was copied in.
+export interface PushedFile {
+  vmid: number;
+  path: string;
+  bytes: number;
+}
+
+/// The most a guest agent will take, matching lumen_virt::MAX_GUEST_FILE_BYTES.
+///
+/// Checked here as well as on the node, not instead of it: a refusal that
+/// arrives before a 16 MiB upload is a better answer than one that arrives
+/// after.
+export const MAX_GUEST_FILE_BYTES = 16 * 1024 * 1024;
+
+/// Copy a file into a running guest.
+///
+/// The body is the file itself rather than a form: there is one field and its
+/// name is already in the query. It travels through the guest's own agent
+/// rather than over the console's connection — there is no file transfer in
+/// RFB, and this is the only way in that does not need the guest's network.
+export const pushFile = (vmid: number, path: string, file: File): Promise<PushedFile> =>
+  apiFetch<PushedFile>(`/vms/${vmid}/files?path=${encodeURIComponent(path)}`, {
+    method: "PUT",
+    body: file,
+    // Overrides apiFetch's JSON default: the body is bytes, not a document.
+    headers: { "Content-Type": "application/octet-stream" },
+  });
+
 /// The absolute URL of the console stream.
 ///
 /// Built from the page's own origin rather than from anything configured: the

@@ -130,7 +130,19 @@ pub async fn attach(
     // opened the socket, or a machine that stopped between the check above and
     // this line, is a sentence the console can show — and it can only be a
     // sentence while this is still an HTTP request.
+    // Logged as well as returned, and that is not belt and braces: a browser
+    // cannot read the body of a failed WebSocket handshake — it gets a close
+    // and nothing else — so this sentence reaches the operator only through the
+    // journal. Without it the console fails with "the connection ended" and no
+    // node-side record of why.
     let stream = UnixStream::connect(&target.socket).await.map_err(|err| {
+        tracing::warn!(
+            vmid,
+            name = %target.name,
+            socket = %target.socket,
+            error = %err,
+            "could not open the console socket"
+        );
         ApiError::Conflict(format!(
             "Could not open the console of \"{}\": {err} ({}).",
             target.name, target.socket

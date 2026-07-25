@@ -33,6 +33,9 @@ lumen-net = { path = "../../lumen-networking/lumen-net" }
 lumen-zfs = { path = "../../lumen-storage/lumen-zfs" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The guest agent takes file contents as base64 inside a JSON message, so a
+# file pushed into a guest is encoded a chunk at a time on the way through.
+base64 = "0.22"
 anyhow = "1"
 async-trait = "0.1"
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
@@ -42,7 +45,12 @@ tracing = "0.1"
 # else in the tree.
 quick-xml = "0.37"
 # The official libvirt bindings. See the note above: no bindgen, no libclang.
-virt = "0.4"
+#
+# The `qemu` feature is what exposes `virDomainQemuAgentCommand`, and with it
+# the only way to reach software running *inside* a guest. It links
+# libvirt-qemu, which ships in the same libvirt-libs package as the core
+# library — no new dependency on the appliance, only one more symbol.
+virt = { version = "0.4", features = ["qemu"] }
 # The same bindings' constant layer, so flags are named rather than numeric.
 # It is `virt`'s own dependency; naming it here only makes it importable.
 virt-sys = "0.3"

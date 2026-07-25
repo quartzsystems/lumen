@@ -3,8 +3,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
+  ClipboardPaste,
   ExternalLink,
   Eye,
+  FileUp,
   Keyboard,
   Maximize2,
   Monitor,
@@ -14,9 +16,28 @@ import {
 } from "lucide-react";
 import type RFB from "@novnc/novnc";
 import { Button } from "@/components/ui/Button";
-import { Fact, Facts, Mono, Panel } from "@/components/vm/VmBits";
+import { ModalHeader, ModalShell } from "@/components/ui/Modal";
+import {
+  ErrorText,
+  Field,
+  ModalFooter,
+  TextInput,
+  blurBorder,
+  focusBorder,
+  inputCls,
+  monoSt,
+} from "@/components/ui/formkit";
+import { Panel } from "@/components/vm/VmBits";
 import { LifecycleControls } from "@/components/vm/LifecycleControls";
-import { consoleUrl, fetchConsole, type ConsoleInfo, type VmView } from "@/lib/vmClient";
+import {
+  consoleUrl,
+  fetchConsole,
+  formatBytes,
+  MAX_GUEST_FILE_BYTES,
+  pushFile,
+  type ConsoleInfo,
+  type VmView,
+} from "@/lib/vmClient";
 
 /// Where the console viewer is in its life.
 ///
@@ -59,28 +80,15 @@ export function VmConsole({
     );
   }
 
+  // Nothing under the screen: the socket path, the protocol, and the node were
+  // three facts an operator reads once and never again, and they were taking
+  // the bottom third of the page from the only thing on it. The socket is still
+  // named where it is worth naming — on the veil, when the console could not be
+  // opened and the path is part of the diagnosis.
   return (
-    <div className="flex flex-col gap-4">
-      {/* Keyed on the machine so opening a different one starts a new
-          connection rather than pointing the old viewer somewhere else. */}
-      <ConsoleScreen key={vm.vmid} vmid={vm.vmid} name={vm.name} popout />
-      <Panel title="Connection">
-        <Facts>
-          <Fact label="Protocol">VNC</Fact>
-          <Fact label="Socket">
-            <Mono>{vm.vnc_socket}</Mono>
-          </Fact>
-          <Fact label="Node">
-            <Mono>{vm.node}</Mono>
-          </Fact>
-        </Facts>
-        <p className="text-[12px] text-[var(--qz-fg-4)] mt-4 mb-0">
-          The stream is the hypervisor&rsquo;s own, carried over this
-          console&rsquo;s connection and not interpreted on the way through. It
-          is reachable only with the session you are already signed in with.
-        </p>
-      </Panel>
-    </div>
+    // Keyed on the machine so opening a different one starts a new connection
+    // rather than pointing the old viewer somewhere else.
+    <ConsoleScreen key={vm.vmid} vmid={vm.vmid} name={vm.name} popout />
   );
 }
 
@@ -110,6 +118,15 @@ export function ConsoleScreen({
   const [fit, setFit] = useState(true);
   const [viewOnly, setViewOnly] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
+  /// The text of the fallback paste dialog, or `null` when it is closed. Only
+  /// opened when the browser will not hand over its clipboard by itself.
+  const [pasting, setPasting] = useState<string | null>(null);
+  /// A file dragged onto the screen, waiting for somebody to say where it goes.
+  const [dropped, setDropped] = useState<File | null>(null);
+  /// Whether a drag is currently over the screen, for the overlay.
+  const [dragging, setDragging] = useState(false);
+  /// The last file that made it in, shown briefly in the toolbar.
+  const [delivered, setDelivered] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -170,6 +187,19 @@ export function ConsoleScreen({
       });
       rfb.addEventListener("desktopname", (event) => {
         if (!cancelled) setDesktop(event.detail.name);
+      });
+      // The guest copied something. Writing it into the browser's clipboard is
+      // best-effort on purpose: the permission is the browser's to give, it is
+      // refused outright when the document is not focused, and a console that
+      // threw an error because somebody pressed Ctrl+C in a guest they were not
+      // looking at would be worse than one that quietly did not.
+      rfb.addEventListener("clipboard", (event) => {
+        if (cancelled) return;
+        const text = event.detail.text;
+        if (typeof text !== "string" || text === "") return;
+        void navigator.clipboard?.writeText(text).catch(() => {
+          /* not focused, or not permitted — the guest still has it */
+        });
       });
       // Lumen's console socket has no password of its own — reaching it at all
       // means being root on the node — so being asked for one means the
@@ -234,10 +264,85 @@ export function ConsoleScreen({
     else void frameRef.current?.requestFullscreen();
   }, []);
 
+  /// Put text on the guest's clipboard.
+  ///
+  /// This does not type it. It hands the string to the guest's clipboard agent,
+  /// and the paste inside the guest is still the operator's own Ctrl+V — which
+  /// is what makes it work in a terminal, in an installer's text field, and in
+  /// anything else that knows how to paste.
+  const sendClipboard = useCallback((text: string) => {
+    if (text) rfbRef.current?.clipboardPasteFrom(text);
+  }, []);
+
+  const pasteFromBrowser = useCallback(async () => {
+    // The Clipboard API is the good path, and it needs both a secure context
+    // and the operator's permission. Everything that is not that — an insecure
+    // origin in development, a browser without the API, a refused prompt —
+    // falls back to asking for the text outright instead of failing silently.
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text) {
+        sendClipboard(text);
+        return;
+      }
+    } catch {
+      /* fall through to the dialog */
+    }
+    setPasting("");
+  }, [sendClipboard]);
+
+  // A real paste, when the browser lets one through. noVNC swallows most key
+  // presses to send them to the guest, so this fires only when the frame has
+  // focus but the canvas does not — worth having, not worth relying on, which
+  // is why the toolbar has a button as well.
+  useEffect(() => {
+    const onPaste = (event: ClipboardEvent) => {
+      if (!frameRef.current?.contains(document.activeElement)) return;
+      const text = event.clipboardData?.getData("text");
+      if (text) {
+        event.preventDefault();
+        sendClipboard(text);
+      }
+    };
+    document.addEventListener("paste", onPaste);
+    return () => document.removeEventListener("paste", onPaste);
+  }, [sendClipboard]);
+
+  // A delivered-file note is worth seeing and not worth keeping.
+  useEffect(() => {
+    if (!delivered) return;
+    const timer = setTimeout(() => setDelivered(null), 6000);
+    return () => clearTimeout(timer);
+  }, [delivered]);
+
   const connected = status.kind === "connected";
 
   return (
-    <div className="qz-console" ref={frameRef}>
+    <div
+      className="qz-console"
+      ref={frameRef}
+      onDragOver={(event) => {
+        // Only a file drag. Dragging selected text across the screen is not an
+        // offer to copy anything into the guest.
+        if (!event.dataTransfer.types.includes("Files")) return;
+        event.preventDefault();
+        event.dataTransfer.dropEffect = "copy";
+        setDragging(true);
+      }}
+      onDragLeave={(event) => {
+        // Moving between children fires dragleave too, so the frame is only
+        // really left when what is being entered is outside it.
+        if (frameRef.current?.contains(event.relatedTarget as Node | null)) return;
+        setDragging(false);
+      }}
+      onDrop={(event) => {
+        if (!event.dataTransfer.types.includes("Files")) return;
+        event.preventDefault();
+        setDragging(false);
+        const file = event.dataTransfer.files?.[0];
+        if (file) setDropped(file);
+      }}
+    >
       <div className="qz-console-bar">
         <span className="qz-console-status">
           <span
@@ -252,6 +357,11 @@ export function ConsoleScreen({
               ? (desktop ?? name)
               : "Not connected"}
         </span>
+        {delivered && (
+          <span className="text-[12px] text-[var(--qz-fg-3)]">
+            Copied <span className="qz-mono">{delivered}</span> into the guest
+          </span>
+        )}
 
         <div className="ml-auto flex items-center gap-2">
           <Button
@@ -263,6 +373,17 @@ export function ConsoleScreen({
           >
             Ctrl+Alt+Del
           </Button>
+          <span title="Put this browser's clipboard on the guest's, then paste inside the guest">
+            <Button
+              kind="secondary"
+              size="sm"
+              icon={ClipboardPaste}
+              disabled={!connected || viewOnly}
+              onClick={() => void pasteFromBrowser()}
+            >
+              Paste
+            </Button>
+          </span>
           <Toggle
             icon={Scaling}
             on={fit}
@@ -332,7 +453,180 @@ export function ConsoleScreen({
           </div>
         )}
       </div>
+
+      {pasting !== null && (
+        <PasteDialog
+          text={pasting}
+          onChange={setPasting}
+          onClose={() => setPasting(null)}
+          onSend={() => {
+            sendClipboard(pasting);
+            setPasting(null);
+          }}
+        />
+      )}
+
+      {dragging && (
+        <div className="qz-console-drop">
+          <FileUp size={26} className="text-[var(--qz-accent)]" />
+          <span>Drop a file to copy it into {name}</span>
+        </div>
+      )}
+
+      {dropped && (
+        <PushFileDialog
+          vmid={vmid}
+          name={name}
+          file={dropped}
+          onClose={() => setDropped(null)}
+          onPushed={(path) => {
+            setDropped(null);
+            setDelivered(path);
+          }}
+        />
+      )}
     </div>
+  );
+}
+
+/// Where a dropped file is going, and the copy itself.
+///
+/// The path is asked for rather than assumed. A guest is somebody else's
+/// filesystem — the console has no idea what is on it, whether it is Linux at
+/// all, or what would be overwritten — so the one thing this must not do is
+/// pick a destination quietly and write over something.
+function PushFileDialog({
+  vmid,
+  name,
+  file,
+  onClose,
+  onPushed,
+}: {
+  vmid: number;
+  name: string;
+  file: File;
+  onClose: () => void;
+  onPushed: (path: string) => void;
+}) {
+  const [path, setPath] = useState(`/root/${file.name}`);
+  const [working, setWorking] = useState(false);
+  const [error, setError] = useState("");
+
+  const tooBig = file.size > MAX_GUEST_FILE_BYTES;
+
+  const send = async () => {
+    setWorking(true);
+    setError("");
+    try {
+      const result = await pushFile(vmid, path.trim(), file);
+      onPushed(result.path);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not copy the file into the guest.");
+      setWorking(false);
+    }
+  };
+
+  return (
+    <ModalShell onClose={onClose}>
+      <ModalHeader
+        title={`Copy into ${name}`}
+        subtitle="The guest's own agent writes this, so the machine has to be running."
+        onClose={onClose}
+      />
+      <div className="flex flex-col gap-4">
+        <div className="qz-facts">
+          <dt>File</dt>
+          <dd className="qz-mono">{file.name}</dd>
+          <dt>Size</dt>
+          <dd>
+            {formatBytes(file.size)}
+            {tooBig && (
+              <span style={{ color: "var(--qz-danger)" }}>
+                {" "}
+                — more than the {formatBytes(MAX_GUEST_FILE_BYTES)} a guest agent will take
+              </span>
+            )}
+          </dd>
+        </div>
+
+        <Field
+          label="Where it goes, inside the guest"
+          htmlFor="push-path"
+          hint="A full path. Anything already there is replaced."
+        >
+          <TextInput id="push-path" value={path} onChange={setPath} mono autoFocus />
+        </Field>
+
+        <p className="text-[12px] text-[var(--qz-fg-4)] m-0">
+          This goes over the guest agent, not over the console — so it needs{" "}
+          <span className="qz-mono">qemu-guest-agent</span> running inside the machine, and the
+          file lands with whatever ownership that agent has. It is meant for a script, a key, or a
+          configuration file; anything large belongs on a disk or on installation media.
+        </p>
+
+        <ErrorText msg={error} />
+        <ModalFooter
+          onCancel={onClose}
+          saving={working}
+          disabled={!path.trim().startsWith("/") || tooBig}
+          savingLabel="Copying…"
+          submitLabel="Copy in"
+          onSubmit={send}
+        />
+      </div>
+    </ModalShell>
+  );
+}
+
+/// Where text goes when the browser will not hand over its clipboard.
+///
+/// Not a lesser path to apologise for: an insecure origin in development, a
+/// browser without the Clipboard API, and an operator who said no to the prompt
+/// all end up here, and typing into a box is a thing that always works.
+function PasteDialog({
+  text,
+  onChange,
+  onClose,
+  onSend,
+}: {
+  text: string;
+  onChange: (value: string) => void;
+  onClose: () => void;
+  onSend: () => void;
+}) {
+  return (
+    <ModalShell onClose={onClose}>
+      <ModalHeader
+        title="Paste into the guest"
+        subtitle="This goes onto the guest's clipboard. Paste it inside the guest as usual."
+        onClose={onClose}
+      />
+      <div className="flex flex-col gap-4">
+        <textarea
+          value={text}
+          autoFocus
+          rows={6}
+          onChange={(event) => onChange(event.target.value)}
+          className={inputCls}
+          style={{ ...monoSt, resize: "vertical", lineHeight: 1.5 }}
+          onFocus={focusBorder}
+          onBlur={blurBorder}
+          placeholder="Text to put on the guest's clipboard"
+        />
+        <p className="text-[12px] text-[var(--qz-fg-4)] m-0">
+          The guest needs <span className="qz-mono">spice-vdagent</span> running for this to reach
+          it. A machine without one takes the text and does nothing with it.
+        </p>
+        <ModalFooter
+          onCancel={onClose}
+          saving={false}
+          disabled={!text}
+          savingLabel="Sending…"
+          submitLabel="Send"
+          onSubmit={onSend}
+        />
+      </div>
+    </ModalShell>
   );
 }
 

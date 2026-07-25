@@ -10,11 +10,14 @@
 
 # cargo (make targets build into build/cargo-target; this covers plain
 # `cargo build` runs inside the crate directories)
-lumen-installer/app/target/
-lumen-controlplane/target/
-lumen-networking/lumen-net/target/
-lumen-storage/lumen-zfs/target/
-lumen-compute/lumen-virt/target/
+#
+# Deliberately a pattern rather than one line per crate. The list used to be
+# enumerated, lumen-sys was added without its line, and the first `cargo test`
+# in that directory put eleven hundred build artifacts in front of a commit.
+# Every crate here is its own cargo project, so "a directory called target next
+# to a Cargo.toml" is the actual rule — write that instead of a list that has
+# to be remembered.
+target/
 
 # Editor / OS noise
 *.swp

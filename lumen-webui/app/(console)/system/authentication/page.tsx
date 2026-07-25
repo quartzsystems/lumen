@@ -113,7 +113,8 @@ export default function AuthenticationPage() {
             and this page can never disagree. Membership of{" "}
             <span className="qz-mono">{adminGroup}</span> is what grants administrative rights.{" "}
             <span className="qz-mono">root</span> is shown but is not changed from here: it is the
-            account this appliance is recovered with.
+            account this appliance is recovered with. The accounts the operating system made for
+            its own daemons are hidden — <strong>Show ▸ Service accounts</strong> lists them.
           </p>
         </div>
       </PageBody>
@@ -164,6 +165,15 @@ export default function AuthenticationPage() {
     </Page>
   );
 }
+
+/// An account the operating system made for a daemon to run as, rather than
+/// one somebody signs in with.
+///
+/// The backend's `system` flag is the plain identifier fact — below the human
+/// floor — and `root` is on the wrong side of it. It is nonetheless the first
+/// account an operator looks for on this page: it is what this appliance is
+/// recovered with. So the console draws the line one uid to the left.
+const isService = (user: UserView) => user.system && user.uid !== 0;
 
 // --- the table ---------------------------------------------------------------
 
@@ -289,17 +299,21 @@ function UsersTable({
 
   // The filters offer what is actually on this node rather than every value
   // the API can produce — and "people" versus "the operating system's" is the
-  // one an operator opening this page nearly always wants.
+  // one an operator opening this page nearly always wants, which is why it
+  // starts there rather than at All. A fresh AlmaLinux node has around twenty
+  // accounts nobody made, and a table that opens on them buries the three that
+  // matter.
   const filters: FilterDef<UserView>[] = useMemo(
     () => [
       {
         key: "kind",
         label: "Show",
+        initial: "people",
         options: [
           { value: "people", label: "People" },
-          { value: "system", label: "System accounts" },
+          { value: "system", label: "Service accounts" },
         ],
-        predicate: (user, value) => (value === "system" ? user.system : !user.system),
+        predicate: (user, value) => (value === "system" ? isService(user) : !isService(user)),
       },
       {
         key: "role",

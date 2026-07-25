@@ -50,6 +50,15 @@ pub const OSINFO_NS: &str = "http://libosinfo.org/xmlns/libvirt/domain/1.0";
 /// The channel name a guest agent is reached on. Fixed by the agent itself.
 const GUEST_AGENT_CHANNEL: &str = "org.qemu.guest_agent.0";
 
+/// The channel a guest's clipboard agent is reached on.
+///
+/// The name is SPICE's and looks out of place on a VNC machine, but it is what
+/// `spice-vdagent` binds to inside the guest and it is not ours to choose.
+/// QEMU's `qemu-vdagent` backend speaks the same protocol over it and hands the
+/// clipboard to the VNC server, which is how a console with no SPICE in it
+/// anywhere ends up with copy and paste.
+const CLIPBOARD_CHANNEL: &str = "com.redhat.spice.0";
+
 /// Where a machine's console socket lives. Predictable rather than assigned by
 /// the hypervisor, so the console viewer can find it without a lookup, and so a
 /// policy rule can name it.
@@ -199,6 +208,27 @@ pub fn render(config: &VmConfig) -> String {
         );
         out.push_str("    </channel>\n");
     }
+    // The clipboard. Unconditional, like the console it belongs to: it is not a
+    // choice an operator would know how to make, and a machine that turns out
+    // not to have `spice-vdagent` in it has an idle virtio port rather than a
+    // problem — the channel simply never connects.
+    //
+    // `mouse mode='server'` is deliberate. The agent can also own the pointer,
+    // which gets absolute positioning without a tablet device, but it means a
+    // guest that has not started its agent yet — an installer, a machine at a
+    // firmware prompt, exactly when the console matters most — has no working
+    // mouse at all. The clipboard is worth having; the pointer is already
+    // solved.
+    out.push_str("    <channel type='qemu-vdagent'>\n");
+    out.push_str("      <source>\n");
+    out.push_str("        <clipboard copypaste='yes'/>\n");
+    out.push_str("        <mouse mode='server'/>\n");
+    out.push_str("      </source>\n");
+    let _ = writeln!(
+        out,
+        "      <target type='virtio' name='{CLIPBOARD_CHANNEL}'/>"
+    );
+    out.push_str("    </channel>\n");
     // Defined from the very first machine even though the console arrives in
     // part 2: adding it later would mean redefining every domain that already
     // exists, and a redefine is the one operation an operator has no reason to
@@ -262,26 +292,33 @@ fn render_metadata(out: &mut String, config: &VmConfig, started_at: Option<u64>)
 /// is up, which is what an uptime needs: it survives a control-plane restart
 /// (the hypervisor is holding it, not us) and it disappears by itself when the
 /// machine stops, so there is no stale start time to clean up.
+///
+/// ## No prefix, and no declaration — unlike [`render_metadata`]
+///
+/// Inside a document the element is written `<lumen:vm xmlns:lumen='…'>`,
+/// because there it has to carry its own namespace. Here it must not, and the
+/// difference is not cosmetic: `virDomainSetMetadata` takes the namespace as
+/// *arguments* — the prefix and the URI — copies this element, and then calls
+/// `xmlNewNs` on the copy to attach them. libxml2 refuses to declare a prefix
+/// that the node already declares and answers with NULL, which libvirt reports
+/// as `internal error: failed to create a new XML namespace`. So a metadata
+/// element that declares the namespace itself can never be set, on any machine,
+/// ever — the start time simply never records.
+///
+/// Reading it back is unaffected either way: [`parse`] matches on local names,
+/// so `vm/started` and `lumen:vm/lumen:started` are the same path to it.
 pub fn live_metadata(config: &VmConfig, started_at: u64) -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "<lumen:vm xmlns:lumen='{LUMEN_NS}'>");
-    let _ = writeln!(out, "  <lumen:vmid>{}</lumen:vmid>", config.vmid);
+    out.push_str("<vm>\n");
+    let _ = writeln!(out, "  <vmid>{}</vmid>", config.vmid);
     if let Some(description) = config.description.as_deref().filter(|d| !d.is_empty()) {
-        let _ = writeln!(
-            out,
-            "  <lumen:description>{}</lumen:description>",
-            text(description)
-        );
+        let _ = writeln!(out, "  <description>{}</description>", text(description));
     }
     if !config.tags.is_empty() {
-        let _ = writeln!(
-            out,
-            "  <lumen:tags>{}</lumen:tags>",
-            text(&config.tags.join(","))
-        );
+        let _ = writeln!(out, "  <tags>{}</tags>", text(&config.tags.join(",")));
     }
-    let _ = writeln!(out, "  <lumen:started>{started_at}</lumen:started>");
-    out.push_str("</lumen:vm>");
+    let _ = writeln!(out, "  <started>{started_at}</started>");
+    out.push_str("</vm>");
     out
 }
 
@@ -1203,6 +1240,44 @@ mod tests {
         assert_eq!(
             vnc_socket_of(&xml).as_deref(),
             Some(vnc_socket_path(101).as_str())
+        );
+    }
+
+    /// `virDomainSetMetadata` attaches the namespace itself, from the prefix
+    /// and URI it is given. An element that also declares it makes libxml2
+    /// refuse the duplicate prefix, and libvirt turns that into "internal
+    /// error: failed to create a new XML namespace" — so this is not a style
+    /// rule, it is the difference between recording a start time and never
+    /// recording one on any machine.
+    #[test]
+    fn live_metadata_leaves_the_namespace_to_the_hypervisor() {
+        let metadata = live_metadata(&sample(), 1_700_000_000);
+        assert!(
+            !metadata.contains("xmlns"),
+            "the element must not declare the namespace it is about to be given: {metadata}"
+        );
+        assert!(
+            !metadata.contains("lumen:"),
+            "nor carry the prefix: {metadata}"
+        );
+
+        // And it still reads back, which is the whole point of writing it.
+        assert_eq!(started_from_metadata(&metadata), Some(1_700_000_000));
+    }
+
+    /// The hypervisor hands metadata back with its own prefix on it, and the
+    /// reader matches local names precisely so that both shapes work.
+    #[test]
+    fn a_start_time_reads_back_however_the_hypervisor_prefixes_it() {
+        assert_eq!(
+            started_from_metadata("<vm><started>1700000000</started></vm>"),
+            Some(1_700_000_000)
+        );
+        assert_eq!(
+            started_from_metadata(&format!(
+                "<lumen:vm xmlns:lumen='{LUMEN_NS}'><lumen:started>1700000000</lumen:started></lumen:vm>"
+            )),
+            Some(1_700_000_000)
         );
     }
 

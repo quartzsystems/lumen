@@ -702,6 +702,9 @@ body {
 .qz-console {
   display: flex;
   flex-direction: column;
+  /* Fills a flex-column parent rather than sitting at its natural height —
+     which is what makes the detached window's screen the whole window. */
+  flex: 1;
   border: 1px solid var(--qz-border);
   border-radius: 10px;
   background: var(--qz-surface-sunken);
@@ -722,7 +725,10 @@ body {
 .qz-console-screen {
   position: relative;
   flex: 1;
-  min-height: 420px;
+  /* The screen is the page — there is nothing under it — so it takes the
+     window rather than a fixed box with dead space below. The floor is what a
+     short window falls back to, and it scrolls rather than being squeezed. */
+  min-height: max(460px, calc(100vh - 300px));
   background: #000;
 }
 /* Full screen means the guest's screen, not the page's: the toolbar comes with
@@ -751,6 +757,28 @@ body {
   backdrop-filter: blur(2px);
   font-size: 13px;
   color: var(--qz-fg-2);
+}
+/* Shown while a file is being dragged over the console. Covers the frame
+   rather than the screen so it is visible whether or not a guest is connected —
+   copying a file in does not need the viewer, only a running machine. */
+.qz-console-drop {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  z-index: 2;
+  pointer-events: none;
+  border-radius: 10px;
+  border: 2px dashed var(--qz-accent);
+  background: color-mix(in oklab, black 55%, transparent);
+  font-size: 13px;
+  color: var(--qz-fg-1);
+}
+.qz-console {
+  position: relative;
 }
 .qz-console-status {
   display: inline-flex;

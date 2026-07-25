@@ -74,6 +74,16 @@ pub fn router(state: Arc<AppState>) -> Router {
         // because an upgrade request is one — see src/api/console.rs.
         .route("/api/vms/{vmid}/console", get(console::info))
         .route("/api/vms/{vmid}/console/ws", get(console::attach))
+        // A file into a running guest, over its agent rather than over the
+        // console — RFB has no file transfer in it. The limit is raised to what
+        // the agent will actually take rather than disabled: unlike an
+        // installation image this is buffered, so the cap is the defence.
+        .route(
+            "/api/vms/{vmid}/files",
+            put(vms::push_file).layer(axum::extract::DefaultBodyLimit::max(
+                lumen_virt::MAX_GUEST_FILE_BYTES,
+            )),
+        )
         .route("/api/vms/{vmid}/disks", post(vms::attach_disk))
         .route("/api/vms/{vmid}/disks/{id}", delete(vms::detach_disk))
         .route("/api/vms/{vmid}/nics", post(vms::attach_nic))

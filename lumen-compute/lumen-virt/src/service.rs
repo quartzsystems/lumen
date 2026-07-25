@@ -48,6 +48,62 @@ use crate::validate::{
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
+/// The largest file that may be copied into a guest through its agent.
+///
+/// Not the agent's limit — the arrangement's. Every byte is base64 inside a
+/// JSON message on the hypervisor's control socket and is held in memory on
+/// both sides while it travels, so this path is for a key, a script, or a
+/// configuration file. Sixteen mebibytes is comfortably more than any of those
+/// and comfortably less than anything that ought to be a disk instead.
+pub const MAX_GUEST_FILE_BYTES: usize = 16 * 1024 * 1024;
+
+/// How much of a file goes in one write.
+///
+/// The agent reads one JSON message at a time and both ends cap how big one may
+/// be. 48 KiB of file is about 64 KiB once base64 has grown it by a third,
+/// which every agent in the field accepts.
+const GUEST_WRITE_CHUNK: usize = 48 * 1024;
+
+/// One guest agent request, as the agent expects to read it.
+fn agent_command(execute: &str, arguments: serde_json::Value) -> String {
+    serde_json::json!({ "execute": execute, "arguments": arguments }).to_string()
+}
+
+/// The result out of an agent's reply, or the guest's own refusal.
+///
+/// The agent answers `{"return": …}` or `{"error": {"desc": …}}`, and the
+/// second is not a failure of this node: it is the guest saying no — no such
+/// directory, no permission, no room. Its own sentence is the useful one, so it
+/// is carried through as a conflict rather than flattened into an internal
+/// error.
+fn agent_return(reply: &str) -> Result<serde_json::Value> {
+    let parsed: serde_json::Value = serde_json::from_str(reply).map_err(|err| {
+        VirtError::Backend(anyhow::anyhow!(
+            "the guest agent answered with something that is not JSON ({err}): {reply}"
+        ))
+    })?;
+    if let Some(error) = parsed.get("error") {
+        let said = error
+            .get("desc")
+            .and_then(|desc| desc.as_str())
+            .unwrap_or("it gave no reason");
+        return Err(VirtError::Conflict(format!("The guest refused: {said}")));
+    }
+    parsed.get("return").cloned().ok_or_else(|| {
+        VirtError::Backend(anyhow::anyhow!(
+            "the guest agent answered without a result: {reply}"
+        ))
+    })
+}
+
+/// What arrived, and where.
+#[derive(Debug, Clone, Serialize)]
+pub struct PushedFile {
+    pub vmid: u32,
+    pub path: String,
+    pub bytes: u64,
+}
+
 /// Whether a lifecycle control is available, and — when it is not — why, so
 /// the console renders a control that explains itself rather than one that is
 /// silently grey. The same shape as `lumen_net`'s `delete_blocked_reason`.
@@ -1315,6 +1371,151 @@ impl VirtService {
         })
     }
 
+    // --- files into a guest -----------------------------------------------
+
+    /// Write a file into a running guest, through the guest's own agent.
+    ///
+    /// ## Why this is not a console feature
+    ///
+    /// A console is a screen and a keyboard. There is no file transfer in RFB
+    /// and there is not going to be one, so dropping a file on the console
+    /// cannot travel over the console's connection — it goes the only way into
+    /// a running guest that does not involve its network: the agent already
+    /// listening on a virtio port, which is the same channel an orderly
+    /// shutdown uses.
+    ///
+    /// ## What it is for, and what it is not
+    ///
+    /// Every byte is base64 inside a JSON message on the hypervisor's control
+    /// socket, and is held in memory on both sides on the way through. That is
+    /// entirely reasonable for a key, a script, a certificate, or a
+    /// configuration file — the things somebody actually wants to get into a
+    /// guest that has no network yet — and it is the wrong shape for anything
+    /// large. [`MAX_GUEST_FILE_BYTES`] is where that line is drawn, and the
+    /// refusal says what to use instead.
+    ///
+    /// The guest decides everything about the result: the agent runs as root
+    /// in most guests, so the file lands with the agent's ownership and the
+    /// guest's umask, and a path the agent cannot write is the guest's refusal
+    /// rather than this appliance's.
+    pub async fn push_file(&self, vmid: u32, path: &str, contents: &[u8]) -> Result<PushedFile> {
+        let machine = self.machine(vmid).await?;
+        let name = machine.config.name.clone();
+
+        if !machine.observed.state.is_running() {
+            return Err(VirtError::Conflict(format!(
+                "\"{name}\" is not running. A file can only be copied into a guest that is up, \
+                 because it is the guest's own agent that writes it."
+            )));
+        }
+
+        let path = path.trim();
+        // Checked here rather than trusted from the console, and deliberately
+        // shallow: this is not a sandbox — the agent runs inside the guest and
+        // writing anywhere in that guest is the entire point. What it rules out
+        // is a relative path, which the agent would resolve against a working
+        // directory nobody chose.
+        if !path.starts_with('/') || path.ends_with('/') {
+            return Err(VirtError::Conflict(format!(
+                "\"{path}\" is not a full path to a file inside the guest. It has to start with \
+                 \"/\" and end with a file name."
+            )));
+        }
+        if contents.len() > MAX_GUEST_FILE_BYTES {
+            return Err(VirtError::Conflict(format!(
+                "That file is {:.1} MiB, and {} MiB is the most that can be copied in this way. \
+                 Every byte travels through the hypervisor's control socket, so this is meant for \
+                 a script, a key, or a configuration file — anything larger belongs on a disk or \
+                 on installation media.",
+                contents.len() as f64 / (1024.0 * 1024.0),
+                MAX_GUEST_FILE_BYTES / (1024 * 1024),
+            )));
+        }
+
+        let handle = self.agent_open(&name, path).await?;
+
+        // From here the guest is holding an open file, so every way out of this
+        // function has to close it. A copy that failed half way must not also
+        // leave a descriptor behind in a guest that nothing here can reach
+        // again — hence the close before either result is unwrapped.
+        let written = self.agent_write_all(&name, handle, contents).await;
+        let closed = self
+            .backend
+            .guest_agent(
+                &name,
+                &agent_command("guest-file-close", serde_json::json!({ "handle": handle })),
+            )
+            .await;
+        written?;
+        closed?;
+
+        tracing::info!(vmid, %name, %path, bytes = contents.len(), "file copied into the guest");
+        Ok(PushedFile {
+            vmid,
+            path: path.to_string(),
+            bytes: contents.len() as u64,
+        })
+    }
+
+    /// Open a file in the guest for writing, and take the handle.
+    async fn agent_open(&self, name: &str, path: &str) -> Result<i64> {
+        // "w" truncates, which is what replacing a file means, and "b" is what
+        // stops anything rewriting a line ending on a file that is not text.
+        let reply = self
+            .backend
+            .guest_agent(
+                name,
+                &agent_command(
+                    "guest-file-open",
+                    serde_json::json!({ "path": path, "mode": "wb" }),
+                ),
+            )
+            .await?;
+        agent_return(&reply)?.as_i64().ok_or_else(|| {
+            VirtError::Backend(anyhow::anyhow!(
+                "the guest agent did not answer with a file handle: {reply}"
+            ))
+        })
+    }
+
+    /// Send the whole file, a chunk at a time.
+    async fn agent_write_all(&self, name: &str, handle: i64, contents: &[u8]) -> Result<()> {
+        use base64::Engine as _;
+
+        for chunk in contents.chunks(GUEST_WRITE_CHUNK) {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(chunk);
+            let reply = self
+                .backend
+                .guest_agent(
+                    name,
+                    &agent_command(
+                        "guest-file-write",
+                        serde_json::json!({
+                            "handle": handle,
+                            "buf-b64": encoded,
+                            "count": chunk.len(),
+                        }),
+                    ),
+                )
+                .await?;
+            // A short write is not a partial success worth reporting as one:
+            // the file in the guest is now wrong, and the usual reason is that
+            // the guest's filesystem is full.
+            let wrote = agent_return(&reply)?
+                .get("count")
+                .and_then(|count| count.as_u64())
+                .unwrap_or(0);
+            if wrote != chunk.len() as u64 {
+                return Err(VirtError::Conflict(format!(
+                    "The guest took {wrote} of {} bytes and stopped. The usual reason is no room \
+                     left on the filesystem the file was being written to.",
+                    chunk.len()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Try to add or remove a device on the running machine, and report what
     /// the hypervisor said. A machine that is not running has nothing pending:
     /// the stored configuration is what it will start with.
@@ -1531,6 +1732,62 @@ mod tests {
     }
 
     /// A console exists for exactly as long as the guest does, and the domain
+    /// The mock applies the three agent commands to an in-memory guest, so this
+    /// asserts on what actually landed on the other side rather than on which
+    /// calls were made — the chunking, the encoding, and the close are all in
+    /// the answer.
+    #[tokio::test]
+    async fn a_file_copied_into_a_guest_arrives_whole() {
+        let h = harness("push-file").await;
+        let vm = h.service.create(create("web01")).await.unwrap();
+        h.service.start(vm.vmid).await.unwrap();
+
+        // Deliberately more than one write and not a whole number of them: a
+        // file that fits in a single message would pass whatever the loop did,
+        // and an exact multiple would hide an off-by-one in the last chunk.
+        let contents: Vec<u8> = (0..(GUEST_WRITE_CHUNK * 2 + 17))
+            .map(|byte| (byte % 251) as u8)
+            .collect();
+
+        let pushed = h
+            .service
+            .push_file(vm.vmid, "/root/bootstrap.sh", &contents)
+            .await
+            .unwrap();
+        assert_eq!(pushed.path, "/root/bootstrap.sh");
+        assert_eq!(pushed.bytes, contents.len() as u64);
+        assert_eq!(
+            h.virt.guest_file("/root/bootstrap.sh").as_deref(),
+            Some(contents.as_slice()),
+            "every byte, in order, on the other side"
+        );
+    }
+
+    /// Both refusals are the guest's situation rather than this node's, and
+    /// both are worth saying in words: there is no agent in a machine that is
+    /// off, and a relative path would be resolved against a working directory
+    /// nobody chose.
+    #[tokio::test]
+    async fn a_file_needs_a_running_machine_and_a_full_path() {
+        let h = harness("push-file-refused").await;
+        let vm = h.service.create(create("web01")).await.unwrap();
+
+        let err = h
+            .service
+            .push_file(vm.vmid, "/root/x", b"hello")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not running"), "{err}");
+
+        h.service.start(vm.vmid).await.unwrap();
+        let err = h
+            .service
+            .push_file(vm.vmid, "etc/passwd", b"hello")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("full path"), "{err}");
+    }
+
     /// says so rather than handing back a path nothing is listening on.
     #[tokio::test]
     async fn a_console_is_offered_only_while_the_machine_is_running() {
