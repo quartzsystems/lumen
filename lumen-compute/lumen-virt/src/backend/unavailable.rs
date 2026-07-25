@@ -88,6 +88,9 @@ impl VirtBackend for UnavailableBackend {
     async fn set_live_metadata(&self, _name: &str, _metadata_xml: &str) -> Result<()> {
         self.error()
     }
+    async fn live_xml(&self, _name: &str) -> Result<String> {
+        self.error()
+    }
     async fn guest_agent(&self, _name: &str, _command: &str) -> Result<String> {
         self.error()
     }

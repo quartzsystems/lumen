@@ -397,6 +397,13 @@ impl VirtBackend for LibvirtBackend {
         .await
     }
 
+    async fn live_xml(&self, name: &str) -> Result<String> {
+        // No flags: for a running machine that is the live document, which is
+        // the whole point of asking here rather than reading `observed.xml`.
+        self.with_domain(name, move |domain| domain.get_xml_desc(0))
+            .await
+    }
+
     async fn guest_agent(&self, name: &str, command: &str) -> Result<String> {
         let command = command.to_string();
         self.with_domain(name, move |domain| {

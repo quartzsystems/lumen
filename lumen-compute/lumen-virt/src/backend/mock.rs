@@ -468,6 +468,15 @@ impl VirtBackend for MockBackend {
         Ok(())
     }
 
+    /// The mock has one document per machine and says so in the module note —
+    /// it does not model the gap between stored and running. So this answers
+    /// with the stored one, and a test about *that* gap belongs on a real node
+    /// rather than here.
+    async fn live_xml(&self, name: &str) -> Result<String> {
+        let mut inner = self.inner.lock().unwrap();
+        Ok(inner.entry(name)?.xml.clone())
+    }
+
     /// A fake rather than a mock: it applies the three file commands to an
     /// in-memory guest, so the round trip the service actually performs —
     /// open, write in chunks, close — is the thing under test rather than a

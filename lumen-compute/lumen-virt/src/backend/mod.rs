@@ -116,6 +116,18 @@ pub trait VirtBackend: Send + Sync {
     /// from; see [`crate::domain_xml::live_metadata`].
     async fn set_live_metadata(&self, name: &str, metadata_xml: &str) -> Result<()>;
 
+    /// The document of the machine as it is **running**, not as it is stored.
+    ///
+    /// Every other read in this trait deliberately answers with the stored
+    /// document, because that is the one the console edits and the difference
+    /// between the two is what "waiting for a restart" means. The console
+    /// viewer is the one caller that needs the opposite: a socket is a fact
+    /// about the process that is listening, and the stored document describes a
+    /// machine that may not have started yet with those devices — or, for a
+    /// machine defined before this appliance put a screen on one, may not
+    /// describe a screen at all.
+    async fn live_xml(&self, name: &str) -> Result<String>;
+
     /// Ask the guest's own agent to do something, and hand back its reply.
     ///
     /// `command` is one QEMU guest agent request as JSON — `{"execute": …,

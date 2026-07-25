@@ -562,12 +562,34 @@ impl VirtService {
                 machine.config.name
             )));
         }
+        // The *running* document, not the stored one. A socket is a fact about
+        // the process that is listening, and those two documents are allowed to
+        // disagree — which is the whole reason this asks the hypervisor again
+        // rather than reading the one already in hand.
+        let live = self.backend.live_xml(&machine.config.name).await?;
+
+        // And when there is no screen in it, say so instead of guessing. The
+        // naming rule would give a path, and handing that back sends an
+        // operator to a socket nothing ever created: a machine defined before
+        // this appliance put a screen on one has no graphics device at all, and
+        // the viewer's failure — "the connection ended" over a path that does
+        // not exist — says nothing about the actual remedy, which is to save
+        // the machine's configuration and start it again.
+        let socket = domain_xml::vnc_socket_of(&live).ok_or_else(|| {
+            VirtError::Conflict(format!(
+                "\"{}\" is running without a screen. It was defined before this appliance gave \
+                 machines a console, so its document has no graphics device — save its \
+                 configuration, then stop and start it, and the console will be there.",
+                machine.config.name
+            ))
+        })?;
+
         Ok(ConsoleTarget {
             vmid: machine.config.vmid,
             name: machine.config.name.clone(),
             node: self.node.clone(),
             protocol: ConsoleProtocol::Vnc,
-            socket: console_socket_of(&machine.observed, machine.config.vmid),
+            socket,
         })
     }
 
@@ -1560,9 +1582,15 @@ impl VirtService {
 ///
 /// The fallback matters for exactly one case — a document the reader could not
 /// find a graphics element in — and it is the predictable path rather than
-/// nothing, because "connect and find out" is a better answer than "there is
-/// no console" when the machine is running and the naming rule has held since
-/// the first machine was defined.
+/// nothing, because on the table this is a label rather than somewhere anything
+/// is about to connect.
+///
+/// [`VirtService::console`] deliberately does **not** use this. It asks the
+/// hypervisor for the running document and refuses outright when there is no
+/// screen in it, because a fabricated path is the worst possible answer to give
+/// something that is about to open a socket: the viewer fails with an operating
+/// system error against a file nobody ever created, and the real remedy — the
+/// machine predates consoles and needs redefining — is nowhere in sight.
 fn console_socket_of(observed: &ObservedDomain, vmid: u32) -> String {
     domain_xml::vnc_socket_of(&observed.xml).unwrap_or_else(|| domain_xml::vnc_socket_path(vmid))
 }
