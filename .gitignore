@@ -13,6 +13,8 @@
 lumen-installer/app/target/
 lumen-controlplane/target/
 lumen-networking/lumen-net/target/
+lumen-storage/lumen-zfs/target/
+lumen-compute/lumen-virt/target/
 
 # Editor / OS noise
 *.swp

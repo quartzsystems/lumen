@@ -1,0 +1,373 @@
+//! The real backend: the hypervisor's own library, over its local socket.
+//!
+//! ## Why this is safe under the control plane's hardening
+//!
+//! The daemon this talks to is privileged and runs in its own process, reached
+//! over a socket under `/run`. That is the same arrangement the networking
+//! domain has with the network daemon, and it has the same consequence:
+//! `lumen-controlplane.service` keeps `ProtectSystem=strict`,
+//! `ProtectKernelTunables=yes`, `PrivateTmp=yes`, and `ProtectHome=yes`
+//! unchanged, because none of the privileged work happens in this process.
+//! `ProtectSystem=strict` leaves `/run` writable, so the socket is reachable.
+//! See docs/compute.md for the reproduction.
+//!
+//! ## Threads
+//!
+//! Every call into the library blocks, so each one runs on a blocking thread
+//! rather than on the async runtime. The connection handle is shared across
+//! those threads, which the library explicitly supports — see the safety note
+//! on [`Handle`].
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use virt::connect::Connect;
+use virt::domain::Domain;
+use virt::error::{Error as LibvirtError, ErrorNumber};
+
+use crate::backend::VirtBackend;
+use crate::error::{Result, VirtError};
+use crate::state::{DomainRuntime, DomainState, HostInfo, ObservedDomain};
+
+/// The local system hypervisor. Not the session one: a session connection
+/// would run machines as an unprivileged user with no access to the host's
+/// bridges or volumes.
+pub const SYSTEM_URI: &str = "qemu:///system";
+
+/// The running machine and nothing else. `define` is the only thing that
+/// writes the stored configuration, so every live call carries exactly this —
+/// which is what stops a device being added to the configuration twice.
+const LIVE_ONLY: u32 = virt_sys::VIR_DOMAIN_AFFECT_LIVE;
+
+/// A connection shared across blocking threads.
+///
+/// # Safety
+///
+/// The hypervisor's client library is thread safe, and a connection object may
+/// be used concurrently from several threads: each API call takes the
+/// connection's own lock internally. The Rust binding wraps a raw pointer and
+/// therefore does not derive these automatically, so they are asserted here
+/// rather than working around the library's own guarantee by opening a
+/// connection per request.
+struct Handle(Connect);
+
+unsafe impl Send for Handle {}
+unsafe impl Sync for Handle {}
+
+pub struct LibvirtBackend {
+    handle: Arc<Handle>,
+    node: String,
+}
+
+impl LibvirtBackend {
+    /// Connect to the local hypervisor, or say why not.
+    ///
+    /// A failure here is not fatal to the control plane: `main` swaps in
+    /// [`super::unavailable::UnavailableBackend`] and the console comes up
+    /// reporting the reason, because an operator whose hypervisor is down
+    /// needs the console more than usual.
+    pub async fn connect() -> Result<Self> {
+        Self::connect_to(SYSTEM_URI).await
+    }
+
+    pub async fn connect_to(uri: &str) -> Result<Self> {
+        let uri = uri.to_string();
+        let handle = tokio::task::spawn_blocking(move || Connect::open(Some(&uri)))
+            .await
+            .map_err(|err| VirtError::Backend(anyhow::anyhow!("{err}")))?
+            .map_err(|err| {
+                VirtError::Backend(anyhow::anyhow!(
+                    "could not reach the hypervisor: {}",
+                    err.message()
+                ))
+            })?;
+        Ok(Self {
+            handle: Arc::new(Handle(handle)),
+            node: crate::state::hostname(),
+        })
+    }
+
+    /// Run one blocking library call off the async runtime.
+    async fn call<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connect) -> std::result::Result<T, LibvirtError> + Send + 'static,
+        T: Send + 'static,
+    {
+        let handle = self.handle.clone();
+        tokio::task::spawn_blocking(move || f(&handle.0))
+            .await
+            .map_err(|err| VirtError::Backend(anyhow::anyhow!("hypervisor call failed: {err}")))?
+            .map_err(map_error)
+    }
+
+    /// Look one machine up and do something with it.
+    async fn with_domain<T, F>(&self, name: &str, f: F) -> Result<T>
+    where
+        F: FnOnce(&Domain) -> std::result::Result<T, LibvirtError> + Send + 'static,
+        T: Send + 'static,
+    {
+        let name = name.to_string();
+        self.call(move |conn| {
+            let domain = Domain::lookup_by_name(conn, &name)?;
+            f(&domain)
+        })
+        .await
+    }
+}
+
+/// The hypervisor's own error, mapped onto the API's. A machine that is not
+/// there is a 404, not a 500 — every other failure is the hypervisor's to
+/// explain and its message is carried through verbatim.
+fn map_error(err: LibvirtError) -> VirtError {
+    match err.code() {
+        ErrorNumber::NoDomain => VirtError::NotFound(format!(
+            "No machine matching that name on this node ({}).",
+            err.message()
+        )),
+        ErrorNumber::OperationInvalid => VirtError::Conflict(err.message().to_string()),
+        _ => VirtError::Backend(anyhow::anyhow!("{}", err.message())),
+    }
+}
+
+fn state_of(raw: virt_sys::virDomainState) -> DomainState {
+    match raw {
+        virt_sys::VIR_DOMAIN_RUNNING | virt_sys::VIR_DOMAIN_BLOCKED => DomainState::Running,
+        virt_sys::VIR_DOMAIN_PAUSED => DomainState::Paused,
+        // A machine mid-shutdown is still up as far as anything an operator
+        // can do to it is concerned.
+        virt_sys::VIR_DOMAIN_SHUTDOWN => DomainState::Running,
+        virt_sys::VIR_DOMAIN_SHUTOFF => DomainState::ShutOff,
+        virt_sys::VIR_DOMAIN_CRASHED => DomainState::Crashed,
+        virt_sys::VIR_DOMAIN_PMSUSPENDED => DomainState::Suspended,
+        _ => DomainState::Unknown,
+    }
+}
+
+/// Everything one domain has to say, gathered in a single blocking call so a
+/// listing is one trip rather than five per machine.
+fn observe(domain: &Domain) -> std::result::Result<ObservedDomain, LibvirtError> {
+    let name = domain.get_name()?;
+    let info = domain.get_info()?;
+    let state = state_of(info.state);
+    let running = !matches!(state, DomainState::ShutOff | DomainState::Crashed);
+
+    // Always the *stored* document, even while the machine is running: that is
+    // the one the console edits, and the difference between it and what is
+    // running is reported as changes waiting for a restart.
+    let xml = domain.get_xml_desc(virt_sys::VIR_DOMAIN_XML_INACTIVE)?;
+
+    // The start time lives in metadata attached to the running machine only,
+    // so it is asked for separately and its absence is ordinary — a machine
+    // somebody started with `virsh` has none.
+    let started_at = running
+        .then(|| {
+            domain
+                .get_metadata(
+                    virt_sys::VIR_DOMAIN_METADATA_ELEMENT as i32,
+                    Some(crate::domain_xml::LUMEN_NS),
+                    virt_sys::VIR_DOMAIN_AFFECT_LIVE,
+                )
+                .ok()
+                .and_then(|metadata| crate::domain_xml::started_from_metadata(&metadata))
+        })
+        .flatten();
+
+    Ok(ObservedDomain {
+        name,
+        uuid: domain.get_uuid_string().ok(),
+        state,
+        persistent: domain.is_persistent().unwrap_or(true),
+        autostart: domain.get_autostart().unwrap_or(false),
+        runtime: running.then_some(DomainRuntime {
+            vcpus: info.nr_virt_cpu,
+            memory_kib: info.memory,
+            max_memory_kib: info.max_mem,
+            cpu_time_ns: info.cpu_time,
+        }),
+        xml,
+        started_at,
+    })
+}
+
+#[async_trait]
+impl VirtBackend for LibvirtBackend {
+    async fn host(&self) -> Result<HostInfo> {
+        let node = self.node.clone();
+        self.call(move |conn| {
+            let info = conn.get_node_info()?;
+            let version = conn.get_lib_version().unwrap_or(0);
+            Ok(HostInfo {
+                node,
+                // `cpus` is the number of logical processors the node has
+                // online, which is what a machine's processor count is
+                // measured against.
+                cpus: info.cpus,
+                memory_mib: info.memory / 1024,
+                hypervisor_version: (version > 0).then(|| {
+                    format!(
+                        "{}.{}.{}",
+                        version / 1_000_000,
+                        (version % 1_000_000) / 1_000,
+                        version % 1_000
+                    )
+                }),
+            })
+        })
+        .await
+    }
+
+    async fn domains(&self) -> Result<Vec<ObservedDomain>> {
+        self.call(move |conn| {
+            // No flags: running and stopped alike. A machine that is off is
+            // still a machine.
+            let domains = conn.list_all_domains(0)?;
+            domains.iter().map(observe).collect()
+        })
+        .await
+    }
+
+    async fn domain(&self, name: &str) -> Result<ObservedDomain> {
+        self.with_domain(name, observe).await
+    }
+
+    async fn define(&self, xml: &str) -> Result<()> {
+        let xml = xml.to_string();
+        self.call(move |conn| Domain::define_xml(conn, &xml).map(|_| ()))
+            .await
+    }
+
+    async fn undefine(&self, name: &str) -> Result<()> {
+        self.with_domain(name, |domain| {
+            // The firmware variable store and any saved state belong to the
+            // machine: leaving them behind means the next machine to take the
+            // name inherits somebody else's boot entries.
+            domain.undefine_flags(
+                virt_sys::VIR_DOMAIN_UNDEFINE_NVRAM
+                    | virt_sys::VIR_DOMAIN_UNDEFINE_MANAGED_SAVE
+                    | virt_sys::VIR_DOMAIN_UNDEFINE_SNAPSHOTS_METADATA
+                    | virt_sys::VIR_DOMAIN_UNDEFINE_CHECKPOINTS_METADATA,
+            )
+        })
+        .await
+    }
+
+    async fn rename(&self, name: &str, new_name: &str) -> Result<()> {
+        let new_name = new_name.to_string();
+        self.with_domain(name, move |domain| domain.rename(&new_name, 0).map(|_| ()))
+            .await
+    }
+
+    async fn start(&self, name: &str) -> Result<()> {
+        self.with_domain(name, |domain| domain.create().map(|_| ()))
+            .await
+    }
+
+    async fn shutdown(&self, name: &str) -> Result<()> {
+        self.with_domain(name, |domain| domain.shutdown().map(|_| ()))
+            .await
+    }
+
+    async fn destroy(&self, name: &str) -> Result<()> {
+        self.with_domain(name, |domain| domain.destroy()).await
+    }
+
+    async fn reboot(&self, name: &str) -> Result<()> {
+        self.with_domain(name, |domain| domain.reboot(0)).await
+    }
+
+    async fn reset(&self, name: &str) -> Result<()> {
+        self.with_domain(name, |domain| domain.reset().map(|_| ()))
+            .await
+    }
+
+    async fn set_autostart(&self, name: &str, on: bool) -> Result<()> {
+        self.with_domain(name, move |domain| domain.set_autostart(on).map(|_| ()))
+            .await
+    }
+
+    async fn attach_device_live(&self, name: &str, device_xml: &str) -> Result<()> {
+        let xml = device_xml.to_string();
+        self.with_domain(name, move |domain| {
+            domain.attach_device_flags(&xml, LIVE_ONLY).map(|_| ())
+        })
+        .await
+    }
+
+    async fn detach_device_live(&self, name: &str, device_xml: &str) -> Result<()> {
+        let xml = device_xml.to_string();
+        self.with_domain(name, move |domain| {
+            domain.detach_device_flags(&xml, LIVE_ONLY).map(|_| ())
+        })
+        .await
+    }
+
+    async fn set_memory_live(&self, name: &str, mib: u64) -> Result<()> {
+        let kib = mib.saturating_mul(1024);
+        self.with_domain(name, move |domain| {
+            // Only the running machine: the stored configuration already
+            // carries the new number, because `define` put it there. The
+            // hypervisor refuses to go above the maximum the machine booted
+            // with, and that refusal is the answer we want.
+            domain.set_memory_flags(kib, LIVE_ONLY).map(|_| ())
+        })
+        .await
+    }
+
+    async fn set_vcpus_live(&self, name: &str, count: u32) -> Result<()> {
+        self.with_domain(name, move |domain| {
+            domain.set_vcpus_flags(count, LIVE_ONLY).map(|_| ())
+        })
+        .await
+    }
+
+    async fn set_live_metadata(&self, name: &str, metadata_xml: &str) -> Result<()> {
+        let metadata = metadata_xml.to_string();
+        self.with_domain(name, move |domain| {
+            domain
+                .set_metadata(
+                    virt_sys::VIR_DOMAIN_METADATA_ELEMENT as i32,
+                    Some(&metadata),
+                    Some("lumen"),
+                    Some(crate::domain_xml::LUMEN_NS),
+                    virt_sys::VIR_DOMAIN_AFFECT_LIVE,
+                )
+                .map(|_| ())
+        })
+        .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The projection an operator reads in the console. There is no hypervisor
+    /// in this test — it is the mapping that is being pinned, not a call.
+    #[test]
+    fn hypervisor_states_project_onto_the_ones_the_console_shows() {
+        assert_eq!(state_of(virt_sys::VIR_DOMAIN_RUNNING), DomainState::Running);
+        assert_eq!(state_of(virt_sys::VIR_DOMAIN_BLOCKED), DomainState::Running);
+        // Mid-shutdown is still running as far as anything an operator can do
+        // to it is concerned.
+        assert_eq!(
+            state_of(virt_sys::VIR_DOMAIN_SHUTDOWN),
+            DomainState::Running
+        );
+        assert_eq!(state_of(virt_sys::VIR_DOMAIN_SHUTOFF), DomainState::ShutOff);
+        assert_eq!(state_of(virt_sys::VIR_DOMAIN_PAUSED), DomainState::Paused);
+        assert_eq!(state_of(virt_sys::VIR_DOMAIN_CRASHED), DomainState::Crashed);
+        assert_eq!(
+            state_of(virt_sys::VIR_DOMAIN_PMSUSPENDED),
+            DomainState::Suspended
+        );
+        assert_eq!(state_of(virt_sys::VIR_DOMAIN_NOSTATE), DomainState::Unknown);
+    }
+
+    /// The live calls must never touch the stored configuration — `define`
+    /// owns it, and a device added by both would be added twice.
+    #[test]
+    fn live_calls_carry_only_the_live_flag() {
+        assert_eq!(LIVE_ONLY, virt_sys::VIR_DOMAIN_AFFECT_LIVE);
+        assert_eq!(LIVE_ONLY & virt_sys::VIR_DOMAIN_AFFECT_CONFIG, 0);
+    }
+}

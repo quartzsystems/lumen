@@ -1,7 +1,43 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use serde::Serialize;
 use serde_json::json;
+
+/// A rejected document, in the shape the console reads: a joined sentence for
+/// anything that only knows the standard envelope, plus the machine-readable
+/// detail for anything that can pin each problem to a field.
+///
+/// Each domain has its own `ValidationError` — networking's names a link,
+/// virtualization's names a machine — and neither should have to know about
+/// the other. They meet here, where the answer is JSON either way.
+#[derive(Debug)]
+pub struct Rejection {
+    pub message: String,
+    pub errors: serde_json::Value,
+}
+
+impl Rejection {
+    fn of<T: Serialize>(errors: Vec<T>, message: impl Fn(&T) -> &str) -> Self {
+        let joined = errors.iter().map(&message).collect::<Vec<_>>().join(" ");
+        Self {
+            message: joined,
+            errors: serde_json::to_value(&errors).unwrap_or(serde_json::Value::Null),
+        }
+    }
+}
+
+impl From<Vec<lumen_net::ValidationError>> for Rejection {
+    fn from(errors: Vec<lumen_net::ValidationError>) -> Self {
+        Rejection::of(errors, |e| e.message.as_str())
+    }
+}
+
+impl From<Vec<lumen_virt::ValidationError>> for Rejection {
+    fn from(errors: Vec<lumen_virt::ValidationError>) -> Self {
+        Rejection::of(errors, |e| e.message.as_str())
+    }
+}
 
 /// API error → `{ "error": "..." }` with the matching status. The web UI's
 /// client surfaces the message verbatim, so texts are user-facing.
@@ -13,11 +49,12 @@ pub enum ApiError {
     BadRequest(String),
     NotFound(String),
     /// Well-formed, but not allowed in the current state — a second network
-    /// apply while one is still waiting to be confirmed, say.
+    /// apply while one is still waiting to be confirmed, or starting a machine
+    /// that is already running.
     Conflict(String),
     /// A rejected configuration. Carries every problem, each with a stable
     /// code, so the console can render them against the offending fields.
-    Validation(Vec<lumen_net::ValidationError>),
+    Validation(Rejection),
     Internal(anyhow::Error),
 }
 
@@ -26,15 +63,10 @@ impl IntoResponse for ApiError {
         // Validation answers carry an extra `errors` array alongside the
         // standard envelope; `error` is still there, so a client that only
         // knows the envelope still shows something useful.
-        if let ApiError::Validation(errors) = self {
-            let message = errors
-                .iter()
-                .map(|e| e.message.as_str())
-                .collect::<Vec<_>>()
-                .join(" ");
+        if let ApiError::Validation(rejection) = self {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({ "error": message, "errors": errors })),
+                Json(json!({ "error": rejection.message, "errors": rejection.errors })),
             )
                 .into_response();
         }
@@ -64,10 +96,34 @@ impl IntoResponse for ApiError {
 impl From<lumen_net::NetError> for ApiError {
     fn from(err: lumen_net::NetError) -> Self {
         match err {
-            lumen_net::NetError::Invalid(errors) => ApiError::Validation(errors),
+            lumen_net::NetError::Invalid(errors) => ApiError::Validation(errors.into()),
             lumen_net::NetError::NotFound(message) => ApiError::NotFound(message),
             lumen_net::NetError::Conflict(message) => ApiError::Conflict(message),
             lumen_net::NetError::Backend(err) => ApiError::Internal(err),
+        }
+    }
+}
+
+/// The virtualization domain's errors, mapped the same way.
+impl From<lumen_virt::VirtError> for ApiError {
+    fn from(err: lumen_virt::VirtError) -> Self {
+        match err {
+            lumen_virt::VirtError::Invalid(errors) => ApiError::Validation(errors.into()),
+            lumen_virt::VirtError::NotFound(message) => ApiError::NotFound(message),
+            lumen_virt::VirtError::Conflict(message) => ApiError::Conflict(message),
+            lumen_virt::VirtError::Backend(err) => ApiError::Internal(err),
+        }
+    }
+}
+
+/// The storage domain's errors. It has no validation arm: the rules worth a
+/// machine-readable code live where the disk is actually being asked for.
+impl From<lumen_zfs::ZfsError> for ApiError {
+    fn from(err: lumen_zfs::ZfsError) -> Self {
+        match err {
+            lumen_zfs::ZfsError::NotFound(message) => ApiError::NotFound(message),
+            lumen_zfs::ZfsError::Conflict(message) => ApiError::Conflict(message),
+            lumen_zfs::ZfsError::Backend(err) => ApiError::Internal(err),
         }
     }
 }

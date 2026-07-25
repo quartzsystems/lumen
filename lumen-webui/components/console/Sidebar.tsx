@@ -5,6 +5,7 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { NAV, type NavItem } from "@/lib/nav";
+import { SidebarVms } from "@/components/console/SidebarVms";
 import { getCurrentUser, logout as apiLogout } from "@/lib/authClient";
 import type { AuthUserInfo } from "@/lib/authClient";
 
@@ -129,12 +130,27 @@ export function Sidebar({ onOpenPalette }: { onOpenPalette: () => void }) {
             );
           }
 
-          return (
-            <Link key={item.id} href={item.href} className={itemClass(pathname.startsWith(item.href))}>
+          const active = pathname.startsWith(item.href);
+          const link = (
+            <Link key={item.id} href={item.href} className={itemClass(active)}>
               <Icon size={16} />
               <span>{item.label}</span>
             </Link>
           );
+
+          // Machines hang off their nav item as live data rather than as nav
+          // entries: lib/nav.ts is static and they are not. See SidebarVms.
+          if (item.id === "virtual-machines") {
+            return (
+              <div key={item.id}>
+                {link}
+                <div className="ml-[26px] mt-[2px]">
+                  <SidebarVms />
+                </div>
+              </div>
+            );
+          }
+          return link;
         })}
       </div>
 

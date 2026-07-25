@@ -8,6 +8,10 @@ use lumen_controlplane::{app, security, tls, AppState};
 use lumen_net::backend::nm::NmBackend;
 use lumen_net::backend::unavailable::UnavailableBackend;
 use lumen_net::NetworkService;
+use lumen_virt::backend::libvirt::LibvirtBackend;
+use lumen_virt::VirtService;
+use lumen_zfs::backend::cli::CliBackend;
+use lumen_zfs::StorageService;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -60,6 +64,43 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Storage. The real backend runs the supported command line, so a node
+    // without the storage software swaps in the unavailable one and the
+    // console comes up saying so rather than refusing to start.
+    let zfs_backend: Arc<dyn lumen_zfs::backend::ZfsBackend> = match CliBackend::probe().await {
+        Ok(backend) => Arc::new(backend),
+        Err(err) => {
+            tracing::error!("storage is unavailable: {err}");
+            Arc::new(lumen_zfs::backend::unavailable::UnavailableBackend::new(
+                err.to_string(),
+            ))
+        }
+    };
+    let storage = Arc::new(StorageService::new(zfs_backend));
+
+    // Virtual machines. The hypervisor is a privileged daemon reached over its
+    // own socket, exactly as networking reaches NetworkManager over the bus —
+    // so the unit's hardening stays as it is. Same failure policy: an operator
+    // whose hypervisor is down needs the console more than usual.
+    let virt_backend: Arc<dyn lumen_virt::backend::VirtBackend> =
+        match LibvirtBackend::connect().await {
+            Ok(backend) => Arc::new(backend),
+            Err(err) => {
+                tracing::error!("virtualization is unavailable: {err}");
+                Arc::new(lumen_virt::backend::unavailable::UnavailableBackend::new(
+                    err.to_string(),
+                ))
+            }
+        };
+    // Constructed last, and given the other two: a machine needs a bridge to
+    // attach to and a volume to boot from, while neither networking nor
+    // storage has any reason to know a machine exists.
+    let virt = Arc::new(VirtService::new(
+        virt_backend,
+        storage.clone(),
+        network.clone(),
+    ));
+
     let listen: std::net::SocketAddr = config
         .listen
         .parse()
@@ -74,6 +115,8 @@ async fn main() -> Result<()> {
         jwt_secret,
         realms,
         network,
+        storage,
+        virt,
     }));
 
     if no_tls {

@@ -3,17 +3,22 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowRight, Search } from "lucide-react";
 import { NAV, firstChildHref } from "@/lib/nav";
+import { vmHref } from "@/components/console/SidebarVms";
+import { useVmsOptional } from "@/lib/VmContext";
 
 interface PaletteAction {
   id: string;
   section: string;
   label: string;
   href: string;
+  /// Extra text that matches but is not displayed — a machine's identifier,
+  /// so typing "101" finds it as readily as typing its name.
+  keywords?: string;
 }
 
 /// Every nav destination, flattened. Sections read "Networking › Interfaces"
 /// so a child is findable by either half of its name.
-const ACTIONS: PaletteAction[] = NAV.flatMap((item) => [
+const NAV_ACTIONS: PaletteAction[] = NAV.flatMap((item) => [
   { id: `nav-${item.id}`, section: "Go to", label: item.label, href: firstChildHref(item) },
   ...(item.children ?? []).map((child) => ({
     id: `nav-${item.id}-${child.id}`,
@@ -35,6 +40,24 @@ export function CommandPalette({
 }) {
   const [q, setQ] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
+  // Machines are a dynamic source: jumping to one by name is the single most
+  // useful thing this palette does on a hypervisor, and they cannot come from
+  // lib/nav.ts because that file is static.
+  const machines = useVmsOptional()?.vms ?? [];
+
+  const actions = useMemo<PaletteAction[]>(
+    () => [
+      ...machines.map((vm) => ({
+        id: `vm-${vm.vmid}`,
+        section: "Machines",
+        label: `${vm.vmid} · ${vm.name}`,
+        href: vmHref(vm.vmid),
+        keywords: `${vm.name} ${vm.vmid} ${vm.state} ${vm.tags.join(" ")}`,
+      })),
+      ...NAV_ACTIONS,
+    ],
+    [machines],
+  );
 
   useEffect(() => {
     if (open) setTimeout(() => inputRef.current?.focus(), 50);
@@ -51,12 +74,14 @@ export function CommandPalette({
 
   const grouped = useMemo(() => {
     const needle = q.toLowerCase();
-    const filtered = ACTIONS.filter((a) => a.label.toLowerCase().includes(needle));
+    const filtered = actions.filter((a) =>
+      `${a.label} ${a.keywords ?? ""}`.toLowerCase().includes(needle),
+    );
     return filtered.reduce<Record<string, PaletteAction[]>>((acc, a) => {
       (acc[a.section] = acc[a.section] || []).push(a);
       return acc;
     }, {});
-  }, [q]);
+  }, [q, actions]);
 
   if (!open) return null;
 
@@ -72,7 +97,7 @@ export function CommandPalette({
           <Search size={16} className="text-[var(--qz-fg-3)]" />
           <input
             ref={inputRef}
-            placeholder="Jump to a section…"
+            placeholder="Jump to a machine or a section…"
             value={q}
             onChange={(e) => setQ(e.target.value)}
             className="flex-1 bg-transparent border-0 outline-none text-[var(--qz-fg-1)] text-[15px]"

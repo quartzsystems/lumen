@@ -25,12 +25,15 @@ jobs:
     container: almalinux:10
     steps:
       - name: Install build dependencies
-        # rust/pam-devel/nodejs: build-rpms.sh compiles lumen-controlplane
-        # and the web UI export before packaging them.
+        # rust/pam-devel/libvirt-devel/nodejs: build-rpms.sh compiles
+        # lumen-controlplane and the web UI export before packaging them, and
+        # the control plane links both libpam and the hypervisor's client
+        # library.
         run: |
           dnf -y install epel-release   # rpmlint lives in EPEL on EL10
           dnf -y install rpm-build rpmdevtools rpmlint make git-core \
-            rust cargo pam-devel nodejs npm systemd-rpm-macros
+            rust cargo pam-devel libvirt-devel pkgconf-pkg-config \
+            nodejs npm systemd-rpm-macros
       - uses: actions/checkout@v4
       - name: Build RPMs
         run: make rpms
@@ -101,15 +104,87 @@ jobs:
           cargo test --manifest-path lumen-networking/lumen-net/Cargo.toml \
             --target-dir build/cargo-target-net
 
+  storage:
+    name: Storage (Rust, AlmaLinux 10)
+    runs-on: ubuntu-latest
+    container: almalinux:10
+    steps:
+      - name: Install Rust toolchain
+        # No system libraries and no storage software: lumen-zfs shells out to
+        # the supported command line, and its tests run against the in-memory
+        # backend, so there is nothing to link and no pools to touch.
+        run: dnf -y install rust cargo rustfmt clippy make git-core
+      - uses: actions/checkout@v4
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            build/cargo-target-zfs
+          key: cargo-zfs-${{ hashFiles('lumen-storage/lumen-zfs/Cargo.lock') }}
+      - name: Format
+        run: cargo fmt --manifest-path lumen-storage/lumen-zfs/Cargo.toml --check
+      - name: Clippy
+        run: |
+          cargo clippy --manifest-path lumen-storage/lumen-zfs/Cargo.toml \
+            --all-targets --target-dir build/cargo-target-zfs -- -D warnings
+      - name: Tests
+        run: |
+          cargo test --manifest-path lumen-storage/lumen-zfs/Cargo.toml \
+            --target-dir build/cargo-target-zfs
+
+  compute:
+    name: Compute (Rust, AlmaLinux 10)
+    runs-on: ubuntu-latest
+    container: almalinux:10
+    steps:
+      - name: Install Rust toolchain + hypervisor headers
+        # libvirt-devel is needed to LINK, not to run: every test uses the
+        # in-memory backend and CI never touches the runner's hypervisor.
+        # The bindings ship generated, so no libclang comes with it.
+        run: |
+          dnf -y install rust cargo rustfmt clippy libvirt-devel \
+            pkgconf-pkg-config make git-core
+      - uses: actions/checkout@v4
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            build/cargo-target-virt
+          key: cargo-virt-${{ hashFiles('lumen-compute/lumen-virt/Cargo.lock') }}
+      - name: Confirm no code generator is pulled in
+        # The decision recorded in docs/compute.md, enforced: if a future
+        # bump makes the bindings generate at build time, this fails here
+        # rather than on an appliance.
+        run: |
+          cargo tree --manifest-path lumen-compute/lumen-virt/Cargo.toml \
+            -e normal,build | tee /tmp/tree.txt
+          ! grep -qE '^\s*[|`+-]*\s*(bindgen|clang-sys) ' /tmp/tree.txt
+      - name: Format
+        run: cargo fmt --manifest-path lumen-compute/lumen-virt/Cargo.toml --check
+      - name: Clippy
+        run: |
+          cargo clippy --manifest-path lumen-compute/lumen-virt/Cargo.toml \
+            --all-targets --target-dir build/cargo-target-virt -- -D warnings
+      - name: Tests
+        run: |
+          cargo test --manifest-path lumen-compute/lumen-virt/Cargo.toml \
+            --target-dir build/cargo-target-virt
+
   controlplane:
     name: Control plane (Rust, AlmaLinux 10)
     runs-on: ubuntu-latest
     container: almalinux:10
     steps:
-      - name: Install Rust toolchain + libpam headers
+      - name: Install Rust toolchain + system headers
         # pam-devel: the built-in "lumen" realm links libpam directly.
+        # libvirt-devel: the compute domain links the hypervisor's client
+        # library. Neither pulls a code generator into the toolchain — the
+        # bindings ship generated (see docs/compute.md), so no libclang.
         run: |
-          dnf -y install rust cargo rustfmt clippy pam-devel make git-core
+          dnf -y install rust cargo rustfmt clippy pam-devel libvirt-devel \
+            pkgconf-pkg-config make git-core
       - uses: actions/checkout@v4
       - name: Cache cargo
         uses: actions/cache@v4

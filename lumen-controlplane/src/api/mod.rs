@@ -1,5 +1,8 @@
 pub mod auth;
 pub mod network;
+pub mod request;
+pub mod storage;
+pub mod vms;
 
 use std::sync::Arc;
 
@@ -45,6 +48,27 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/network/management-bridge",
             post(network::management_bridge),
         )
+        // Virtual machines. Same discipline as networking: every handler
+        // deserializes, calls one lumen-virt method, and serializes; see
+        // src/api/vms.rs and docs/compute.md.
+        .route("/api/vms", get(vms::list))
+        .route("/api/vms", post(vms::create))
+        .route("/api/vms/{vmid}", get(vms::get))
+        .route("/api/vms/{vmid}", patch(vms::update))
+        .route("/api/vms/{vmid}", delete(vms::delete))
+        .route("/api/vms/{vmid}/start", post(vms::start))
+        .route("/api/vms/{vmid}/shutdown", post(vms::shutdown))
+        .route("/api/vms/{vmid}/stop", post(vms::stop))
+        .route("/api/vms/{vmid}/reboot", post(vms::reboot))
+        .route("/api/vms/{vmid}/reset", post(vms::reset))
+        .route("/api/vms/{vmid}/disks", post(vms::attach_disk))
+        .route("/api/vms/{vmid}/disks/{id}", delete(vms::detach_disk))
+        .route("/api/vms/{vmid}/nics", post(vms::attach_nic))
+        .route("/api/vms/{vmid}/nics/{id}", delete(vms::detach_nic))
+        // Storage. Read-only at this stage — the one write is reached through
+        // a machine's disks, because a volume is created for a machine.
+        .route("/api/storage/pools", get(storage::pools))
+        .route("/api/storage/pools/{pool}/volumes", get(storage::volumes))
         .with_state(state)
 }
 

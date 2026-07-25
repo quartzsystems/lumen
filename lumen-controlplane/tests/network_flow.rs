@@ -83,12 +83,24 @@ async fn harness(tag: &str) -> Harness {
     let state_dir = TempDir::new(tag);
     let backend = Arc::new(MockBackend::appliance());
     let network = Arc::new(NetworkService::new(backend.clone(), &state_dir.0, 60));
+    // The router needs every domain; these tests only exercise networking, and
+    // the other two are the in-memory backends so nothing is touched.
+    let storage = Arc::new(lumen_zfs::StorageService::new(Arc::new(
+        lumen_zfs::backend::mock::MockBackend::appliance(),
+    )));
+    let virt = Arc::new(lumen_virt::VirtService::new(
+        Arc::new(lumen_virt::backend::mock::MockBackend::appliance()),
+        storage.clone(),
+        network.clone(),
+    ));
 
     let router = app(Arc::new(AppState {
         config,
         jwt_secret: TICKET_SECRET.to_vec(),
         realms: RealmRegistry::new().register(Box::new(MockRealm)),
         network,
+        storage,
+        virt,
     }));
 
     // Sign in once; every networking route requires the session.

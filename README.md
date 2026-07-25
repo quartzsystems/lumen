@@ -9,9 +9,10 @@
 
 Lumen is a KVM hypervisor platform by [Quartz Systems](https://www.quartzsystems.net).
 At this stage the repository contains the **appliance ISO with a custom
-graphical installer**: a minimal AlmaLinux 10 system installed onto a **ZFS
-boot drive** by `lumen-installer`, a Rust/GTK4 wizard with Quartz styling.
-Hypervisor components (libvirt, QEMU, orchestration) land later.
+graphical installer** — a minimal AlmaLinux 10 system installed onto a **ZFS
+boot drive** by `lumen-installer`, a Rust/GTK4 wizard with Quartz styling —
+plus the management console, its networking, and **the first virtual machines
+that boot**. Clustering, migration, and backups land later.
 
 ## Repository layout
 
@@ -22,9 +23,11 @@ lumen-installer/     Rust GUI installer (app/) + live environment (live/)
 lumen-controlplane/  Rust (axum) control plane: auth API + web UI server on :8443
 lumen-webui/         Next.js/TypeScript/Tailwind web console (login + shell)
 lumen-networking/    lumen-net (bridges/bonds/VLANs) + nic0..nicN naming
+lumen-storage/       lumen-zfs (pools, datasets, virtual machine volumes)
+lumen-compute/       lumen-virt (the machine model, domain documents, lifecycle)
 iso/                 ISO build pipeline + version pins (upstream.env, pins.env)
 branding/            Release files, MOTD/issue, os-release additions, artwork
-packages/            RPM specs (lumen-release, lumen-logos, lumen-networking)
+packages/            RPM specs (lumen-release/-logos/-networking/-storage/-compute)
 docs/                Build and design documentation
 .github/             CI (RPMs, Rust, web UI, ISO + QEMU boot smoke test)
 ```
@@ -51,6 +54,18 @@ nobody confirms it within the window — a configuration that cuts your own
 path to the node heals on its own instead of costing a trip to the rack.
 See [docs/networking.md](docs/networking.md).
 
+## Virtual machines & storage
+
+The console **defines, starts, and removes virtual machines**, with their
+disks created as zvols under each pool's `lumen` dataset and their adapters
+attached to the node's bridges. libvirt is the source of truth — there is no
+database, and Lumen's own per-machine data rides inside the domain document's
+`<metadata>`, so `virsh dumpxml` shows the whole picture. Changes to a running
+machine report **what reached the guest and what waits for a restart**, using
+libvirt's own answer rather than a guess. Storage is read-only for now: pool
+creation is the one operation with no privileged daemon to delegate to. See
+[docs/compute.md](docs/compute.md).
+
 ## Prerequisites
 
 Building is supported on **AlmaLinux 10 x86_64**; a container works — root
@@ -60,9 +75,13 @@ inside it, but no `--privileged`, loop devices, or mounts needed:
 dnf config-manager --set-enabled crb
 dnf install rpm-build rpmdevtools rpmlint createrepo_c xorriso mtools \
             dosfstools squashfs-tools isomd5sum kmod \
-            rust cargo rustfmt clippy gtk4-devel pam-devel \
-            nodejs npm systemd-rpm-macros make
+            rust cargo rustfmt clippy gtk4-devel pam-devel libvirt-devel \
+            pkgconf-pkg-config nodejs npm systemd-rpm-macros make
 ```
+
+`libvirt-devel` is needed to **link** the control plane against the
+hypervisor's client library; nothing needs a hypervisor running, and no code
+generator comes with it (see [docs/compute.md](docs/compute.md)).
 
 Optional for linting shell scripts: `shellcheck` (EPEL).
 
@@ -74,9 +93,10 @@ Optional for linting shell scripts: `shellcheck` (EPEL).
 make rpms
 ```
 
-Builds `lumen-release`, `lumen-logos`, and `lumen-networking` (noarch)
-plus `lumen-controlplane` (x86_64: management daemon + web UI export)
-into `dist/rpms/`. The version comes from the top-level `VERSION` file.
+Builds `lumen-release`, `lumen-logos`, `lumen-networking`, `lumen-storage`,
+and `lumen-compute` (noarch) plus `lumen-controlplane` (x86_64: management
+daemon + web UI export) into `dist/rpms/`. The version comes from the
+top-level `VERSION` file.
 
 ### 2. ISO
 
@@ -90,16 +110,17 @@ make iso UPSTREAM_ISO=/path/to/AlmaLinux-10.2-x86_64-minimal.iso \
 ```
 
 This builds the Rust installer, assembles a live installer environment
-(squashfs + dracut), mirrors a pinned OpenZFS EL10 subset, and produces a
-**UEFI-only** `dist/lumen-<version>-x86_64.iso` (+ `.sha256`). Hard build
-gates keep the kernel pin, the ZFS kABI kmod, and offline dependency
-resolution honest — see [docs/build.md](docs/build.md).
+(squashfs + dracut), mirrors a pinned OpenZFS EL10 subset and the
+virtualization stack the media does not carry, and produces a **UEFI-only**
+`dist/lumen-<version>-x86_64.iso` (+ `.sha256`). Hard build gates keep the
+kernel pin, the ZFS kABI kmod, and offline dependency resolution honest — see
+[docs/build.md](docs/build.md).
 
 ### 3. Validation
 
 ```sh
-make test    # installer engine unit tests (headless)
-make lint    # shellcheck, rpmlint, cargo fmt/clippy
+make test    # installer, networking, storage, compute, control plane
+make lint    # shellcheck, rpmlint, cargo fmt/clippy across five manifests
 ```
 
 ## Installing the appliance

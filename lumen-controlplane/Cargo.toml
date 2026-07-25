@@ -19,6 +19,14 @@ license = "MIT"
 # backend. A path dependency, deliberately not a workspace member — see the
 # note at the top of lumen-networking/lumen-net/Cargo.toml.
 lumen-net = { path = "../lumen-networking/lumen-net" }
+# The storage domain: pools, datasets, and the volumes a machine's disks live
+# on. Shells out to the supported command line; nothing is linked.
+lumen-zfs = { path = "../lumen-storage/lumen-zfs" }
+# The virtualization domain: the machine model, the domain document, and the
+# hypervisor backend. Linking needs libvirt-devel (EL) / libvirt-dev (Debian);
+# the bindings ship generated, so bindgen and libclang stay out of the
+# toolchain exactly as they do for PAM below. See docs/compute.md.
+lumen-virt = { path = "../lumen-compute/lumen-virt" }
 axum = "0.8"
 # Typed cookie jar for the httpOnly session cookie.
 axum-extra = { version = "0.10", features = ["cookie"] }

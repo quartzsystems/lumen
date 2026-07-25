@@ -79,6 +79,9 @@ ln -s ../lumen-logos/lumen-mark.svg %{buildroot}%{_datadir}/pixmaps/lumen.svg
 %{_datadir}/pixmaps/lumen.svg
 
 %changelog
+* Fri Jul 24 2026 Quartz Systems Engineering <engineering@quartz.systems> - 0.3.0-1
+- Rebuilt for the release that adds guest machines
+
 * Thu Jul 23 2026 Quartz Systems Engineering <engineering@quartz.systems> - 0.1.0-1
 - Initial lumen-logos package: layered mark, lockups, favicon, raster
   renditions, Anaconda and Plymouth staging directories

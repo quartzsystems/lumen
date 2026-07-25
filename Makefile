@@ -1,12 +1,13 @@
 # Lumen build entry points — see README.md and docs/build.md.
 #
-# make rpms                          build lumen-release/-logos/-networking
+# make rpms                          build lumen-release/-logos/-networking/
+#                                    -storage/-compute
 # make installer                     cargo build the Rust installer (release)
 # make controlplane                  cargo build lumen-controlplane (release)
 # make webui                         Next.js static export -> lumen-webui/out
 # make iso UPSTREAM_ISO=... \
 #          [UPSTREAM_SHA256=...]     build dist/lumen-<version>-x86_64.iso
-# make test                          installer + networking + controlplane tests
+# make test                          installer + domain crates + controlplane
 # make lint                          shellcheck + rpmlint + fmt/clippy
 # make clean                         remove build/ and dist/
 
@@ -18,13 +19,17 @@ SCRIPTS := packages/build-rpms.sh iso/build-live-iso.sh \
            branding/console/lumen-console-banner \
            branding/console/50-lumen-banner
 SPECS   := packages/lumen-release.spec packages/lumen-logos.spec \
-           packages/lumen-networking.spec
+           packages/lumen-networking.spec packages/lumen-storage.spec \
+           packages/lumen-compute.spec
 CARGO_MANIFEST := lumen-installer/app/Cargo.toml
 CP_MANIFEST    := lumen-controlplane/Cargo.toml
-# lumen-net is a path dependency of the control plane, not a workspace member
-# (the three manifests are independent by design — see docs/networking.md), so
-# it gets its own fmt/clippy/test invocations.
+# The three domain crates are path dependencies of the control plane, not
+# workspace members (the manifests are independent by design — see
+# docs/networking.md and docs/compute.md), so each gets its own
+# fmt/clippy/test invocation.
 NET_MANIFEST   := lumen-networking/lumen-net/Cargo.toml
+ZFS_MANIFEST   := lumen-storage/lumen-zfs/Cargo.toml
+VIRT_MANIFEST  := lumen-compute/lumen-virt/Cargo.toml
 
 .PHONY: all rpms installer controlplane webui iso test lint clean
 
@@ -39,7 +44,9 @@ installer:
 	cargo build --release --manifest-path $(CARGO_MANIFEST) \
 		--target-dir build/cargo-target
 
-# Needs libpam headers: pam-devel (EL) / libpam0g-dev (Debian).
+# Needs libpam headers (pam-devel / libpam0g-dev) and the hypervisor client
+# library (libvirt-devel / libvirt-dev). Neither pulls a code generator into
+# the toolchain — see docs/compute.md.
 controlplane:
 	cargo build --release --manifest-path $(CP_MANIFEST) \
 		--target-dir build/cargo-target-cp
@@ -51,13 +58,19 @@ iso:
 	UPSTREAM_ISO="$(UPSTREAM_ISO)" UPSTREAM_SHA256="$(UPSTREAM_SHA256)" \
 		bash iso/build-live-iso.sh
 
-# Networking tests run entirely against the in-memory backend: no system bus,
-# no NetworkManager, nothing touched on the machine running them.
+# Every domain crate's tests run entirely against its in-memory backend: no
+# system bus, no hypervisor, no pools, nothing touched on the machine running
+# them. Building lumen-virt still needs libvirt-devel to link against;
+# running the tests does not need a hypervisor.
 test:
 	cargo test --manifest-path $(CARGO_MANIFEST) \
 		--target-dir build/cargo-target
 	cargo test --manifest-path $(NET_MANIFEST) \
 		--target-dir build/cargo-target-net
+	cargo test --manifest-path $(ZFS_MANIFEST) \
+		--target-dir build/cargo-target-zfs
+	cargo test --manifest-path $(VIRT_MANIFEST) \
+		--target-dir build/cargo-target-virt
 	cargo test --manifest-path $(CP_MANIFEST) \
 		--target-dir build/cargo-target-cp
 
@@ -70,6 +83,12 @@ lint:
 	cargo fmt --manifest-path $(NET_MANIFEST) --check
 	cargo clippy --manifest-path $(NET_MANIFEST) --all-targets \
 		--target-dir build/cargo-target-net -- -D warnings
+	cargo fmt --manifest-path $(ZFS_MANIFEST) --check
+	cargo clippy --manifest-path $(ZFS_MANIFEST) --all-targets \
+		--target-dir build/cargo-target-zfs -- -D warnings
+	cargo fmt --manifest-path $(VIRT_MANIFEST) --check
+	cargo clippy --manifest-path $(VIRT_MANIFEST) --all-targets \
+		--target-dir build/cargo-target-virt -- -D warnings
 	cargo fmt --manifest-path $(CP_MANIFEST) --check
 	cargo clippy --manifest-path $(CP_MANIFEST) --all-targets \
 		--target-dir build/cargo-target-cp -- -D warnings

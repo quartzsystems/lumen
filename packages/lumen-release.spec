@@ -130,6 +130,9 @@ fi
 %{_prefix}/lib/NetworkManager/dispatcher.d/50-lumen-banner
 
 %changelog
+* Fri Jul 24 2026 Quartz Systems Engineering <engineering@quartz.systems> - 0.3.0-1
+- Rebuilt for the release that adds guest machines
+
 * Fri Jul 24 2026 Quartz Systems Engineering <engineering@quartz.systems> - 0.1.0-1
 - Boot console banner: host name, current address, and console location on
   the pre-login screen, refreshed when addresses change

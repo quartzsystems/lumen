@@ -1,0 +1,34 @@
+# lumen-zfs — the Lumen storage domain: pools, datasets, and the volumes a
+# virtual machine's disks live on.
+#
+# A library crate, not a daemon: it compiles into lumen-controlplane the same
+# way lumen-net does. It is deliberately NOT a workspace member — the Lumen
+# manifests are independent by design and the Makefile drives each with its own
+# --manifest-path/--target-dir pair; a path dependency needs no workspace. See
+# the note at the top of lumen-networking/lumen-net/Cargo.toml.
+#
+# Nothing here links a storage library. libzfs has no stable ABI and binding it
+# is a maintenance trap, so the real backend shells out to the supported
+# command-line interface with typed argument arrays — never an interpolated
+# shell string. That also keeps bindgen/libclang out of the toolchain, matching
+# the reasoning behind the in-tree PAM FFI in lumen-controlplane/Cargo.toml.
+
+[package]
+name = "lumen-zfs"
+version = "0.3.0"
+edition = "2021"
+description = "Lumen storage: pools, datasets, and virtual-machine volumes"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+async-trait = "0.1"
+# "process" is what the real backend needs: argv arrays handed straight to
+# execve, with no shell anywhere in the path.
+tokio = { version = "1", features = ["process", "sync", "time", "rt", "macros"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

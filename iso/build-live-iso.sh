@@ -167,6 +167,52 @@ if [ -n "${MEDIA_EXTRA_PACKAGES:-}" ]; then
     mv "$extra_dl"/*.rpm "$TREE/lumen/"
 fi
 
+# The virtualization stack. It lives in AppStream, so none of it is on the
+# minimal media, and its dependency closure is far too long to list by hand
+# (see pins.env). Resolve the closure, subtract what the media already
+# carries, and mirror the remainder — so the ISO grows by what is genuinely
+# missing rather than by a second copy of half of BaseOS.
+if [ -n "${MEDIA_VIRT_PACKAGES:-}" ]; then
+    echo "==> Resolving the virtualization closure: $MEDIA_VIRT_PACKAGES"
+    virt_dl="$WORK/virt-download"
+    mkdir -p "$virt_dl"
+
+    # Everything the media already has, by name.
+    dnf repoquery --quiet --disablerepo='*' \
+        --repofrompath="media,$TREE/Minimal" --setopt=media.gpgcheck=0 \
+        --qf '%{name}' --available 2>/dev/null | LC_ALL=C sort -u > "$WORK/on-media.txt"
+
+    # Everything the stack needs, by name, transitively.
+    # shellcheck disable=SC2086 # intentional word splitting of the package list
+    dnf repoquery --quiet --qf '%{name}' --resolve --recursive --requires \
+        $MEDIA_VIRT_PACKAGES 2>/dev/null | LC_ALL=C sort -u > "$WORK/virt-closure.txt"
+    # shellcheck disable=SC2086 # intentional word splitting of the package list
+    printf '%s\n' $MEDIA_VIRT_PACKAGES >> "$WORK/virt-closure.txt"
+    LC_ALL=C sort -u -o "$WORK/virt-closure.txt" "$WORK/virt-closure.txt"
+
+    # comm needs both sides in the same collation, hence LC_ALL=C throughout.
+    LC_ALL=C comm -23 "$WORK/virt-closure.txt" "$WORK/on-media.txt" >"$WORK/virt-missing.txt"
+    missing_count="$(wc -l < "$WORK/virt-missing.txt")"
+    [ "$missing_count" -gt 0 ] \
+        || die "the virtualization closure resolved to nothing — is the build container's AppStream repo enabled?"
+    echo "==> Mirroring $missing_count packages the media lacks"
+
+    # xargs rather than one invocation: the list is long enough to matter.
+    xargs -a "$WORK/virt-missing.txt" -r dnf download --quiet --destdir "$virt_dl" \
+        || die "virtualization download failed"
+
+    echo "==> Gate: virtualization RPM signatures"
+    alma_key="/etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-10"
+    [ -r "$alma_key" ] || die "AlmaLinux GPG key not found at $alma_key (not building on AlmaLinux 10?)"
+    rpmkeys --import "$alma_key"
+    for rpm in "$virt_dl"/*.rpm; do
+        sig="$(rpmkeys --checksig "$rpm")"
+        grep -q "signatures OK" <<<"$sig" \
+            || die "RPM signature check failed: $sig"
+    done
+    mv "$virt_dl"/*.rpm "$TREE/lumen/"
+fi
+
 echo "==> Creating lumen repo"
 createrepo_c --quiet "$TREE/lumen"
 
@@ -182,7 +228,9 @@ resolve_out="$(dnf --assumeno --installroot="$resolve_root" --releasever=10 \
         grub2-efi-x64 shim-x64 grub2-tools grubby efibootmgr \
         e2fsprogs dosfstools NetworkManager chrony firewalld openssh-server \
         policycoreutils selinux-policy-targeted \
-        lumen-release lumen-networking lumen-controlplane 2>&1)"
+        libvirt-daemon-kvm qemu-kvm edk2-ovmf \
+        lumen-release lumen-networking lumen-storage lumen-compute \
+        lumen-controlplane 2>&1)"
 set -e
 # --assumeno exits nonzero after successfully resolving; a printed
 # transaction summary is the actual success signal.

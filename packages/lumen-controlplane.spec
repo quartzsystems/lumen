@@ -98,6 +98,15 @@ install -d -m 0700 %{buildroot}%{_sharedstatedir}/lumen-controlplane
 %dir %attr(0700,root,root) %{_sharedstatedir}/lumen-controlplane
 
 %changelog
+* Fri Jul 24 2026 Quartz Systems Engineering <engineering@quartz.systems> - 0.3.0-1
+- Add guest machine management: define, start, stop, and remove machines,
+  with their disks created on the node's own pools and their adapters
+  attached to its bridges
+- Add the console views for machines and for the node's pools, and a second
+  navigation column for whichever machine is open
+- Report which settings a running machine accepted and which wait for it to
+  restart, using the answer the guest service itself gave
+
 * Fri Jul 24 2026 Quartz Systems Engineering <engineering@quartz.systems> - 0.2.0-1
 - Add the network configuration interface: link aggregation, virtual
   networks, tagged interfaces, and per-adapter settings, staged and applied

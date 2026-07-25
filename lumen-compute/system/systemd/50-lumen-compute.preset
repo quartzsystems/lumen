@@ -1,0 +1,19 @@
+# Lumen: the machine daemons the management daemon delegates privileged work
+# to, enabled on a fresh install.
+#
+# Vendor preset rather than a %post that runs systemctl enable: a preset is
+# advice to the first `systemctl preset-all`, so an operator who has turned one
+# of these off keeps it off across upgrades.
+#
+# The socket units, not the service units: they are socket activated, so the
+# daemons start the first time something connects and are not running on a node
+# that has no machines on it yet.
+enable virtqemud.socket
+enable virtqemud-ro.socket
+enable virtqemud-admin.socket
+# Storage and network drivers, which the qemu driver hands work to.
+enable virtstoraged.socket
+enable virtnetworkd.socket
+enable virtnodedevd.socket
+# The event proxy the management daemon reads machine state changes from.
+enable virtproxyd.socket

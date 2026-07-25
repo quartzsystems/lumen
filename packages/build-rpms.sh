@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Build the Lumen RPMs: the noarch branding/tooling packages (lumen-release,
-# lumen-logos, lumen-networking) plus the arch-specific lumen-controlplane
-# (management daemon + web console).
+# lumen-logos, lumen-networking, lumen-storage, lumen-compute) plus the
+# arch-specific lumen-controlplane (management daemon + web console).
 #
 # The controlplane artifacts are produced here, before rpmbuild: cargo needs
 # crates.io and npm needs its registry, so the compile happens in the normal
 # build environment and the spec packages the prebuilt results. Requires:
-# rust/cargo, pam-devel (libpam headers), nodejs/npm >= 20.
+# rust/cargo, pam-devel (libpam headers), libvirt-devel (the hypervisor client
+# library the compute domain links), nodejs/npm >= 20.
 #
 # The version is read from the top-level VERSION file and injected into the
 # specs as %{lumen_version}. Outputs land in dist/rpms/.
@@ -21,7 +22,7 @@ die() { echo "FATAL: $*" >&2; exit 1; }
 
 for tool in rpmbuild cargo npm; do
     command -v "$tool" >/dev/null 2>&1 \
-        || die "$tool not found (dnf install rpm-build rust cargo pam-devel nodejs npm)"
+        || die "$tool not found (dnf install rpm-build rust cargo pam-devel libvirt-devel nodejs npm)"
 done
 [ -n "$VERSION" ] || die "VERSION file is empty"
 
@@ -95,6 +96,10 @@ cp "$REPO_ROOT"/branding/release/lumen-release.in \
 # distinct source name so it cannot collide in the flat SOURCES dir.
 cp "$REPO_ROOT/lumen-networking/system/NetworkManager/00-lumen.conf" \
    "$TOPDIR/SOURCES/lumen-nm-00-lumen.conf"
+# Service policy for the two domains that delegate their privileged work.
+cp "$REPO_ROOT/lumen-compute/system/systemd/50-lumen-compute.preset" \
+   "$REPO_ROOT/lumen-storage/system/systemd/50-lumen-storage.preset" \
+   "$TOPDIR/SOURCES/"
 
 for spec in "$REPO_ROOT"/packages/*.spec; do
     echo "==> rpmbuild $(basename "$spec") (version $VERSION)"

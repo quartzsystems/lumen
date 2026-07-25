@@ -1,0 +1,51 @@
+# lumen-virt — the Lumen virtualization domain: the machine model, the domain
+# document it renders to, validation, and the hypervisor backend.
+#
+# A library crate, not a daemon: it compiles into lumen-controlplane the same
+# way lumen-net does, and is deliberately NOT a workspace member — see the note
+# at the top of lumen-networking/lumen-net/Cargo.toml.
+#
+# It depends on lumen-net and lumen-zfs, and that direction is the correct one:
+# a machine needs a bridge to attach to and a volume to boot from, while
+# neither networking nor storage has any reason to know a machine exists.
+#
+# The `virt` crate does NOT run bindgen. Its `virt-sys` layer ships generated
+# bindings in the published crate and regenerates them only behind the opt-in
+# `bindgen_regenerate` feature; its one build dependency is pkg-config. That is
+# what keeps libclang out of the appliance and CI toolchains, exactly as the
+# in-tree PAM FFI does in lumen-controlplane/Cargo.toml. Evidence, and the
+# EL10 container run that produced it, are in docs/compute.md.
+#
+# Linking needs libvirt-devel (EL) / libvirt-dev (Debian). Running the tests
+# does not need libvirtd: every test uses the in-memory backend.
+
+[package]
+name = "lumen-virt"
+version = "0.3.0"
+edition = "2021"
+description = "Lumen virtualization: machine model, domain documents, lifecycle"
+license = "MIT"
+
+[dependencies]
+# A machine attaches to a bridge and boots off a volume, so the compute domain
+# asks the other two rather than reimplementing either.
+lumen-net = { path = "../../lumen-networking/lumen-net" }
+lumen-zfs = { path = "../../lumen-storage/lumen-zfs" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+async-trait = "0.1"
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+tracing = "0.1"
+# Pure Rust, no build script of its own: reads and escapes the domain
+# document. Generation and parsing both live in src/domain_xml.rs and nowhere
+# else in the tree.
+quick-xml = "0.37"
+# The official libvirt bindings. See the note above: no bindgen, no libclang.
+virt = "0.4"
+# The same bindings' constant layer, so flags are named rather than numeric.
+# It is `virt`'s own dependency; naming it here only makes it importable.
+virt-sys = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

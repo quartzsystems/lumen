@@ -1,0 +1,17 @@
+# Lumen: the pool services a node with storage needs, enabled on a fresh
+# install.
+#
+# Vendor preset rather than a %post that runs systemctl enable, for the same
+# reason as the compute one: a preset is advice to the first
+# `systemctl preset-all`, so an operator who has turned one of these off keeps
+# it off across upgrades.
+#
+# The event daemon is the one worth saying out loud: it is what notices a
+# device going away and a pool going degraded. Without it the first anyone
+# hears about a failed device is when they happen to look at the console.
+enable zfs-zed.service
+enable zfs-import-cache.service
+enable zfs-import.target
+enable zfs-mount.service
+enable zfs-volume-wait.service
+enable zfs.target

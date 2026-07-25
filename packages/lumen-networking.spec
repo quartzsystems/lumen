@@ -50,6 +50,10 @@ install -D -p -m 0644 %{SOURCE1} \
 %{_prefix}/lib/NetworkManager/conf.d/00-lumen.conf
 
 %changelog
+* Fri Jul 24 2026 Quartz Systems Engineering <engineering@quartz.systems> - 0.3.0-1
+- Rebuilt for the release that adds guest machines; no packaged content
+  changed
+
 * Fri Jul 24 2026 Quartz Systems Engineering <engineering@quartz.systems> - 0.2.0-1
 - Add the appliance policy fragment that stops automatic profiles being
   created for unconfigured hardware

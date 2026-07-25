@@ -14,6 +14,8 @@ use lumen_controlplane::realm::{AuthFailure, Realm, RealmKind, RealmRegistry};
 use lumen_controlplane::{app, AppState};
 use lumen_net::backend::mock::MockBackend;
 use lumen_net::NetworkService;
+use lumen_virt::VirtService;
+use lumen_zfs::StorageService;
 
 struct MockRealm;
 
@@ -50,11 +52,24 @@ fn test_app() -> axum::Router {
         &state_dir,
         60,
     ));
+    // These tests are about sessions, not about machines, but the router needs
+    // every domain — and every one of them is the in-memory backend, so
+    // nothing here touches the runner's networking, storage, or hypervisor.
+    let storage = Arc::new(StorageService::new(Arc::new(
+        lumen_zfs::backend::mock::MockBackend::appliance(),
+    )));
+    let virt = Arc::new(VirtService::new(
+        Arc::new(lumen_virt::backend::mock::MockBackend::appliance()),
+        storage.clone(),
+        network.clone(),
+    ));
     let state = AppState {
         config,
         jwt_secret: b"test-secret-test-secret-test-secret!".to_vec(),
         realms: RealmRegistry::new().register(Box::new(MockRealm)),
         network,
+        storage,
+        virt,
     };
     app(Arc::new(state))
 }

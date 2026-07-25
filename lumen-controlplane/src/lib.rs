@@ -13,17 +13,27 @@ use tower_http::trace::TraceLayer;
 
 use config::Config;
 use lumen_net::NetworkService;
+use lumen_virt::VirtService;
+use lumen_zfs::StorageService;
 use realm::RealmRegistry;
 
 /// Shared state behind every /api handler.
+///
+/// Each domain takes its backend as a parameter the same way the realm
+/// registry does, so tests inject the in-memory ones and never touch the
+/// runner's NetworkManager, hypervisor, or storage.
 pub struct AppState {
     pub config: Config,
     pub jwt_secret: Vec<u8>,
     pub realms: RealmRegistry,
-    /// The networking domain. Takes its backend as a parameter the same way
-    /// the realm registry does, so tests inject the in-memory one and never
-    /// touch the runner's NetworkManager.
+    /// Bridges, bonds, VLAN interfaces.
     pub network: Arc<NetworkService>,
+    /// Pools, datasets, and the volumes a machine's disks live on.
+    pub storage: Arc<StorageService>,
+    /// The machines themselves. Depends on the other two — a machine needs a
+    /// bridge to attach to and a volume to boot from — which is why it is
+    /// constructed last.
+    pub virt: Arc<VirtService>,
 }
 
 /// The full application router: /api plus the static web UI fallback.

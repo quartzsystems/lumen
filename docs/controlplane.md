@@ -72,6 +72,33 @@ mechanism, and a copy-pasteable `curl` walkthrough):
 | `/api/network/apply/extend`                | POST   | Extend the confirm window                |
 | `/api/network/management-bridge`           | POST   | Convert the management NIC to a bridge   |
 
+Virtual machines and storage (all require a session; see
+[docs/compute.md](compute.md) for the model, the live-versus-restart
+distinction, and a copy-pasteable `curl` walkthrough):
+
+| Endpoint                                | Method | Purpose                                     |
+| --------------------------------------- | ------ | ------------------------------------------- |
+| `/api/vms`                              | GET    | All machines, grouped by node                |
+| `/api/vms`                              | POST   | Define a machine and the volumes its disks live on |
+| `/api/vms/:vmid`                        | GET    | One machine, full detail                     |
+| `/api/vms/:vmid`                        | PATCH  | Update; reports what applied live and what waits |
+| `/api/vms/:vmid`                        | DELETE | Undefine; `purge_disks` off by default       |
+| `/api/vms/:vmid/start`                  | POST   | Start it                                     |
+| `/api/vms/:vmid/shutdown`               | POST   | Ask the guest to stop                        |
+| `/api/vms/:vmid/stop`                   | POST   | Stop it now — needs the acknowledgement      |
+| `/api/vms/:vmid/reboot`                 | POST   | Ask the guest to restart                     |
+| `/api/vms/:vmid/reset`                  | POST   | Restart it now — needs the acknowledgement   |
+| `/api/vms/:vmid/disks`                  | POST   | Create a volume and attach it                |
+| `/api/vms/:vmid/disks/:id`              | DELETE | Detach; destroys the volume only if asked    |
+| `/api/vms/:vmid/nics`                   | POST   | Attach an adapter                            |
+| `/api/vms/:vmid/nics/:id`               | DELETE | Detach it (`:id` is the hardware address)    |
+| `/api/storage/pools`                    | GET    | Pools, grouped by node                       |
+| `/api/storage/pools/:pool/volumes`      | GET    | Datasets and volumes under a pool            |
+
+Pool creation, import, and destroy have no endpoint: they are the operations
+that need privileges this daemon deliberately does not have. See
+[docs/compute.md](compute.md).
+
 Errors are `{ "error": "<user-facing text>" }`. Login failures are a
 uniform 401 regardless of cause, so responses don't leak whether an
 account exists. A rejected network configuration adds an `errors` array
