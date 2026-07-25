@@ -61,11 +61,13 @@ pub struct LibvirtBackend {
 }
 
 impl LibvirtBackend {
-    /// Connect to the local hypervisor, or say why not.
+    /// Connect to the local hypervisor and check it can actually run a
+    /// machine, or say why not.
     ///
     /// A failure here is not fatal to the control plane: `main` swaps in
     /// [`super::unavailable::UnavailableBackend`] and the console comes up
-    /// reporting the reason, because an operator whose hypervisor is down
+    /// reporting the reason, because an operator whose hypervisor is down — or
+    /// whose node turns out not to have KVM at all, see `ensure_kvm` below —
     /// needs the console more than usual.
     pub async fn connect() -> Result<Self> {
         Self::connect_to(SYSTEM_URI).await
@@ -82,10 +84,40 @@ impl LibvirtBackend {
                     err.message()
                 ))
             })?;
-        Ok(Self {
+        let backend = Self {
             handle: Arc::new(Handle(handle)),
             node: crate::state::hostname(),
-        })
+        };
+        backend.ensure_kvm().await?;
+        Ok(backend)
+    }
+
+    /// Refuse a node that cannot run a machine, at startup rather than at the
+    /// first create.
+    ///
+    /// Reaching the hypervisor is not the same as being able to run a guest. A
+    /// node whose processor virtualization is off in firmware — or a nested one
+    /// whose host does not pass it through — has a perfectly healthy libvirt
+    /// and no `/dev/kvm`, and answers every question the console asks at boot.
+    /// Nothing notices until a create, and then the failure arrives in the
+    /// worst possible shape: the disks are made first, so the hypervisor's
+    /// refusal rolls a volume back and reports itself as an internal error
+    /// with the reason only in the journal.
+    ///
+    /// Worse, the reason it reports is not the one an operator needs. Firmware
+    /// selection is resolved against the machine types the domain's accelerator
+    /// can provide, so a UEFI machine on a node without KVM fails with
+    /// "Unable to find 'efi' firmware that is compatible with the current
+    /// configuration" — which reads as a missing firmware package and is not.
+    ///
+    /// Asking for the KVM domain capabilities is how the hypervisor itself
+    /// answers the question, and asking at startup turns all of that into one
+    /// sentence on the page.
+    async fn ensure_kvm(&self) -> Result<()> {
+        self.call(|conn| conn.get_domain_capabilities(None, Some("x86_64"), None, Some("kvm"), 0))
+            .await
+            .map(|_| ())
+            .map_err(|err| kvm_unavailable(&err.to_string()))
     }
 
     /// Run one blocking library call off the async runtime.
@@ -114,6 +146,21 @@ impl LibvirtBackend {
         })
         .await
     }
+}
+
+/// Why this node cannot run machines, in the words an operator can act on.
+///
+/// The hypervisor's own sentence is kept — it names the emulator, which is
+/// worth having — but on its own it says nothing about what to do next, and
+/// the two things that cause it are firmware settings on the node and a host
+/// that does not pass virtualization through to it.
+fn kvm_unavailable(reason: &str) -> VirtError {
+    VirtError::Backend(anyhow::anyhow!(
+        "the hypervisor is running but KVM is not available ({reason}). \
+         On hardware, virtualization has to be enabled in the node's firmware; \
+         if this node is itself a virtual machine, its host has to pass \
+         hardware virtualization through to it."
+    ))
 }
 
 /// The hypervisor's own error, mapped onto the API's. A machine that is not
@@ -383,5 +430,25 @@ mod tests {
     fn live_calls_carry_only_the_live_flag() {
         assert_eq!(LIVE_ONLY, virt_sys::VIR_DOMAIN_AFFECT_LIVE);
         assert_eq!(LIVE_ONLY & virt_sys::VIR_DOMAIN_AFFECT_CONFIG, 0);
+    }
+
+    /// A node without KVM is a node that cannot run anything, and the answer
+    /// has to say so in terms an operator can act on — the hypervisor's own
+    /// sentence names the emulator and stops there. Backend, so `main` swaps
+    /// in the unavailable backend and the console still comes up.
+    #[test]
+    fn a_node_without_kvm_says_what_to_check() {
+        let err = kvm_unavailable("the accel 'kvm' is not supported by '/usr/libexec/qemu-kvm'");
+        assert!(matches!(err, VirtError::Backend(_)), "{err:?}");
+        let text = err.to_string();
+        // The hypervisor's own words, kept.
+        assert!(text.contains("/usr/libexec/qemu-kvm"), "{text}");
+        // And both things that cause it, because the operator cannot tell
+        // which one they are looking at from the hypervisor's sentence.
+        assert!(text.contains("firmware"), "{text}");
+        assert!(
+            text.contains("pass hardware virtualization through"),
+            "{text}"
+        );
     }
 }

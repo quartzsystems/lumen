@@ -877,91 +877,94 @@ function OsTab({
 
   return (
     <>
-      <div className="grid gap-4" style={{ gridTemplateColumns: "1fr 1fr" }}>
-        <div className="flex flex-col gap-4">
-          {/* The two answers to "what does this machine boot from" sit
-              together; the storage and image that only matter to the first
-              of them follow underneath. */}
-          <div className="flex flex-col gap-[10px]">
-            <label className="flex items-center gap-[10px] cursor-pointer select-none">
-              <input
-                type="radio"
-                checked={draft.useMedia}
-                onChange={() => set("useMedia", true)}
-                style={{ accentColor: "var(--qz-accent)" }}
-              />
-              <span className="text-[13px] text-[var(--qz-fg-2)]">
-                Use CD/DVD disc image file (iso)
-              </span>
-            </label>
-            <label className="flex items-center gap-[10px] cursor-pointer select-none">
-              <input
-                type="radio"
-                checked={!draft.useMedia}
-                onChange={() => set("useMedia", false)}
-                style={{ accentColor: "var(--qz-accent)" }}
-              />
-              <span className="text-[13px] text-[var(--qz-fg-2)]">Do not use any media</span>
-            </label>
-          </div>
-          <div className={draft.useMedia ? "" : "opacity-40 pointer-events-none"}>
-            <Field label="Storage" htmlFor="vm-media-storage">
-              <SelectInput
-                id="vm-media-storage"
-                value={draft.mediaStorage}
-                mono
-                onChange={(v) => mark("mediaStorage", v)}
-              >
-                {stores.length === 0 && <option value="">no media library</option>}
-                {stores.map((s) => (
-                  <option key={s.storage} value={s.storage}>
-                    {s.storage}
-                  </option>
-                ))}
-              </SelectInput>
-            </Field>
-            <div className="mt-4">
-              <Field label="ISO image" htmlFor="vm-media-image" error={errors.cdroms}>
-                <SelectInput
-                  id="vm-media-image"
-                  value={draft.mediaImage}
-                  mono
-                  invalid={!!errors.cdroms}
-                  onChange={(v) => mark("mediaImage", v)}
-                >
-                  <option value="">Choose an image…</option>
-                  {imagesIn(draft.mediaStorage).map((image) => (
-                    <option key={image.name} value={image.name}>
-                      {image.name} — {formatBytes(image.size)}
-                    </option>
-                  ))}
-                </SelectInput>
-              </Field>
-            </div>
-          </div>
+      {/* One grid rather than two independent columns, so the rows line up:
+          the media heading sits level with the guest heading, and Storage with
+          Type. Stacking each side separately left the right-hand fields riding
+          higher than the left by exactly the height of the radios. */}
+      <div className="grid gap-4 items-start" style={{ gridTemplateColumns: "1fr 1fr" }}>
+        {/* The two answers to "what does this machine boot from" sit together;
+            the storage and image that only matter to the first of them follow
+            underneath. */}
+        <div className="flex flex-col gap-[10px]">
+          <label className="flex items-center gap-[10px] cursor-pointer select-none">
+            <input
+              type="radio"
+              checked={draft.useMedia}
+              onChange={() => set("useMedia", true)}
+              style={{ accentColor: "var(--qz-accent)" }}
+            />
+            <span className="text-[13px] text-[var(--qz-fg-2)]">
+              Use CD/DVD disc image file (iso)
+            </span>
+          </label>
+          <label className="flex items-center gap-[10px] cursor-pointer select-none">
+            <input
+              type="radio"
+              checked={!draft.useMedia}
+              onChange={() => set("useMedia", false)}
+              style={{ accentColor: "var(--qz-accent)" }}
+            />
+            <span className="text-[13px] text-[var(--qz-fg-2)]">Do not use any media</span>
+          </label>
         </div>
+        <div className="text-[13px] text-[var(--qz-fg-2)] font-semibold">Guest OS:</div>
 
-        <div className="flex flex-col gap-4">
-          <div className="text-[13px] text-[var(--qz-fg-2)] font-semibold">Guest OS:</div>
-          <Field label="Type" htmlFor="vm-os-family">
+        <div className={draft.useMedia ? "" : "opacity-40 pointer-events-none"}>
+          <Field label="Storage" htmlFor="vm-media-storage">
             <SelectInput
-              id="vm-os-family"
-              value={draft.osFamily}
-              onChange={(v) => {
-                set("osFamily", v);
-                // The version list is per family, so the old choice is not in
-                // it any more.
-                set("osId", "");
-              }}
+              id="vm-media-storage"
+              value={draft.mediaStorage}
+              mono
+              onChange={(v) => mark("mediaStorage", v)}
             >
-              {(catalog?.families.length ?? 0) === 0 && <option value="">unavailable</option>}
-              {catalog?.families.map((f) => (
-                <option key={f.id} value={f.id}>
-                  {f.label}
+              {stores.length === 0 && <option value="">no media library</option>}
+              {stores.map((s) => (
+                <option key={s.storage} value={s.storage}>
+                  {s.storage}
                 </option>
               ))}
             </SelectInput>
           </Field>
+        </div>
+        <Field label="Type" htmlFor="vm-os-family">
+          <SelectInput
+            id="vm-os-family"
+            value={draft.osFamily}
+            onChange={(v) => {
+              set("osFamily", v);
+              // The version list is per family, so the old choice is not in
+              // it any more.
+              set("osId", "");
+            }}
+          >
+            {(catalog?.families.length ?? 0) === 0 && <option value="">unavailable</option>}
+            {catalog?.families.map((f) => (
+              <option key={f.id} value={f.id}>
+                {f.label}
+              </option>
+            ))}
+          </SelectInput>
+        </Field>
+
+        <div className={draft.useMedia ? "" : "opacity-40 pointer-events-none"}>
+          <Field label="ISO image" htmlFor="vm-media-image" error={errors.cdroms}>
+            <SelectInput
+              id="vm-media-image"
+              value={draft.mediaImage}
+              mono
+              invalid={!!errors.cdroms}
+              onChange={(v) => mark("mediaImage", v)}
+            >
+              <option value="">Choose an image…</option>
+              {imagesIn(draft.mediaStorage).map((image) => (
+                <option key={image.name} value={image.name}>
+                  {image.name} — {formatBytes(image.size)}
+                </option>
+              ))}
+            </SelectInput>
+          </Field>
+        </div>
+        <div className="flex flex-col gap-4">
           <Field label="Version" htmlFor="vm-os-version">
             <SelectInput id="vm-os-version" value={draft.osId} onChange={(v) => set("osId", v)}>
               <option value="">Not specified</option>
