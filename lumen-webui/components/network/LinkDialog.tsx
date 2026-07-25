@@ -22,7 +22,6 @@ import {
   updateVlan,
   validationErrorsOf,
   type BondMode,
-  type Duplex,
   type IpConfig,
   type LinkKind,
   type LinkView,
@@ -45,8 +44,6 @@ interface Draft {
   gateway: string;
   ports: string[];
   vlanAware: boolean;
-  stp: boolean;
-  forwardDelay: string;
   mtu: string;
   mode: BondMode;
   miimon: string;
@@ -55,9 +52,6 @@ interface Draft {
   primary: string;
   parent: string;
   vlanId: string;
-  autoneg: "" | "on" | "off";
-  speed: string;
-  duplex: "" | Duplex;
 }
 
 const emptyDraft = (): Draft => ({
@@ -68,8 +62,6 @@ const emptyDraft = (): Draft => ({
   gateway: "",
   ports: [],
   vlanAware: false,
-  stp: false,
-  forwardDelay: "",
   mtu: "",
   mode: "active-backup",
   miimon: "",
@@ -78,9 +70,6 @@ const emptyDraft = (): Draft => ({
   primary: "",
   parent: "",
   vlanId: "",
-  autoneg: "",
-  speed: "",
-  duplex: "",
 });
 
 const draftFrom = (link: LinkView): Draft => ({
@@ -144,8 +133,8 @@ const ipConfigOf = (draft: Draft): IpConfig => {
 
 /// Create or edit one link.
 ///
-/// All four kinds share one form: name, addressing, MTU, and a comment are in
-/// the same place every time, with only the middle — ports, VLAN id, bond
+/// All four kinds share one form: name, addressing, MTU, and a description are
+/// in the same place every time, with only the middle — ports, VLAN id, bond
 /// options — changing. Server-side validation errors come back with the field
 /// they belong to, so they land under the input that caused them instead of in
 /// a banner at the top.
@@ -233,11 +222,15 @@ export function LinkDialog({
       const common = { ip: ipConfigOf(draft), comment: draft.comment.trim(), mtu };
       let pending: PendingResponse;
       if (kind === "bridge") {
+        // Spanning tree and its forward delay are not offered: a hypervisor
+        // bridge carries guest ports, and a listening period before traffic
+        // passes is a machine that looks broken for the first half minute of
+        // its life. The backend still takes both — this form asks for the one
+        // answer an appliance wants.
         const body = {
           ...common,
           ports: draft.ports,
-          stp: draft.stp,
-          forward_delay: numberOrUndefined(draft.forwardDelay),
+          stp: false,
           vlan_filtering: draft.vlanAware,
         };
         pending = editing
@@ -266,13 +259,10 @@ export function LinkDialog({
           ? await updateVlan(editing.name, body)
           : await createVlan({ name: draft.name, ...body });
       } else {
-        // A physical NIC is configured, never created.
-        pending = await updateNic(editing!.name, {
-          ...common,
-          autoneg: draft.autoneg === "" ? undefined : draft.autoneg === "on",
-          speed: draft.autoneg === "off" ? numberOrUndefined(draft.speed) : undefined,
-          duplex: draft.autoneg === "off" && draft.duplex ? draft.duplex : undefined,
-        });
+        // A physical NIC is configured, never created. Speed and duplex are
+        // left to auto-negotiation — the fields are omitted rather than sent
+        // empty, so whatever the link already agreed on stays agreed on.
+        pending = await updateNic(editing!.name, common);
       }
       onSaved(pending);
     } catch (err) {
@@ -569,67 +559,6 @@ export function LinkDialog({
           </div>
         )}
 
-        {kind === "bridge" && (
-          <div className="grid gap-4 items-end" style={{ gridTemplateColumns: "1fr 1fr" }}>
-            <Field label="Forward delay (s)" htmlFor="bridge-delay">
-              <TextInput
-                id="bridge-delay"
-                value={draft.forwardDelay}
-                mono
-                inputMode="numeric"
-                placeholder="0"
-                onChange={(v) => set("forwardDelay", v)}
-              />
-            </Field>
-            <label className="flex items-center gap-[10px] cursor-pointer select-none pb-[9px]">
-              <Switch on={draft.stp} onChange={(v) => set("stp", v)} />
-              <span className="text-[13px] text-[var(--qz-fg-2)]">Spanning tree (STP)</span>
-            </label>
-          </div>
-        )}
-
-        {kind === "ethernet" && (
-          <div className="grid gap-4" style={{ gridTemplateColumns: "1fr 1fr" }}>
-            <Field label="Link negotiation" htmlFor="nic-autoneg">
-              <SelectInput
-                id="nic-autoneg"
-                value={draft.autoneg}
-                onChange={(v) => set("autoneg", v as Draft["autoneg"])}
-              >
-                <option value="">Leave as configured</option>
-                <option value="on">Automatic</option>
-                <option value="off">Forced</option>
-              </SelectInput>
-            </Field>
-            {draft.autoneg === "off" && (
-              <>
-                <Field label="Speed (Mb/s)" htmlFor="nic-speed">
-                  <TextInput
-                    id="nic-speed"
-                    value={draft.speed}
-                    mono
-                    inputMode="numeric"
-                    placeholder="1000"
-                    onChange={(v) => set("speed", v)}
-                  />
-                </Field>
-                <Field label="Duplex" htmlFor="nic-duplex">
-                  <SelectInput
-                    id="nic-duplex"
-                    value={draft.duplex}
-                    mono
-                    onChange={(v) => set("duplex", v as Draft["duplex"])}
-                  >
-                    <option value="">Choose…</option>
-                    <option value="full">full</option>
-                    <option value="half">half</option>
-                  </SelectInput>
-                </Field>
-              </>
-            )}
-          </div>
-        )}
-
         <Field label="MTU" htmlFor="link-mtu" error={errors.mtu}>
           <TextInput
             id="link-mtu"
@@ -642,7 +571,7 @@ export function LinkDialog({
           />
         </Field>
 
-        <Field label="Comment" htmlFor="link-comment" hint="Shown in the Description column.">
+        <Field label="Description" htmlFor="link-comment">
           <TextInput
             id="link-comment"
             value={draft.comment}

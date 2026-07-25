@@ -18,6 +18,7 @@ import { ModalShell, ModalHeader } from "@/components/ui/Modal";
 import { ModalFooter } from "@/components/ui/formkit";
 import { LinkDialog, dialogKindFor, type DialogKind } from "@/components/network/LinkDialog";
 import { ApiError } from "@/lib/authClient";
+import { titleCase, titleCaseOptions } from "@/lib/labels";
 import { useConsole } from "@/lib/ConsoleContext";
 import { useNetworkCheckpoint } from "@/lib/NetworkCheckpointContext";
 import {
@@ -130,57 +131,60 @@ export default function InterfacesPage() {
       await refreshCheckpoint();
     }, "Management bridge created. Confirm before the window runs out.");
 
+  // The Create control sits in the table's own toolbar, next to Columns and
+  // Refresh, rather than up in the page header: it acts on the table below it,
+  // and every other control that does is already there.
+  const createControl = (
+    <div className="relative">
+      <span
+        title={outstanding ? "Confirm or roll back the outstanding change first" : undefined}
+      >
+        <Button
+          kind="primary"
+          size="sm"
+          icon={Plus}
+          iconRight={ChevronDown}
+          onClick={() => setMenuOpen((open) => !open)}
+          disabled={outstanding}
+        >
+          Create
+        </Button>
+      </span>
+      {menuOpen && (
+        <>
+          {/* Click-away, so the menu closes the way every other one does. */}
+          <div className="fixed inset-0 z-10" onClick={() => setMenuOpen(false)} />
+          <div className="menu">
+            {(
+              [
+                { kind: "bridge", label: "Linux Bridge", Icon: Network },
+                { kind: "bond", label: "Linux Bond", Icon: Share2 },
+                { kind: "vlan", label: "Linux VLAN", Icon: Tags },
+              ] as const
+            ).map(({ kind, label, Icon }) => (
+              <button
+                key={kind}
+                type="button"
+                className="menu-item"
+                onClick={() => {
+                  setMenuOpen(false);
+                  setDialog({ kind, editing: null });
+                }}
+              >
+                <Icon size={15} /> {label}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+
   return (
     <Page>
       <PageHeader
         title="Interfaces"
         description="Physical adapters, bridges, bonds, and VLAN interfaces on this node."
-        actions={
-          <div className="relative">
-            <span
-              title={
-                outstanding ? "Confirm or roll back the outstanding change first" : undefined
-              }
-            >
-              <Button
-                kind="primary"
-                icon={Plus}
-                iconRight={ChevronDown}
-                onClick={() => setMenuOpen((open) => !open)}
-                disabled={outstanding}
-              >
-                Create
-              </Button>
-            </span>
-            {menuOpen && (
-              <>
-                {/* Click-away, so the menu closes the way every other one does. */}
-                <div className="fixed inset-0 z-10" onClick={() => setMenuOpen(false)} />
-                <div className="menu">
-                  {(
-                    [
-                      { kind: "bridge", label: "Linux Bridge", Icon: Network },
-                      { kind: "bond", label: "Linux Bond", Icon: Share2 },
-                      { kind: "vlan", label: "Linux VLAN", Icon: Tags },
-                    ] as const
-                  ).map(({ kind, label, Icon }) => (
-                    <button
-                      key={kind}
-                      type="button"
-                      className="menu-item"
-                      onClick={() => {
-                        setMenuOpen(false);
-                        setDialog({ kind, editing: null });
-                      }}
-                    >
-                      <Icon size={15} /> {label}
-                    </button>
-                  ))}
-                </div>
-              </>
-            )}
-          </div>
-        }
       />
 
       <PageBody>
@@ -289,6 +293,7 @@ export default function InterfacesPage() {
               <InterfaceTable
                 rows={node.interfaces}
                 busy={busy || outstanding}
+                toolbar={createControl}
                 onRefresh={load}
                 onEdit={(link) => setDialog({ kind: dialogKindFor(link.kind), editing: link })}
                 onDelete={(link) =>
@@ -391,7 +396,7 @@ const columns: Column<LinkView>[] = [
     key: "kind",
     header: "Type",
     value: (link) => link.kind,
-    render: (link) => <span className="text-[var(--qz-fg-4)]">{link.kind}</span>,
+    render: (link) => <span className="text-[var(--qz-fg-4)]">{titleCase(link.kind)}</span>,
     sortable: true,
     width: 100,
   },
@@ -409,7 +414,7 @@ const columns: Column<LinkView>[] = [
     value: (link) => (link.kind === "bridge" ? (link.vlan_aware ? "yes" : "no") : ""),
     render: (link) =>
       link.kind === "bridge" ? (
-        <span className="text-[var(--qz-fg-4)]">{link.vlan_aware ? "yes" : "no"}</span>
+        <span className="text-[var(--qz-fg-4)]">{link.vlan_aware ? "Yes" : "No"}</span>
       ) : (
         <Dash />
       ),
@@ -476,23 +481,25 @@ const columns: Column<LinkView>[] = [
 function InterfaceTable({
   rows,
   busy,
+  toolbar,
   onRefresh,
   onEdit,
   onDelete,
 }: {
   rows: LinkView[];
   busy: boolean;
+  toolbar?: React.ReactNode;
   onRefresh: () => Promise<void>;
   onEdit: (link: LinkView) => void;
   onDelete: (link: LinkView) => Promise<void>;
 }) {
   // The drop-downs offer what is actually on this node, not every value the
   // API can produce — a filter for a type the box does not have is dead space.
+  // The option value stays the wire one the predicate matches on; only the
+  // label an operator reads is capitalised.
   const filters: FilterDef<LinkView>[] = useMemo(() => {
     const optionsOf = (of: (link: LinkView) => string) =>
-      Array.from(new Set(rows.map(of).filter(Boolean)))
-        .sort()
-        .map((value) => ({ value, label: value }));
+      titleCaseOptions(Array.from(new Set(rows.map(of).filter(Boolean))).sort());
     return [
       {
         key: "kind",
@@ -514,6 +521,7 @@ function InterfaceTable({
       rows={rows}
       columns={columns}
       filters={filters}
+      toolbar={toolbar}
       rowId={(link) => link.name}
       storageKey="networking-interfaces"
       searchPlaceholder="Search interfaces…"
@@ -550,7 +558,7 @@ function ActiveCell({ link }: { link: LinkView }) {
           : link.oper_state
       }
     >
-      {activeText(link)}
+      {titleCase(activeText(link))}
     </span>
   );
 }

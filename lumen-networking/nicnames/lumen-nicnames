@@ -62,18 +62,41 @@ mapfile -t nics < <(
 # The recorded alternative name comes back too: on a re-run the adapter is
 # already called nic<N>, so the original name is only still knowable from the
 # file that recorded it the first time.
-declare -A mac_to_idx used_idx idx_to_alt
-for f in "$LINKDIR"/70-lumen-nic*.link; do
-    [ -e "$f" ] || continue
-    idx="$(basename "$f")"; idx="${idx#70-lumen-nic}"; idx="${idx%.link}"
-    case "$idx" in *[!0-9]*|'') continue ;; esac
-    mac="$(sed -n 's/^PermanentMACAddress=//p' "$f" | head -n1 | tr 'A-F' 'a-f')"
-    [ -n "$mac" ] || continue
-    mac_to_idx["$mac"]="$idx"
-    used_idx["$idx"]=1
-    alt="$(sed -n 's/^AlternativeName=//p' "$f" | head -n1)"
-    if [ -n "$alt" ]; then idx_to_alt["$idx"]="$alt"; fi
-done
+#
+# Keyed by MAC rather than by index, because the second reader below is a
+# different root whose indices are not this one's.
+declare -A mac_to_idx used_idx mac_to_alt
+
+# read_pins DIR PIN  — scan DIR's link files. With PIN=1 the MAC->index pins
+# are adopted as well; with PIN=0 only the recorded alternative names are, and
+# only where nothing is known yet.
+read_pins() {
+    local dir="$1" pin="$2" f idx mac alt
+    for f in "$dir"/70-lumen-nic*.link; do
+        [ -e "$f" ] || continue
+        idx="$(basename "$f")"; idx="${idx#70-lumen-nic}"; idx="${idx%.link}"
+        case "$idx" in *[!0-9]*|'') continue ;; esac
+        mac="$(sed -n 's/^PermanentMACAddress=//p' "$f" | head -n1 | tr 'A-F' 'a-f')"
+        [ -n "$mac" ] || continue
+        if [ "$pin" = 1 ]; then
+            mac_to_idx["$mac"]="$idx"
+            used_idx["$idx"]=1
+        fi
+        alt="$(sed -n 's/^AlternativeName=//p' "$f" | head -n1)"
+        if [ -n "$alt" ] && [ -z "${mac_to_alt[$mac]:-}" ]; then mac_to_alt["$mac"]="$alt"; fi
+    done
+}
+
+read_pins "$LINKDIR" 1
+# Writing into an install target, from a live environment that has already
+# renamed these adapters: /sys now says nic<N>, so the kernel's original name
+# survives only in the live root's own link file. Without this the installed
+# system gets no AlternativeName at all and the console's Alternative Name
+# column is empty on every fresh install. The live root never pins indices —
+# those come from the target, which is the system being built.
+if [ "$LINKDIR" != "/etc/systemd/network" ]; then
+    read_pins /etc/systemd/network 0
+fi
 
 # --- assign indices: keep pins, give new NICs the next free index -----------
 next_free() {
@@ -100,8 +123,8 @@ for entry in "${nics[@]}"; do
     mac="$(tr 'A-F' 'a-f' <<<"$mac")"
     idx="${dev_to_idx[$dev]}"
     # The kernel's own name, if this NIC is being renamed; otherwise whatever
-    # a previous run recorded, so a re-run never loses it.
-    if [ "$dev" != "nic$idx" ]; then alt="$dev"; else alt="${idx_to_alt[$idx]:-}"; fi
+    # an earlier run recorded for this MAC, so a re-run never loses it.
+    if [ "$dev" != "nic$idx" ]; then alt="$dev"; else alt="${mac_to_alt[$mac]:-}"; fi
     {
         cat <<EOF
 # Written by lumen-nicnames. MAC pin is authoritative; do not renumber.

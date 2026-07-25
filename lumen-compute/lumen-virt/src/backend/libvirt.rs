@@ -26,6 +26,7 @@ use virt::domain::Domain;
 use virt::error::{Error as LibvirtError, ErrorNumber};
 
 use crate::backend::VirtBackend;
+use crate::domain_caps::CpuModels;
 use crate::error::{Result, VirtError};
 use crate::state::{DomainRuntime, DomainState, HostInfo, ObservedDomain};
 
@@ -191,6 +192,19 @@ fn observe(domain: &Domain) -> std::result::Result<ObservedDomain, LibvirtError>
 
 #[async_trait]
 impl VirtBackend for LibvirtBackend {
+    async fn cpu_models(&self) -> Result<CpuModels> {
+        self.call(move |conn| {
+            // Every argument left to the hypervisor: it picks the emulator and
+            // the machine type it would actually use for a KVM x86_64 guest,
+            // which is the same one `render` asks for. Naming a binary path
+            // here would be this crate guessing at a layout that differs
+            // between distributions.
+            let xml = conn.get_domain_capabilities(None, Some("x86_64"), None, Some("kvm"), 0)?;
+            Ok(crate::domain_caps::parse_cpu_models(&xml))
+        })
+        .await
+    }
+
     async fn host(&self) -> Result<HostInfo> {
         let node = self.node.clone();
         self.call(move |conn| {

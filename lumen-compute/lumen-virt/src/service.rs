@@ -31,12 +31,15 @@ use lumen_net::NetworkService;
 use lumen_zfs::StorageService;
 
 use crate::backend::VirtBackend;
+use crate::domain_caps::CpuModels;
 use crate::domain_xml;
 use crate::error::{Result, VirtError};
 use crate::model::{
     generate_mac, valid_vm_name, BootDevice, CacheMode, CpuModel, CpuTopology, DiskBus, Firmware,
-    NicModel, VmConfig, VmDisk, VmNic, DEFAULT_MEMORY_MIB, DEFAULT_VCPUS, FIRST_VMID, LAST_VMID,
+    NicModel, VmCdrom, VmConfig, VmDisk, VmNic, DEFAULT_MEMORY_MIB, DEFAULT_VCPUS, FIRST_VMID,
+    LAST_VMID,
 };
+use crate::osinfo::{self, OsCatalog};
 use crate::state::{DomainState, HostInfo, ObservedDomain};
 use crate::validate::{
     check_destructive, validate, Acknowledgements, HostFacts, PlannedDisk, ValidationCode,
@@ -156,7 +159,11 @@ pub struct VmView {
     pub boot_order: Vec<BootDevice>,
     pub start_on_boot: bool,
     pub guest_agent: bool,
+    /// What the machine was built to run, in libosinfo's words. Metadata; the
+    /// console shows it and nothing reads it to decide anything.
+    pub os_id: Option<String>,
     pub disks: Vec<VmDisk>,
+    pub cdroms: Vec<VmCdrom>,
     pub nics: Vec<VmNic>,
 
     // What the running machine is actually doing. All absent when it is not.
@@ -255,8 +262,16 @@ pub struct VmCreate {
     pub guest_agent: bool,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// The guest this machine is for, as a libosinfo identifier. Checked
+    /// against the node's own database when it has one.
+    #[serde(default)]
+    pub os_id: Option<String>,
     #[serde(default)]
     pub disks: Vec<DiskCreate>,
+    /// Optical drives, in order. The first is the installation media; a second
+    /// is where the driver disc a Windows installer needs goes.
+    #[serde(default)]
+    pub cdroms: Vec<CdromCreate>,
     #[serde(default)]
     pub nics: Vec<NicCreate>,
     /// Start it as soon as it is defined.
@@ -280,6 +295,25 @@ pub struct DiskCreate {
     /// Volume block size in bytes. `None` leaves the pool default.
     #[serde(default)]
     pub blocksize: Option<u64>,
+}
+
+/// An optical drive to define. The image is named by the pool it is in and
+/// its file name, never by a path: a path from the console would be a path the
+/// console chose, and the one rule about where media may live belongs in the
+/// storage domain.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CdromCreate {
+    /// The pool whose media library the image is in. Absent leaves the drive
+    /// empty, which is a real thing to ask for.
+    #[serde(default)]
+    pub storage: Option<String>,
+    #[serde(default)]
+    pub image: Option<String>,
+    /// An absolute path, resolved by the caller. Set by the control plane from
+    /// `storage`/`image`; a request that sets it directly is refused.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -320,6 +354,10 @@ pub struct VirtService {
     /// Serializes every mutation. Two machines being created at once must not
     /// race for the same identifier.
     gate: Mutex<()>,
+    /// Where the guest operating system database lives, and the copy read out
+    /// of it. See [`VirtService::os_catalog`] for why it is cached.
+    osinfo_root: std::path::PathBuf,
+    os_catalog: tokio::sync::RwLock<Option<OsCatalog>>,
 }
 
 /// One machine, as the hypervisor holds it and as Lumen reads it.
@@ -340,7 +378,18 @@ impl VirtService {
             network,
             node: crate::state::hostname(),
             gate: Mutex::new(()),
+            osinfo_root: osinfo::OSINFO_DB_ROOT.into(),
+            os_catalog: tokio::sync::RwLock::new(None),
         }
+    }
+
+    /// The same service reading its guest database from somewhere else — the
+    /// seam the tests use, so none of them depends on what is installed on the
+    /// machine running them.
+    pub fn with_osinfo_root(mut self, root: impl Into<std::path::PathBuf>) -> Self {
+        self.osinfo_root = root.into();
+        self.os_catalog = tokio::sync::RwLock::new(None);
+        self
     }
 
     pub fn node(&self) -> &str {
@@ -528,7 +577,9 @@ impl VirtService {
             boot_order: config.boot_order.clone(),
             start_on_boot: observed.autostart,
             guest_agent: config.guest_agent,
+            os_id: config.os_id.clone(),
             disks: config.disks.clone(),
+            cdroms: config.cdroms.clone(),
             nics: config.nics.clone(),
             current_vcpus: runtime.map(|r| r.vcpus),
             current_memory_mib: runtime.map(|r| r.memory_kib / 1024),
@@ -542,6 +593,63 @@ impl VirtService {
             pending_reboot: pending,
             actions: actions_for(observed.state, &config.name),
         }
+    }
+
+    // --- what this node offers --------------------------------------------
+
+    /// The processor models this node can run.
+    pub async fn cpu_models(&self) -> Result<CpuModels> {
+        self.backend.cpu_models().await
+    }
+
+    /// The guest operating systems this node knows about.
+    ///
+    /// Read once and kept: the database is a package on disk that changes only
+    /// when the package does, and it is a thousand small files. The read
+    /// happens on a blocking thread because it is file work, not async work.
+    pub async fn os_catalog(&self) -> Result<OsCatalog> {
+        if let Some(cached) = self.os_catalog.read().await.clone() {
+            return Ok(cached);
+        }
+        let root = self.osinfo_root.clone();
+        let catalog = tokio::task::spawn_blocking(move || osinfo::read(root))
+            .await
+            .map_err(|err| VirtError::Backend(anyhow::anyhow!("{err}")))?;
+        *self.os_catalog.write().await = Some(catalog.clone());
+        Ok(catalog)
+    }
+
+    /// Turn a requested image into the absolute path a domain document points
+    /// at, or refuse it.
+    ///
+    /// The storage domain owns what a media path may look like, so this asks
+    /// it rather than joining strings — and it checks the file is actually
+    /// there, because a machine defined against media that is not present
+    /// boots to a firmware prompt with nothing explaining why.
+    async fn resolve_media(&self, cdrom: &CdromCreate) -> Result<Option<String>> {
+        if cdrom.source.is_some() {
+            return Err(VirtError::Conflict(
+                "An optical drive names its image by storage and file name, not by path.".into(),
+            ));
+        }
+        let (Some(storage), Some(image)) = (cdrom.storage.as_deref(), cdrom.image.as_deref())
+        else {
+            // Both absent is an empty drive, which is a real request. One
+            // without the other is a mistake worth saying out loud.
+            if cdrom.storage.is_some() || cdrom.image.is_some() {
+                return Err(VirtError::Conflict(
+                    "An optical drive needs both a storage and an image, or neither.".into(),
+                ));
+            }
+            return Ok(None);
+        };
+        let path = self.storage.iso_path(storage, image)?;
+        if !self.storage.iso_exists(&path).await? {
+            return Err(VirtError::NotFound(format!(
+                "No image named \"{image}\" in the \"{storage}\" media library."
+            )));
+        }
+        Ok(Some(path))
     }
 
     // --- create / update / delete ----------------------------------------
@@ -572,9 +680,24 @@ impl VirtService {
             start_on_boot: request.start_on_boot,
             guest_agent: request.guest_agent,
             tags: tidy_tags(request.tags),
+            os_id: tidy(request.os_id),
             disks: Vec::new(),
+            cdroms: Vec::new(),
             nics: Vec::new(),
         };
+
+        // Optical drives are files that already exist, so like adapters they
+        // cost nothing to build and are checked with everything else rather
+        // than after something has been created on the node.
+        for cdrom in &request.cdroms {
+            let source = self.resolve_media(cdrom).await?;
+            let id = config.next_cdrom_target();
+            config.cdroms.push(VmCdrom {
+                id,
+                source,
+                boot_index: None,
+            });
+        }
 
         // Adapters cost nothing to build, so they exist before validation and
         // are checked with everything else.
@@ -1242,8 +1365,13 @@ mod tests {
         network.management_bridge().await.unwrap();
         network.confirm().await.unwrap();
 
-        let storage = Arc::new(StorageService::new(zfs.clone()));
-        let service = VirtService::new(virt.clone(), storage, network);
+        // The media library and the guest database both live under the same
+        // temporary root, so no test reads or writes anything the machine
+        // running it actually has.
+        let storage =
+            Arc::new(StorageService::new(zfs.clone()).with_iso_root(state_dir.join("iso")));
+        let service = VirtService::new(virt.clone(), storage, network)
+            .with_osinfo_root(state_dir.join("osinfo"));
 
         Harness {
             service,
@@ -1251,6 +1379,16 @@ mod tests {
             zfs,
             state_dir,
         }
+    }
+
+    /// Put an image in a pool's library, as an upload would have.
+    async fn seed_image(harness: &Harness, pool: &str, name: &str) {
+        std::fs::create_dir_all(harness.state_dir.join("iso").join(pool)).unwrap();
+        std::fs::write(
+            harness.state_dir.join("iso").join(pool).join(name),
+            b"CD001 pretend installation media",
+        )
+        .unwrap();
     }
 
     fn create(name: &str) -> VmCreate {
@@ -1268,6 +1406,8 @@ mod tests {
             start_on_boot: false,
             guest_agent: true,
             tags: Vec::new(),
+            os_id: None,
+            cdroms: Vec::new(),
             disks: vec![DiskCreate {
                 pool: "rpool".into(),
                 size_gib: 32,
@@ -1839,5 +1979,124 @@ mod tests {
         let vm = h.service.create(request).await.unwrap();
         assert_eq!(vm.state, DomainState::Running);
         assert!(vm.start_on_boot);
+    }
+
+    /// A machine built to install an operating system: media in the first
+    /// drive, the driver disc in the second, booting off the media. All of it
+    /// has to survive the document, because the document is the database.
+    #[tokio::test]
+    async fn a_machine_is_defined_with_its_installation_media() {
+        let h = harness("media").await;
+        seed_image(&h, "rpool", "almalinux-10.iso").await;
+        seed_image(&h, "rpool", "virtio-win.iso").await;
+
+        let mut request = create("win01");
+        request.os_id = Some("http://microsoft.com/win/11".into());
+        request.boot_order = Some(vec![BootDevice::Cdrom, BootDevice::Disk]);
+        request.cdroms = vec![
+            CdromCreate {
+                storage: Some("rpool".into()),
+                image: Some("almalinux-10.iso".into()),
+                source: None,
+            },
+            CdromCreate {
+                storage: Some("rpool".into()),
+                image: Some("virtio-win.iso".into()),
+                source: None,
+            },
+        ];
+        let vm = h.service.create(request).await.unwrap();
+
+        assert_eq!(vm.cdroms.len(), 2);
+        // Targets are allocated around the disk, which is on virtio and takes
+        // the other prefix.
+        assert_eq!(vm.disks[0].id, "vda");
+        assert_eq!(vm.cdroms[0].id, "sda");
+        assert_eq!(vm.cdroms[1].id, "sdb");
+        assert!(vm.cdroms[0]
+            .source
+            .as_deref()
+            .unwrap()
+            .ends_with("almalinux-10.iso"));
+        assert_eq!(vm.os_id.as_deref(), Some("http://microsoft.com/win/11"));
+        // The media boots first, and it is the drives that carry the numbers.
+        assert_eq!(vm.boot_order, vec![BootDevice::Cdrom, BootDevice::Disk]);
+        assert_eq!(vm.cdroms[0].boot_index, Some(1));
+        assert_eq!(vm.disks[0].boot_index, Some(3));
+    }
+
+    /// The drive is empty, which is a real thing to ask for, and stays a drive.
+    #[tokio::test]
+    async fn a_drive_with_nothing_in_it_is_still_a_drive() {
+        let h = harness("empty-drive").await;
+        let mut request = create("web01");
+        request.cdroms = vec![CdromCreate {
+            storage: None,
+            image: None,
+            source: None,
+        }];
+        let vm = h.service.create(request).await.unwrap();
+        assert_eq!(vm.cdroms.len(), 1);
+        assert_eq!(vm.cdroms[0].source, None);
+        // Nothing in it, so it is not in the boot order.
+        assert_eq!(vm.boot_order, vec![BootDevice::Disk]);
+    }
+
+    /// Media that is not on the node must be refused *before* the machine is
+    /// defined: a domain pointing at a file that is not there boots to a
+    /// firmware prompt with nothing to explain it.
+    #[tokio::test]
+    async fn media_that_is_not_on_the_node_is_refused_before_anything_is_created() {
+        let h = harness("missing-media").await;
+        let cases = [
+            ("no such image", Some("rpool"), Some("nothere.iso")),
+            ("no such pool", Some("tank"), Some("almalinux-10.iso")),
+            (
+                "a name that is a path",
+                Some("rpool"),
+                Some("../../etc/passwd.iso"),
+            ),
+            ("a storage with no image", Some("rpool"), None),
+            ("an image with no storage", None, Some("almalinux-10.iso")),
+        ];
+        for (label, storage, image) in cases {
+            let mut request = create("web01");
+            request.cdroms = vec![CdromCreate {
+                storage: storage.map(String::from),
+                image: image.map(String::from),
+                source: None,
+            }];
+            assert!(h.service.create(request).await.is_err(), "{label}");
+        }
+        // And nothing was left behind on the way to being refused.
+        assert!(h.service.list().await.unwrap().nodes[0].vms.is_empty());
+        assert!(!h.zfs.has_dataset("rpool/lumen/vm-100-disk-0"));
+
+        // A caller trying to name a path directly is refused too — the storage
+        // domain owns where media may live, and this is the only door.
+        let mut request = create("web01");
+        request.cdroms = vec![CdromCreate {
+            storage: None,
+            image: None,
+            source: Some("/etc/shadow".into()),
+        }];
+        assert!(h.service.create(request).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn the_node_reports_what_processors_and_guests_it_offers() {
+        let h = harness("catalogues").await;
+
+        let cpus = h.service.cpu_models().await.unwrap();
+        assert!(cpus.host_passthrough);
+        assert_eq!(cpus.host_model.as_deref(), Some("EPYC-Rome"));
+        assert!(cpus.usable("EPYC"));
+        assert!(!cpus.usable("Skylake-Server"));
+
+        // No database installed under the test root, so the catalogue is empty
+        // and says why rather than failing the request.
+        let guests = h.service.os_catalog().await.unwrap();
+        assert!(guests.is_empty());
+        assert!(guests.reason.is_some());
     }
 }

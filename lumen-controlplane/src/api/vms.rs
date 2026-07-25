@@ -17,7 +17,7 @@ use lumen_virt::service::{
     DiskCreate, NicCreate, VmCreate, VmDeleteResponse, VmPatch, VmUpdateResponse, VmView,
     VmsResponse,
 };
-use lumen_virt::Acknowledgements;
+use lumen_virt::{Acknowledgements, CpuModels, OsCatalog};
 
 use crate::api::request::{body, node_only, required_body, Body};
 use crate::error::ApiError;
@@ -67,6 +67,38 @@ pub async fn list(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<VmsResponse>, ApiError> {
     Ok(Json(state.virt.list().await?))
+}
+
+/// GET /api/vms/next-id — the identifier a machine created now would get.
+///
+/// Advisory, not a reservation: two operators opening the dialog at the same
+/// moment see the same number, and whichever creates second is allocated the
+/// next one by the service. Offering it is what lets the console show the
+/// identifier before anything is created, the way the rest of the form shows
+/// its defaults.
+pub async fn next_id(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(
+        serde_json::json!({ "vmid": state.virt.next_vmid().await? }),
+    ))
+}
+
+/// GET /api/vms/cpu-models — the processor models this node can run.
+pub async fn cpu_models(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<CpuModels>, ApiError> {
+    Ok(Json(state.virt.cpu_models().await?))
+}
+
+/// GET /api/vms/os-catalog — the guest operating systems this node knows.
+pub async fn os_catalog(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<OsCatalog>, ApiError> {
+    Ok(Json(state.virt.os_catalog().await?))
 }
 
 /// GET /api/vms/{vmid} — one machine, in full.

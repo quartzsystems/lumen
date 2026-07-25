@@ -13,8 +13,10 @@ use tokio::sync::Mutex;
 
 use crate::backend::ZfsBackend;
 use crate::error::{Result, ZfsError};
+use crate::iso::{IsoLibrary, IsoStoreView, IsoUpload, IsoView};
 use crate::model::{
-    device_path, is_lumen_volume, valid_pool_name, Dataset, DatasetKind, PoolHealth, VolumeRequest,
+    device_path, is_lumen_volume, is_reserved_leaf, valid_pool_name, Dataset, DatasetKind,
+    PoolHealth, VolumeRequest,
 };
 use crate::state::{hostname, StorageState};
 
@@ -79,12 +81,23 @@ pub struct VolumesResponse {
     pub volumes: Vec<VolumeView>,
 }
 
+/// GET /api/storage/iso. Both halves in one answer: what libraries the node
+/// has, and what is in them — so a console that has to explain an empty picker
+/// never needs a second request to find out why.
+#[derive(Debug, Clone, Serialize)]
+pub struct IsosResponse {
+    pub node: String,
+    pub stores: Vec<IsoStoreView>,
+    pub images: Vec<IsoView>,
+}
+
 pub struct StorageService {
     backend: Arc<dyn ZfsBackend>,
     node: String,
     /// Serializes writes. Two virtual machines being created at once must not
     /// race to the same volume name.
     gate: Mutex<()>,
+    isos: IsoLibrary,
 }
 
 impl StorageService {
@@ -93,7 +106,16 @@ impl StorageService {
             backend,
             node: hostname(),
             gate: Mutex::new(()),
+            isos: IsoLibrary::default(),
         }
+    }
+
+    /// The same service with its media library somewhere else — the seam the
+    /// crate's own tests and the control plane's use so neither writes to the
+    /// appliance's real directory.
+    pub fn with_iso_root(mut self, root: impl Into<std::path::PathBuf>) -> Self {
+        self.isos = IsoLibrary::new(root);
+        self
     }
 
     pub fn node(&self) -> &str {
@@ -190,6 +212,75 @@ impl StorageService {
     pub fn device_path(&self, dataset: &str) -> String {
         device_path(dataset)
     }
+
+    // --- the installation media library -----------------------------------
+
+    /// Every pool's library and everything in it.
+    pub async fn isos(&self) -> Result<IsosResponse> {
+        let pools = self.observe().await?.pools;
+        let mut stores = Vec::with_capacity(pools.len());
+        let mut images = Vec::new();
+        for pool in &pools {
+            stores.push(self.isos.store(&pool.name).await?);
+            images.extend(self.isos.list(&pool.name).await?);
+        }
+        Ok(IsosResponse {
+            node: self.node.clone(),
+            stores,
+            images,
+        })
+    }
+
+    /// Make a pool's library, if the node's storage will let us.
+    ///
+    /// Creating the dataset also mounts it, and the control plane may not be
+    /// able to see that mount until it restarts — so the store view is
+    /// returned rather than a bare success, and it says which of those two
+    /// happened.
+    pub async fn create_iso_store(&self, pool: &str) -> Result<IsoStoreView> {
+        let _guard = self.gate.lock().await;
+        reject_bad_pool(pool)?;
+        if !self.pool_exists(pool).await? {
+            return Err(ZfsError::NotFound(format!(
+                "No pool named \"{pool}\" on this node."
+            )));
+        }
+        self.backend.ensure_iso_store(pool).await?;
+        self.isos.store(pool).await
+    }
+
+    /// Begin storing an uploaded image. The caller streams into the returned
+    /// handle and finishes it; nothing is visible under its real name until
+    /// then.
+    pub async fn begin_iso_upload(&self, pool: &str, name: &str) -> Result<IsoUpload> {
+        reject_bad_pool(pool)?;
+        self.isos.begin_upload(pool, name).await
+    }
+
+    /// Remove one image.
+    pub async fn delete_iso(&self, pool: &str, name: &str) -> Result<()> {
+        reject_bad_pool(pool)?;
+        self.isos.delete(pool, name).await
+    }
+
+    /// The absolute path a domain document points at, checked. The compute
+    /// domain calls this rather than building a path of its own, so there is
+    /// one rule about what a media path may look like and it lives here.
+    pub fn iso_path(&self, pool: &str, name: &str) -> Result<String> {
+        reject_bad_pool(pool)?;
+        Ok(self.isos.path(pool, name)?.to_string_lossy().into_owned())
+    }
+
+    /// Whether a path names a file that is actually in a library on this node.
+    /// A machine must not be defined pointing at media that is not there.
+    pub async fn iso_exists(&self, path: &str) -> Result<bool> {
+        Ok(self
+            .isos()
+            .await?
+            .images
+            .iter()
+            .any(|image| image.path == path))
+    }
 }
 
 fn reject_bad_pool(pool: &str) -> Result<()> {
@@ -202,6 +293,11 @@ fn reject_bad_pool(pool: &str) -> Result<()> {
 }
 
 fn reject_outside_namespace(path: &str) -> Result<()> {
+    if is_reserved_leaf(path) {
+        return Err(ZfsError::Conflict(format!(
+            "\"{path}\" is this node's installation media library, not a machine's disk."
+        )));
+    }
     if is_lumen_volume(path) {
         return Ok(());
     }
@@ -350,6 +446,77 @@ mod tests {
                 .await
                 .is_err());
         }
+    }
+
+    /// The library is made, seen, filled, and emptied through the service —
+    /// and the pool that has no library says so rather than looking empty for
+    /// no reason.
+    #[tokio::test]
+    async fn the_media_library_is_created_listed_and_emptied() {
+        let root = std::env::temp_dir().join(format!(
+            "lumen-svc-iso-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let backend = Arc::new(MockBackend::appliance());
+        let service = StorageService::new(backend.clone()).with_iso_root(&root);
+
+        // Nothing yet, and the reason is a command an operator can run.
+        let before = service.isos().await.unwrap();
+        assert_eq!(before.stores.len(), 1);
+        assert!(!before.stores[0].ready);
+        assert!(before.images.is_empty());
+
+        // The dataset is created on the pool, and the directory now exists.
+        let created = service.create_iso_store("rpool").await.unwrap();
+        assert!(backend.has_dataset("rpool/lumen/iso"));
+        // The mock creates the dataset but not the directory — exactly the
+        // "made on the box, not yet visible here" case the view exists for.
+        assert!(!created.ready);
+        std::fs::create_dir_all(root.join("rpool")).unwrap();
+        assert!(service.isos().await.unwrap().stores[0].ready);
+
+        let mut upload = service
+            .begin_iso_upload("rpool", "almalinux-10.iso")
+            .await
+            .unwrap();
+        upload.write(b"CD001").await.unwrap();
+        upload.finish().await.unwrap();
+
+        let after = service.isos().await.unwrap();
+        assert_eq!(after.images.len(), 1);
+        assert_eq!(after.images[0].name, "almalinux-10.iso");
+        let path = service.iso_path("rpool", "almalinux-10.iso").unwrap();
+        assert_eq!(after.images[0].path, path);
+        assert!(service.iso_exists(&path).await.unwrap());
+        assert!(!service.iso_exists("/etc/passwd").await.unwrap());
+
+        service
+            .delete_iso("rpool", "almalinux-10.iso")
+            .await
+            .unwrap();
+        assert!(service.isos().await.unwrap().images.is_empty());
+        assert!(!service.iso_exists(&path).await.unwrap());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The library is shaped like a volume and must never be destroyed as one.
+    #[tokio::test]
+    async fn the_media_library_cannot_be_destroyed_as_a_disk() {
+        let (service, backend) = service();
+        backend.ensure_iso_store("rpool").await.unwrap();
+        let err = service.destroy_volume("rpool/lumen/iso").await.unwrap_err();
+        assert!(matches!(err, ZfsError::Conflict(_)), "{err:?}");
+        assert!(backend.has_dataset("rpool/lumen/iso"));
+        // Nor created as one, which would put a machine's disk where the
+        // media lives.
+        assert!(service
+            .create_volume("rpool", "iso", 1024, None)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

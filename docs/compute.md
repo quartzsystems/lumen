@@ -112,6 +112,26 @@ that starts generating bindings breaks in CI rather than on an appliance.
 The appliance itself needs `libvirt-daemon-kvm`, `qemu-kvm`, and `edk2-ovmf`;
 `lumen-compute.spec` requires all three.
 
+Two links in that chain are easy to leave out, and both of them fail the same
+silent way — a node that installs cleanly and then answers
+`Failed to connect socket to '/var/run/libvirt/virtqemud-sock'` the first time
+anyone opens Virtual Machines:
+
+- **The installer must actually install the package.** `lumen-compute` is not
+  a dependency of `lumen-controlplane` — the machine logic is compiled into the
+  daemon, so nothing pulls the daemons in on its own. The install set in
+  `engine/plan.rs` names it explicitly, and a test asserts it stays named.
+- **Something must apply the vendor preset.** A file under
+  `/usr/lib/systemd/system-preset` is advice to `systemctl preset`, and nothing
+  on an installed node runs `preset-all` after the first boot. `%post` in the
+  spec runs `%systemd_post` over exactly the units the preset lists, which is
+  what turns the advice into the enabled `virtqemud.socket` the daemon connects
+  to. `lumen-storage` carries the same pair for `zfs-zed` and friends.
+
+On a node installed before this was wired up, the recovery is
+`dnf install lumen-compute lumen-storage` — the `%post` enables the sockets on
+the way in.
+
 ### `ProtectSystem=strict` needed no relaxation
 
 **No `ReadWritePaths=` was added.** `lumen-controlplane.service` is unchanged.
@@ -432,12 +452,140 @@ entry carrying `code`, `vm`, `field`, and `message`.
 | DELETE | `/api/vms/:vmid/disks/:id` | Detach; destroys the volume only if asked |
 | POST | `/api/vms/:vmid/nics` | Attach an adapter |
 | DELETE | `/api/vms/:vmid/nics/:id` | Detach it (`:id` is the hardware address) |
+| GET | `/api/vms/next-id` | The identifier a machine created now would get |
+| GET | `/api/vms/cpu-models` | Processor models this node can run |
+| GET | `/api/vms/os-catalog` | Guest operating systems this node knows |
 | GET | `/api/storage/pools` | Pools, grouped by node |
 | GET | `/api/storage/pools/:pool/volumes` | Datasets and volumes under a pool |
+| GET | `/api/storage/iso` | Media libraries and every image in them |
+| POST | `/api/storage/iso/:pool` | Make a pool's media library |
+| PUT | `/api/storage/iso/:pool/:name` | Upload an image (body is the file) |
+| DELETE | `/api/storage/iso/:pool/:name` | Remove one image |
 
 There is deliberately **no** endpoint that creates, imports, or destroys a
 pool, and `vm_flow::there_is_no_way_to_create_or_destroy_a_pool` asserts that
-none appears by accident.
+none appears by accident. The media library is the one storage *write* the
+console has, for the reason below.
+
+---
+
+## Installation media
+
+A machine that is going to install an operating system needs a file, not a
+volume — which is the one thing the compute domain wants that the storage
+domain had no shape for. Three decisions follow from that.
+
+### Where it lives, and why the path is fixed
+
+Each pool gets a `<pool>/lumen/iso` filesystem dataset, mounted at
+`/var/lib/lumen/iso/<pool>`. Not at the natural ZFS path: `ProtectSystem=strict`
+makes the whole hierarchy read-only inside the control plane's unit, and the
+only way back is a `ReadWritePaths=` line written long before any pool exists.
+One parent directory covers every pool the node will ever have, so the unit
+gains exactly one line:
+
+```
+ReadWritePaths=-/var/lib/lumen/iso
+```
+
+**This is the first relaxation of that unit**, and it is deliberately the
+smallest one that works. Everything else the daemon writes still reaches the
+kernel through `/dev/zfs`, which `ProtectSystem=strict` does not cover; an
+uploaded file cannot. The leading `-` keeps a node with no library from failing
+to start.
+
+`<pool>/lumen/iso` is shaped exactly like a machine's disk — three components,
+under the Lumen prefix — so `is_lumen_volume` matches it. `is_reserved_leaf`
+is what keeps a disk destroy from naming the library and taking every image on
+the node with it, and both the service and the backend check it.
+
+### Why the library reports whether it can see itself
+
+Creating the dataset also mounts it, and **a mount made while the control plane
+is running does not reliably appear inside its namespace.** Rather than assume
+either way, `IsoLibrary::store` reports what it can actually read: a library
+that exists but is not visible reads as `ready: false` with the remedy in the
+`reason` field, and the console shows that sentence instead of an empty picker.
+
+So the root pool's library is created **at install time**
+(`engine/plan.rs`, asserted by `the_media_library_is_made_at_install_time`) and
+the unit orders itself `After=zfs-mount.service`. A library made later works
+after a `systemctl restart lumen-controlplane`, and the API says so.
+
+### Uploads
+
+`PUT /api/storage/iso/:pool/:name` with the file as the body — not multipart,
+because there is exactly one field and its name is already in the path, and a
+form parser between the socket and the disk buys nothing. The body is streamed
+a chunk at a time and never buffered; it is the one route with
+`DefaultBodyLimit::disable()`, since an installation image is gigabytes.
+
+Bytes land in `<name>.part` and the file only takes its real name once the
+upload completes, so an interrupted transfer never leaves something that looks
+bootable. A zero-byte upload is refused rather than published.
+
+The console uses `XMLHttpRequest` rather than `fetch` for exactly one reason:
+upload progress events, which `fetch` still does not have, and a multi-gigabyte
+upload with no progress bar is indistinguishable from a hang.
+
+### The drive
+
+`VmCdrom` is always SATA. A guest booting an installer has no drivers loaded
+yet — that is the entire point of the drive — so the bus has to be one the
+firmware and every installer already understand, which rules out virtio. An
+empty drive is a real state: `source` is absent, and the document carries no
+`<source>` element at all, because `<source file=''/>` is not an empty tray but
+a document the hypervisor rejects.
+
+A drive is asked for by **storage and image name, never by path**. The console
+cannot name a path; `VirtService::resolve_media` asks the storage domain to
+build one and then checks the file is actually there, because a machine defined
+against media that is not present boots to a firmware prompt with nothing to
+explain it.
+
+---
+
+## What a new machine is offered
+
+Two lists the console fills its pickers from, both read from the node rather
+than written down here.
+
+### Processor models
+
+`GET /api/vms/cpu-models` parses libvirt's own **domain capabilities**
+document — computed from the host silicon, the emulator, and the machine type,
+and therefore right for this box rather than right in general. Each model
+carries `usable`, so a model this CPU cannot run is shown greyed out with the
+reason instead of being accepted and then failing at start time. The response
+also carries what `host-model` resolves to here, so the default is not an
+unexplained word in the drop-down.
+
+A static table of QEMU's x86 models would have been easy and would also have
+been wrong, in exactly that way.
+
+### Guest operating systems
+
+`GET /api/vms/os-catalog` reads **libosinfo's database** from
+`/usr/share/osinfo/os/*/*.xml`. The hypervisor does not restrict what a machine
+may run — there is no field in a domain document for "this is Windows" that
+changes how it boots — so the only real list is the shared vocabulary
+`virt-manager`, `virt-install`, GNOME Boxes, and Cockpit all use, kept current
+by the distribution.
+
+The **files**, not the library: `osinfo-db` is a noarch data package, so reading
+it needs nothing this crate does not already have. `libosinfo` is a C library,
+and linking it would put a third `-devel` package in the build root for one
+list. Same reasoning as `lumen-zfs` choosing the command line over `libzfs`.
+
+`lumen-compute.spec` requires `osinfo-db`. A node without it gets an empty
+catalogue **with the reason in it** and a free-text identifier in the console —
+the field is metadata, and a machine defines perfectly well with none.
+
+The chosen identifier is written into the domain document twice: in Lumen's own
+metadata element and in libosinfo's namespace, so every tool that reads the
+document sees the same answer. One family has behaviour attached to it, and
+only in the console: `needs_virtio_drivers` is true for Windows, and that is
+what turns on the driver-disc drive.
 
 ### Node grouping
 
@@ -506,6 +654,32 @@ the component behind it.
 
 Console, Snapshots, Backups, and Tasks render as stubs in the existing
 `StubPage` voice.
+
+### Create Virtual Machine: tabs, not a wizard
+
+Eight tabs — General, OS, System, Disks, CPU, Memory, Network, Confirm — in the
+order Proxmox established, because that is the order the decisions actually
+depend on each other in and the order anyone coming from Proxmox already knows.
+The bar is `components/ui/Tabs.tsx`, ported from Quartz Command so a tab bar in
+Lumen and one in Quartz Command are the same control.
+
+**Every tab is reachable at any time, and Create works from any of them.** A
+wizard that makes you walk forwards to reach step five is a wizard you fight
+when you only wanted to change one thing on step two. Nothing is gated; a tab
+with something wrong on it grows a mark, and submitting jumps to the first tab
+that has one. Marks only appear after the operator has touched something, so an
+empty form does not open covered in red.
+
+Three things are read once when the dialog opens and never again, because none
+of them changes while a machine is being described: the next free identifier,
+the processor models, and the guest catalogue. The identifier is **advisory,
+not a reservation** — two operators opening the dialog together see the same
+number and the service allocates the second one properly.
+
+The guest choice drives exactly one thing: picking a Windows variant turns on
+the second drive for the VirtIO driver disc, and pre-selects any
+`virtio-win*.iso` already in the library. Name-matching is a convenience, not a
+restriction — an operator who keeps it under another name picks it by hand.
 
 ---
 
@@ -604,6 +778,36 @@ virsh version                                   # hypervisor and library
 virsh pool-capabilities | grep -i zfs || echo "no ZFS storage backend (expected)"
 zpool list -H -p -o name,size,alloc,free,frag,dedup,health,readonly
 systemctl is-enabled virtqemud.socket zfs-zed.service
+# The two lists the create dialog fills its pickers from.
+virsh domcapabilities --virttype kvm --arch x86_64 | grep -c "<model usable"
+ls /usr/share/osinfo/os | wc -l
+```
+
+### 0b. The media library, which is the one thing tests cannot prove
+
+Everything about the library is covered by tests **except whether a mount made
+while the daemon is running becomes visible to it** — which is precisely why
+the API reports readiness rather than assuming it. Confirm the behaviour on
+real hardware:
+
+```sh
+# Installed by the installer, so it should already be there and readable.
+zfs list -o name,mountpoint rpool/lumen/iso
+curl -sk -b "$JAR" "$HOST/api/storage/iso" | jq '.stores'
+# -> ready: true
+
+# Now the case the design is defensive about: destroy it and make it again
+# from the console while the daemon is up.
+zfs destroy rpool/lumen/iso && systemctl restart lumen-controlplane
+curl -sk -b "$JAR" -X POST "$HOST/api/storage/iso/rpool" | jq
+#    If ready is false, the reason names the restart — that is the expected
+#    conservative answer. If ready is true, the mount propagated and the
+#    console can make a library on a new pool without a restart. Record which.
+
+# Upload, and check it lands whole and under the right name.
+curl -sk -b "$JAR" -X PUT --data-binary @almalinux-10.iso \
+  "$HOST/api/storage/iso/rpool/almalinux-10.iso" | jq
+ls -l /var/lib/lumen/iso/rpool/          # no .part file left behind
 ```
 
 ### 1. Create a zvol from the running service — the one still unconfirmed

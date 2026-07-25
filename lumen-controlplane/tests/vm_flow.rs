@@ -100,12 +100,15 @@ async fn harness(tag: &str) -> Harness {
     network.management_bridge().await.unwrap();
     network.confirm().await.unwrap();
 
-    let storage = Arc::new(StorageService::new(zfs_backend.clone()));
-    let virt = Arc::new(VirtService::new(
-        virt_backend.clone(),
-        storage.clone(),
-        network.clone(),
-    ));
+    // The media library and the guest database both live under this test's own
+    // temporary root, so nothing here reads or writes what the machine running
+    // the tests actually has.
+    let storage =
+        Arc::new(StorageService::new(zfs_backend.clone()).with_iso_root(state_dir.0.join("iso")));
+    let virt = Arc::new(
+        VirtService::new(virt_backend.clone(), storage.clone(), network.clone())
+            .with_osinfo_root(state_dir.0.join("osinfo")),
+    );
 
     let router = app(Arc::new(AppState {
         config,
@@ -185,6 +188,25 @@ impl Harness {
 
     async fn post(&self, path: &str, body: &str) -> (StatusCode, serde_json::Value) {
         self.call("POST", path, Some(body)).await
+    }
+
+    async fn put_bytes(&self, path: &str, bytes: &'static [u8]) -> (StatusCode, serde_json::Value) {
+        let request = Request::builder()
+            .method("PUT")
+            .uri(path)
+            .header(header::COOKIE, &self.cookie)
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .body(Body::from(bytes))
+            .unwrap();
+        let response = self.router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    async fn delete(&self, path: &str) -> (StatusCode, serde_json::Value) {
+        self.call("DELETE", path, None).await
     }
 
     /// Define the machine every test below starts from: one disk, one adapter.
@@ -647,4 +669,131 @@ async fn every_machine_and_storage_route_requires_a_session() {
             "{method} {path} must require a session"
         );
     }
+}
+
+// --- installation media, end to end ------------------------------------------
+
+/// The whole media path over HTTP: make the library, upload an image, see it
+/// listed, define a machine that boots it, and remove it again.
+///
+/// This is the test the ISO work exists for. Every step is a real request
+/// through the real router — the only things mocked are the hypervisor and the
+/// pool, exactly as everywhere else in this file.
+#[tokio::test]
+async fn an_image_is_uploaded_and_a_machine_boots_it() {
+    let h = harness("media").await;
+
+    // A fresh node has a pool but no library, and says how to make one rather
+    // than showing an empty picker with no explanation.
+    let before = h.get("/api/storage/iso").await;
+    assert!(before["images"].as_array().unwrap().is_empty());
+    let store = &before["stores"][0];
+    assert_eq!(store["storage"], "rpool");
+    assert_eq!(store["ready"], false);
+    assert!(store["reason"].as_str().unwrap().contains("zfs create"));
+
+    // Making it creates the dataset. The mock does not mount anything, so the
+    // directory is made here the way the mount would have.
+    let (status, _) = h.post("/api/storage/iso/rpool", "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(h.zfs.has_dataset("rpool/lumen/iso"));
+    std::fs::create_dir_all(h._state_dir.0.join("iso/rpool")).unwrap();
+
+    // Upload. The body is the file itself.
+    let (status, body) = h
+        .put_bytes(
+            "/api/storage/iso/rpool/almalinux-10.iso",
+            b"CD001 pretend media",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["size"], 19);
+
+    let listed = h.get("/api/storage/iso").await;
+    let images = listed["images"].as_array().unwrap();
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0]["name"], "almalinux-10.iso");
+    assert_eq!(images[0]["storage"], "rpool");
+
+    // The same name twice is refused rather than overwriting an image a
+    // machine may already be booting.
+    let (status, _) = h
+        .put_bytes("/api/storage/iso/rpool/almalinux-10.iso", b"different")
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // A machine that boots the installer, with the driver disc behind it.
+    let (status, vm) = h
+        .post(
+            "/api/vms",
+            r#"{"name":"win01","vcpus":2,"memory_mib":4096,
+                "os_id":"http://microsoft.com/win/11",
+                "boot_order":["cdrom","disk"],
+                "cdroms":[{"storage":"rpool","image":"almalinux-10.iso"}],
+                "disks":[{"pool":"rpool","size_gib":32}],
+                "nics":[{"bridge":"br0"}]}"#,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{vm}");
+    assert_eq!(vm["os_id"], "http://microsoft.com/win/11");
+    assert_eq!(vm["cdroms"][0]["id"], "sda");
+    assert!(vm["cdroms"][0]["source"]
+        .as_str()
+        .unwrap()
+        .ends_with("almalinux-10.iso"));
+    // The media boots before the disk, and it is the devices that carry it.
+    assert_eq!(vm["boot_order"][0], "cdrom");
+    assert_eq!(vm["cdroms"][0]["boot_index"], 1);
+
+    // Media that is not there is refused, and nothing is left behind.
+    let (status, _) = h
+        .post(
+            "/api/vms",
+            r#"{"name":"web02","cdroms":[{"storage":"rpool","image":"nothere.iso"}]}"#,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // …as is a name that is really a path.
+    let (status, _) = h
+        .post(
+            "/api/vms",
+            r#"{"name":"web03","cdroms":[{"storage":"rpool","image":"../../etc/passwd.iso"}]}"#,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    let (status, _) = h.delete("/api/storage/iso/rpool/almalinux-10.iso").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(h.get("/api/storage/iso").await["images"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+/// What the create dialog fills its pickers from. Three reads, no side effects.
+#[tokio::test]
+async fn the_node_reports_what_it_offers_a_new_machine() {
+    let h = harness("offers").await;
+
+    // The identifier is advisory: it moves once a machine takes it.
+    assert_eq!(h.get("/api/vms/next-id").await["vmid"], 100);
+    h.create_web01().await;
+    assert_eq!(h.get("/api/vms/next-id").await["vmid"], 101);
+
+    let cpus = h.get("/api/vms/cpu-models").await;
+    assert_eq!(cpus["host_model"], "EPYC-Rome");
+    assert_eq!(cpus["host_passthrough"], true);
+    let models = cpus["models"].as_array().unwrap();
+    assert!(models
+        .iter()
+        .any(|m| m["name"] == "EPYC" && m["usable"] == true));
+    assert!(models
+        .iter()
+        .any(|m| m["name"] == "Skylake-Server" && m["usable"] == false));
+
+    // No database under the test root, so the catalogue is empty and says why
+    // rather than failing the request — the console falls back to free text.
+    let guests = h.get("/api/vms/os-catalog").await;
+    assert!(guests["families"].as_array().unwrap().is_empty());
+    assert!(guests["reason"].as_str().unwrap().contains("osinfo-db"));
 }

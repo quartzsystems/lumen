@@ -526,6 +526,18 @@ netlink property list is a whole dependency for one string per NIC, so
 line back. The tool that renames the adapter is the one that knows what the
 name used to be.
 
+The install path is where that record nearly gets lost. `lumen-nicnames` runs
+twice: once in the live environment with `--apply`, which renames the running
+adapters and records what they were called, and once against the install target
+with `--root`, which writes the link files the installed system boots with. By
+the time the second run happens `/sys` already says `nic0`, so the kernel's
+original name survives only in the *live* root's link file — and the target
+root, being brand new, has nothing to carry it forward. So the second run reads
+the live root too, for recorded alternative names only; index pins still come
+solely from the target, which is the system being built. Without that the
+Alternative Name column is empty on every freshly installed node, which is
+precisely where it is most wanted.
+
 ---
 
 ## Walkthrough

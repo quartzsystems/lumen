@@ -43,6 +43,62 @@ export interface VmNic {
   boot_index?: number | null;
 }
 
+/// One optical drive. `source` is absent when the drive is empty, which is a
+/// real state rather than a missing value.
+export interface VmCdrom {
+  id: string;
+  source?: string | null;
+  boot_index?: number | null;
+}
+
+/// One processor model the node can define a machine against.
+export interface CpuModelInfo {
+  name: string;
+  /// Runnable on this node's silicon. A model that is not is still listed, so
+  /// the console can show it greyed out with the reason.
+  usable: boolean;
+  vendor?: string;
+  deprecated: boolean;
+}
+
+export interface CpuModels {
+  /// What "host model" resolves to on this node — shown beside the default so
+  /// the default is not an unexplained word.
+  host_model?: string;
+  host_passthrough: boolean;
+  models: CpuModelInfo[];
+  reason?: string;
+}
+
+/// One guest operating system, as libosinfo's database describes it.
+export interface OsVariant {
+  /// The canonical identifier, and the only field anything downstream needs.
+  id: string;
+  short_id: string;
+  name: string;
+  family: string;
+  vendor?: string;
+  version?: string;
+  release_date?: string;
+  end_of_life: boolean;
+  /// Its installer has no virtio driver, so it wants the driver disc in a
+  /// second drive. True for Windows, which is the whole of the rule.
+  needs_virtio_drivers: boolean;
+}
+
+export interface OsFamily {
+  id: string;
+  label: string;
+  variants: OsVariant[];
+}
+
+export interface OsCatalog {
+  families: OsFamily[];
+  source: string;
+  /// Why there is nothing, when there is nothing.
+  reason?: string;
+}
+
 /// Whether a lifecycle control is available, and why not when it is not — so
 /// a disabled control explains itself instead of being silently grey.
 export interface Action {
@@ -80,7 +136,10 @@ export interface VmView {
   boot_order: BootDevice[];
   start_on_boot: boolean;
   guest_agent: boolean;
+  /// What the machine was built to run, as a libosinfo identifier.
+  os_id: string | null;
   disks: VmDisk[];
+  cdroms: VmCdrom[];
   nics: VmNic[];
 
   /// What the running machine is actually doing. All null when it is not.
@@ -146,6 +205,14 @@ export interface NicCreate {
   vlan_tag?: number;
 }
 
+/// An optical drive to define. The image is named by the storage it is in and
+/// its file name - never by a path, because where media may live is the
+/// backend's rule and not the console's.
+export interface CdromCreate {
+  storage?: string;
+  image?: string;
+}
+
 export interface VmCreate {
   name: string;
   vmid?: number;
@@ -160,7 +227,9 @@ export interface VmCreate {
   start_on_boot?: boolean;
   guest_agent?: boolean;
   tags?: string[];
+  os_id?: string;
   disks?: DiskCreate[];
+  cdroms?: CdromCreate[];
   nics?: NicCreate[];
   /// Start it as soon as it is defined.
   start?: boolean;
@@ -191,6 +260,16 @@ const del = <T>(path: string, body?: unknown): Promise<T> =>
   apiFetch<T>(path, { method: "DELETE", body: JSON.stringify(body ?? {}) });
 
 export const fetchVms = (): Promise<VmsResponse> => apiFetch<VmsResponse>("/vms");
+
+/// What this node offers, for the create dialog's pickers. All three are read
+/// once when the dialog opens and never again - none of them changes while a
+/// machine is being described.
+export const fetchNextVmid = (): Promise<{ vmid: number }> =>
+  apiFetch<{ vmid: number }>("/vms/next-id");
+
+export const fetchCpuModels = (): Promise<CpuModels> => apiFetch<CpuModels>("/vms/cpu-models");
+
+export const fetchOsCatalog = (): Promise<OsCatalog> => apiFetch<OsCatalog>("/vms/os-catalog");
 
 export const fetchVm = (vmid: number): Promise<VmView> => apiFetch<VmView>(`/vms/${vmid}`);
 

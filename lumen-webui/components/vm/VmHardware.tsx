@@ -159,6 +159,37 @@ export function VmHardware({
         )}
       </Panel>
 
+      {/* Read-only for now: a drive is defined with the machine, and changing
+          what is in one after the fact needs an eject/insert the API does not
+          have yet. Shown regardless, because a machine that boots off media an
+          operator cannot see is a machine nobody can explain. */}
+      {vm.cdroms.length > 0 && (
+        <Panel title="Optical drives">
+          <div className="rounded-md overflow-x-auto" style={{ border: "1px solid var(--qz-border)" }}>
+            <table className="qz-table">
+              <thead>
+                <tr>
+                  <th>Target</th>
+                  <th>Image</th>
+                  <th>Boot</th>
+                </tr>
+              </thead>
+              <tbody>
+                {vm.cdroms.map((cdrom) => (
+                  <tr key={cdrom.id} style={{ cursor: "default" }}>
+                    <td className="mono">{cdrom.id}</td>
+                    <td className="mono" title={cdrom.source ?? undefined}>
+                      {cdrom.source ? cdrom.source.split("/").pop() : "empty"}
+                    </td>
+                    <td className="mono">{cdrom.boot_index ?? "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Panel>
+      )}
+
       <Panel
         title="Network adapters"
         actions={

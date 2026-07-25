@@ -6,6 +6,7 @@ import { Page, PageBody, PageHeader } from "@/components/PageHeader";
 import { DataTable, Dash, type Column, type FilterDef } from "@/components/console/DataTable";
 import { Meter } from "@/components/vm/VmBits";
 import { ApiError } from "@/lib/authClient";
+import { titleCase, titleCaseOptions } from "@/lib/labels";
 import { fetchPools, HEALTH_TONE, type PoolsResponse, type PoolView } from "@/lib/storageClient";
 import { formatBytes } from "@/lib/vmClient";
 
@@ -113,7 +114,7 @@ const columns: Column<PoolView>[] = [
     sortable: true,
     width: 120,
     render: (pool) => (
-      <span className={`badge badge-${HEALTH_TONE[pool.health]}`}>{pool.health}</span>
+      <span className={`badge badge-${HEALTH_TONE[pool.health]}`}>{titleCase(pool.health)}</span>
     ),
   },
   {
@@ -177,9 +178,9 @@ const columns: Column<PoolView>[] = [
     value: (pool) => (pool.read_only ? "no" : "yes"),
     render: (pool) =>
       pool.read_only ? (
-        <span className="badge badge-warn">read only</span>
+        <span className="badge badge-warn">Read only</span>
       ) : (
-        <span className="qz-dim">yes</span>
+        <span className="qz-dim">Yes</span>
       ),
     width: 110,
   },
@@ -191,9 +192,9 @@ function PoolTable({ rows, onRefresh }: { rows: PoolView[]; onRefresh: () => Pro
       {
         key: "health",
         label: "Health",
-        options: Array.from(new Set(rows.map((pool) => pool.health)))
-          .sort()
-          .map((value) => ({ value, label: value })),
+        // The option value stays the wire one the predicate matches on; only
+        // the label an operator reads is capitalised.
+        options: titleCaseOptions(Array.from(new Set(rows.map((pool) => pool.health))).sort()),
         predicate: (pool, value) => pool.health === value,
       },
     ],

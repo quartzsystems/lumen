@@ -9,6 +9,7 @@
 use async_trait::async_trait;
 
 use crate::backend::VirtBackend;
+use crate::domain_caps::CpuModels;
 use crate::error::{Result, VirtError};
 use crate::state::{HostInfo, ObservedDomain};
 
@@ -34,6 +35,9 @@ impl UnavailableBackend {
 #[async_trait]
 impl VirtBackend for UnavailableBackend {
     async fn host(&self) -> Result<HostInfo> {
+        self.error()
+    }
+    async fn cpu_models(&self) -> Result<CpuModels> {
         self.error()
     }
     async fn domains(&self) -> Result<Vec<ObservedDomain>> {

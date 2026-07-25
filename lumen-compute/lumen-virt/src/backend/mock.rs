@@ -28,6 +28,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 
 use crate::backend::VirtBackend;
+use crate::domain_caps::{CpuModelInfo, CpuModels};
 use crate::domain_xml;
 use crate::error::{Result, VirtError};
 use crate::state::{DomainRuntime, DomainState, HostInfo, ObservedDomain};
@@ -204,6 +205,43 @@ impl Inner {
 impl VirtBackend for MockBackend {
     async fn host(&self) -> Result<HostInfo> {
         Ok(self.inner.lock().unwrap().host.clone())
+    }
+
+    /// A small, fixed processor list with one of each interesting case: a
+    /// usable model, one this "host" cannot run, and a deprecated one. Enough
+    /// to exercise every branch above it without pretending to be a CPU.
+    async fn cpu_models(&self) -> Result<CpuModels> {
+        Ok(CpuModels {
+            host_model: Some("EPYC-Rome".into()),
+            host_passthrough: true,
+            models: vec![
+                CpuModelInfo {
+                    name: "EPYC".into(),
+                    usable: true,
+                    vendor: Some("AMD".into()),
+                    deprecated: false,
+                },
+                CpuModelInfo {
+                    name: "EPYC-Rome".into(),
+                    usable: true,
+                    vendor: Some("AMD".into()),
+                    deprecated: false,
+                },
+                CpuModelInfo {
+                    name: "Skylake-Server".into(),
+                    usable: false,
+                    vendor: Some("Intel".into()),
+                    deprecated: false,
+                },
+                CpuModelInfo {
+                    name: "qemu64".into(),
+                    usable: true,
+                    vendor: None,
+                    deprecated: true,
+                },
+            ],
+            reason: None,
+        })
     }
 
     async fn domains(&self) -> Result<Vec<ObservedDomain>> {

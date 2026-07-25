@@ -12,6 +12,22 @@ use serde::{Deserialize, Serialize};
 /// the operator and is never written or removed here.
 pub const LUMEN_PREFIX: &str = "lumen";
 
+/// The leaf name of a pool's installation-media library: `<pool>/lumen/iso`.
+///
+/// Reserved. It is the one dataset under the Lumen prefix that is a filesystem
+/// rather than a machine's disk, so [`is_lumen_volume`] deliberately still
+/// matches it — and [`is_reserved_leaf`] is what keeps a volume destroy from
+/// taking the whole library with it.
+pub const ISO_LEAF: &str = "iso";
+
+/// Where every pool's media library is mounted, one directory per pool.
+///
+/// A fixed path rather than each dataset's natural one because the control
+/// plane's unit has to name it: `ProtectSystem=strict` makes the whole
+/// hierarchy read-only, and a `ReadWritePaths=` line cannot enumerate pools
+/// that do not exist yet. One parent covers every pool the node will ever have.
+pub const ISO_MOUNT_ROOT: &str = "/var/lib/lumen/iso";
+
 /// Health as `zpool list` reports it. `Unknown` covers a state a future
 /// release adds rather than making an unfamiliar word fatal.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,6 +193,44 @@ pub fn lumen_root(pool: &str) -> String {
     format!("{pool}/{LUMEN_PREFIX}")
 }
 
+/// A pool's media library dataset: `<pool>/lumen/iso`.
+pub fn iso_dataset(pool: &str) -> String {
+    format!("{pool}/{LUMEN_PREFIX}/{ISO_LEAF}")
+}
+
+/// Where that dataset is mounted: `/var/lib/lumen/iso/<pool>`.
+pub fn iso_mountpoint(pool: &str) -> String {
+    format!("{ISO_MOUNT_ROOT}/{pool}")
+}
+
+/// A leaf under `<pool>/lumen/` that is Lumen's own furniture rather than a
+/// machine's disk. Creating and destroying volumes must step around these.
+pub fn is_reserved_leaf(path: &str) -> bool {
+    path.split('/').nth(2) == Some(ISO_LEAF) && path.split('/').count() == 3
+}
+
+/// A usable name for a file in the media library.
+///
+/// This is the guard between an operator-supplied name and a path handed to
+/// the filesystem: one path component, no traversal, no separators, no control
+/// characters, and an `.iso` suffix so the library cannot be used as a general
+/// file drop.
+pub fn valid_iso_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    !name.is_empty()
+        && name.len() <= 255
+        && lower.ends_with(".iso")
+        && lower.len() > 4
+        && !name.starts_with('.')
+        && !name.starts_with('-')
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains("..")
+        && !name
+            .chars()
+            .any(|c| c.is_control() || c == '\0' || c.is_whitespace() && c != ' ')
+}
+
 /// Exactly `<pool>/lumen/<name>`: one pool component, the Lumen prefix, one
 /// leaf. This is the guard that makes `destroy_volume` safe to expose — a
 /// request naming `rpool`, `rpool/lumen`, `rpool/data/important`, or anything
@@ -263,6 +317,44 @@ mod tests {
                 !is_lumen_volume(refused),
                 "{refused:?} must NOT be destroyable"
             );
+        }
+    }
+
+    /// The media library sits under the same prefix as the machine disks, so
+    /// the destroy guard has to know it apart from one — otherwise removing a
+    /// disk could name the library and take every ISO on the node with it.
+    #[test]
+    fn the_media_library_is_reserved_furniture_not_a_volume() {
+        assert_eq!(iso_dataset("rpool"), "rpool/lumen/iso");
+        assert_eq!(iso_mountpoint("rpool"), "/var/lib/lumen/iso/rpool");
+        assert!(is_lumen_volume("rpool/lumen/iso"), "shape-wise it matches");
+        assert!(is_reserved_leaf("rpool/lumen/iso"));
+        assert!(!is_reserved_leaf("rpool/lumen/vm-100-disk-0"));
+        assert!(!is_reserved_leaf("rpool/lumen/iso/nested"));
+        assert!(!is_reserved_leaf("rpool/iso"));
+    }
+
+    #[test]
+    fn an_iso_name_is_one_component_and_says_what_it_is() {
+        for allowed in [
+            "almalinux-10.iso",
+            "Windows Server 2025.iso",
+            "virtio-win-0.1.271.ISO",
+        ] {
+            assert!(valid_iso_name(allowed), "{allowed}");
+        }
+        for refused in [
+            "",
+            ".iso",
+            "notanimage.img",
+            "../../etc/passwd.iso",
+            "sub/dir.iso",
+            "sub\\dir.iso",
+            ".hidden.iso",
+            "-rf.iso",
+            "line\nbreak.iso",
+        ] {
+            assert!(!valid_iso_name(refused), "{refused:?} must be refused");
         }
     }
 

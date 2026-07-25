@@ -13,8 +13,8 @@ use async_trait::async_trait;
 use crate::backend::ZfsBackend;
 use crate::error::{Result, ZfsError};
 use crate::model::{
-    is_lumen_volume, lumen_root, valid_pool_name, Dataset, DatasetKind, Pool, PoolHealth,
-    VolumeRequest,
+    is_lumen_volume, is_reserved_leaf, iso_dataset, iso_mountpoint, lumen_root, valid_pool_name,
+    Dataset, DatasetKind, Pool, PoolHealth, VolumeRequest,
 };
 
 #[derive(Debug, Default)]
@@ -164,7 +164,34 @@ impl ZfsBackend for MockBackend {
         Ok(())
     }
 
+    async fn ensure_iso_store(&self, pool: &str) -> Result<String> {
+        self.ensure_namespace(pool).await?;
+        let dataset = iso_dataset(pool);
+        let mountpoint = iso_mountpoint(pool);
+        let mut inner = self.inner.lock().unwrap();
+        if inner.datasets.iter().any(|d| d.name == dataset) {
+            return Ok(mountpoint);
+        }
+        let available = inner.pools.iter().find(|p| p.name == pool).map(|p| p.free);
+        inner.datasets.push(Dataset {
+            name: dataset,
+            kind: DatasetKind::Filesystem,
+            used: 98_304,
+            available,
+            referenced: 98_304,
+            mountpoint: Some(mountpoint.clone()),
+            ..Dataset::default()
+        });
+        Ok(mountpoint)
+    }
+
     async fn create_volume(&self, request: &VolumeRequest) -> Result<Dataset> {
+        if is_reserved_leaf(&request.path) {
+            return Err(ZfsError::Conflict(format!(
+                "\"{}\" is this node's installation media library.",
+                request.path
+            )));
+        }
         if !is_lumen_volume(&request.path) {
             return Err(ZfsError::Conflict(format!(
                 "\"{}\" is outside the namespace this appliance manages.",
@@ -213,7 +240,7 @@ impl ZfsBackend for MockBackend {
     }
 
     async fn destroy_volume(&self, path: &str) -> Result<()> {
-        if !is_lumen_volume(path) {
+        if is_reserved_leaf(path) || !is_lumen_volume(path) {
             return Err(ZfsError::Conflict(format!(
                 "\"{path}\" is not a volume this appliance created, so it will not be removed."
             )));

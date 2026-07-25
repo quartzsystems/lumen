@@ -48,6 +48,9 @@ impl ZfsBackend for UnavailableBackend {
     async fn ensure_namespace(&self, _pool: &str) -> Result<()> {
         self.error()
     }
+    async fn ensure_iso_store(&self, _pool: &str) -> Result<String> {
+        self.error()
+    }
 }
 
 #[cfg(test)]

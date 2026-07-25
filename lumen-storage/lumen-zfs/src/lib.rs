@@ -9,6 +9,7 @@
 //! ```text
 //!   model.rs      pools, datasets, volumes — and the namespace rule
 //!   state.rs      what the box actually has
+//!   iso.rs        the installation media library, one directory per pool
 //!   backend/      the supported command line (cli/), plus mock/ and unavailable/
 //!   service.rs    the one entry point the control plane calls
 //! ```
@@ -21,14 +22,17 @@
 
 pub mod backend;
 pub mod error;
+pub mod iso;
 pub mod model;
 pub mod service;
 pub mod state;
 
 pub use error::{Result, ZfsError};
+pub use iso::{IsoLibrary, IsoStoreView, IsoUpload, IsoView};
 pub use model::{
-    device_path, is_lumen_volume, lumen_root, valid_pool_name, vm_disk_path, Dataset, DatasetKind,
-    Pool, PoolHealth, VolumeRequest, LUMEN_PREFIX,
+    device_path, is_lumen_volume, is_reserved_leaf, iso_dataset, iso_mountpoint, lumen_root,
+    valid_iso_name, valid_pool_name, vm_disk_path, Dataset, DatasetKind, Pool, PoolHealth,
+    VolumeRequest, ISO_MOUNT_ROOT, LUMEN_PREFIX,
 };
 pub use service::StorageService;
 pub use state::{PoolContents, StorageState};

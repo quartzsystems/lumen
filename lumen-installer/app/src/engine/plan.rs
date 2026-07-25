@@ -239,7 +239,8 @@ pub fn build_plan(cfg: &InstallConfig, pins: &BuildPins) -> Vec<Step> {
              e2fsprogs dosfstools \
              NetworkManager chrony firewalld openssh-server \
              policycoreutils selinux-policy-targeted \
-             lumen-release lumen-networking lumen-controlplane"
+             lumen-release lumen-networking lumen-storage lumen-compute \
+             lumen-controlplane"
             )),
         ],
     });
@@ -250,6 +251,13 @@ pub fn build_plan(cfg: &InstallConfig, pins: &BuildPins) -> Vec<Step> {
             // hostid + zpool.cache coherence: dracut's zfs module needs both
             // to import rpool without force at first boot.
             sh(format!("cp /etc/hostid {TARGET}/etc/hostid")),
+            // The root pool's installation media library, made here so a fresh
+            // node can be given an image from the console without anyone
+            // touching the box first. Created now rather than on demand
+            // because the control plane cannot see a mount that appears after
+            // its own namespace was set up — the dataset has to exist before
+            // it starts, and at install time it always can.
+            sh("zfs create -p -o mountpoint=/var/lib/lumen/iso/rpool rpool/lumen/iso"),
             sh(format!(
                 "mkdir -p {TARGET}/etc/zfs && \
                  cp /etc/zfs/zpool.cache {TARGET}/etc/zfs/zpool.cache 2>/dev/null || true"
@@ -775,6 +783,53 @@ mod tests {
             .position(|s| s.contains("firewall-offline-cmd --add-service=lumen-controlplane"))
             .expect("plan must open the console port");
         assert!(dnf < fw, "firewall edit needs the installed service file");
+    }
+
+    /// The management daemon speaks to the hypervisor and to the pool tooling
+    /// through packages that are not its own dependencies — they are appliance
+    /// policy, and they carry the presets that start those services. Leaving
+    /// them out of the install set is invisible until a fresh node opens the
+    /// Virtual Machines page and finds no hypervisor socket to connect to.
+    #[test]
+    fn integration_packages_are_installed() {
+        let plan = build_plan(&test_cfg(), &BuildPins::default());
+        let dnf = plan
+            .iter()
+            .flat_map(|s| &s.actions)
+            .find_map(|a| match a {
+                Action::Shell(s) if s.contains("dnf -y --installroot") => Some(s),
+                _ => None,
+            })
+            .expect("plan must contain the dnf install action");
+        for package in ["lumen-networking", "lumen-storage", "lumen-compute"] {
+            assert!(dnf.contains(package), "install set must contain {package}");
+        }
+    }
+
+    /// The media library has to exist before the control plane's first start:
+    /// a mount made later is not visible inside its namespace, so a node
+    /// installed without one cannot be given an image from the console until
+    /// somebody restarts the daemon.
+    #[test]
+    fn the_media_library_is_made_at_install_time() {
+        let plan = build_plan(&test_cfg(), &BuildPins::default());
+        let shells: Vec<&str> = plan
+            .iter()
+            .flat_map(|s| &s.actions)
+            .filter_map(|a| match a {
+                Action::Shell(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        let iso = shells
+            .iter()
+            .position(|s| s.contains("rpool/lumen/iso"))
+            .expect("plan must create the media library");
+        assert!(
+            shells[iso].contains("mountpoint=/var/lib/lumen/iso/rpool"),
+            "it must mount where the unit's ReadWritePaths names: {}",
+            shells[iso]
+        );
     }
 
     #[test]

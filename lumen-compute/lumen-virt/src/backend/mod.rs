@@ -38,6 +38,7 @@ pub mod unavailable;
 
 use async_trait::async_trait;
 
+use crate::domain_caps::CpuModels;
 use crate::error::Result;
 use crate::state::{HostInfo, ObservedDomain};
 
@@ -45,6 +46,14 @@ use crate::state::{HostInfo, ObservedDomain};
 pub trait VirtBackend: Send + Sync {
     /// Processors, memory, and the hypervisor's own version.
     async fn host(&self) -> Result<HostInfo>;
+
+    /// The processor models this node can actually run, as the hypervisor
+    /// computes them from the host silicon and the emulator.
+    ///
+    /// Here rather than in a table of our own for the reason in
+    /// [`crate::domain_caps`]: a model this box cannot run must be visibly not
+    /// offered, not accepted and then refused at start time.
+    async fn cpu_models(&self) -> Result<CpuModels>;
 
     /// Every domain this node holds, running or not, with its document.
     async fn domains(&self) -> Result<Vec<ObservedDomain>>;

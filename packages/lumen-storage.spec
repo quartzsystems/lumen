@@ -52,6 +52,19 @@ install -D -p -m 0644 %{SOURCE0} \
 %files
 %{_prefix}/lib/systemd/system-preset/50-lumen-storage.preset
 
+# A preset file is only advice until something acts on it, and nothing on an
+# installed node ever runs `systemctl preset-all` again. This is that something:
+# on first install it applies the preset above to exactly these units, which is
+# how the vendor default gets honoured while an operator who later turns one off
+# keeps it off. The units belong to the pool package this one requires, so they
+# are on disk before this scriptlet runs.
+#
+# Only %%post. Removing this package must not unmount a node's datasets, so
+# there is deliberately no %%preun that disables what it enabled.
+%post
+%systemd_post zfs-zed.service zfs-import-cache.service zfs-import.target \
+    zfs-mount.service zfs-volume-wait.service zfs.target
+
 %changelog
 * Fri Jul 24 2026 Quartz Systems Engineering <engineering@quartz.systems> - 0.3.0-1
 - Initial lumen-storage package: pulls in the pool tooling and ships the

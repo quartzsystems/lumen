@@ -37,6 +37,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 tokio = { version = "1", features = ["full"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["fs", "trace"] }
+# Reading an upload off the socket a chunk at a time. Already in the tree as a
+# transitive dependency of axum; named here only to make `StreamExt` usable.
+futures-util = { version = "0.3", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"

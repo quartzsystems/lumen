@@ -56,7 +56,7 @@ TARGET_PACKAGES=(
     grub2-efi-x64 shim-x64 grub2-tools grubby efibootmgr
     e2fsprogs dosfstools NetworkManager chrony firewalld openssh-server
     policycoreutils selinux-policy-targeted
-    libvirt-daemon-kvm qemu-kvm edk2-ovmf
+    libvirt-daemon-kvm qemu-kvm edk2-ovmf osinfo-db
     lumen-release lumen-networking lumen-storage lumen-compute
     lumen-controlplane
 )

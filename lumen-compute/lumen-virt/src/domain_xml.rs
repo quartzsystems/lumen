@@ -33,14 +33,19 @@ use quick_xml::Reader;
 
 use crate::error::{Result, VirtError};
 use crate::model::{
-    BootDevice, CacheMode, CpuModel, CpuTopology, DiskBus, Firmware, NicModel, VmConfig, VmDisk,
-    VmNic,
+    BootDevice, CacheMode, CpuModel, CpuTopology, DiskBus, Firmware, NicModel, VmCdrom, VmConfig,
+    VmDisk, VmNic, CDROM_BUS,
 };
 
 /// The namespace Lumen's own per-machine data lives in. Versioned in the URI
 /// so a later shape can be told from this one by anything reading the document
 /// — including a human with `virsh dumpxml`.
 pub const LUMEN_NS: &str = "https://www.quartzsystems.net/xmlns/lumen/1.0";
+
+/// libosinfo's namespace, which is not ours and is not versioned by us. The
+/// guest operating system is recorded here as well as in Lumen's own element,
+/// so every tool that reads a domain document sees the same answer.
+pub const OSINFO_NS: &str = "http://libosinfo.org/xmlns/libvirt/domain/1.0";
 
 /// The channel name a guest agent is reached on. Fixed by the agent itself.
 const GUEST_AGENT_CHANNEL: &str = "org.qemu.guest_agent.0";
@@ -113,6 +118,9 @@ pub fn render(config: &VmConfig) -> String {
     for disk in &config.disks {
         render_disk(&mut out, disk);
     }
+    for cdrom in &config.cdroms {
+        render_cdrom(&mut out, cdrom);
+    }
     for nic in &config.nics {
         render_nic(&mut out, nic);
     }
@@ -167,6 +175,18 @@ fn render_metadata(out: &mut String, config: &VmConfig, started_at: Option<u64>)
         let _ = writeln!(out, "      <lumen:started>{started}</lumen:started>");
     }
     out.push_str("    </lumen:vm>\n");
+    // The same answer in libosinfo's namespace as well as ours. It costs one
+    // element and it is what makes `virt-manager` and `virt-install` show the
+    // guest this machine was built for instead of "unknown" — the whole point
+    // of recording an operator's choice in a shared vocabulary.
+    if let Some(os_id) = config.os_id.as_deref().filter(|id| !id.is_empty()) {
+        let _ = writeln!(
+            out,
+            "    <libosinfo:libosinfo xmlns:libosinfo='{OSINFO_NS}'>"
+        );
+        let _ = writeln!(out, "      <libosinfo:os id='{}'/>", text(os_id));
+        out.push_str("    </libosinfo:libosinfo>\n");
+    }
     out.push_str("  </metadata>\n");
 }
 
@@ -261,6 +281,29 @@ fn render_disk(out: &mut String, disk: &VmDisk) {
     out.push_str("    </disk>\n");
 }
 
+/// An optical drive. `type='file'` with no `<source>` at all is how an empty
+/// drive is written — a `<source file=''/>` is not an empty tray, it is a
+/// document the hypervisor rejects.
+fn render_cdrom(out: &mut String, cdrom: &VmCdrom) {
+    out.push_str("    <disk type='file' device='cdrom'>\n");
+    out.push_str("      <driver name='qemu' type='raw'/>\n");
+    if let Some(source) = cdrom.source.as_deref().filter(|s| !s.is_empty()) {
+        let _ = writeln!(out, "      <source file='{}'/>", text(source));
+    }
+    let _ = writeln!(
+        out,
+        "      <target dev='{}' bus='{}'/>",
+        text(&cdrom.id),
+        CDROM_BUS.as_str()
+    );
+    if let Some(order) = cdrom.boot_index {
+        let _ = writeln!(out, "      <boot order='{order}'/>");
+    }
+    // A guest must not be able to write to its own installation media.
+    out.push_str("      <readonly/>\n");
+    out.push_str("    </disk>\n");
+}
+
 fn render_nic(out: &mut String, nic: &VmNic) {
     out.push_str("    <interface type='bridge'>\n");
     let _ = writeln!(out, "      <mac address='{}'/>", text(&nic.id));
@@ -286,6 +329,12 @@ pub fn disk_fragment(disk: &VmDisk) -> String {
     out
 }
 
+pub fn cdrom_fragment(cdrom: &VmCdrom) -> String {
+    let mut out = String::new();
+    render_cdrom(&mut out, cdrom);
+    out
+}
+
 pub fn nic_fragment(nic: &VmNic) -> String {
     let mut out = String::new();
     render_nic(&mut out, nic);
@@ -303,6 +352,7 @@ struct PartialDisk {
     discard: bool,
     boot_index: Option<u32>,
     is_disk: bool,
+    is_cdrom: bool,
 }
 
 #[derive(Default)]
@@ -393,6 +443,7 @@ fn read(xml: &str) -> Result<(ParsedDomain, Option<u32>)> {
     let mut disk = PartialDisk::default();
     let mut nic = PartialNic::default();
     let mut disks: Vec<(VmDisk, Option<u32>)> = Vec::new();
+    let mut cdroms: Vec<(VmCdrom, Option<u32>)> = Vec::new();
     let mut nics: Vec<(VmNic, Option<u32>)> = Vec::new();
 
     loop {
@@ -429,10 +480,14 @@ fn read(xml: &str) -> Result<(ParsedDomain, Option<u32>)> {
                         })
                     }
                     "domain/devices/disk" => {
+                        // A disk and an optical drive are the same element
+                        // with a different `device`; anything else (a floppy,
+                        // a LUN) is a device this appliance does not define
+                        // and does not claim to understand.
+                        let device = attr(e, "device");
                         disk = PartialDisk {
-                            // A cdrom is a disk element too, and this stage
-                            // does not define them — so only "disk" counts.
-                            is_disk: attr(e, "device").as_deref() == Some("disk"),
+                            is_disk: device.as_deref() == Some("disk"),
+                            is_cdrom: device.as_deref() == Some("cdrom"),
                             ..PartialDisk::default()
                         }
                     }
@@ -470,6 +525,10 @@ fn read(xml: &str) -> Result<(ParsedDomain, Option<u32>)> {
                     "domain/devices/interface/boot" => {
                         nic.boot_index = number(attr(e, "order")).map(|v| v as u32)
                     }
+                    // Read from libosinfo's element, not Lumen's: it is the
+                    // shared vocabulary, and a machine defined by another tool
+                    // carries it too.
+                    "domain/metadata/libosinfo/os" => config.os_id = attr(e, "id"),
                     "domain/devices/channel/target" => {
                         if attr(e, "name").as_deref() == Some(GUEST_AGENT_CHANNEL) {
                             config.guest_agent = true;
@@ -508,6 +567,20 @@ fn read(xml: &str) -> Result<(ParsedDomain, Option<u32>)> {
                                 },
                                 disk.boot_index,
                             ));
+                        } else if disk.is_cdrom {
+                            // A drive with nothing in it is still a drive, so
+                            // unlike a disk it needs no source to be real —
+                            // only a target to be addressed by.
+                            if let Some(target) = disk.target.clone() {
+                                cdroms.push((
+                                    VmCdrom {
+                                        id: target,
+                                        source: disk.source.clone().filter(|s| !s.is_empty()),
+                                        boot_index: disk.boot_index,
+                                    },
+                                    disk.boot_index,
+                                ));
+                            }
                         }
                         disk = PartialDisk::default();
                     }
@@ -582,6 +655,11 @@ fn read(xml: &str) -> Result<(ParsedDomain, Option<u32>)> {
         .iter()
         .filter_map(|(_, order)| order.map(|o| (o, BootDevice::Disk)))
         .chain(
+            cdroms
+                .iter()
+                .filter_map(|(_, order)| order.map(|o| (o, BootDevice::Cdrom))),
+        )
+        .chain(
             nics.iter()
                 .filter_map(|(_, order)| order.map(|o| (o, BootDevice::Network))),
         )
@@ -594,6 +672,7 @@ fn read(xml: &str) -> Result<(ParsedDomain, Option<u32>)> {
     }
 
     config.disks = disks.into_iter().map(|(disk, _)| disk).collect();
+    config.cdroms = cdroms.into_iter().map(|(cdrom, _)| cdrom).collect();
     config.nics = nics.into_iter().map(|(nic, _)| nic).collect();
 
     Ok((
@@ -668,12 +747,17 @@ impl VmConfig {
         // boot index first, then position, so re-normalizing is idempotent.
         let mut disk_order: Vec<usize> = (0..config.disks.len()).collect();
         disk_order.sort_by_key(|&i| (config.disks[i].boot_index.unwrap_or(u32::MAX), i));
+        let mut cdrom_order: Vec<usize> = (0..config.cdroms.len()).collect();
+        cdrom_order.sort_by_key(|&i| (config.cdroms[i].boot_index.unwrap_or(u32::MAX), i));
         let mut nic_order: Vec<usize> = (0..config.nics.len()).collect();
         nic_order.sort_by_key(|&i| (config.nics[i].boot_index.unwrap_or(u32::MAX), i));
 
         let mut boot_order: Vec<BootDevice> = Vec::new();
         for disk in &mut config.disks {
             disk.boot_index = None;
+        }
+        for cdrom in &mut config.cdroms {
+            cdrom.boot_index = None;
         }
         for nic in &mut config.nics {
             nic.boot_index = None;
@@ -700,10 +784,19 @@ impl VmConfig {
                     }
                     boot_order.push(BootDevice::Network);
                 }
-                // No optical devices are defined at this stage, so an entry
-                // for one is not a setting — it is a line with nothing behind
-                // it, and the document would not carry it either.
-                BootDevice::Cdrom => {}
+                BootDevice::Cdrom => {
+                    // An entry for a device class the machine does not have is
+                    // not a setting — it is a line with nothing behind it, and
+                    // the document would not carry it either.
+                    if config.cdroms.is_empty() {
+                        continue;
+                    }
+                    for &index in &cdrom_order {
+                        config.cdroms[index].boot_index = Some(order);
+                        order += 1;
+                    }
+                    boot_order.push(BootDevice::Cdrom);
+                }
             }
         }
         config.boot_order = boot_order;
@@ -728,6 +821,14 @@ mod tests {
         }
     }
 
+    fn cdrom(id: &str, source: Option<&str>) -> VmCdrom {
+        VmCdrom {
+            id: id.into(),
+            source: source.map(String::from),
+            boot_index: None,
+        }
+    }
+
     fn sample() -> VmConfig {
         VmConfig {
             vmid: 101,
@@ -747,11 +848,13 @@ mod tests {
             start_on_boot: false,
             guest_agent: true,
             tags: vec!["production".into(), "web".into()],
+            os_id: Some("http://almalinux.org/almalinux/10".into()),
             disks: vec![disk(
                 "vda",
                 "/dev/zvol/rpool/lumen/vm-101-disk-0",
                 DiskBus::VirtioBlk,
             )],
+            cdroms: Vec::new(),
             nics: vec![VmNic {
                 id: generate_mac(101, 0),
                 model: NicModel::Virtio,
@@ -831,6 +934,34 @@ mod tests {
             }),
             ("characters the document would otherwise eat", |c| {
                 c.description = Some("web & \"app\" <primary>".into())
+            }),
+            ("no recorded guest", |c| c.os_id = None),
+            ("an installation drive, booting first", |c| {
+                c.cdroms
+                    .push(cdrom("sda", Some("/var/lib/lumen/iso/rpool/al10.iso")));
+                c.boot_order = vec![BootDevice::Cdrom, BootDevice::Disk];
+            }),
+            ("an empty drive", |c| c.cdroms.push(cdrom("sda", None))),
+            ("installation media and the driver disc", |c| {
+                c.cdroms
+                    .push(cdrom("sda", Some("/var/lib/lumen/iso/rpool/win.iso")));
+                c.cdroms.push(cdrom(
+                    "sdb",
+                    Some("/var/lib/lumen/iso/rpool/virtio-win.iso"),
+                ));
+                c.boot_order = vec![BootDevice::Cdrom, BootDevice::Disk];
+            }),
+            ("a drive alongside disks that share its prefix", |c| {
+                c.disks.push(disk(
+                    "sda",
+                    "/dev/zvol/rpool/lumen/vm-101-disk-1",
+                    DiskBus::Sata,
+                ));
+                c.cdroms
+                    .push(cdrom("sdb", Some("/var/lib/lumen/iso/rpool/al10.iso")));
+            }),
+            ("a drive named in the boot order that is not there", |c| {
+                c.boot_order = vec![BootDevice::Cdrom, BootDevice::Disk]
             }),
         ];
 

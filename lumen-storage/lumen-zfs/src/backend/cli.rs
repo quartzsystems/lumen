@@ -27,8 +27,8 @@ use tokio::process::Command;
 use crate::backend::ZfsBackend;
 use crate::error::{Result, ZfsError};
 use crate::model::{
-    is_lumen_volume, lumen_root, valid_pool_name, Dataset, DatasetKind, Pool, PoolHealth,
-    VolumeRequest,
+    is_lumen_volume, is_reserved_leaf, iso_dataset, iso_mountpoint, lumen_root, valid_pool_name,
+    Dataset, DatasetKind, Pool, PoolHealth, VolumeRequest,
 };
 
 /// Columns asked for by name, so a release that adds one does not shift the
@@ -185,7 +185,16 @@ fn reject_bad_pool(pool: &str) -> Result<()> {
 
 /// The last line of defence before a destroy. The service checks this too; a
 /// backend that trusts its caller is one refactor away from not being safe.
+///
+/// The media library matches the volume shape and is explicitly excluded: it
+/// is a filesystem full of an operator's installation media, and losing it to
+/// a mistyped disk name would be unrecoverable.
 fn reject_outside_namespace(path: &str) -> Result<()> {
+    if is_reserved_leaf(path) {
+        return Err(ZfsError::Conflict(format!(
+            "\"{path}\" is this node's installation media library, not a machine's disk."
+        )));
+    }
     if is_lumen_volume(path) {
         return Ok(());
     }
@@ -244,6 +253,39 @@ impl ZfsBackend for CliBackend {
             Ok(_) => Ok(()),
             // Already there is the ordinary case on every call after the first.
             Err(ZfsError::Backend(err)) if err.to_string().contains("already exists") => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn ensure_iso_store(&self, pool: &str) -> Result<String> {
+        reject_bad_pool(pool)?;
+        self.ensure_namespace(pool).await?;
+        let dataset = iso_dataset(pool);
+        let mountpoint = iso_mountpoint(pool);
+        // Unlike the parent, this one holds files and therefore has to be
+        // mounted — at the fixed path the control plane's unit names, not at
+        // the pool's natural one, which no static unit could enumerate.
+        let result = self
+            .run(
+                &self.zfs,
+                &[
+                    "create",
+                    "-p",
+                    "-o",
+                    &format!("mountpoint={mountpoint}"),
+                    &dataset,
+                ],
+            )
+            .await;
+        match result {
+            Ok(_) => Ok(mountpoint),
+            // Already there is the ordinary case on every call after the
+            // first. The mount point is not re-asserted: an operator who moved
+            // the library deliberately keeps it where they put it, and the
+            // service reads the real one back from the dataset listing.
+            Err(ZfsError::Backend(err)) if err.to_string().contains("already exists") => {
+                Ok(mountpoint)
+            }
             Err(err) => Err(err),
         }
     }
@@ -362,6 +404,8 @@ mod tests {
         assert!(reject_outside_namespace("rpool/lumen/vm-101-disk-0").is_ok());
         assert!(reject_outside_namespace("rpool/data/important").is_err());
         assert!(reject_outside_namespace("rpool").is_err());
+        // Shaped like a volume, but it is the media library.
+        assert!(reject_outside_namespace("rpool/lumen/iso").is_err());
         assert!(reject_bad_pool("rpool").is_ok());
         assert!(reject_bad_pool("rpool/lumen").is_err());
         assert!(reject_bad_pool("-rf").is_err());

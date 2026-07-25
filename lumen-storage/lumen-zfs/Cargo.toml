@@ -26,8 +26,18 @@ serde_json = "1"
 anyhow = "1"
 async-trait = "0.1"
 # "process" is what the real backend needs: argv arrays handed straight to
-# execve, with no shell anywhere in the path.
-tokio = { version = "1", features = ["process", "sync", "time", "rt", "macros"] }
+# execve, with no shell anywhere in the path. "fs" and "io-util" are the media
+# library's: an installation image is streamed to disk a chunk at a time and is
+# never held in memory.
+tokio = { version = "1", features = [
+    "process",
+    "fs",
+    "io-util",
+    "sync",
+    "time",
+    "rt",
+    "macros",
+] }
 tracing = "0.1"
 
 [dev-dependencies]

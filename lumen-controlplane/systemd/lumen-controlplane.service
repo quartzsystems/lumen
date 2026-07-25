@@ -3,6 +3,13 @@ Description=Lumen control plane (web UI + API on :8443)
 Documentation=https://github.com/quartzsystems/lumen
 After=network-online.target
 Wants=network-online.target
+# The media library is a pool dataset mounted under /var/lib/lumen/iso, and a
+# mount that appears after this unit's namespace is set up is not reliably
+# visible inside it. Ordering after the pool mounts is what makes an existing
+# library readable at start; a library created later is reported as not yet
+# visible, with the remedy said out loud (lumen_zfs::iso).
+After=zfs-mount.service
+
 
 [Service]
 Type=exec
@@ -17,10 +24,15 @@ StateDirectory=lumen-controlplane
 StateDirectoryMode=0700
 Environment=LUMEN_CP_STATE_DIR=/var/lib/lumen-controlplane
 
-# Hardening — the daemon only needs its state dir writable. NoNewPrivileges
-# is deliberately absent: PAM stacks (faillock, audit) may need privilege
-# transitions.
+# Hardening — the daemon needs its state dir writable, and the media library.
+# NoNewPrivileges is deliberately absent: PAM stacks (faillock, audit) may need
+# privilege transitions.
 ProtectSystem=strict
+# The one relaxation, and it is one directory: uploaded installation images are
+# files rather than volumes, so unlike every other write in this daemon they
+# cannot go through /dev/zfs. The leading "-" keeps a node with no media
+# library from failing to start. Everything else stays read-only.
+ReadWritePaths=-/var/lib/lumen/iso
 ProtectHome=yes
 PrivateTmp=yes
 ProtectKernelTunables=yes

@@ -30,18 +30,22 @@
 //! checkpoint engine is deliberately not copied here.
 
 pub mod backend;
+pub mod domain_caps;
 pub mod domain_xml;
 pub mod error;
 pub mod model;
+pub mod osinfo;
 pub mod service;
 pub mod state;
 pub mod validate;
 
+pub use domain_caps::{CpuModelInfo, CpuModels};
 pub use error::{Result, VirtError};
 pub use model::{
     generate_mac, valid_tag, valid_vm_name, BootDevice, CacheMode, CpuModel, CpuTopology, DiskBus,
-    Firmware, NicModel, VmConfig, VmDisk, VmNic, FIRST_VMID, LAST_VMID,
+    Firmware, NicModel, VmCdrom, VmConfig, VmDisk, VmNic, CDROM_BUS, FIRST_VMID, LAST_VMID,
 };
+pub use osinfo::{OsCatalog, OsFamily, OsVariant, OSINFO_DB_ROOT, WINDOWS_FAMILY};
 pub use service::VirtService;
 pub use state::{DomainRuntime, DomainState, HostInfo, ObservedDomain};
 pub use validate::{Acknowledgements, ValidationCode, ValidationError};

@@ -36,4 +36,15 @@ pub trait ZfsBackend: Send + Sync {
 
     /// Create the `<pool>/lumen` parent if it is not there yet. Idempotent.
     async fn ensure_namespace(&self, pool: &str) -> Result<()>;
+
+    /// Create the pool's media library — `<pool>/lumen/iso`, mounted at
+    /// [`crate::model::iso_mountpoint`] — if it is not there yet. Idempotent,
+    /// and returns the mount point either way.
+    ///
+    /// Unlike every other write here this one produces a *mount*, and a mount
+    /// made while the control plane is running does not necessarily appear
+    /// inside its namespace. The service checks whether it can actually see
+    /// the directory afterwards rather than assuming; see
+    /// [`crate::iso::IsoLibrary`].
+    async fn ensure_iso_store(&self, pool: &str) -> Result<String>;
 }

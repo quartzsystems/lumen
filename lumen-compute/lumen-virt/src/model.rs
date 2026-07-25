@@ -55,8 +55,18 @@ pub struct VmConfig {
     pub guest_agent: bool,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// What the guest is, in libosinfo's words — `http://almalinux.org/almalinux/10`.
+    ///
+    /// Metadata, never behaviour: nothing here reads it to decide how to
+    /// define the machine. It is written into the document in libosinfo's own
+    /// namespace as well as Lumen's, so `virt-manager` and friends see the same
+    /// answer, and so the console can show the guest a machine was built for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os_id: Option<String>,
     #[serde(default)]
     pub disks: Vec<VmDisk>,
+    #[serde(default)]
+    pub cdroms: Vec<VmCdrom>,
     #[serde(default)]
     pub nics: Vec<VmNic>,
 }
@@ -85,7 +95,9 @@ impl Default for VmConfig {
             start_on_boot: false,
             guest_agent: true,
             tags: Vec::new(),
+            os_id: None,
             disks: Vec::new(),
+            cdroms: Vec::new(),
             nics: Vec::new(),
         }
     }
@@ -114,16 +126,32 @@ impl VmConfig {
         self.disks.iter().map(|d| d.size).sum()
     }
 
+    pub fn cdrom(&self, id: &str) -> Option<&VmCdrom> {
+        self.cdroms.iter().find(|c| c.id == id)
+    }
+
     /// The next free target name for a disk on this bus. Targets must be
-    /// unique across the whole machine, so the search looks at every disk and
-    /// not just the ones sharing a bus.
+    /// unique across the whole machine, so the search looks at every disk —
+    /// and at every optical drive, which shares the `sd` prefix with the two
+    /// non-virtio buses and would otherwise be allocated the same name.
     pub fn next_disk_target(&self, bus: DiskBus) -> String {
-        let prefix = bus.target_prefix();
-        // a..z is 26 disks on one prefix, which is well past anything this
+        self.next_target(bus.target_prefix())
+    }
+
+    /// The next free target name for an optical drive.
+    pub fn next_cdrom_target(&self) -> String {
+        self.next_target(CDROM_BUS.target_prefix())
+    }
+
+    fn next_target(&self, prefix: &str) -> String {
+        // a..z is 26 devices on one prefix, which is well past anything this
         // stage will define; past that the name simply keeps counting.
         (0u32..)
             .map(|index| format!("{prefix}{}", disk_suffix(index)))
-            .find(|candidate| !self.disks.iter().any(|d| &d.id == candidate))
+            .find(|candidate| {
+                !self.disks.iter().any(|d| &d.id == candidate)
+                    && !self.cdroms.iter().any(|c| &c.id == candidate)
+            })
             .expect("an unbounded search always finds a free target")
     }
 
@@ -345,6 +373,30 @@ pub struct VmDisk {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boot_index: Option<u32>,
 }
+
+/// One optical drive, and what is in it.
+///
+/// Always SATA. A guest that is booting an installer has no drivers loaded yet
+/// — that is the entire point of the drive — so the bus has to be one the
+/// firmware and every installer already understand, which rules out virtio.
+/// The q35 machine type provides the controller, so nothing else is needed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VmCdrom {
+    /// The target name — `sda`, `sdb`. Unique within the machine, and what the
+    /// API addresses a drive by, exactly as a disk's is.
+    pub id: String,
+    /// The image in the tray. `None` is an empty drive, which is a real state:
+    /// it is what a machine has after its installation media is ejected, and
+    /// the drive stays so the guest can be given something else later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_index: Option<u32>,
+}
+
+/// The bus every optical drive uses. Not a choice, for the reason above.
+pub const CDROM_BUS: DiskBus = DiskBus::Sata;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
