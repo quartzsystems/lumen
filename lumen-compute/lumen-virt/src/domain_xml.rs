@@ -975,6 +975,7 @@ mod tests {
             }),
             machine: "q35".into(),
             firmware: Firmware::Uefi,
+            video: VideoModel::Virtio,
             boot_order: vec![BootDevice::Disk, BootDevice::Network],
             start_on_boot: false,
             guest_agent: true,
