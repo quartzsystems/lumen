@@ -269,10 +269,12 @@ pub struct VmView {
     /// Convenience the table would otherwise have to compute per row.
     pub boot_disk: Option<String>,
     pub total_disk_bytes: u64,
-    /// Where the machine's console socket is, as its own document gives it —
-    /// shown as a fact on the console page, and the thing to name in a support
-    /// conversation when a viewer will not open.
-    pub vnc_socket: String,
+    /// Where the machine's console socket is, when its stored document names
+    /// one. For a machine this appliance defines it does not: the hypervisor
+    /// chooses the path at start, and [`VirtService::console`] asks the live
+    /// document. What remains here is the fact for a support conversation —
+    /// a machine defined by hand carries whatever it carries.
+    pub vnc_socket: Option<String>,
     /// Changes that are stored but will not reach the guest until it restarts.
     pub pending_reboot: Vec<String>,
     pub actions: VmActions,
@@ -769,7 +771,7 @@ impl VirtService {
                 .map(|started| now_unix().saturating_sub(started)),
             boot_disk: config.boot_disk().map(|d| d.id.clone()),
             total_disk_bytes: config.total_disk_bytes(),
-            vnc_socket: console_socket_of(observed, config.vmid),
+            vnc_socket: domain_xml::vnc_socket_of(&observed.xml),
             pending_reboot: pending,
             actions: actions_for(observed.state, &config.name, has_screen),
         }
@@ -956,18 +958,20 @@ impl VirtService {
         tracing::info!(vmid, name = %config.name, "machine defined");
         let view = self.get(vmid).await?;
         // The hypervisor may normalize the document it was given; it must not
-        // lose the screen out of it. It has: a real EL10 node stored a
-        // machine defined with `<graphics type='vnc' socket='…'/>` as
-        // `autoport='yes'` with no socket anywhere, and the only symptom was
-        // a console that refused a machine created that morning as one
-        // "defined before this appliance gave machines a console". A sentence
-        // in the journal at creation time is the difference between reading
-        // the cause and re-deriving it from a stored document days later.
+        // lose the screen out of it. It has, twice: any VNC socket *path* this
+        // appliance chose under /var/lib/libvirt/qemu was silently wiped at
+        // define time (see the graphics note in `domain_xml::render`), and the
+        // only symptom was a console that refused a machine created that
+        // morning. The document now defers the path, so this firing again
+        // means the hypervisor has found a new way to drop the listener — and
+        // a sentence in the journal at creation time is the difference between
+        // reading the cause and re-deriving it from a stored document days
+        // later.
         if !view.has_screen {
             tracing::warn!(
                 vmid,
                 name = %config.name,
-                "the machine was defined with a console socket, but the hypervisor \
+                "the machine was defined with a console listener, but the hypervisor \
                  stored it without one — its console will not open"
             );
         }
@@ -1681,24 +1685,6 @@ impl VirtService {
     }
 }
 
-/// A machine's console socket: what its own document says, and only failing
-/// that the path this appliance would have given it.
-///
-/// The fallback matters for exactly one case — a document the reader could not
-/// find a graphics element in — and it is the predictable path rather than
-/// nothing, because on the table this is a label rather than somewhere anything
-/// is about to connect.
-///
-/// [`VirtService::console`] deliberately does **not** use this. It asks the
-/// hypervisor for the running document and refuses outright when there is no
-/// screen in it, because a fabricated path is the worst possible answer to give
-/// something that is about to open a socket: the viewer fails with an operating
-/// system error against a file nobody ever created, and the real remedy — the
-/// machine predates consoles and needs redefining — is nowhere in sight.
-fn console_socket_of(observed: &ObservedDomain, vmid: u32) -> String {
-    domain_xml::vnc_socket_of(&observed.xml).unwrap_or_else(|| domain_xml::vnc_socket_path(vmid))
-}
-
 /// The dataset behind a disk's device path, if the appliance created it.
 fn volume_of(source: &str) -> Option<String> {
     let dataset = source.strip_prefix("/dev/zvol/")?;
@@ -1852,7 +1838,11 @@ mod tests {
         assert_eq!(vm.nics[0].id, generate_mac(100, 0));
         assert_eq!(vm.nics[0].bridge, "br0");
         assert_eq!(vm.boot_disk.as_deref(), Some("vda"));
-        assert_eq!(vm.vnc_socket, "/var/lib/libvirt/qemu/lumen-100-vnc.sock");
+        // The stored document asks for a console but defers its path to the
+        // hypervisor, which chooses one at start — so a machine that has not
+        // started has a screen and no address for it yet.
+        assert!(vm.has_screen);
+        assert_eq!(vm.vnc_socket, None);
 
         // The volume really exists, and so does the domain.
         assert!(h.zfs.has_dataset("boot/lumen/vm-100-disk-0"));
@@ -1950,10 +1940,15 @@ mod tests {
         assert_eq!(target.vmid, 100);
         assert_eq!(target.name, "web01");
         assert_eq!(target.protocol, ConsoleProtocol::Vnc);
-        // Read out of the machine's own document, and therefore the same
-        // socket the view reports.
-        assert_eq!(target.socket, "/var/lib/libvirt/qemu/lumen-100-vnc.sock");
-        assert_eq!(target.socket, running.vnc_socket);
+        // Read out of the *live* document: the hypervisor chose the path when
+        // the machine started, under its own per-domain directory.
+        assert_eq!(
+            target.socket,
+            "/var/lib/libvirt/qemu/domain-1-web01/vnc.sock"
+        );
+        // The stored document still defers it, so the view still has none —
+        // the console endpoint is the one place that knows the address.
+        assert_eq!(running.vnc_socket, None);
 
         // A machine that is not there is a not-found, not a console.
         assert!(matches!(
@@ -1983,11 +1978,10 @@ mod tests {
             "    <video>\n      <model type='virtio'/>\n    </video>\n",
             "",
         );
-        let before_consoles = no_video
-            .lines()
-            .filter(|line| !line.contains("<graphics"))
-            .map(|line| format!("{line}\n"))
-            .collect::<String>();
+        let before_consoles = no_video.replace(
+            "    <graphics type='vnc'>\n      <listen type='socket'/>\n    </graphics>\n",
+            "",
+        );
         assert!(!before_consoles.contains("<video>"), "{before_consoles}");
         assert!(!before_consoles.contains("<graphics"), "{before_consoles}");
         assert!(!domain_xml::has_screen(&before_consoles));

@@ -181,11 +181,20 @@ ausearch -m AVC,USER_AVC -ts recent
 semodule -B                               # put them back
 ```
 
-`lumen-controlplane/selinux/lumen-controlplane.te` carries the grant, and
+`lumen-controlplane/selinux/lumen-controlplane.te` carries the grants, and
 `lumen-controlplane.spec` builds it into the package and loads it at priority
-200. The daemon gains nothing: it already holds the descriptors, and the grant
-is to `dbus-broker`, for reading a pipe it is being handed on purpose. The
-unit's `ProtectSystem=strict` sandbox does not move.
+200. The daemon gains nothing: it already holds the descriptors, and the grants
+are to `dbus-broker` and PID 1, for accepting pipes they are being handed on
+purpose. The unit's `ProtectSystem=strict` sandbox does not move.
+
+Two grants per recipient, because receiving a passed descriptor is one kernel
+hook making two decisions: `fd use` on the descriptor itself, and the
+`fifo_file` permission matching the mode it was opened for. Version 1.0 of the
+module carried only the fifo half, and the symptom did not change — a refusal
+of either check looks identical from outside, and both denials are
+dontaudit'ed. And the broker is not the last recipient: it relays the
+descriptors to PID 1, which receives them the same way, so `init_t` gets the
+same pair rather than being assumed covered by stock policy.
 
 The target type is broader than it should be — `unconfined_service_t` is every
 service without a policy of its own, not just this one. Narrowing it means

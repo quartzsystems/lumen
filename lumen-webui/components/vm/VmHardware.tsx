@@ -12,6 +12,7 @@ import {
   MemoryStick,
   Monitor,
   Network,
+  Pencil,
   Plus,
   type LucideIcon,
 } from "lucide-react";
@@ -29,16 +30,19 @@ import {
   cpuModelLabel,
   detachDisk,
   detachNic,
+  fetchCpuModels,
   formatBytes,
   formatMib,
   updateVm,
   validationErrorsOf,
   VIDEO_HINT,
   VIDEO_LABEL,
-  type BootDevice,
+  type CpuModel,
+  type CpuModels,
   type DiskBus,
   type NicModel,
   type VideoModel,
+  type VmPatch,
   type VmUpdateResponse,
   type VmView,
 } from "@/lib/vmClient";
@@ -104,7 +108,7 @@ export function VmHardware({
   onChanged: (message: string) => Promise<void> | void;
 }) {
   const [adding, setAdding] = useState<"disk" | "nic" | null>(null);
-  const [editingSizing, setEditingSizing] = useState(false);
+  const [editing, setEditing] = useState<SizingKey | null>(null);
   const [working, setWorking] = useState(false);
 
   const report = async (response: VmUpdateResponse, what: string) => {
@@ -132,13 +136,12 @@ export function VmHardware({
 
   const disabled = busy || working;
 
-  // The one dialog behind every sizing row — memory, processors, BIOS,
-  // display, and machine type are edited together, and the node answers which
-  // changes the running machine took.
-  const sizingEdit = (
-    <Button kind="ghost" size="sm" disabled={disabled} onClick={() => setEditingSizing(true)}>
-      Edit
-    </Button>
+  // One dialog per row, each editing exactly the thing its row names. The
+  // earlier single dialog edited five settings at once, which meant the task
+  // log said "Change memory, firmware, graphics…" for a save that changed one
+  // of them — every untouched field still went over the wire.
+  const editPencil = (key: SizingKey, label: string) => (
+    <EditPencil label={label} disabled={disabled} onClick={() => setEditing(key)} />
   );
 
   const processors = `${vm.vcpus}${
@@ -161,7 +164,7 @@ export function VmHardware({
       device: "Memory",
       text: formatMib(vm.memory_mib),
       value: <span className="qz-mono">{formatMib(vm.memory_mib)}</span>,
-      actions: sizingEdit,
+      actions: editPencil("memory", "memory"),
     },
     {
       key: "processors",
@@ -169,7 +172,7 @@ export function VmHardware({
       device: "Processors",
       text: processors,
       value: <span className="qz-mono">{processors}</span>,
-      actions: sizingEdit,
+      actions: editPencil("processors", "processors"),
     },
     {
       key: "bios",
@@ -177,7 +180,7 @@ export function VmHardware({
       device: "BIOS",
       text: vm.firmware === "uefi" ? "UEFI" : "Legacy BIOS",
       value: vm.firmware === "uefi" ? "UEFI" : "Legacy BIOS",
-      actions: sizingEdit,
+      actions: editPencil("bios", "firmware"),
     },
     {
       key: "display",
@@ -185,19 +188,21 @@ export function VmHardware({
       device: "Display",
       /* Not simply the card. A machine whose document has no display device
          reads back as the default one, so printing `video` here told an
-         operator "VirtIO GPU" about a machine with no graphics device and no
-         console socket — and then the console said there was no screen, which
-         reads as a broken appliance rather than as a machine that needs
-         saving. */
-      text: vm.has_screen ? VIDEO_LABEL[vm.video] : "none yet",
+         operator "VirtIO GPU" about a machine with no console listener — and
+         then the console said there was no screen, which reads as a broken
+         appliance rather than as a machine that needs saving. The missing
+         thing is the console, not the card, and the remedy is a save (which
+         rewrites the document) followed by a full stop and start. */
+      text: vm.has_screen ? VIDEO_LABEL[vm.video] : "no console yet",
       value: vm.has_screen ? (
         VIDEO_LABEL[vm.video]
       ) : (
         <span style={{ color: "var(--qz-warn)" }}>
-          none yet <span className="qz-dim">— save to give it {VIDEO_LABEL[vm.video]}</span>
+          no console yet{" "}
+          <span className="qz-dim">— save this machine, then stop and start it</span>
         </span>
       ),
-      actions: sizingEdit,
+      actions: editPencil("display", "display"),
     },
     {
       key: "machine",
@@ -205,7 +210,7 @@ export function VmHardware({
       device: "Machine",
       text: vm.machine,
       value: <span className="qz-mono">{vm.machine}</span>,
-      actions: sizingEdit,
+      actions: editPencil("machine", "machine type"),
     },
     // Derived, not stored: the controller exists in the machine's document
     // exactly when a disk rides the virtio-scsi bus.
@@ -353,17 +358,65 @@ export function VmHardware({
           }}
         />
       )}
-      {editingSizing && (
-        <SizingDialog
-          vm={vm}
-          onClose={() => setEditingSizing(false)}
-          onSaved={async (response) => {
-            setEditingSizing(false);
-            await report(response, "Hardware updated");
-          }}
-        />
-      )}
+      {editing !== null &&
+        (() => {
+          const dialogs: Record<
+            SizingKey,
+            [React.ComponentType<SizingDialogProps>, string]
+          > = {
+            memory: [EditMemoryDialog, "Memory updated"],
+            processors: [EditProcessorsDialog, "Processors updated"],
+            bios: [EditFirmwareDialog, "Firmware updated"],
+            display: [EditDisplayDialog, "Display updated"],
+            machine: [EditMachineDialog, "Machine type updated"],
+          };
+          const [Dialog, message] = dialogs[editing];
+          return (
+            <Dialog
+              vm={vm}
+              onClose={() => setEditing(null)}
+              onSaved={async (response) => {
+                setEditing(null);
+                await report(response, message);
+              }}
+            />
+          );
+        })()}
     </div>
+  );
+}
+
+/// The five rows above the devices, each with a dialog of its own.
+type SizingKey = "memory" | "processors" | "bios" | "display" | "machine";
+
+interface SizingDialogProps {
+  vm: VmView;
+  onClose: () => void;
+  onSaved: (response: VmUpdateResponse) => Promise<void>;
+}
+
+/// The pencil RowActions draws, without the delete half: a sizing row is not
+/// removable, so a pair with a permanently disabled bin would be noise.
+function EditPencil({
+  label,
+  disabled,
+  onClick,
+}: {
+  label: string;
+  disabled: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      title={`Edit ${label}`}
+      aria-label={`Edit ${label}`}
+      disabled={disabled}
+      onClick={onClick}
+      className="grid place-items-center w-7 h-7 rounded-md bg-transparent border-0 text-[var(--qz-fg-4)] hover:text-[var(--qz-accent)] hover:bg-[color-mix(in_oklab,white_5%,transparent)] transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:text-[var(--qz-fg-4)] disabled:hover:bg-transparent"
+    >
+      <Pencil size={14} />
+    </button>
   );
 }
 
@@ -691,49 +744,17 @@ function AddNicDialog({
   );
 }
 
-/// Processors, memory, firmware, and boot order. Everything here except the
-/// first two needs a restart on a running machine, and the answer comes back
-/// from the node rather than being predicted in this dialog.
-function SizingDialog({
-  vm,
-  onClose,
-  onSaved,
-}: {
-  vm: VmView;
-  onClose: () => void;
-  onSaved: (response: VmUpdateResponse) => Promise<void>;
-}) {
-  const [vcpus, setVcpus] = useState(String(vm.vcpus));
-  const [memoryMib, setMemoryMib] = useState(String(vm.memory_mib));
-  const [firmware, setFirmware] = useState(vm.firmware);
-  const [video, setVideo] = useState(vm.video);
-  const [bootOrder, setBootOrder] = useState<string>(vm.boot_order.join(","));
+/// The submit plumbing every sizing dialog shares: send the patch, pin the
+/// node's validation sentences to their fields, and never invent a message the
+/// backend already wrote.
+function usePatchForm(vm: VmView, onSaved: (response: VmUpdateResponse) => Promise<void>) {
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
 
-  const submit = async () => {
-    const found: Record<string, string> = {};
-    const cpus = numberOf(vcpus);
-    if (cpus === undefined || cpus < 1) found.vcpus = "A machine needs at least one processor.";
-    const memory = numberOf(memoryMib);
-    if (memory === undefined || memory < 128) found.memory_mib = "Use at least 128 MiB.";
-    setErrors(found);
-    if (Object.keys(found).length > 0) return;
-
+  const save = async (patch: VmPatch) => {
     setSaving(true);
     try {
-      await onSaved(
-        await updateVm(vm.vmid, {
-          vcpus: cpus,
-          memory_mib: memory,
-          firmware,
-          video,
-          boot_order: bootOrder
-            .split(",")
-            .map((entry) => entry.trim())
-            .filter(Boolean) as BootDevice[],
-        }),
-      );
+      await onSaved(await updateVm(vm.vmid, patch));
     } catch (err) {
       const detail = validationErrorsOf(err);
       const pinned: Record<string, string> = {};
@@ -747,17 +768,114 @@ function SizingDialog({
     }
   };
 
+  return { errors, setErrors, saving, save };
+}
+
+/// The one subtitle every sizing dialog wants: whether the change lands now or
+/// at the next start is the node's answer, not this dialog's prediction.
+const appliesWhen = (vm: VmView) =>
+  vm.state === "running"
+    ? "The node will say whether the running machine takes this now or waits for a restart."
+    : "The machine is stopped, so this takes effect the next time it starts.";
+
+function EditMemoryDialog({ vm, onClose, onSaved }: SizingDialogProps) {
+  const [memoryMib, setMemoryMib] = useState(String(vm.memory_mib));
+  const { errors, setErrors, saving, save } = usePatchForm(vm, onSaved);
+
+  const parsed = numberOf(memoryMib);
+
+  const submit = async () => {
+    if (parsed === undefined || parsed < 128) {
+      setErrors({ memory_mib: "Use at least 128 MiB." });
+      return;
+    }
+    await save({ memory_mib: parsed });
+  };
+
   return (
     <ModalShell onClose={onClose}>
-      <ModalHeader
-        title={`Hardware for ${vm.name}`}
-        subtitle={
-          vm.state === "running"
-            ? "The node will say which of these it could apply now and which wait for a restart."
-            : "The machine is stopped, so everything takes effect the next time it starts."
-        }
-        onClose={onClose}
-      />
+      <ModalHeader title="Memory" subtitle={appliesWhen(vm)} onClose={onClose} />
+      <form
+        className="flex flex-col gap-4"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void submit();
+        }}
+      >
+        <Field
+          label="Memory (MiB)"
+          htmlFor="hw-memory"
+          required
+          error={errors.memory_mib}
+          hint={parsed !== undefined && parsed >= 128 ? formatMib(parsed) : undefined}
+        >
+          <TextInput
+            id="hw-memory"
+            value={memoryMib}
+            mono
+            inputMode="numeric"
+            invalid={!!errors.memory_mib}
+            onChange={setMemoryMib}
+          />
+        </Field>
+        {errors.form && <ErrorText msg={errors.form} />}
+        <ModalFooter onCancel={onClose} saving={saving} savingLabel="Saving…" submitLabel="Save" />
+      </form>
+    </ModalShell>
+  );
+}
+
+/// Sockets × cores, the way the wizard asks: the node refuses a layout that
+/// multiplies out to a different total, so asking for the total and the layout
+/// separately is asking to be refused.
+function EditProcessorsDialog({ vm, onClose, onSaved }: SizingDialogProps) {
+  const [sockets, setSockets] = useState(String(vm.topology?.sockets ?? 1));
+  const [cores, setCores] = useState(String(vm.topology?.cores ?? vm.vcpus));
+  const [cpuType, setCpuType] = useState<string>(
+    typeof vm.cpu_model === "string" ? vm.cpu_model : vm.cpu_model.named,
+  );
+  const [cpus, setCpus] = useState<CpuModels | null>(null);
+  const { errors, setErrors, saving, save } = usePatchForm(vm, onSaved);
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        setCpus(await fetchCpuModels());
+      } catch {
+        setCpus({ host_passthrough: true, models: [], reason: "unreadable" });
+      }
+    })();
+  }, []);
+
+  const socketCount = numberOf(sockets);
+  const coreCount = numberOf(cores);
+  const total =
+    socketCount !== undefined && coreCount !== undefined ? socketCount * coreCount : undefined;
+
+  // The machine's current model may be one the list does not carry — the list
+  // being unreadable, or a model this node cannot run — and a select that
+  // silently swapped it for the default would be an edit nobody made.
+  const named = cpus?.models.map((model) => model.name) ?? [];
+  const keepCurrent =
+    cpuType !== "host_model" && cpuType !== "host_passthrough" && !named.includes(cpuType);
+
+  const submit = async () => {
+    if (socketCount === undefined || socketCount < 1 || coreCount === undefined || coreCount < 1) {
+      setErrors({ topology: "A machine needs at least one socket and one core." });
+      return;
+    }
+    const model: CpuModel =
+      cpuType === "host_model" || cpuType === "host_passthrough" ? cpuType : { named: cpuType };
+    await save({
+      vcpus: socketCount * coreCount,
+      topology: { sockets: socketCount, cores: coreCount, threads: 1 },
+      cpu_model: model,
+    });
+  };
+
+  return (
+    <ModalShell onClose={onClose}>
+      <ModalHeader title="Processors" subtitle={appliesWhen(vm)} onClose={onClose} />
       <form
         className="flex flex-col gap-4"
         onSubmit={(e) => {
@@ -766,28 +884,77 @@ function SizingDialog({
         }}
       >
         <div className="grid gap-4" style={{ gridTemplateColumns: "1fr 1fr" }}>
-          <Field label="Processors" htmlFor="hw-vcpus" required error={errors.vcpus}>
+          <Field label="Sockets" htmlFor="hw-sockets" required error={errors.topology}>
             <TextInput
-              id="hw-vcpus"
-              value={vcpus}
+              id="hw-sockets"
+              value={sockets}
+              mono
+              inputMode="numeric"
+              invalid={!!errors.topology}
+              onChange={setSockets}
+            />
+          </Field>
+          <Field
+            label="Cores"
+            htmlFor="hw-cores"
+            required
+            error={errors.vcpus}
+            hint={total !== undefined ? `${total} processor${total === 1 ? "" : "s"} in total.` : undefined}
+          >
+            <TextInput
+              id="hw-cores"
+              value={cores}
               mono
               inputMode="numeric"
               invalid={!!errors.vcpus}
-              onChange={setVcpus}
-            />
-          </Field>
-          <Field label="Memory (MiB)" htmlFor="hw-memory" required error={errors.memory_mib}>
-            <TextInput
-              id="hw-memory"
-              value={memoryMib}
-              mono
-              inputMode="numeric"
-              invalid={!!errors.memory_mib}
-              onChange={setMemoryMib}
+              onChange={setCores}
             />
           </Field>
         </div>
-        <Field label="Firmware" htmlFor="hw-firmware" error={errors.firmware}>
+        <Field label="Type" htmlFor="hw-cpu-type" error={errors.cpu_model}>
+          <SelectInput id="hw-cpu-type" value={cpuType} onChange={setCpuType}>
+            <option value="host_model">
+              Default (host model{cpus?.host_model ? ` — ${cpus.host_model}` : ""})
+            </option>
+            {(cpus?.host_passthrough ?? true) && (
+              <option value="host_passthrough">Host passthrough</option>
+            )}
+            {keepCurrent && <option value={cpuType}>{cpuType}</option>}
+            {cpus?.models.map((model) => (
+              <option key={model.name} value={model.name} disabled={!model.usable}>
+                {model.name}
+                {model.usable ? "" : " — not runnable on this node"}
+              </option>
+            ))}
+          </SelectInput>
+        </Field>
+        {errors.form && <ErrorText msg={errors.form} />}
+        <ModalFooter onCancel={onClose} saving={saving} savingLabel="Saving…" submitLabel="Save" />
+      </form>
+    </ModalShell>
+  );
+}
+
+function EditFirmwareDialog({ vm, onClose, onSaved }: SizingDialogProps) {
+  const [firmware, setFirmware] = useState(vm.firmware);
+  const { errors, saving, save } = usePatchForm(vm, onSaved);
+
+  return (
+    <ModalShell onClose={onClose}>
+      <ModalHeader title="Firmware" subtitle={appliesWhen(vm)} onClose={onClose} />
+      <form
+        className="flex flex-col gap-4"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void save({ firmware });
+        }}
+      >
+        <Field
+          label="Firmware"
+          htmlFor="hw-firmware"
+          error={errors.firmware}
+          hint="A guest boots the way it was installed — an operating system put down under one firmware does not usually start under the other."
+        >
           <SelectInput
             id="hw-firmware"
             value={firmware}
@@ -797,6 +964,35 @@ function SizingDialog({
             <option value="bios">Legacy BIOS</option>
           </SelectInput>
         </Field>
+        {errors.form && <ErrorText msg={errors.form} />}
+        <ModalFooter onCancel={onClose} saving={saving} savingLabel="Saving…" submitLabel="Save" />
+      </form>
+    </ModalShell>
+  );
+}
+
+function EditDisplayDialog({ vm, onClose, onSaved }: SizingDialogProps) {
+  const [video, setVideo] = useState(vm.video);
+  const { errors, saving, save } = usePatchForm(vm, onSaved);
+
+  return (
+    <ModalShell onClose={onClose}>
+      <ModalHeader
+        title="Display"
+        subtitle={
+          vm.has_screen
+            ? appliesWhen(vm)
+            : "This machine has no display device yet. Saving gives it one; it appears after the machine is stopped and started."
+        }
+        onClose={onClose}
+      />
+      <form
+        className="flex flex-col gap-4"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void save({ video });
+        }}
+      >
         <Field
           label="Graphics card"
           htmlFor="hw-video"
@@ -811,19 +1007,56 @@ function SizingDialog({
             ))}
           </SelectInput>
         </Field>
+        {/* The same sentence the wizard says, for the same reason: legal, and
+            a black console rather than an error. */}
+        {video === "bochs" && vm.firmware === "bios" && (
+          <div className="callout callout-warn">
+            <span className="text-[13px] text-[var(--qz-fg-2)]">
+              Bochs has no VGA BIOS underneath it, so on legacy BIOS this machine will show nothing
+              on the console until the guest&apos;s own driver loads. Standard VGA draws from the
+              first frame.
+            </span>
+          </div>
+        )}
+        {errors.form && <ErrorText msg={errors.form} />}
+        <ModalFooter onCancel={onClose} saving={saving} savingLabel="Saving…" submitLabel="Save" />
+      </form>
+    </ModalShell>
+  );
+}
+
+function EditMachineDialog({ vm, onClose, onSaved }: SizingDialogProps) {
+  // The stored type is the hypervisor's canonical name — "pc-q35-rhel10.2.0"
+  // — and the choice on offer is the chipset, so the name is read back down
+  // to the one word that picks it. Saving sends the word; the hypervisor
+  // re-canonicalizes it.
+  const [machine, setMachine] = useState(vm.machine.includes("q35") ? "q35" : "pc");
+  const { errors, saving, save } = usePatchForm(vm, onSaved);
+
+  return (
+    <ModalShell onClose={onClose}>
+      <ModalHeader
+        title="Machine type"
+        subtitle={`Currently ${vm.machine}. ${appliesWhen(vm)}`}
+        onClose={onClose}
+      />
+      <form
+        className="flex flex-col gap-4"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void save({ machine });
+        }}
+      >
         <Field
-          label="Boot order"
-          htmlFor="hw-boot"
-          hint="Comma separated: disk, network. A device the machine does not have is ignored."
-          error={errors.boot_order}
+          label="Machine type"
+          htmlFor="hw-machine"
+          error={errors.machine}
+          hint="The chipset the guest sees. q35 is PCIe and the one to keep; i440fx is for guests too old to know what that is. Changing it re-plumbs every bus, so an installed guest may need reconfiguring."
         >
-          <TextInput
-            id="hw-boot"
-            value={bootOrder}
-            mono
-            placeholder="disk,network"
-            onChange={setBootOrder}
-          />
+          <SelectInput id="hw-machine" value={machine} onChange={setMachine}>
+            <option value="q35">q35</option>
+            <option value="pc">i440fx</option>
+          </SelectInput>
         </Field>
         {errors.form && <ErrorText msg={errors.form} />}
         <ModalFooter onCancel={onClose} saving={saving} savingLabel="Saving…" submitLabel="Save" />

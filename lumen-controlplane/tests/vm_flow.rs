@@ -283,7 +283,11 @@ async fn create_start_shutdown_delete() {
     assert_eq!(vm["nics"][0]["id"], "52:54:00:00:64:00");
     assert_eq!(vm["firmware"], "uefi");
     assert_eq!(vm["machine"], "q35");
-    assert_eq!(vm["vnc_socket"], "/var/lib/libvirt/qemu/lumen-100-vnc.sock");
+    // The machine has a screen, and no address for it yet: the stored
+    // document defers the socket's path to the hypervisor, which chooses one
+    // at start. The console endpoint is where the address lives.
+    assert_eq!(vm["has_screen"], true);
+    assert_eq!(vm["vnc_socket"], serde_json::Value::Null);
     // The controls carry their own reasons, so the console never has to guess.
     assert_eq!(vm["actions"]["start"]["allowed"], true);
     assert_eq!(vm["actions"]["shutdown"]["allowed"], false);
@@ -752,17 +756,19 @@ async fn the_console_is_offered_only_while_the_machine_is_running() {
     assert_eq!(console["vmid"], 100);
     assert_eq!(console["name"], "web01");
     assert_eq!(console["protocol"], "vnc");
+    // The hypervisor's own choice, made at start under its per-domain
+    // directory and read back out of the live document.
     assert_eq!(
         console["socket"],
-        "/var/lib/libvirt/qemu/lumen-100-vnc.sock"
+        "/var/lib/libvirt/qemu/domain-1-web01/vnc.sock"
     );
     assert_eq!(console["websocket"], "/api/vms/100/console/ws");
 
-    // The running row agrees with it, so the console never has to reconcile
-    // two answers about the same machine.
+    // The running row still defers the address — the stored document never
+    // carries it — so the console endpoint is the one answer, not one of two.
     let running = h.get("/api/vms/100").await;
     assert_eq!(running["actions"]["console"]["allowed"], true);
-    assert_eq!(running["vnc_socket"], console["socket"]);
+    assert_eq!(running["vnc_socket"], serde_json::Value::Null);
 }
 
 #[tokio::test]

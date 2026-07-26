@@ -5,7 +5,7 @@ import { Panel } from "@/components/vm/VmBits";
 import { Button } from "@/components/ui/Button";
 import { Switch } from "@/components/ui/Switch";
 import { ErrorText, Field, TextInput } from "@/components/ui/formkit";
-import { updateVm, validationErrorsOf, type VmView } from "@/lib/vmClient";
+import { updateVm, validationErrorsOf, type BootDevice, type VmView } from "@/lib/vmClient";
 
 /// The settings that are about the machine rather than about its hardware:
 /// what it is called, what it is for, and whether the node starts it.
@@ -23,6 +23,10 @@ export function VmOptions({
   const [tags, setTags] = useState(vm.tags.join(", "));
   const [startOnBoot, setStartOnBoot] = useState(vm.start_on_boot);
   const [guestAgent, setGuestAgent] = useState(vm.guest_agent);
+  // Here rather than on the hardware page, the way Proxmox files it: boot
+  // order is about the machine, not about any one device — each hardware
+  // dialog edits exactly the thing its row names.
+  const [bootOrder, setBootOrder] = useState(vm.boot_order.join(", "));
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
 
@@ -31,7 +35,8 @@ export function VmOptions({
     description !== (vm.description ?? "") ||
     tags !== vm.tags.join(", ") ||
     startOnBoot !== vm.start_on_boot ||
-    guestAgent !== vm.guest_agent;
+    guestAgent !== vm.guest_agent ||
+    bootOrder !== vm.boot_order.join(", ");
 
   const submit = async () => {
     setErrors({});
@@ -46,6 +51,10 @@ export function VmOptions({
           .filter(Boolean),
         start_on_boot: startOnBoot,
         guest_agent: guestAgent,
+        boot_order: bootOrder
+          .split(",")
+          .map((entry) => entry.trim())
+          .filter(Boolean) as BootDevice[],
       });
       const pending = response.pending_reboot;
       await onChanged(
@@ -70,6 +79,7 @@ export function VmOptions({
     setTags(vm.tags.join(", "));
     setStartOnBoot(vm.start_on_boot);
     setGuestAgent(vm.guest_agent);
+    setBootOrder(vm.boot_order.join(", "));
     setErrors({});
   };
 
@@ -126,6 +136,22 @@ export function VmOptions({
               invalid={!!errors.tags}
               placeholder="production, web"
               onChange={setTags}
+            />
+          </Field>
+
+          <Field
+            label="Boot order"
+            htmlFor="opt-boot"
+            hint="Comma separated: cdrom, disk, network. A device the machine does not have is ignored."
+            error={errors.boot_order}
+          >
+            <TextInput
+              id="opt-boot"
+              value={bootOrder}
+              mono
+              invalid={!!errors.boot_order}
+              placeholder="disk, network"
+              onChange={setBootOrder}
             />
           </Field>
 

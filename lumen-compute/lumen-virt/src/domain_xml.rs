@@ -59,30 +59,64 @@ const GUEST_AGENT_CHANNEL: &str = "org.qemu.guest_agent.0";
 /// anywhere ends up with copy and paste.
 const CLIPBOARD_CHANNEL: &str = "com.redhat.spice.0";
 
-/// Where a machine's console socket lives. Predictable rather than assigned by
-/// the hypervisor, so the console viewer can find it without a lookup, and so a
-/// policy rule can name it.
-pub fn vnc_socket_path(vmid: u32) -> String {
-    format!("/var/lib/libvirt/qemu/lumen-{vmid}-vnc.sock")
+/// What a machine's document says about its console.
+#[derive(Debug, Default)]
+struct VncConsole {
+    /// The document asks for a VNC server on a unix socket — a `<listen
+    /// type='socket'>` child, with or without a path in it. This is the
+    /// "does the machine have a screen" question.
+    socket_listen: bool,
+    /// The socket's path, when the document names one. The *stored* document
+    /// of a machine this appliance defines never does — see the note on the
+    /// graphics element in [`render`] — the hypervisor chooses a path when the
+    /// machine starts, and the live document is where it says which.
+    path: Option<String>,
 }
 
-/// Where a machine's console socket actually is, according to its own document.
+/// Where a machine's console socket is, according to its own document.
 ///
-/// [`vnc_socket_path`] is where Lumen *puts* one, and for a machine this
-/// appliance defined the two agree. They need not: a domain someone edited with
-/// `virsh`, or one defined by an older version of this appliance, carries
-/// whatever it carries — and a viewer has to connect to the socket the
-/// hypervisor is listening on rather than to the one we would have chosen.
+/// There is no naming rule to fall back on: the hypervisor assigns the path at
+/// start, under its own per-domain directory, and publishes it in the live
+/// document. A stored document answers `None` — as does a domain someone
+/// defined by hand to listen on a TCP port, which is a console this viewer
+/// does not speak to.
 ///
-/// The path may sit on the `<graphics>` element, on the `<listen>` child the
-/// hypervisor adds when it hands the document back, or on both. The child wins,
-/// because it is the hypervisor's own answer rather than the one it was given.
+/// The path may sit on the `<graphics>` element (the legacy spelling), on the
+/// `<listen>` child (the canonical one), or on both. The child wins, because
+/// it is the hypervisor's own answer rather than the one it was given.
 pub fn vnc_socket_of(xml: &str) -> Option<String> {
+    vnc_console_of(xml).path
+}
+
+/// Whether this document gives the machine a screen at all.
+///
+/// The distinction [`VmConfig::video`] cannot make. A document with no
+/// `<video>` in it reads back as the default card — see the note on
+/// `config.video` in [`read`] — so a machine that predates consoles and a
+/// machine deliberately set to virtio-gpu are the same value by the time
+/// anything sees a `VmConfig`. That is fine for rendering, where the default
+/// is what the next save will write, and wrong everywhere an operator is being
+/// told what the machine *has*: the console page showed "VirtIO GPU" for a
+/// machine with no display device and no VNC server on it, which reads as a
+/// broken console rather than as a machine that needs saving.
+///
+/// So this asks the document rather than the parsed configuration, and it asks
+/// about `<graphics>` rather than `<video>` — the VNC server is the half the
+/// viewer connects to. A socket listener with no path yet is still a screen:
+/// the path arrives when the machine starts, and it is the hypervisor's to
+/// choose.
+pub fn has_screen(xml: &str) -> bool {
+    let console = vnc_console_of(xml);
+    console.socket_listen || console.path.is_some()
+}
+
+fn vnc_console_of(xml: &str) -> VncConsole {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
 
     let mut path: Vec<String> = Vec::new();
     let mut in_vnc = false;
+    let mut console = VncConsole::default();
     let mut on_element: Option<String> = None;
     let mut on_listen: Option<String> = None;
 
@@ -105,6 +139,9 @@ pub fn vnc_socket_of(xml: &str) -> Option<String> {
                     }
                     "domain/devices/graphics/listen" if in_vnc => {
                         if attr(e, "type").as_deref() == Some("socket") {
+                            // With or without a path: the listener is the
+                            // screen, the path is the hypervisor's to fill in.
+                            console.socket_listen = true;
                             on_listen = attr(e, "socket");
                         }
                     }
@@ -127,28 +164,10 @@ pub fn vnc_socket_of(xml: &str) -> Option<String> {
         }
     }
 
-    on_listen
+    console.path = on_listen
         .or(on_element)
-        .filter(|socket| !socket.trim().is_empty())
-}
-
-/// Whether this document gives the machine a screen at all.
-///
-/// The distinction [`VmConfig::video`] cannot make. A document with no
-/// `<video>` in it reads back as the default card — see the note on
-/// `config.video` in [`read`] — so a machine that predates consoles and a
-/// machine deliberately set to virtio-gpu are the same value by the time
-/// anything sees a `VmConfig`. That is fine for rendering, where the default
-/// is what the next save will write, and wrong everywhere an operator is being
-/// told what the machine *has*: the console page showed "VirtIO GPU" for a
-/// machine with no display device and no VNC server on it, which reads as a
-/// broken console rather than as a machine that needs saving.
-///
-/// So this asks the document rather than the parsed configuration, and it asks
-/// about `<graphics>` rather than `<video>` — the VNC server is the half the
-/// viewer connects to, and it is the half [`vnc_socket_of`] has to find.
-pub fn has_screen(xml: &str) -> bool {
-    vnc_socket_of(xml).is_some()
+        .filter(|socket| !socket.trim().is_empty());
+    console
 }
 
 /// Everything the document carries, on the way back in.
@@ -293,20 +312,22 @@ fn render_document(config: &VmConfig, uuid: Option<&str>) -> String {
     // exists, and a redefine is the one operation an operator has no reason to
     // expect.
     //
-    // Both spellings of the socket, on purpose. The `socket` attribute is the
-    // legacy form; the `<listen type='socket'>` child is the canonical one,
-    // and it is what the hypervisor itself writes back. A machine defined on a
-    // real EL10 node with only the attribute came back stored as
-    // `autoport='yes'` with `<listen type='address'/>` — the socket silently
-    // gone, and with it the console. Writing the canonical child is the fix;
-    // keeping the attribute as well costs one line and means a libvirt that
-    // honors either spelling honors this document.
-    let socket = text(&vnc_socket_path(config.vmid));
-    let _ = writeln!(
-        out,
-        "    <graphics type='vnc' socket='{socket}'>\n      \
-         <listen type='socket' socket='{socket}'/>\n    </graphics>"
-    );
+    // A socket listener with **no path**, deliberately. This document asks for
+    // a unix-socket console and leaves the path to the hypervisor, which
+    // creates one under its per-domain directory at start — owned, labelled,
+    // and published in the live document, which is where `vnc_socket_of` reads
+    // it back.
+    //
+    // Naming the path ourselves was tried twice, and no spelling of it can
+    // work. The qemu driver treats any user-given VNC socket under its own
+    // `/var/lib/libvirt/qemu` as a relic of pre-2016 auto-generated sockets:
+    // `qemuDomainRecheckInternalPaths` frees the path and turns the listen
+    // into `<listen type='address'/>` at define time — silently, attribute
+    // and child spelling alike. What comes back is `autoport='yes'` with no
+    // socket anywhere, a console that never existed on a machine created that
+    // morning. A pathless listener is the arrangement that code is protecting,
+    // so it is the one arrangement it leaves alone.
+    out.push_str("    <graphics type='vnc'>\n      <listen type='socket'/>\n    </graphics>\n");
     let _ = writeln!(
         out,
         "    <video>\n      <model type='{}'/>\n    </video>",
@@ -1323,35 +1344,23 @@ mod tests {
     }
 
     #[test]
-    fn a_console_socket_is_defined_from_the_very_first_machine() {
+    fn a_console_listener_is_defined_from_the_very_first_machine() {
         let xml = render(&sample());
-        assert!(
-            xml.contains(&format!("socket='{}'", vnc_socket_path(101))),
-            "{xml}"
-        );
-        // The canonical spelling, not only the legacy attribute. A machine
-        // defined on a real EL10 node with the attribute alone came back
-        // stored as `autoport='yes'` with no socket anywhere — a console that
-        // never existed, on a machine created that morning. The listen child
-        // is the form the hypervisor itself writes, so it is the one it
-        // cannot mistake.
-        assert!(
-            xml.contains(&format!(
-                "<listen type='socket' socket='{}'/>",
-                vnc_socket_path(101)
-            )),
-            "{xml}"
-        );
-        assert_eq!(
-            vnc_socket_path(101),
-            "/var/lib/libvirt/qemu/lumen-101-vnc.sock"
-        );
-        // What was written is what comes back: the viewer connects to the
-        // machine's own answer rather than to the path it would have guessed.
-        assert_eq!(
-            vnc_socket_of(&xml).as_deref(),
-            Some(vnc_socket_path(101).as_str())
-        );
+        // A socket listener with no path. Naming one was tried twice — the
+        // legacy attribute, then the canonical child — and the qemu driver
+        // silently discarded both at define time, because any user-given VNC
+        // socket under its own /var/lib/libvirt/qemu reads to it as a relic
+        // of pre-2016 auto sockets (`qemuDomainRecheckInternalPaths`). The
+        // pathless listener is the arrangement it fills in itself at start.
+        assert!(xml.contains("<listen type='socket'/>"), "{xml}");
+        // No path of ours anywhere in the element: a path is precisely what
+        // gets the listener wiped.
+        assert!(!xml.contains("vnc.sock"), "{xml}");
+
+        // The machine has a screen the moment it is defined; where the screen
+        // is stays unanswered until the hypervisor starts it and says.
+        assert!(has_screen(&xml));
+        assert_eq!(vnc_socket_of(&xml), None);
     }
 
     /// `virDomainSetMetadata` attaches the namespace itself, from the prefix
@@ -1426,6 +1435,18 @@ mod tests {
         // than handing back a path nothing is listening on.
         let headless = "<domain type='kvm'><name>web01</name><devices/></domain>";
         assert_eq!(vnc_socket_of(headless), None);
+
+        // The stored document of a machine this appliance defines: a socket
+        // listener whose path the hypervisor has not chosen yet. That is a
+        // screen without an address — not a machine without a screen, and not
+        // an address to connect to either.
+        let deferred = "<domain type='kvm'><name>web01</name><devices>\
+                        <graphics type='vnc'><listen type='socket'/>\
+                        </graphics></devices></domain>";
+        assert_eq!(vnc_socket_of(deferred), None);
+        assert!(has_screen(deferred));
+        assert!(!has_screen(on_a_port));
+        assert!(!has_screen(headless));
     }
 
     /// Without this the guest never hears a shutdown request and an orderly
@@ -1500,13 +1521,9 @@ mod tests {
         assert!(has_screen(&with));
 
         // A machine from before consoles: no <graphics>, no <video>.
-        let socket = vnc_socket_path(config.vmid);
         let without = with
             .replace(
-                &format!(
-                    "    <graphics type='vnc' socket='{socket}'>\n      \
-                     <listen type='socket' socket='{socket}'/>\n    </graphics>\n"
-                ),
+                "    <graphics type='vnc'>\n      <listen type='socket'/>\n    </graphics>\n",
                 "",
             )
             .replace(&format!("    {}\n", video_block(VideoModel::Virtio)), "");

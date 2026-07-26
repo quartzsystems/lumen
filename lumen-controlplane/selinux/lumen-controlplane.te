@@ -36,17 +36,33 @@
 ## creating an account, and the restart controls — fail together and none of
 ## them names SELinux.
 ##
-## ## Why the rule is this shape
+## ## Why the rules are this shape
 ##
-## The daemon gains nothing here. It already has the descriptors; the grant is
-## to `dbus-broker`, for reading a pipe it is being handed on purpose. Nothing
-## about the unit's `ProtectSystem=strict` sandbox moves, and the privileged
-## work still happens in a transient unit outside it.
+## Receiving a passed descriptor is one kernel hook (`file_receive`) making
+## two decisions: may the receiving domain use a descriptor another domain
+## created at all (`fd use`), and may it act on the object behind it with the
+## mode it was opened for (`fifo_file read` on the input end, `write` on the
+## output and error ends, `getattr` for the `fstat` everything does on an fd
+## it is handed). Both must pass, a refusal of either looks identical from
+## outside, and both denials sit under the same dontaudit blanket.
 ##
-## `read` is the denial that was actually observed. `write` and `getattr` are
-## the same operation on the other two ends of the same triplet — standard
-## input is a read end and standard output and error are write ends — and
-## granting `read` alone would move the failure rather than fix it.
+## Version 1.0 of this module granted the fifo half and not the fd half, and
+## the failure did not move an inch — same reset, same silent hang — which is
+## exactly what a half-grant of one hook's checks does. `semodule -DB` on a
+## node carrying 1.0 shows the remainder: `denied { use }` for
+## `comm="dbus-broker"`, `tclass=fd`, `tcontext=...unconfined_service_t`.
+##
+## The broker is also not the last recipient. It relays the descriptors to
+## PID 1, which receives them the same way and attaches them to the transient
+## unit it starts — the same two checks, one hop later, with `init_t` as the
+## source. That grant is stated here rather than assumed of the stock policy:
+## a duplicate allow costs nothing, and an absent one moves the failure one
+## hop down the same pipe with the same silence.
+##
+## The daemon gains nothing here. It already has the descriptors; the grants
+## are to `dbus-broker` and PID 1, for accepting pipes they are being handed
+## on purpose. Nothing about the unit's `ProtectSystem=strict` sandbox moves,
+## and the privileged work still happens in a transient unit outside it.
 ##
 ## The target type is broader than this daemon: `unconfined_service_t` covers
 ## every service without a policy of its own, not just ours. Narrowing it means
@@ -55,12 +71,20 @@
 ## socket, and its state directory. That is the right end state and it is a
 ## much larger piece of work than the bug in front of us; see docs/system.md.
 
-module lumen-controlplane 1.0;
+module lumen-controlplane 1.1;
 
 require {
         type system_dbusd_t;
+        type init_t;
         type unconfined_service_t;
         class fifo_file { getattr read write };
+        class fd use;
 }
 
+# The broker accepts the descriptors from the daemon.
+allow system_dbusd_t unconfined_service_t:fd use;
 allow system_dbusd_t unconfined_service_t:fifo_file { getattr read write };
+
+# PID 1 accepts them from the broker and attaches them to the transient unit.
+allow init_t unconfined_service_t:fd use;
+allow init_t unconfined_service_t:fifo_file { getattr read write };

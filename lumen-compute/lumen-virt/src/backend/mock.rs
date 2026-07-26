@@ -468,13 +468,26 @@ impl VirtBackend for MockBackend {
         Ok(())
     }
 
-    /// The mock has one document per machine and says so in the module note —
-    /// it does not model the gap between stored and running. So this answers
-    /// with the stored one, and a test about *that* gap belongs on a real node
-    /// rather than here.
+    /// The mock has one document per machine and does not model the gap
+    /// between stored and running — with one deliberate exception. The stored
+    /// document defers the console socket's path to the hypervisor, which
+    /// chooses one under its per-domain directory at start and publishes it in
+    /// the live document (`qemuProcessGraphicsSetupListen`). The console flow
+    /// *is* that round trip, so the mock does here what the real hypervisor
+    /// does: a running machine's pathless listener answers with a path.
     async fn live_xml(&self, name: &str) -> Result<String> {
         let mut inner = self.inner.lock().unwrap();
-        Ok(inner.entry(name)?.xml.clone())
+        let entry = inner.entry(name)?;
+        if entry.state.is_running() {
+            return Ok(entry.xml.replace(
+                "<listen type='socket'/>",
+                &format!(
+                    "<listen type='socket' \
+                     socket='/var/lib/libvirt/qemu/domain-1-{name}/vnc.sock'/>"
+                ),
+            ));
+        }
+        Ok(entry.xml.clone())
     }
 
     /// A fake rather than a mock: it applies the three file commands to an

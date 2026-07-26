@@ -184,7 +184,11 @@ export interface VmView {
 
   boot_disk: string | null;
   total_disk_bytes: number;
-  vnc_socket: string;
+  /// The console socket path, when the stored document names one. Machines
+  /// this appliance defines defer the path to the hypervisor, which chooses
+  /// it at start — the console endpoint asks the live document, so this is
+  /// null in the ordinary case.
+  vnc_socket: string | null;
   /// Stored changes that will not reach the guest until it restarts.
   pending_reboot: string[];
   actions: VmActions;

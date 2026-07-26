@@ -554,8 +554,8 @@ explain it.
 
 ## The console viewer
 
-Every machine has carried `<graphics type='vnc' socket='…'/>` since the first
-one was defined, precisely so this stage would be additive: nothing had to be
+Every machine has carried a VNC graphics element since the first one was
+defined, precisely so this stage would be additive: nothing had to be
 redefined, and a machine created before the viewer existed has a console the
 moment the viewer does.
 
@@ -576,15 +576,32 @@ hypervisor already implements correctly, a second place for it to be wrong, and
 a second thing to keep current for no gain: the socket already carries exactly
 the stream the viewer wants.
 
-### The socket is read from the machine's document, not computed
+### The socket's path is the hypervisor's to choose, and the document is where it says
 
-`domain_xml::vnc_socket_of` reads `<graphics>`'s `socket` attribute, preferring
-the `<listen>` child the hypervisor adds on the way back out, because that is
-the hypervisor's own answer rather than the one it was given.
-`vnc_socket_path(vmid)` is only the fallback. A machine somebody edited with
-`virsh`, or one defined by an older version of this appliance, has its socket
-where it has it — and a viewer that connected to the *predicted* path would
-fail with an operating-system error and nothing to explain it.
+The machine is defined with `<graphics type='vnc'><listen type='socket'/></graphics>`
+— a unix-socket console with **no path in it**. At start, libvirt creates the
+socket under its per-domain directory (`/var/lib/libvirt/qemu/domain-<n>-<name>/vnc.sock`),
+owned and labelled correctly, and publishes the path in the **live** document.
+`VirtService::console` asks for that document and `domain_xml::vnc_socket_of`
+reads the path out of it — the `<listen>` child first, the legacy `socket`
+attribute as the fallback spelling. There is no predicted path anywhere: a
+machine somebody edited with `virsh` has its socket where it has it, and the
+stored document of a machine that has never started does not have one at all,
+which is why `VmView::vnc_socket` is optional.
+
+Naming the path ourselves was tried twice, and no spelling of it can work —
+this is the appliance's second-best-hidden failure after the dontaudit'ed bus
+denial in docs/system.md. Any user-given VNC socket path under
+`/var/lib/libvirt/qemu` reads to the qemu driver as a relic of its own
+pre-2016 auto-generated sockets: `qemuDomainRecheckInternalPaths` frees the
+path and turns the listen into `<listen type='address'/>` **at define time,
+silently** — the attribute spelling and the canonical child alike. What the
+node stores is `port='-1' autoport='yes'` with no socket anywhere, the define
+returns success, and the first symptom is a console that refuses a machine
+created that morning. `VirtService::create` checks the document it gets back
+and puts one warning sentence in the journal when the screen did not survive,
+because that sentence is the difference between reading the cause and
+re-deriving it from a stored document days later.
 
 ### The card is a choice, because the wrong one looks like a broken appliance
 
@@ -923,7 +940,7 @@ curl -sk -b "$JAR" -X PATCH "$HOST/api/vms/100" \
 #     origin, so the browser's cookie is the only credential it needs.
 curl -sk -b "$JAR" "$HOST/api/vms/100/console" | jq
 # { "vmid": 100, "name": "web01", "protocol": "vnc",
-#   "socket": "/var/lib/libvirt/qemu/lumen-100-vnc.sock",
+#   "socket": "/var/lib/libvirt/qemu/domain-1-web01/vnc.sock",
 #   "websocket": "/api/vms/100/console/ws" }
 
 #    A machine that is not running has no console, and says so:
@@ -1053,9 +1070,10 @@ Tests cover the refusals and the ordering. They cannot cover a hypervisor
 actually listening on a socket, so this is the acceptance test for the viewer.
 
 ```sh
-# What the machine says its console is. Must match the file on the node.
+# What the machine says its console is. The path is the hypervisor's choice,
+# under its per-domain directory — must match the file on the node.
 curl -sk -b "$JAR" "$HOST/api/vms/100/console" | jq
-ls -l /var/lib/libvirt/qemu/lumen-100-vnc.sock
+ls -l /var/lib/libvirt/qemu/domain-*-web01/vnc.sock
 
 # And the check the design rests on: the daemon is sandboxed, and the socket is
 # on a hierarchy ProtectSystem=strict made read-only. This must succeed.
