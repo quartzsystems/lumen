@@ -171,16 +171,56 @@ fn text(value: &str) -> String {
     escape(value).into_owned()
 }
 
-/// Render `config` as a domain document.
+/// Render `config` as a document for a machine that does **not** exist yet.
 ///
 /// Normalizes first, so the boot numbers in the output are a function of the
 /// configuration alone and two equal configurations always render identically.
+///
+/// No `<uuid>`, deliberately: the hypervisor mints one for a domain it has
+/// never seen. Every *other* define is a redefine and must carry the one it
+/// already has — see [`redefine`].
 pub fn render(config: &VmConfig) -> String {
+    render_document(config, None)
+}
+
+/// Render `config` as a document for a machine that already exists.
+///
+/// The difference from [`render`] is one element, and without it a redefine
+/// cannot succeed at all. A domain's identity is its **UUID**, not its name: a
+/// document that omits one gets a freshly generated UUID, and
+/// `virDomainDefineXML` then finds the name taken by a domain with a different
+/// UUID and refuses the whole call —
+///
+/// ```text
+/// operation failed: domain 'web01' already exists with uuid 0c8d4b1e-…
+/// ```
+///
+/// which reaches the console as `Internal server error`, because a backend
+/// error carries no words an operator is shown. That made every save of every
+/// machine fail on a real node — including the one
+/// [`crate::VirtService::console`] tells an operator to perform to give a
+/// machine defined before consoles a screen, so the remedy for that was
+/// unreachable by the only route the console offers.
+///
+/// It is invisible to the in-memory backend, which stores domains by name and
+/// so cannot have a name collide with a different identity. That is a gap in
+/// the fake rather than a reason to trust it: `a_redefine_carries_the_identity_
+/// the_hypervisor_already_has` pins the document instead.
+pub fn redefine(config: &VmConfig, uuid: Option<&str>) -> String {
+    render_document(config, uuid)
+}
+
+fn render_document(config: &VmConfig, uuid: Option<&str>) -> String {
     let config = config.normalized();
     let mut out = String::with_capacity(2048);
 
     out.push_str("<domain type='kvm'>\n");
     let _ = writeln!(out, "  <name>{}</name>", text(&config.name));
+    // Immediately after the name, which is where the hypervisor writes it and
+    // therefore where anyone comparing the two documents looks for it.
+    if let Some(uuid) = uuid.map(str::trim).filter(|value| !value.is_empty()) {
+        let _ = writeln!(out, "  <uuid>{}</uuid>", text(uuid));
+    }
     render_metadata(&mut out, &config, None);
 
     let _ = writeln!(out, "  <memory unit='MiB'>{}</memory>", config.memory_mib);
@@ -1455,6 +1495,49 @@ mod tests {
             parse(&without).unwrap().config.video
         );
         assert!(!has_screen(&without));
+    }
+
+    /// A domain's identity is its UUID, not its name.
+    ///
+    /// A redefine that omits it is given a fresh one, and the hypervisor then
+    /// finds the name taken by a domain with a different identity and refuses
+    /// the whole call — so every save of every machine failed on a real node,
+    /// and arrived in the console as `Internal server error`.
+    ///
+    /// The in-memory backend keys domains by name, so a name cannot collide
+    /// with a different identity there and no test using it can see this. That
+    /// is why this asserts on the document rather than on a round trip.
+    #[test]
+    fn a_redefine_carries_the_identity_the_hypervisor_already_has() {
+        let config = sample();
+        let uuid = "0c8d4b1e-3a5f-4e8a-9d21-7f3c9b0a1122";
+        let redefined = redefine(&config, Some(uuid));
+
+        // Immediately after the name, which is where the hypervisor puts it.
+        assert!(
+            redefined.contains(&format!(
+                "<name>{}</name>\n  <uuid>{uuid}</uuid>",
+                config.name
+            )),
+            "{redefined}"
+        );
+        // And it reads back, so a document this appliance wrote round-trips
+        // through the same reader that reads the hypervisor's.
+        assert_eq!(parse(&redefined).unwrap().uuid.as_deref(), Some(uuid));
+
+        // A machine that does not exist yet has no identity to carry, and
+        // inventing one would be worse than letting the hypervisor mint it.
+        assert!(!render(&config).contains("<uuid>"));
+        assert!(!redefine(&config, None).contains("<uuid>"));
+        // Blank is absent, not an empty element the hypervisor would reject.
+        assert!(!redefine(&config, Some("  ")).contains("<uuid>"));
+
+        // One element is the whole difference. Nothing else about the document
+        // may depend on which of the two rendered it.
+        assert_eq!(
+            redefined.replace(&format!("  <uuid>{uuid}</uuid>\n"), ""),
+            render(&config)
+        );
     }
 
     /// Operator text goes into the document as text, not as markup.

@@ -141,10 +141,27 @@ what a service binary with no policy of its own gets. `dbus-broker` has to
 accept them to relay the call, and stock EL policy does not let it read a pipe
 labelled that way.
 
-So the broker refuses the message and drops the connection. Every privileged
-command the daemon delegates fails, together: creating a pool, creating an
-account, and — because the same daemon reaches logind over the same bus — the
-restart controls.
+So the broker refuses the message. Every privileged command the daemon
+delegates fails, together: creating a pool, creating an account, and — because
+the same daemon reaches logind over the same bus — the restart controls.
+
+**It has two shapes, and only one of them is an error.** Sometimes the broker
+drops the connection and `systemd-run` reports `Failed to start transient
+service unit: Connection reset by peer`. Sometimes the message is simply never
+relayed and no reply ever comes, and then `systemd-run` waits — forever. The
+second shape is the one that is hard to recognise, because nothing fails:
+
+```
+$ ps -eLo tid,stat,wchan:32,comm -p $(pidof lumen-controlplane)
+ 2844 S    poll_schedule_timeout.constprop. systemd-run      # blocked on the bus
+$ systemctl list-units 'run-*' --all                          # no transient unit
+$ pgrep -a zpool                                              # nothing ever started
+```
+
+That triple is the signature: **a `systemd-run` that exists, a unit that does
+not, and no command running.** `systemd_refused` cannot catch it — there is no
+message to match on — which is why the wait is bounded instead. See "`--wait`
+is bounded" above.
 
 **The denial is `dontaudit`ed upstream**, which is the part worth writing down.
 Under `Enforcing` it produces no audit record at all. `getenforce` says

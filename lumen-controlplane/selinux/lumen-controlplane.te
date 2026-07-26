@@ -9,8 +9,20 @@
 ##
 ## `dbus-broker` has to accept them to relay the call. Stock policy does not
 ## let it read a pipe labelled `unconfined_service_t`, which is what a service
-## binary with no policy of its own gets. So the broker refuses the message and
-## drops the connection, and every one of those commands fails.
+## binary with no policy of its own gets. So the broker refuses the message,
+## and every one of those commands fails.
+##
+## ## It does not always fail *loudly*
+##
+## Sometimes the broker drops the connection and `systemd-run` says "Failed to
+## start transient service unit: Connection reset by peer". Sometimes the
+## message is simply never relayed, no reply ever comes, and `systemd-run`
+## blocks on the bus indefinitely — observed on a node as a create-pool request
+## that never returned, with `systemd-run` sitting in `poll_schedule_timeout`,
+## no `run-*.service` in `systemctl list-units`, and no `zpool` process at all.
+##
+## That second shape is why `lumen_sys::exec` bounds its wait rather than
+## relying on recognising a refusal message: there is no message to recognise.
 ##
 ## ## Why this took a day to find
 ##

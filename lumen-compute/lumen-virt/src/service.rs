@@ -1026,7 +1026,12 @@ impl VirtService {
             self.backend.rename(&before.name, &config.name).await?;
         }
 
-        self.backend.define(&domain_xml::render(&config)).await?;
+        self.backend
+            .define(&domain_xml::redefine(
+                &config,
+                machine.observed.uuid.as_deref(),
+            ))
+            .await?;
         if config.start_on_boot != before.start_on_boot {
             self.backend
                 .set_autostart(&config.name, config.start_on_boot)
@@ -1310,7 +1315,14 @@ impl VirtService {
         };
         config.disks.push(disk.clone());
 
-        if let Err(err) = self.backend.define(&domain_xml::render(&config)).await {
+        if let Err(err) = self
+            .backend
+            .define(&domain_xml::redefine(
+                &config,
+                machine.observed.uuid.as_deref(),
+            ))
+            .await
+        {
             self.remove_volumes(&[volume.name]).await;
             return Err(err);
         }
@@ -1358,7 +1370,12 @@ impl VirtService {
 
         let mut config = machine.config.clone();
         config.disks.retain(|d| d.id != id);
-        self.backend.define(&domain_xml::render(&config)).await?;
+        self.backend
+            .define(&domain_xml::redefine(
+                &config,
+                machine.observed.uuid.as_deref(),
+            ))
+            .await?;
 
         if purge {
             let still_attached = machine.observed.state.is_running() && !pending_reboot.is_empty();
@@ -1417,7 +1434,12 @@ impl VirtService {
             return Err(VirtError::Invalid(errors));
         }
 
-        self.backend.define(&domain_xml::render(&config)).await?;
+        self.backend
+            .define(&domain_xml::redefine(
+                &config,
+                machine.observed.uuid.as_deref(),
+            ))
+            .await?;
         let (applied_live, pending_reboot) = self
             .live_device(&machine, true, &domain_xml::nic_fragment(&nic), &nic.id)
             .await;
@@ -1443,7 +1465,12 @@ impl VirtService {
 
         let mut config = machine.config.clone();
         config.nics.retain(|n| !n.id.eq_ignore_ascii_case(id));
-        self.backend.define(&domain_xml::render(&config)).await?;
+        self.backend
+            .define(&domain_xml::redefine(
+                &config,
+                machine.observed.uuid.as_deref(),
+            ))
+            .await?;
 
         tracing::info!(vmid, nic = %id, "adapter detached");
         Ok(VmUpdateResponse {
