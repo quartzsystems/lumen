@@ -822,7 +822,9 @@ fn read(xml: &str) -> Result<(ParsedDomain, Option<u32>)> {
 pub fn started_from_metadata(metadata_xml: &str) -> Option<u64> {
     let wrapped =
         format!("<domain type='kvm'><name/><metadata>{metadata_xml}</metadata><devices/></domain>");
-    read(&wrapped).ok().and_then(|(parsed, _)| parsed.started_at)
+    read(&wrapped)
+        .ok()
+        .and_then(|(parsed, _)| parsed.started_at)
 }
 
 /// Local name of a possibly-namespaced element: `lumen:vmid` is `vmid`. The
