@@ -42,7 +42,7 @@ jobs:
             dosfstools squashfs-tools isomd5sum kmod \
             rust cargo gtk4-devel pam-devel libvirt-devel \
             pkgconf-pkg-config nodejs npm systemd-rpm-macros \
-            make git-core
+            checkpolicy policycoreutils make git-core
       - uses: actions/checkout@v4
       - name: Cache cargo
         uses: actions/cache@v4

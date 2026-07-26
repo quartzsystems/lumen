@@ -24,6 +24,8 @@ import {
   fetchOsCatalog,
   formatBytes,
   validationErrorsOf,
+  VIDEO_HINT,
+  VIDEO_LABEL,
   type BootDevice,
   type CdromCreate,
   type CpuModel,
@@ -33,6 +35,7 @@ import {
   type NicModel,
   type OsCatalog,
   type OsVariant,
+  type VideoModel,
   type VmView,
 } from "@/lib/vmClient";
 
@@ -63,6 +66,7 @@ const TAB_OF_FIELD: Record<string, Tab> = {
   cdroms: "os",
   firmware: "system",
   machine: "system",
+  video: "system",
   pool: "disks",
   size_gib: "disks",
   vcpus: "cpu",
@@ -90,6 +94,7 @@ interface Draft {
   addVirtio: boolean;
   firmware: Firmware;
   machine: string;
+  video: VideoModel;
   guestAgent: boolean;
   pool: string;
   sizeGib: string;
@@ -125,6 +130,7 @@ const emptyDraft = (): Draft => ({
   addVirtio: false,
   firmware: "uefi",
   machine: "q35",
+  video: "virtio",
   guestAgent: true,
   pool: "",
   sizeGib: "32",
@@ -391,6 +397,7 @@ export function CreateVmDialog({
         cpu_model: cpuModel,
         machine: draft.machine || undefined,
         firmware: draft.firmware,
+        video: draft.video,
         boot_order: bootOrder,
         guest_agent: draft.guestAgent,
         start_on_boot: draft.startOnBoot,
@@ -556,6 +563,29 @@ export function CreateVmDialog({
                   <option value="pc">i440fx</option>
                 </SelectInput>
               </Field>
+              <Field label="Graphics card" htmlFor="vm-video" hint={VIDEO_HINT[draft.video]}>
+                <SelectInput
+                  id="vm-video"
+                  value={draft.video}
+                  onChange={(v) => set("video", v as VideoModel)}
+                >
+                  {(Object.keys(VIDEO_LABEL) as VideoModel[]).map((model) => (
+                    <option key={model} value={model}>
+                      {VIDEO_LABEL[model]}
+                    </option>
+                  ))}
+                </SelectInput>
+              </Field>
+              {/* Legal, and the hypervisor will define it — but it is a black
+                  console rather than an error, which is the kind of thing this
+                  dialog should say before it happens rather than after. */}
+              {draft.video === "bochs" && draft.firmware === "bios" && (
+                <Callout tone="warn">
+                  Bochs has no VGA BIOS underneath it, so on legacy BIOS this machine will show
+                  nothing on the console until the guest&apos;s own driver loads. Standard VGA draws
+                  from the first frame.
+                </Callout>
+              )}
               <label className="flex items-center gap-[10px] cursor-pointer select-none">
                 <Switch on={draft.guestAgent} onChange={(v) => set("guestAgent", v)} />
                 <span className="text-[13px] text-[var(--qz-fg-2)]">Guest agent channel</span>
@@ -805,6 +835,8 @@ export function CreateVmDialog({
                 </dd>
                 <dt>Firmware</dt>
                 <dd>{draft.firmware === "uefi" ? "UEFI" : "Legacy BIOS"}</dd>
+                <dt>Graphics</dt>
+                <dd>{VIDEO_LABEL[draft.video]}</dd>
                 <dt>Processors</dt>
                 <dd className="qz-mono">
                   {draft.sockets} × {draft.cores} = {totalCores} · {draft.cpuType}

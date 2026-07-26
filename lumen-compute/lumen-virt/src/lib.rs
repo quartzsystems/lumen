@@ -43,7 +43,8 @@ pub use domain_caps::{CpuModelInfo, CpuModels};
 pub use error::{Result, VirtError};
 pub use model::{
     generate_mac, valid_tag, valid_vm_name, BootDevice, CacheMode, CpuModel, CpuTopology, DiskBus,
-    Firmware, NicModel, VmCdrom, VmConfig, VmDisk, VmNic, CDROM_BUS, FIRST_VMID, LAST_VMID,
+    Firmware, NicModel, VideoModel, VmCdrom, VmConfig, VmDisk, VmNic, CDROM_BUS, FIRST_VMID,
+    LAST_VMID,
 };
 pub use osinfo::{OsCatalog, OsFamily, OsVariant, OSINFO_DB_ROOT, WINDOWS_FAMILY};
 pub use service::{ConsoleProtocol, ConsoleTarget, PushedFile, VirtService, MAX_GUEST_FILE_BYTES};

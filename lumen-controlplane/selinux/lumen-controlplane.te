@@ -1,0 +1,54 @@
+## The SELinux half of the arrangement in docs/system.md.
+##
+## The control plane hands the few commands its sandbox forbids to systemd,
+## and `systemd-run --pipe` passes the daemon's standard input, output, and
+## error to the bus *as file descriptors* — that is how `zpool`'s own words
+## come back, and how a password reaches `chpasswd` without ever being an
+## argument. Those descriptors are pipes, and they carry the daemon's own
+## label.
+##
+## `dbus-broker` has to accept them to relay the call. Stock policy does not
+## let it read a pipe labelled `unconfined_service_t`, which is what a service
+## binary with no policy of its own gets. So the broker refuses the message and
+## drops the connection, and every one of those commands fails.
+##
+## ## Why this took a day to find
+##
+## The stock denial is `dontaudit`ed, so under `Enforcing` it produces **no
+## audit record at all** — `ausearch` is empty and `getenforce` says the right
+## thing. It surfaces only after `semodule -DB`. What an operator sees instead
+## is `systemd-run` reporting "Failed to start transient service unit:
+## Connection reset by peer", PID 1 logging nothing whatsoever (it never
+## received the message — the broker killed it first), and the console saying
+## "Internal server error". Three separate features — creating a pool,
+## creating an account, and the restart controls — fail together and none of
+## them names SELinux.
+##
+## ## Why the rule is this shape
+##
+## The daemon gains nothing here. It already has the descriptors; the grant is
+## to `dbus-broker`, for reading a pipe it is being handed on purpose. Nothing
+## about the unit's `ProtectSystem=strict` sandbox moves, and the privileged
+## work still happens in a transient unit outside it.
+##
+## `read` is the denial that was actually observed. `write` and `getattr` are
+## the same operation on the other two ends of the same triplet — standard
+## input is a read end and standard output and error are write ends — and
+## granting `read` alone would move the failure rather than fix it.
+##
+## The target type is broader than this daemon: `unconfined_service_t` covers
+## every service without a policy of its own, not just ours. Narrowing it means
+## giving the control plane a domain of its own — `lumen_controlplane_t`, with
+## file contexts, a transition, and rules for PAM, `/dev/zfs`, the hypervisor
+## socket, and its state directory. That is the right end state and it is a
+## much larger piece of work than the bug in front of us; see docs/system.md.
+
+module lumen-controlplane 1.0;
+
+require {
+        type system_dbusd_t;
+        type unconfined_service_t;
+        class fifo_file { getattr read write };
+}
+
+allow system_dbusd_t unconfined_service_t:fifo_file { getattr read write };

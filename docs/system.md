@@ -95,7 +95,7 @@ the_flags_are_the_contract_with_systemd` asserts each of them:
 | Flag | Why it is not optional |
 | ---- | ---------------------- |
 | `--wait` | Without it the call returns as soon as the job is queued and **every failure becomes silence**. |
-| `--pipe` | How the output comes back, and how a password reaches `chpasswd` without ever being an argument. |
+| `--pipe` | How the output comes back, and how a password reaches `chpasswd` without ever being an argument. It is also the one flag with a cost — see the SELinux rule below. |
 | `--collect` | Unloads the unit even when it failed, so a node does not accumulate one dead unit per mistyped account name. |
 | `--quiet` | The only thing on standard error should be what the command itself said. |
 
@@ -105,6 +105,51 @@ is nothing to escape because there is no string to escape into — every
 invocation is an array handed to `execve`, and
 `an_argument_is_an_argument_and_never_part_of_a_sentence` pins it with an
 argument that would be a disaster in a shell.
+
+### `--pipe` needs an SELinux rule, and the missing one is invisible
+
+`--pipe` is the flag with a cost. Passing the daemon's standard input, output,
+and error to the bus means passing **file descriptors**, and those descriptors
+are pipes carrying the daemon's own label — `unconfined_service_t`, which is
+what a service binary with no policy of its own gets. `dbus-broker` has to
+accept them to relay the call, and stock EL policy does not let it read a pipe
+labelled that way.
+
+So the broker refuses the message and drops the connection. Every privileged
+command the daemon delegates fails, together: creating a pool, creating an
+account, and — because the same daemon reaches logind over the same bus — the
+restart controls.
+
+**The denial is `dontaudit`ed upstream**, which is the part worth writing down.
+Under `Enforcing` it produces no audit record at all. `getenforce` says
+`Enforcing`, `ausearch -m AVC` says nothing, `systemctl is-active polkit` says
+`active`, and PID 1's journal is empty for the moment of the failure — because
+PID 1 never received the message. What an operator has to work with instead is
+`systemd-run` reporting `Failed to start transient service unit: Connection
+reset by peer`, and a console that says `Internal server error`. Nothing in
+that chain contains the word SELinux.
+
+The rule that surfaces it:
+
+```sh
+semodule -DB                              # disable the dontaudit rules
+# reproduce — create a pool from the console
+ausearch -m AVC,USER_AVC -ts recent
+semodule -B                               # put them back
+```
+
+`lumen-controlplane/selinux/lumen-controlplane.te` carries the grant, and
+`lumen-controlplane.spec` builds it into the package and loads it at priority
+200. The daemon gains nothing: it already holds the descriptors, and the grant
+is to `dbus-broker`, for reading a pipe it is being handed on purpose. The
+unit's `ProtectSystem=strict` sandbox does not move.
+
+The target type is broader than it should be — `unconfined_service_t` is every
+service without a policy of its own, not just this one. Narrowing it means
+giving the control plane a domain of its own, `lumen_controlplane_t`, with file
+contexts, a transition, and rules for PAM, `/dev/zfs`, the hypervisor socket,
+and its state directory. That is the right end state and it is a great deal
+more work than the rule above; it is listed under *Out of scope for this stage*.
 
 ### A password is never an argument
 
@@ -362,7 +407,20 @@ hardware.
 systemd-run --quiet --collect --wait --pipe --service-type=oneshot \
   -- /usr/bin/test -w /etc && echo "writable outside the sandbox (expected)"
 systemctl show lumen-controlplane -p ProtectSystem   # must still be strict
+
+# And the security module, without which none of the above works *from the
+# daemon* even though it works from this shell — the shell is a different
+# domain, so passing this test proves nothing on its own.
+semodule -l | grep -q '^lumen-controlplane' \
+  && echo "security module loaded (expected)"
 ```
+
+Do this one from the console rather than from a shell, because a shell cannot
+reproduce it: create a pool, create an account, and open the Maintenance page.
+All three go through the same delegation, and all three fail together when the
+module is missing. If any of them reports `Internal server error`, run
+`semodule -DB`, reproduce, `ausearch -m AVC,USER_AVC -ts recent`, `semodule -B`
+— the denial is `dontaudit`ed and there is otherwise nothing in any log.
 
 ### 1. An account, end to end
 
@@ -463,3 +521,10 @@ groups other than the administrator one — an account's group list is shown but
 not edited. Directory-server realms, which are `RealmRegistry`'s business
 rather than this page's. `zpool import`, `export`, `scrub`, `replace`, and
 adding a vdev to an existing pool; only create and destroy are here.
+
+An SELinux domain of the daemon's own — `lumen_controlplane_t`, with file
+contexts, a transition, and rules for PAM, `/dev/zfs`, the hypervisor socket,
+and its state directory. The module shipped today grants one thing to
+`dbus-broker` and targets `unconfined_service_t`, which is every service
+without a policy rather than this one; a domain is how that gets narrowed, and
+it is a piece of work in its own right.

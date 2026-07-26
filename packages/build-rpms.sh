@@ -7,7 +7,8 @@
 # crates.io and npm needs its registry, so the compile happens in the normal
 # build environment and the spec packages the prebuilt results. Requires:
 # rust/cargo, pam-devel (libpam headers), libvirt-devel (the hypervisor client
-# library the compute domain links), nodejs/npm >= 20.
+# library the compute domain links), nodejs/npm >= 20, and checkpolicy plus
+# policycoreutils (the control plane ships an SELinux module).
 #
 # The version is read from the top-level VERSION file and injected into the
 # specs as %{lumen_version}. Outputs land in dist/rpms/.
@@ -23,6 +24,14 @@ die() { echo "FATAL: $*" >&2; exit 1; }
 for tool in rpmbuild cargo npm; do
     command -v "$tool" >/dev/null 2>&1 \
         || die "$tool not found (dnf install rpm-build rust cargo pam-devel libvirt-devel nodejs npm)"
+done
+
+# The SELinux module compiler. Checked separately because its package names
+# look nothing like the command names, and a build that got this far and then
+# died on "checkmodule: not found" would send someone hunting.
+for tool in checkmodule semodule_package; do
+    command -v "$tool" >/dev/null 2>&1 \
+        || die "$tool not found (dnf install checkpolicy policycoreutils)"
 done
 
 # The two libraries the control plane links are checked here, not left to the
@@ -76,6 +85,22 @@ cp "$REPO_ROOT/lumen-controlplane/pam/lumen-controlplane" \
 cp "$REPO_ROOT/lumen-controlplane/systemd/lumen-controlplane.service" \
    "$REPO_ROOT/lumen-controlplane/firewalld/lumen-controlplane.xml" \
    "$TOPDIR/SOURCES/"
+
+# The SELinux module, compiled here rather than in the spec for the same
+# reason everything else is: rpmbuild stays free of toolchain requirements.
+# Without it `systemd-run --pipe` cannot pass the daemon's pipes across the
+# bus, and every privileged command the daemon delegates fails — see
+# lumen-controlplane/selinux/lumen-controlplane.te and docs/system.md.
+echo "==> Building lumen-controlplane SELinux module"
+(
+    cd "$TOPDIR/SOURCES"
+    checkmodule -M -m -o lumen-controlplane.mod \
+        "$REPO_ROOT/lumen-controlplane/selinux/lumen-controlplane.te"
+    semodule_package -o lumen-controlplane.pp -m lumen-controlplane.mod
+    rm -f lumen-controlplane.mod
+)
+[ -s "$TOPDIR/SOURCES/lumen-controlplane.pp" ] \
+    || die "SELinux module not produced (lumen-controlplane.pp missing or empty)"
 
 # --- spec sources from branding/ ----------------------------------------------
 # Stage spec sources out of branding/ into a single rpmbuild SOURCES dir.

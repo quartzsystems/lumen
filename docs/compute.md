@@ -586,6 +586,29 @@ the hypervisor's own answer rather than the one it was given.
 where it has it — and a viewer that connected to the *predicted* path would
 fail with an operating-system error and nothing to explain it.
 
+### The card is a choice, because the wrong one looks like a broken appliance
+
+`<video>` was a constant — `virtio` — for as long as there was only one of
+them. That is the right default and it stays the default: virtio-gpu gives the
+best picture, and every current Linux guest has the driver in its installer as
+well as in the installed system.
+
+It is the wrong answer often enough to be worth asking about, though, and its
+failure mode is silence. A guest with no driver for the card draws *nothing* —
+not a low resolution, not a warning, a black rectangle — and nothing on the
+console page can tell that apart from a viewer that failed to connect. So the
+System tab picks it (`VmConfig::video`, `lumen_virt::VideoModel`), each option
+carries the sentence that says who it is for, and `vga` says out loud that it
+is the one to reach for when the screen stays black: standard VGA needs no
+driver from anybody, including the firmware.
+
+Reading it back has one rule worth naming. A document with no `<video>` at all
+— a machine defined before this appliance put a screen on one — reads as the
+default rather than as an error, which is what makes *save, then stop and
+start* the whole of the remedy `VirtService::console` already recommends. A
+document with several takes the first: the extra ones are more heads on the
+same machine, not a second opinion about the card.
+
 ### `ProtectSystem=strict` needed no relaxation here either
 
 **Reproduced, not assumed.** The console socket lives under

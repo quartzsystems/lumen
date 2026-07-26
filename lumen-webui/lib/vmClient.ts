@@ -11,6 +11,11 @@ export type BootDevice = "disk" | "cdrom" | "network";
 export type DiskBus = "virtio-blk" | "virtio-scsi" | "sata";
 export type CacheMode = "none" | "writeback" | "writethrough" | "directsync" | "unsafe";
 export type NicModel = "virtio" | "e1000e" | "rtl8139";
+/// The guest's display adapter, and so what the console viewer is looking at.
+/// `virtio` is the best picture where the guest has the driver; `vga` is the
+/// one that draws without any driver at all, which is what to reach for when
+/// the console stays black.
+export type VideoModel = "virtio" | "vga" | "bochs" | "qxl";
 
 /// How the guest sees the host processor. The two host-derived modes are bare
 /// strings; a named model carries the name, which is how serde spells an enum
@@ -152,6 +157,7 @@ export interface VmView {
   topology: CpuTopology | null;
   machine: string;
   firmware: Firmware;
+  video: VideoModel;
   boot_order: BootDevice[];
   start_on_boot: boolean;
   guest_agent: boolean;
@@ -242,6 +248,7 @@ export interface VmCreate {
   topology?: CpuTopology;
   machine?: string;
   firmware?: Firmware;
+  video?: VideoModel;
   boot_order?: BootDevice[];
   start_on_boot?: boolean;
   guest_agent?: boolean;
@@ -263,6 +270,7 @@ export interface VmPatch {
   topology?: CpuTopology;
   machine?: string;
   firmware?: Firmware;
+  video?: VideoModel;
   boot_order?: BootDevice[];
   start_on_boot?: boolean;
   guest_agent?: boolean;
@@ -386,6 +394,27 @@ export const consoleUrl = (path: string): string => {
 };
 
 // --- display helpers ---------------------------------------------------------
+
+/// How each graphics card reads in the console.
+export const VIDEO_LABEL: Record<VideoModel, string> = {
+  virtio: "VirtIO GPU",
+  vga: "Standard VGA",
+  bochs: "Bochs display",
+  qxl: "QXL",
+};
+
+/// One sentence per card, because "virtio / vga / bochs / qxl" is not a choice
+/// anybody can make from the words alone — and the wrong answer here looks like
+/// a broken console rather than like a setting. These mirror the notes on
+/// `lumen_virt::VideoModel`; if one changes, change both.
+export const VIDEO_HINT: Record<VideoModel, string> = {
+  virtio:
+    "The best picture, and what every current Linux guest already has the driver for — in its installer as well as once installed.",
+  vga: "Draws with no driver at all: firmware, any installer, any operating system. This is the one to choose if the console stays black.",
+  bochs:
+    "Standard VGA without the legacy VGA BIOS underneath it, so it needs UEFI to show anything before the guest's own driver loads.",
+  qxl: "For a guest built when SPICE was how one looked at a machine. Prefer one of the others.",
+};
 
 /// How a state reads in the console, and which badge it wears.
 export const STATE_LABEL: Record<DomainState, string> = {

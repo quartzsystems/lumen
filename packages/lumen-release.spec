@@ -11,7 +11,7 @@ Version:        %{lumen_version}
 Release:        1%{?dist}
 Summary:        Quartz Systems Lumen release and branding files
 License:        MIT
-URL:            https://www.quartzsystems.net
+URL:            https://quartz.systems/
 BuildArch:      noarch
 
 Source0:        lumen-release.in

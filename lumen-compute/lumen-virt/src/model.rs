@@ -45,6 +45,11 @@ pub struct VmConfig {
     pub machine: String,
     #[serde(default)]
     pub firmware: Firmware,
+    /// The display adapter the guest sees, and therefore what the console
+    /// shows. Unlike firmware this can be changed later — it costs a restart,
+    /// not a reinstall.
+    #[serde(default)]
+    pub video: VideoModel,
     #[serde(default)]
     pub boot_order: Vec<BootDevice>,
     /// Held by the hypervisor's autostart flag rather than by the document —
@@ -91,6 +96,7 @@ impl Default for VmConfig {
             topology: None,
             machine: default_machine(),
             firmware: Firmware::default(),
+            video: VideoModel::default(),
             boot_order: vec![BootDevice::Disk],
             start_on_boot: false,
             guest_agent: true,
@@ -240,6 +246,57 @@ impl Firmware {
         match self {
             Firmware::Uefi => "uefi",
             Firmware::Bios => "bios",
+        }
+    }
+}
+
+/// The display adapter, and therefore what an operator sees on the console.
+///
+/// The one piece of a machine's hardware whose wrong answer looks like a
+/// broken appliance rather than like a setting: a card the guest has no driver
+/// for draws nothing at all, and a black console says nothing about why. Hence
+/// a choice rather than the constant it used to be, and hence a sentence on
+/// each variant saying who it is for — the console shows those, because an
+/// operator picking a graphics card is not choosing between four words.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VideoModel {
+    /// virtio-gpu. The best picture, and the default, for a guest new enough
+    /// to have the driver — which every current Linux does, in its installer
+    /// as well as in the installed system.
+    #[default]
+    Virtio,
+    /// QEMU's standard VGA. The compatible answer: firmware, every installer,
+    /// and every operating system can draw on it with no driver at all. This
+    /// is the one to choose when the console stays black.
+    Vga,
+    /// bochs-display. Like [`VideoModel::Vga`] without the legacy VGA BIOS
+    /// underneath it, so it needs UEFI — a machine on legacy BIOS gets nothing
+    /// from it until the guest's own driver loads.
+    Bochs,
+    /// For a guest built when SPICE was how one looked at a machine. Kept
+    /// because an imported machine may ask for it.
+    Qxl,
+}
+
+impl VideoModel {
+    /// The `type` attribute the document uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VideoModel::Virtio => "virtio",
+            VideoModel::Vga => "vga",
+            VideoModel::Bochs => "bochs",
+            VideoModel::Qxl => "qxl",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "virtio" => Some(VideoModel::Virtio),
+            "vga" => Some(VideoModel::Vga),
+            "bochs" => Some(VideoModel::Bochs),
+            "qxl" => Some(VideoModel::Qxl),
+            _ => None,
         }
     }
 }

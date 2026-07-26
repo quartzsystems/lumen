@@ -13,6 +13,9 @@
 # to a label on the chassis. It is only written when the adapter is actually
 # being renamed; a NIC already called nic<N> has no alternative name.
 #
+# The USB gadget a BMC presents to its host (rndis_host and friends) is not a
+# front-panel adapter and is skipped; it keeps its kernel name.
+#
 # Existing MAC->nic<N> pins are preserved: NICs added later get the next
 # free index, so adding/replacing hardware never renames survivors. The
 # .link files take effect when udev (re)processes the devices — i.e. on the
@@ -42,6 +45,25 @@ done
 [ -d "$ROOT" ] || die "no such root: $ROOT"
 LINKDIR="${ROOT%/}/etc/systemd/network"
 
+# Drivers whose interfaces are not real front-panel adapters. A BMC exposes
+# its shared-with-host side as a USB gadget on rndis_host or cdc_ether: it
+# looks like an ordinary ethernet NIC in sysfs, but it leads to the service
+# processor, not to the network the appliance is being installed onto. Naming
+# it nic<N> would burn an index the operator's real adapters expect and offer
+# a dead end as a management interface.
+EXCLUDED_DRIVERS="rndis_host cdc_ether cdc_ncm cdc_eem"
+
+# excluded_driver DEV — true when DEV's kernel driver is one of the above.
+excluded_driver() {
+    local link drv
+    link="/sys/class/net/$1/device/driver"
+    [ -e "$link" ] || return 1
+    drv="$(readlink -f "$link")" || return 1
+    drv="${drv##*/}"
+    case " $EXCLUDED_DRIVERS " in *" $drv "*) return 0 ;; esac
+    return 1
+}
+
 # --- enumerate physical ethernet NICs, ordered by PCI address ---------------
 # Sort key is the resolved sysfs device path: fixed-width lowercase-hex PCI
 # addresses sort correctly lexically, and nested buses (virtio on PCI) keep
@@ -51,6 +73,7 @@ mapfile -t nics < <(
         dev="$(basename "$path")"
         [ -e "$path/device" ] || continue            # physical devices only
         [ "$(cat "$path/type")" = "1" ] || continue  # ethernet only
+        excluded_driver "$dev" && continue           # BMC/IPMI USB gadgets
         mac="$(cat "$path/address")"
         if [ -z "$mac" ] || [ "$mac" = "00:00:00:00:00:00" ]; then continue; fi
         printf '%s %s %s\n' "$(readlink -f "$path/device")" "$mac" "$dev"

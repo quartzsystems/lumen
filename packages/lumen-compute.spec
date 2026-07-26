@@ -14,7 +14,7 @@ Version:        %{lumen_version}
 Release:        1%{?dist}
 Summary:        Quartz Systems Lumen machine-hosting integration
 License:        MIT
-URL:            https://www.quartzsystems.net
+URL:            https://quartz.systems/
 BuildArch:      noarch
 
 Source0:        50-lumen-compute.preset

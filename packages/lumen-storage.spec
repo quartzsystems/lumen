@@ -13,7 +13,7 @@ Version:        %{lumen_version}
 Release:        1%{?dist}
 Summary:        Quartz Systems Lumen pool integration
 License:        MIT
-URL:            https://www.quartzsystems.net
+URL:            https://quartz.systems/
 BuildArch:      noarch
 
 Source0:        50-lumen-storage.preset

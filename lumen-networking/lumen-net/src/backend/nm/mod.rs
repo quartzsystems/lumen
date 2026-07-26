@@ -35,6 +35,19 @@ const DEVICE_TYPE_BOND: u32 = 10;
 const DEVICE_TYPE_VLAN: u32 = 11;
 const DEVICE_TYPE_BRIDGE: u32 = 13;
 
+/// Drivers whose devices are not front-panel adapters and must not appear in
+/// observed state at all. A BMC presents its shared-with-host side as a USB
+/// gadget, and NM sees an ordinary ethernet device with a MAC and a carrier.
+/// Showing it in the console's Interfaces table is the visible problem; the
+/// quieter one is `state::derive_desired`, which seeds `desired.json` from
+/// observed state on first boot and would write it in as a `nic` the operator
+/// never has any reason to configure — and, on a box where something has
+/// addressed it, could pick it as `management.link`.
+///
+/// Kept in step with the same list in `lumen-nicnames`, which skips these when
+/// assigning `nic<N>` names, and in the installer's `sysinfo::nics`.
+const EXCLUDED_DRIVERS: [&str; 4] = ["rndis_host", "cdc_ether", "cdc_ncm", "cdc_eem"];
+
 /// NM_DEVICE_STATE_*.
 const STATE_UNMANAGED: u32 = 10;
 const STATE_UNAVAILABLE: u32 = 20;
@@ -192,6 +205,16 @@ impl NmBackend {
             DEVICE_TYPE_VLAN => LinkKind::Vlan,
             _ => LinkKind::Other,
         };
+        // Only physical devices can be a BMC gadget; a bond or bridge reports
+        // no driver worth checking, and skipping one Lumen created would make
+        // its own configuration invisible.
+        if kind == LinkKind::Ethernet {
+            let driver = device.driver().await.unwrap_or_default();
+            if EXCLUDED_DRIVERS.contains(&driver.as_str()) {
+                tracing::debug!(%name, %driver, "skipping BMC/IPMI USB gadget");
+                return Ok(None);
+            }
+        }
         let raw_state = device.state().await.unwrap_or(0);
         let state = match raw_state {
             STATE_ACTIVATED => LinkState::Activated,

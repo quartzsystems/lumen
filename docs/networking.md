@@ -219,6 +219,36 @@ The management bridge is `br0` on a fresh install because it is allocated
 first. It is not special-cased: what makes a link the management link is
 `management.link` in the desired state, not its name.
 
+### The BMC's USB NIC is not a NIC
+
+A server's service processor presents its shared-with-host side as a USB
+gadget — `rndis_host`, sometimes `cdc_ether` — and sysfs describes it exactly
+like a front-panel adapter: physical device, `type` 1, a MAC, a driver.
+NetworkManager agrees and reports an ethernet device with a carrier. It is not
+one. It leads to the BMC, not to the network the appliance is on, so it is
+filtered at all three places that enumerate adapters:
+
+- `lumen-nicnames` skips those drivers when assigning names, so the gadget
+  never becomes `nic<N>` and never burns an index the operator's real adapters
+  expect. It keeps its kernel name and gets no link file.
+- The installer's `sysinfo::nics` leaves it out of the management-interface
+  list, so step 3 cannot offer a dead end.
+- `NmBackend::observe` drops it from observed state, using NM's own `Driver`
+  property rather than a sysfs read of its own.
+
+The last of those is the one that matters beyond cosmetics. Observed state is
+what `derive_desired` seeds `desired.json` from on the first boot after an
+install: an unfiltered BMC gadget would be written in as a `nic` nobody has
+any reason to configure, and on a box where something has addressed it, could
+be chosen as `management.link`. Filtering the table alone would have left that
+in place.
+
+The driver list is duplicated in all three, for the same reason `NetworkConfig`
+is duplicated rather than shared — the installer deliberately does not depend
+on `lumen-net`, and one bash script cannot import from either. Three copies
+that have to stay in step is the price; the list is four strings and changes
+approximately never.
+
 ### Addressing lives on the link, not on `management`
 
 `Nic`, `Bond`, `Bridge`, and `Vlan` each carry their own `ip: IpConfig`

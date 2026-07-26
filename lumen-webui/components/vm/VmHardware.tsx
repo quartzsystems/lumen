@@ -20,9 +20,12 @@ import {
   formatMib,
   updateVm,
   validationErrorsOf,
+  VIDEO_HINT,
+  VIDEO_LABEL,
   type BootDevice,
   type DiskBus,
   type NicModel,
+  type VideoModel,
   type VmUpdateResponse,
   type VmView,
 } from "@/lib/vmClient";
@@ -271,6 +274,7 @@ export function VmHardware({
           <Fact label="Machine type">
             <Mono>{vm.machine}</Mono>
           </Fact>
+          <Fact label="Graphics">{VIDEO_LABEL[vm.video]}</Fact>
           <Fact label="Boot order">
             <Mono>{vm.boot_order.length > 0 ? vm.boot_order.join(" → ") : "—"}</Mono>
           </Fact>
@@ -650,6 +654,7 @@ function SizingDialog({
   const [vcpus, setVcpus] = useState(String(vm.vcpus));
   const [memoryMib, setMemoryMib] = useState(String(vm.memory_mib));
   const [firmware, setFirmware] = useState(vm.firmware);
+  const [video, setVideo] = useState(vm.video);
   const [bootOrder, setBootOrder] = useState<string>(vm.boot_order.join(","));
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
@@ -670,6 +675,7 @@ function SizingDialog({
           vcpus: cpus,
           memory_mib: memory,
           firmware,
+          video,
           boot_order: bootOrder
             .split(",")
             .map((entry) => entry.trim())
@@ -737,6 +743,20 @@ function SizingDialog({
           >
             <option value="uefi">UEFI</option>
             <option value="bios">Legacy BIOS</option>
+          </SelectInput>
+        </Field>
+        <Field
+          label="Graphics card"
+          htmlFor="hw-video"
+          hint={VIDEO_HINT[video]}
+          error={errors.video}
+        >
+          <SelectInput id="hw-video" value={video} onChange={(v) => setVideo(v as VideoModel)}>
+            {(Object.keys(VIDEO_LABEL) as VideoModel[]).map((model) => (
+              <option key={model} value={model}>
+                {VIDEO_LABEL[model]}
+              </option>
+            ))}
           </SelectInput>
         </Field>
         <Field

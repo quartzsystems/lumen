@@ -92,6 +92,10 @@ pub trait Device {
     fn interface(&self) -> zbus::Result<String>;
     #[zbus(property)]
     fn device_type(&self) -> zbus::Result<u32>;
+    /// Kernel driver bound to the device ("e1000e", "rndis_host", …). NM
+    /// reports it, so the BMC filter needs no sysfs read of its own.
+    #[zbus(property)]
+    fn driver(&self) -> zbus::Result<String>;
     #[zbus(property)]
     fn state(&self) -> zbus::Result<u32>;
     #[zbus(property)]

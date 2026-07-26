@@ -20,13 +20,14 @@ Version:        %{lumen_version}
 Release:        1%{?dist}
 Summary:        Quartz Systems Lumen management daemon and web console
 License:        MIT
-URL:            https://www.quartzsystems.net
+URL:            https://quartz.systems/
 
 Source0:        lumen-controlplane
 Source1:        lumen-webui.tar.gz
 Source2:        lumen-controlplane.pam
 Source3:        lumen-controlplane.service
 Source4:        lumen-controlplane.xml
+Source5:        lumen-controlplane.pp
 
 Requires:       pam
 # systemd is not only what starts this daemon. Two operations cannot happen
@@ -38,6 +39,11 @@ Requires:       systemd
 # chpasswd. Present on every install, and named because the daemon runs them
 # by absolute path.
 Requires:       shadow-utils
+# Loading the module below needs semodule, and the module is what makes the
+# delegation above work at all under Enforcing.
+Requires:       policycoreutils
+Requires(post): policycoreutils
+Requires(postun): policycoreutils
 %{?systemd_requires}
 BuildRequires:  systemd-rpm-macros
 
@@ -86,16 +92,36 @@ tar -xzf %{SOURCE1} -C %{buildroot}%{_datadir}/lumen-webui
 install -D -p -m 0644 %{SOURCE2} %{buildroot}%{_sysconfdir}/pam.d/lumen-controlplane
 install -D -p -m 0644 %{SOURCE3} %{buildroot}%{_unitdir}/lumen-controlplane.service
 install -D -p -m 0644 %{SOURCE4} %{buildroot}%{_prefix}/lib/firewalld/services/lumen-controlplane.xml
+install -D -p -m 0644 %{SOURCE5} %{buildroot}%{_datadir}/selinux/packages/%{name}/lumen-controlplane.pp
 install -d -m 0700 %{buildroot}%{_sharedstatedir}/lumen-controlplane
 
 %post
 %systemd_post lumen-controlplane.service
+# Priority 200: above the base policy at 100, which is the range reserved for
+# modules a package ships. Run on upgrade as well as on install, so a corrected
+# rule reaches a node that already carries the old one.
+#
+# No "-n" and no separate load_policy: semodule reloads the policy itself, and
+# the two-step form would need selinuxenabled from libselinux-utils — a fourth
+# package to depend on, and a silent no-op if it were ever missing.
+#
+# Deliberately not suffixed with "|| :". If this module does not load, three
+# separate features fail later with nothing pointing here; a loud scriptlet
+# warning at install time is the cheapest place to find that out.
+%{_sbindir}/semodule -X 200 -i \
+    %{_datadir}/selinux/packages/%{name}/lumen-controlplane.pp
 
 %preun
 %systemd_preun lumen-controlplane.service
 
 %postun
 %systemd_postun_with_restart lumen-controlplane.service
+# Only on the last removal. An upgrade runs postun for the old package *after*
+# post for the new one, so removing unconditionally here would unload the
+# module that was just installed.
+if [ "$1" -eq 0 ]; then
+    %{_sbindir}/semodule -X 200 -r lumen-controlplane || :
+fi
 
 %files
 %{_sbindir}/lumen-controlplane
@@ -103,6 +129,7 @@ install -d -m 0700 %{buildroot}%{_sharedstatedir}/lumen-controlplane
 %config(noreplace) %{_sysconfdir}/pam.d/lumen-controlplane
 %{_unitdir}/lumen-controlplane.service
 %{_prefix}/lib/firewalld/services/lumen-controlplane.xml
+%{_datadir}/selinux/packages/%{name}/
 %dir %attr(0700,root,root) %{_sharedstatedir}/lumen-controlplane
 
 %changelog
@@ -114,6 +141,9 @@ install -d -m 0700 %{buildroot}%{_sharedstatedir}/lumen-controlplane
   navigation column for whichever machine is open
 - Report which settings a running machine accepted and which wait for it to
   restart, using the answer the guest service itself gave
+- Add the security policy module the daemon needs to hand a command to the
+  system service manager while the security system is enforcing; without it
+  creating a pool, creating an account, and the restart controls all fail
 
 * Fri Jul 24 2026 Quartz Systems Engineering <engineering@quartz.systems> - 0.2.0-1
 - Add the network configuration interface: link aggregation, virtual

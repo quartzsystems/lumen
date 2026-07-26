@@ -33,8 +33,8 @@ use quick_xml::Reader;
 
 use crate::error::{Result, VirtError};
 use crate::model::{
-    BootDevice, CacheMode, CpuModel, CpuTopology, DiskBus, Firmware, NicModel, VmCdrom, VmConfig,
-    VmDisk, VmNic, CDROM_BUS,
+    BootDevice, CacheMode, CpuModel, CpuTopology, DiskBus, Firmware, NicModel, VideoModel, VmCdrom,
+    VmConfig, VmDisk, VmNic, CDROM_BUS,
 };
 
 /// The namespace Lumen's own per-machine data lives in. Versioned in the URI
@@ -238,7 +238,11 @@ pub fn render(config: &VmConfig) -> String {
         "    <graphics type='vnc' socket='{}'/>",
         text(&vnc_socket_path(config.vmid))
     );
-    out.push_str("    <video>\n      <model type='virtio'/>\n    </video>\n");
+    let _ = writeln!(
+        out,
+        "    <video>\n      <model type='{}'/>\n    </video>",
+        config.video.as_str()
+    );
     out.push_str(
         "    <console type='pty'>\n      <target type='serial' port='0'/>\n    </console>\n",
     );
@@ -542,6 +546,10 @@ fn read(xml: &str) -> Result<(ParsedDomain, Option<u32>)> {
     let mut cpu_mode: Option<String> = None;
     let mut cpu_named: Option<String> = None;
     let mut firmware = Firmware::Bios;
+    // Optional rather than defaulted, so "the first one wins" is expressible:
+    // a machine may carry several <video> devices, and the extra ones are more
+    // heads on the same machine rather than a second opinion about the card.
+    let mut video: Option<VideoModel> = None;
 
     let mut disk = PartialDisk::default();
     let mut nic = PartialNic::default();
@@ -610,6 +618,11 @@ fn read(xml: &str) -> Result<(ParsedDomain, Option<u32>)> {
                     }
                     "domain/devices/disk/boot" => {
                         disk.boot_index = number(attr(e, "order")).map(|v| v as u32)
+                    }
+                    "domain/devices/video/model" => {
+                        if video.is_none() {
+                            video = attr(e, "type").as_deref().and_then(VideoModel::parse);
+                        }
                     }
                     "domain/devices/interface" => {
                         nic = PartialNic {
@@ -746,6 +759,11 @@ fn read(xml: &str) -> Result<(ParsedDomain, Option<u32>)> {
 
     config.memory_mib = to_mib(memory.unwrap_or(0), &memory_unit);
     config.firmware = firmware;
+    // A machine defined before this appliance put a screen on one has no
+    // <video> at all. The default is the honest answer to "what card does it
+    // have" only once it has been saved again — which is precisely what
+    // `VirtService::console` tells an operator to do.
+    config.video = video.unwrap_or_default();
     config.cpu_model = match (cpu_mode.as_deref(), cpu_named) {
         (Some("host-passthrough"), _) => CpuModel::HostPassthrough,
         (Some("custom"), Some(name)) => CpuModel::Named(name),
@@ -791,12 +809,20 @@ fn read(xml: &str) -> Result<(ParsedDomain, Option<u32>)> {
 /// The start time out of a bare metadata element, as the hypervisor hands it
 /// back on its own rather than inside a document.
 ///
-/// Wrapping it and reusing [`parse`] keeps one reader in the tree: a change to
-/// how the metadata is written cannot make this and the document disagree.
+/// Wrapping it and reusing the one reader keeps a single parser in the tree: a
+/// change to how the metadata is written cannot make this and the document
+/// disagree.
+///
+/// [`read`] rather than [`parse`], and the difference is not cosmetic: `parse`
+/// refuses a document with no VMID in it, because a *domain* without one is not
+/// a machine this appliance manages. That rule has no meaning here. This is one
+/// element, handed back by the hypervisor for a machine the caller already
+/// named, and asking it to prove its identity again would mean an uptime that
+/// silently reads as absent whenever the element happens not to carry one.
 pub fn started_from_metadata(metadata_xml: &str) -> Option<u64> {
     let wrapped =
         format!("<domain type='kvm'><name/><metadata>{metadata_xml}</metadata><devices/></domain>");
-    parse(&wrapped).ok().and_then(|parsed| parsed.started_at)
+    read(&wrapped).ok().and_then(|(parsed, _)| parsed.started_at)
 }
 
 /// Local name of a possibly-namespaced element: `lumen:vmid` is `vmid`. The
@@ -1337,6 +1363,46 @@ mod tests {
         assert!(render(&config).contains("model='virtio-scsi'"));
     }
 
+    /// The whole `<video>` element, so an assertion about the card cannot be
+    /// satisfied by the adapter's `<model type='virtio'/>` somewhere else in
+    /// the same document.
+    fn video_block(model: VideoModel) -> String {
+        format!(
+            "<video>\n      <model type='{}'/>\n    </video>",
+            model.as_str()
+        )
+    }
+
+    /// The card is a choice now, so it has to survive the document in both
+    /// directions — a machine that comes back as the wrong card would be
+    /// silently reset to it by the next save.
+    #[test]
+    fn the_graphics_card_is_written_and_read_back() {
+        let mut config = sample();
+        // The default is what every machine defined so far already carries.
+        assert!(render(&config).contains(&video_block(VideoModel::Virtio)));
+
+        for model in [VideoModel::Vga, VideoModel::Bochs, VideoModel::Qxl] {
+            config.video = model;
+            let xml = render(&config);
+            assert!(xml.contains(&video_block(model)), "{xml}");
+            assert_eq!(parse(&xml).unwrap().config.video, model);
+        }
+    }
+
+    /// A machine defined before this appliance put a screen on one carries no
+    /// `<video>` at all. That is not an error and not an unknown card: it reads
+    /// as the default, which is exactly what saving the machine then writes
+    /// into its document — the remedy `VirtService::console` names.
+    #[test]
+    fn a_document_with_no_video_device_reads_as_the_default_card() {
+        let mut config = sample();
+        config.video = VideoModel::Vga;
+        let without = render(&config).replace(&video_block(VideoModel::Vga), "");
+        assert!(!without.contains("<video>"), "{without}");
+        assert_eq!(parse(&without).unwrap().config.video, VideoModel::Virtio);
+    }
+
     /// Operator text goes into the document as text, not as markup.
     #[test]
     fn a_name_full_of_markup_cannot_break_out_of_its_element() {
@@ -1354,14 +1420,14 @@ mod tests {
     #[test]
     fn live_metadata_carries_the_start_time_and_reads_back_out_of_itself() {
         let fragment = live_metadata(&sample(), 1_785_000_000);
+        // Unprefixed, because `virDomainSetMetadata` attaches the prefix
+        // itself — see `live_metadata_leaves_the_namespace_to_the_hypervisor`,
+        // which is the test that says why it must not be here.
         assert!(
-            fragment.contains("<lumen:started>1785000000</lumen:started>"),
+            fragment.contains("<started>1785000000</started>"),
             "{fragment}"
         );
-        assert!(
-            fragment.contains("<lumen:vmid>101</lumen:vmid>"),
-            "{fragment}"
-        );
+        assert!(fragment.contains("<vmid>101</vmid>"), "{fragment}");
         // The hypervisor hands this element back on its own, outside any
         // document, and the same reader has to cope with that.
         assert_eq!(started_from_metadata(&fragment), Some(1_785_000_000));

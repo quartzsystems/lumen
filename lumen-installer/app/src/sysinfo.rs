@@ -42,8 +42,16 @@ pub fn human_size(bytes: u64) -> String {
     format!("{value:.1} {}", UNITS[unit])
 }
 
+/// Drivers whose interfaces are not front-panel adapters. A BMC exposes its
+/// shared-with-host side as a USB gadget on rndis_host or cdc_ether: it looks
+/// like an ordinary ethernet NIC in sysfs, but it leads to the service
+/// processor, not to the network this appliance is being installed onto.
+/// Offering it as the management interface is offering a dead end. Kept in
+/// step with the same list in lumen-nicnames, which skips them when naming.
+const EXCLUDED_DRIVERS: [&str; 4] = ["rndis_host", "cdc_ether", "cdc_ncm", "cdc_eem"];
+
 /// Physical ethernet NICs, sorted by name (nic0..nicN after lumen-nicnames
-/// has run in the live environment).
+/// has run in the live environment). BMC/IPMI USB gadgets are left out.
 pub fn nics() -> Vec<Nic> {
     let mut out = Vec::new();
     let Ok(entries) = fs::read_dir("/sys/class/net") else {
@@ -58,6 +66,13 @@ pub fn nics() -> Vec<Nic> {
         if read_trim(&path.join("type")).as_deref() != Some("1") {
             continue; // ethernet only
         }
+        let driver = fs::read_link(path.join("device/driver"))
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .unwrap_or_default();
+        if EXCLUDED_DRIVERS.contains(&driver.as_str()) {
+            continue; // BMC/IPMI USB gadget, not a front-panel adapter
+        }
         let Some(mac) = read_trim(&path.join("address")) else {
             continue;
         };
@@ -70,10 +85,6 @@ pub fn nics() -> Vec<Nic> {
         } else {
             None
         };
-        let driver = fs::read_link(path.join("device/driver"))
-            .ok()
-            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
-            .unwrap_or_default();
         out.push(Nic {
             name,
             mac,

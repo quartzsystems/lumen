@@ -36,8 +36,8 @@ use crate::domain_xml;
 use crate::error::{Result, VirtError};
 use crate::model::{
     generate_mac, valid_vm_name, BootDevice, CacheMode, CpuModel, CpuTopology, DiskBus, Firmware,
-    NicModel, VmCdrom, VmConfig, VmDisk, VmNic, DEFAULT_MEMORY_MIB, DEFAULT_VCPUS, FIRST_VMID,
-    LAST_VMID,
+    NicModel, VideoModel, VmCdrom, VmConfig, VmDisk, VmNic, DEFAULT_MEMORY_MIB, DEFAULT_VCPUS,
+    FIRST_VMID, LAST_VMID,
 };
 use crate::osinfo::{self, OsCatalog};
 use crate::state::{DomainState, HostInfo, ObservedDomain};
@@ -223,6 +223,8 @@ pub struct VmView {
     pub topology: Option<CpuTopology>,
     pub machine: String,
     pub firmware: Firmware,
+    /// The graphics card, which is what the console page is looking at.
+    pub video: VideoModel,
     pub boot_order: Vec<BootDevice>,
     pub start_on_boot: bool,
     pub guest_agent: bool,
@@ -351,6 +353,8 @@ pub struct VmCreate {
     #[serde(default)]
     pub firmware: Firmware,
     #[serde(default)]
+    pub video: VideoModel,
+    #[serde(default)]
     pub boot_order: Option<Vec<BootDevice>>,
     #[serde(default)]
     pub start_on_boot: bool,
@@ -434,6 +438,7 @@ pub struct VmPatch {
     pub topology: Option<CpuTopology>,
     pub machine: Option<String>,
     pub firmware: Option<Firmware>,
+    pub video: Option<VideoModel>,
     pub boot_order: Option<Vec<BootDevice>>,
     pub start_on_boot: Option<bool>,
     pub guest_agent: Option<bool>,
@@ -718,6 +723,7 @@ impl VirtService {
             topology: config.topology,
             machine: config.machine.clone(),
             firmware: config.firmware,
+            video: config.video,
             boot_order: config.boot_order.clone(),
             start_on_boot: observed.autostart,
             guest_agent: config.guest_agent,
@@ -818,6 +824,7 @@ impl VirtService {
                 .machine
                 .unwrap_or_else(|| VmConfig::default().machine),
             firmware: request.firmware,
+            video: request.video,
             boot_order: request
                 .boot_order
                 .unwrap_or_else(|| VmConfig::default().boot_order),
@@ -950,6 +957,9 @@ impl VirtService {
         if let Some(firmware) = patch.firmware {
             config.firmware = firmware;
         }
+        if let Some(video) = patch.video {
+            config.video = video;
+        }
         if let Some(boot_order) = patch.boot_order {
             config.boot_order = boot_order;
         }
@@ -1044,6 +1054,7 @@ impl VirtService {
             (after.topology != before.topology, "processor layout"),
             (after.machine != before.machine, "machine type"),
             (after.firmware != before.firmware, "firmware"),
+            (after.video != before.video, "graphics card"),
             (after.boot_order != before.boot_order, "boot order"),
             (after.guest_agent != before.guest_agent, "guest agent"),
         ] {
@@ -1709,6 +1720,7 @@ mod tests {
             topology: None,
             machine: None,
             firmware: Firmware::Uefi,
+            video: VideoModel::default(),
             boot_order: None,
             start_on_boot: false,
             guest_agent: true,
