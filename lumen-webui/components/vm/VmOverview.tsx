@@ -157,15 +157,3 @@ export function VmOverview({
     </div>
   );
 }
-
-/// A section that has not been built yet, in the voice `StubPage` established.
-export function VmStubSection({ title, note }: { title: string; note: string }) {
-  return (
-    <div className="surface px-6 py-12 text-center">
-      <div className="text-[14px] font-semibold text-[var(--qz-fg-2)]">Not implemented yet</div>
-      <p className="text-[13px] text-[var(--qz-fg-4)] mt-2 mb-0">
-        {title} will land here — {note}
-      </p>
-    </div>
-  );
-}

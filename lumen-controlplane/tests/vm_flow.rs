@@ -128,6 +128,7 @@ async fn harness(tag: &str) -> Harness {
         network,
         storage,
         virt,
+        tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
     }));
 
     // Sign in once; every machine and storage route requires the session.
@@ -315,6 +316,48 @@ async fn create_start_shutdown_delete() {
     assert_eq!(removed["removed_volumes"].as_array().unwrap().len(), 0);
     assert_eq!(removed["kept_volumes"][0], "boot/lumen/vm-100-disk-0");
     assert!(h.zfs.has_dataset("boot/lumen/vm-100-disk-0"));
+}
+
+// --- the task log ------------------------------------------------------------
+
+#[tokio::test]
+async fn every_action_lands_in_the_machines_task_log() {
+    let h = harness("tasks").await;
+    h.create_web01().await;
+    h.post("/api/vms/100/start", "{}").await;
+    // A refusal is history too: a stop without the acknowledgement.
+    let (status, _) = h.post("/api/vms/100/stop", "{}").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    h.post("/api/vms/100/shutdown", "{}").await;
+    let (status, body) = h
+        .call(
+            "PATCH",
+            "/api/vms/100",
+            Some(r#"{"vcpus":4,"memory_mib":8192}"#),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let response = h.get("/api/vms/100/tasks").await;
+    let tasks = response["tasks"].as_array().unwrap();
+    // Newest first: update, shutdown, the refused stop, start, create.
+    assert_eq!(tasks.len(), 5, "{response}");
+    assert_eq!(tasks[0]["action"], "update");
+    assert_eq!(tasks[0]["detail"], "Change processors, memory");
+    assert_eq!(tasks[0]["status"], "ok");
+    assert_eq!(tasks[1]["action"], "shutdown");
+    assert_eq!(tasks[2]["action"], "stop");
+    assert_eq!(tasks[2]["status"], "error");
+    assert!(tasks[2]["error"].as_str().is_some_and(|s| !s.is_empty()));
+    assert_eq!(tasks[3]["action"], "start");
+    assert_eq!(tasks[4]["action"], "create");
+    // Recorded against the principal who asked, not just the account.
+    assert_eq!(tasks[4]["user"], "root@lumen");
+
+    // Another machine's history is its own — and an identifier nothing has
+    // touched answers with an empty list, not a 404.
+    let empty = h.get("/api/vms/999/tasks").await;
+    assert!(empty["tasks"].as_array().unwrap().is_empty());
 }
 
 // --- the acknowledgement paths ----------------------------------------------
@@ -779,6 +822,7 @@ async fn every_machine_and_storage_route_requires_a_session() {
         ("POST", "/api/vms/100/stop"),
         ("POST", "/api/vms/100/reboot"),
         ("POST", "/api/vms/100/reset"),
+        ("GET", "/api/vms/100/tasks"),
         ("GET", "/api/vms/100/console"),
         ("GET", "/api/vms/100/console/ws"),
         ("POST", "/api/vms/100/disks"),

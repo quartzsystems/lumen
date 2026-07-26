@@ -954,7 +954,24 @@ impl VirtService {
         }
 
         tracing::info!(vmid, name = %config.name, "machine defined");
-        self.get(vmid).await
+        let view = self.get(vmid).await?;
+        // The hypervisor may normalize the document it was given; it must not
+        // lose the screen out of it. It has: a real EL10 node stored a
+        // machine defined with `<graphics type='vnc' socket='…'/>` as
+        // `autoport='yes'` with no socket anywhere, and the only symptom was
+        // a console that refused a machine created that morning as one
+        // "defined before this appliance gave machines a console". A sentence
+        // in the journal at creation time is the difference between reading
+        // the cause and re-deriving it from a stored document days later.
+        if !view.has_screen {
+            tracing::warn!(
+                vmid,
+                name = %config.name,
+                "the machine was defined with a console socket, but the hypervisor \
+                 stored it without one — its console will not open"
+            );
+        }
+        Ok(view)
     }
 
     pub async fn update(&self, vmid: u32, patch: VmPatch) -> Result<VmUpdateResponse> {

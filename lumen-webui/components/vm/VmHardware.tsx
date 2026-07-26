@@ -1,13 +1,26 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Clock, Plus } from "lucide-react";
+import {
+  Box,
+  Cable,
+  CircuitBoard,
+  Clock,
+  Cpu,
+  Disc,
+  HardDrive,
+  MemoryStick,
+  Monitor,
+  Network,
+  Plus,
+  type LucideIcon,
+} from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { ModalShell, ModalHeader } from "@/components/ui/Modal";
 import { ErrorText, Field, ModalFooter, SelectInput, TextInput } from "@/components/ui/formkit";
 import { Switch } from "@/components/ui/Switch";
+import { DataTable, type Column } from "@/components/console/DataTable";
 import { RowActions } from "@/components/console/RowActions";
-import { Fact, Facts, Mono, Panel } from "@/components/vm/VmBits";
 import { fetchInterfaces } from "@/lib/networkClient";
 import { fetchPools, type PoolView } from "@/lib/storageClient";
 import {
@@ -37,8 +50,45 @@ const numberOf = (text: string): number | undefined => {
   return Number.isFinite(value) ? value : undefined;
 };
 
+/// One row of the hardware table: a device the machine has, and how it is
+/// configured, the way Proxmox lays the same page out.
+interface HardwareRow {
+  key: string;
+  icon: LucideIcon;
+  device: string;
+  /// What search and sort see — the plain text of the configuration cell.
+  text: string;
+  value: React.ReactNode;
+  actions?: React.ReactNode;
+}
+
+const hardwareColumns: Column<HardwareRow>[] = [
+  {
+    key: "device",
+    header: "Device",
+    value: (row) => row.device,
+    width: 220,
+    render: (row) => {
+      const Icon = row.icon;
+      return (
+        <span className="inline-flex items-center gap-2 min-w-0">
+          <Icon size={15} className="flex-shrink-0 text-[var(--qz-fg-4)]" />
+          <span className="text-[var(--qz-fg-1)] font-semibold truncate">{row.device}</span>
+        </span>
+      );
+    },
+  },
+  {
+    key: "configuration",
+    header: "Configuration",
+    value: (row) => row.text,
+    render: (row) => row.value,
+  },
+];
+
 /// Disks, adapters, and the sizing that only changes when the machine
-/// restarts.
+/// restarts — one table, one row per device, like the hypervisors everyone
+/// has already used.
 ///
 /// Every change here reports what actually happened: the backend answers with
 /// what the running machine took and what is waiting for a restart, using the
@@ -82,6 +132,156 @@ export function VmHardware({
 
   const disabled = busy || working;
 
+  // The one dialog behind every sizing row — memory, processors, BIOS,
+  // display, and machine type are edited together, and the node answers which
+  // changes the running machine took.
+  const sizingEdit = (
+    <Button kind="ghost" size="sm" disabled={disabled} onClick={() => setEditingSizing(true)}>
+      Edit
+    </Button>
+  );
+
+  const processors = `${vm.vcpus}${
+    vm.topology ? ` (${vm.topology.sockets} sockets, ${vm.topology.cores} cores)` : ""
+  } [${cpuModelLabel(vm.cpu_model)}]`;
+
+  const diskText = (disk: (typeof vm.disks)[number]) =>
+    `${disk.source}, ${disk.bus}, ${formatBytes(disk.size)}` +
+    `${disk.cache !== "none" ? `, cache=${disk.cache}` : ""}` +
+    `${disk.discard ? ", discard" : ""}` +
+    `${disk.boot_index != null ? `, boot=${disk.boot_index}` : ""}`;
+
+  const nicText = (nic: (typeof vm.nics)[number]) =>
+    `${nic.model}=${nic.id},bridge=${nic.bridge}${nic.vlan_tag != null ? `,tag=${nic.vlan_tag}` : ""}`;
+
+  const rows: HardwareRow[] = [
+    {
+      key: "memory",
+      icon: MemoryStick,
+      device: "Memory",
+      text: formatMib(vm.memory_mib),
+      value: <span className="qz-mono">{formatMib(vm.memory_mib)}</span>,
+      actions: sizingEdit,
+    },
+    {
+      key: "processors",
+      icon: Cpu,
+      device: "Processors",
+      text: processors,
+      value: <span className="qz-mono">{processors}</span>,
+      actions: sizingEdit,
+    },
+    {
+      key: "bios",
+      icon: CircuitBoard,
+      device: "BIOS",
+      text: vm.firmware === "uefi" ? "UEFI" : "Legacy BIOS",
+      value: vm.firmware === "uefi" ? "UEFI" : "Legacy BIOS",
+      actions: sizingEdit,
+    },
+    {
+      key: "display",
+      icon: Monitor,
+      device: "Display",
+      /* Not simply the card. A machine whose document has no display device
+         reads back as the default one, so printing `video` here told an
+         operator "VirtIO GPU" about a machine with no graphics device and no
+         console socket — and then the console said there was no screen, which
+         reads as a broken appliance rather than as a machine that needs
+         saving. */
+      text: vm.has_screen ? VIDEO_LABEL[vm.video] : "none yet",
+      value: vm.has_screen ? (
+        VIDEO_LABEL[vm.video]
+      ) : (
+        <span style={{ color: "var(--qz-warn)" }}>
+          none yet <span className="qz-dim">— save to give it {VIDEO_LABEL[vm.video]}</span>
+        </span>
+      ),
+      actions: sizingEdit,
+    },
+    {
+      key: "machine",
+      icon: Box,
+      device: "Machine",
+      text: vm.machine,
+      value: <span className="qz-mono">{vm.machine}</span>,
+      actions: sizingEdit,
+    },
+    // Derived, not stored: the controller exists in the machine's document
+    // exactly when a disk rides the virtio-scsi bus.
+    ...(vm.disks.some((disk) => disk.bus === "virtio-scsi")
+      ? [
+          {
+            key: "scsi-controller",
+            icon: Cable,
+            device: "SCSI Controller",
+            text: "VirtIO SCSI",
+            value: "VirtIO SCSI",
+          } satisfies HardwareRow,
+        ]
+      : []),
+    ...vm.disks.map((disk) => ({
+      key: `disk-${disk.id}`,
+      icon: HardDrive,
+      device: `Hard Disk (${disk.id})`,
+      text: diskText(disk),
+      value: (
+        <span className="qz-mono" title={diskText(disk)}>
+          {diskText(disk)}
+        </span>
+      ),
+      actions: (
+        <DiskActions
+          vm={vm}
+          diskId={disk.id}
+          disabled={disabled}
+          onDetach={(purge, ack) =>
+            run(
+              () => detachDisk(vm.vmid, disk.id, purge, ack),
+              `${disk.id} detached${purge ? " and its volume removed" : ""}`,
+            )
+          }
+        />
+      ),
+    })),
+    // Read-only for now: a drive is defined with the machine, and changing
+    // what is in one after the fact needs an eject/insert the API does not
+    // have yet. Shown regardless, because a machine that boots off media an
+    // operator cannot see is a machine nobody can explain.
+    ...vm.cdroms.map((cdrom) => ({
+      key: `cdrom-${cdrom.id}`,
+      icon: Disc,
+      device: `CD/DVD Drive (${cdrom.id})`,
+      text: cdrom.source ? (cdrom.source.split("/").pop() ?? cdrom.source) : "empty",
+      value: (
+        <span className="qz-mono" title={cdrom.source ?? undefined}>
+          {cdrom.source ? cdrom.source.split("/").pop() : "empty"}
+        </span>
+      ),
+    })),
+    ...vm.nics.map((nic, index) => ({
+      key: `nic-${nic.id}`,
+      icon: Network,
+      device: `Network Device (net${index})`,
+      text: nicText(nic),
+      value: (
+        <span className="qz-mono" title={nicText(nic)}>
+          {nicText(nic)}
+        </span>
+      ),
+      actions: (
+        <RowActions
+          label={`adapter ${nic.id}`}
+          onEdit={() => undefined}
+          editDisabled
+          editTitle="An adapter is replaced rather than edited — remove it and add another."
+          deleteDisabled={disabled}
+          onDelete={() => run(() => detachNic(vm.vmid, nic.id), `${nic.id} removed`)}
+        />
+      ),
+    })),
+  ];
+
   return (
     <div className="flex flex-col gap-4">
       {vm.pending_reboot.length > 0 && (
@@ -100,200 +300,38 @@ export function VmHardware({
         </div>
       )}
 
-      <Panel
-        title="Disks"
-        actions={
-          <Button
-            kind="secondary"
-            size="sm"
-            icon={Plus}
-            disabled={disabled}
-            onClick={() => setAdding("disk")}
-          >
-            Add disk
-          </Button>
+      <DataTable
+        rows={rows}
+        columns={hardwareColumns}
+        rowId={(row) => row.key}
+        storageKey="vm-hardware"
+        searchPlaceholder="Search hardware…"
+        emptyMessage="This machine has no hardware at all, which should not be possible."
+        actionsWidth={100}
+        toolbar={
+          <>
+            <Button
+              kind="secondary"
+              size="sm"
+              icon={Plus}
+              disabled={disabled}
+              onClick={() => setAdding("disk")}
+            >
+              Add disk
+            </Button>
+            <Button
+              kind="secondary"
+              size="sm"
+              icon={Plus}
+              disabled={disabled}
+              onClick={() => setAdding("nic")}
+            >
+              Add adapter
+            </Button>
+          </>
         }
-      >
-        {vm.disks.length === 0 ? (
-          <p className="text-[13px] text-[var(--qz-fg-4)] m-0">No disks.</p>
-        ) : (
-          <div className="rounded-md overflow-x-auto" style={{ border: "1px solid var(--qz-border)" }}>
-            <table className="qz-table">
-              <thead>
-                <tr>
-                  <th>Target</th>
-                  <th>Bus</th>
-                  <th>Volume</th>
-                  <th>Size</th>
-                  <th>Cache</th>
-                  <th>Boot</th>
-                  <th className="text-right">Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {vm.disks.map((disk) => (
-                  <tr key={disk.id} style={{ cursor: "default" }}>
-                    <td className="mono">{disk.id}</td>
-                    <td className="mono">{disk.bus}</td>
-                    <td className="mono" title={disk.source}>
-                      {disk.source}
-                    </td>
-                    <td>{formatBytes(disk.size)}</td>
-                    <td className="mono">{disk.cache}</td>
-                    <td className="mono">{disk.boot_index ?? "—"}</td>
-                    <td className="text-right">
-                      <DiskActions
-                        vm={vm}
-                        diskId={disk.id}
-                        disabled={disabled}
-                        onDetach={(purge, ack) =>
-                          run(
-                            () => detachDisk(vm.vmid, disk.id, purge, ack),
-                            `${disk.id} detached${purge ? " and its volume removed" : ""}`,
-                          )
-                        }
-                      />
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </Panel>
-
-      {/* Read-only for now: a drive is defined with the machine, and changing
-          what is in one after the fact needs an eject/insert the API does not
-          have yet. Shown regardless, because a machine that boots off media an
-          operator cannot see is a machine nobody can explain. */}
-      {vm.cdroms.length > 0 && (
-        <Panel title="Optical drives">
-          <div className="rounded-md overflow-x-auto" style={{ border: "1px solid var(--qz-border)" }}>
-            <table className="qz-table">
-              <thead>
-                <tr>
-                  <th>Target</th>
-                  <th>Image</th>
-                  <th>Boot</th>
-                </tr>
-              </thead>
-              <tbody>
-                {vm.cdroms.map((cdrom) => (
-                  <tr key={cdrom.id} style={{ cursor: "default" }}>
-                    <td className="mono">{cdrom.id}</td>
-                    <td className="mono" title={cdrom.source ?? undefined}>
-                      {cdrom.source ? cdrom.source.split("/").pop() : "empty"}
-                    </td>
-                    <td className="mono">{cdrom.boot_index ?? "—"}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </Panel>
-      )}
-
-      <Panel
-        title="Network adapters"
-        actions={
-          <Button
-            kind="secondary"
-            size="sm"
-            icon={Plus}
-            disabled={disabled}
-            onClick={() => setAdding("nic")}
-          >
-            Add adapter
-          </Button>
-        }
-      >
-        {vm.nics.length === 0 ? (
-          <p className="text-[13px] text-[var(--qz-fg-4)] m-0">No adapters.</p>
-        ) : (
-          <div className="rounded-md overflow-x-auto" style={{ border: "1px solid var(--qz-border)" }}>
-            <table className="qz-table">
-              <thead>
-                <tr>
-                  <th>Hardware address</th>
-                  <th>Bridge</th>
-                  <th>Model</th>
-                  <th>VLAN</th>
-                  <th className="text-right">Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {vm.nics.map((nic) => (
-                  <tr key={nic.id} style={{ cursor: "default" }}>
-                    <td className="mono">{nic.id}</td>
-                    <td className="mono">{nic.bridge}</td>
-                    <td className="mono">{nic.model}</td>
-                    <td className="mono">{nic.vlan_tag ?? "—"}</td>
-                    <td className="text-right">
-                      <RowActions
-                        label={`adapter ${nic.id}`}
-                        onEdit={() => undefined}
-                        editDisabled
-                        editTitle="An adapter is replaced rather than edited — remove it and add another."
-                        deleteDisabled={disabled}
-                        onDelete={() =>
-                          run(() => detachNic(vm.vmid, nic.id), `${nic.id} removed`)
-                        }
-                      />
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </Panel>
-
-      <Panel
-        title="Processor, memory, and boot"
-        actions={
-          <Button
-            kind="secondary"
-            size="sm"
-            disabled={disabled}
-            onClick={() => setEditingSizing(true)}
-          >
-            Edit
-          </Button>
-        }
-      >
-        <Facts>
-          <Fact label="Processors">{vm.vcpus}</Fact>
-          <Fact label="Memory">{formatMib(vm.memory_mib)}</Fact>
-          <Fact label="Processor model">{cpuModelLabel(vm.cpu_model)}</Fact>
-          <Fact label="Processor layout">
-            {vm.topology
-              ? `${vm.topology.sockets} × ${vm.topology.cores} × ${vm.topology.threads}`
-              : "left to the hypervisor"}
-          </Fact>
-          <Fact label="Firmware">{vm.firmware === "uefi" ? "UEFI" : "Legacy BIOS"}</Fact>
-          <Fact label="Machine type">
-            <Mono>{vm.machine}</Mono>
-          </Fact>
-          {/* Not simply the card. A machine whose document has no display
-              device reads back as the default one, so printing `video` here
-              told an operator "VirtIO GPU" about a machine with no graphics
-              device and no console socket — and then the console said there
-              was no screen, which reads as a broken appliance rather than as a
-              machine that needs saving. */}
-          <Fact label="Graphics">
-            {vm.has_screen ? (
-              VIDEO_LABEL[vm.video]
-            ) : (
-              <span style={{ color: "var(--qz-warn)" }}>
-                none yet <span className="qz-dim">— save to give it {VIDEO_LABEL[vm.video]}</span>
-              </span>
-            )}
-          </Fact>
-          <Fact label="Boot order">
-            <Mono>{vm.boot_order.length > 0 ? vm.boot_order.join(" → ") : "—"}</Mono>
-          </Fact>
-        </Facts>
-      </Panel>
+        actions={(row) => row.actions ?? null}
+      />
 
       {adding === "disk" && (
         <AddDiskDialog

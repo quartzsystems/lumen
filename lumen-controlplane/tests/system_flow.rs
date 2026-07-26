@@ -157,6 +157,7 @@ async fn harness(tag: &str, signed_in_as: &str) -> Harness {
         network,
         storage,
         virt,
+        tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
     }));
 
     let response = router

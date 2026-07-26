@@ -151,6 +151,7 @@ async fn main() -> Result<()> {
         network,
         storage,
         virt,
+        tasks: lumen_controlplane::tasks::TaskLog::open(state_dir.join("vm-tasks.jsonl")),
     }));
 
     if no_tls {

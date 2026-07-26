@@ -3,6 +3,7 @@ pub mod config;
 pub mod error;
 pub mod realm;
 pub mod security;
+pub mod tasks;
 pub mod tls;
 pub mod web;
 
@@ -39,6 +40,8 @@ pub struct AppState {
     /// bridge to attach to and a volume to boot from — which is why it is
     /// constructed last.
     pub virt: Arc<VirtService>,
+    /// What has been done to each machine — the console's Tasks table.
+    pub tasks: tasks::TaskLog,
 }
 
 /// The full application router: /api plus the static web UI fallback.

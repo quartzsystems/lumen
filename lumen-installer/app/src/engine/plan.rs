@@ -467,6 +467,50 @@ pub fn build_plan(cfg: &InstallConfig, pins: &BuildPins) -> Vec<Step> {
     });
 
     steps.push(Step {
+        title: "Load the security policy module".into(),
+        actions: vec![
+            // The module ships inside lumen-controlplane and its %post
+            // installs it — but %post runs inside `dnf --installroot`, in a
+            // live environment booted `selinux=0`, where semodule has no
+            // store of the target's to write and nothing to load into. RPM
+            // reports a failed %post as a *warning* and dnf carries on, so
+            // the install succeeds and the appliance boots enforcing with the
+            // module absent. The spec deliberately omits `|| :` so that
+            // failure is loud; loud in the middle of a dnf transaction that
+            // then reports success is not loud enough.
+            //
+            // What its absence costs is not guessable from the symptom.
+            // `dbus-broker` may not read a pipe labelled
+            // unconfined_service_t, and `systemd-run --pipe` passes exactly
+            // such pipes — so every command the control plane hands to
+            // systemd fails together: creating a pool, creating an account,
+            // and the restart controls. The denial is dontaudit'ed upstream,
+            // so `ausearch` is empty, and the visible failure is a console
+            // request that never returns. See docs/system.md.
+            //
+            // Here it runs in the chroot, so the store being written is the
+            // target's own. semodule cannot load into the live kernel and
+            // says so; what matters is that it commits to that store and
+            // rebuilds the target's binary policy, which is what the target
+            // loads at boot. It runs before the labelling step below so
+            // setfiles validates against the finished policy rather than one
+            // this is about to replace.
+            sh(format!(
+                "chroot {TARGET} semodule -X 200 -i \
+                 /usr/share/selinux/packages/lumen-controlplane/lumen-controlplane.pp"
+            )),
+            // Hard gate, in the manner of the label check below and for the
+            // same reason: the whole point of moving this out of %post is
+            // that failing silently here ships an appliance whose three most
+            // privileged features are broken, with nothing in any log naming
+            // the cause. Fail the install instead.
+            sh(format!(
+                "chroot {TARGET} semodule -l | grep -q '^lumen-controlplane'"
+            )),
+        ],
+    });
+
+    steps.push(Step {
         title: "Label filesystem for SELinux".into(),
         actions: vec![
             // The live env runs selinux=0, so the target boots with a
@@ -731,6 +775,59 @@ mod tests {
         assert!(shells.iter().any(|s| s.contains("init_exec_t")));
         // Labeling runs after all target writes: last step before Finalize.
         assert_eq!(plan[plan.len() - 2].title, "Label filesystem for SELinux");
+    }
+
+    /// The control plane's policy module cannot be loaded by its own `%post`:
+    /// that scriptlet runs inside `dnf --installroot` under `selinux=0`, and a
+    /// failed `%post` is a warning dnf installs straight past. Without the
+    /// module every privileged command the daemon delegates over the bus
+    /// fails, with no audit record and no error — the request simply never
+    /// returns. So the installer loads it into the target itself.
+    #[test]
+    fn the_policy_module_is_loaded_into_the_target_and_verified() {
+        let plan = build_plan(&test_cfg(), &BuildPins::default());
+        let shells: Vec<&str> = plan
+            .iter()
+            .flat_map(|s| &s.actions)
+            .filter_map(|a| match a {
+                Action::Shell(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        let install = shells
+            .iter()
+            .position(|s| s.contains("semodule -X 200 -i"))
+            .expect("plan must load the control plane's policy module");
+        // In the chroot, so the store written is the target's rather than the
+        // live environment's.
+        assert!(shells[install].contains("chroot"));
+        assert!(shells[install].contains("lumen-controlplane.pp"));
+
+        // Verified, not hoped for: a silent failure here ships an appliance
+        // that cannot create a pool, create an account, or restart itself.
+        let gate = shells
+            .iter()
+            .position(|s| s.contains("semodule -l"))
+            .expect("plan must verify the module actually landed");
+        assert!(install < gate, "the module is loaded before it is checked");
+
+        // After the packages that provide it and semodule itself, and before
+        // labelling, which picks the newest binary policy this has just
+        // rebuilt.
+        let dnf = shells
+            .iter()
+            .position(|s| s.contains("dnf -y --installroot"))
+            .expect("plan must contain the dnf install action");
+        let setfiles = shells
+            .iter()
+            .position(|s| s.contains("setfiles"))
+            .expect("plan must label the target");
+        assert!(
+            dnf < install,
+            "the module ships in a package: install first"
+        );
+        assert!(gate < setfiles, "policy is rebuilt before the label pass");
     }
 
     #[test]

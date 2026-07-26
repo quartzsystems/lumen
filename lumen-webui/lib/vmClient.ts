@@ -356,6 +356,35 @@ export const attachNic = (vmid: number, body: NicCreate): Promise<VmUpdateRespon
 export const detachNic = (vmid: number, id: string): Promise<VmUpdateResponse> =>
   del<VmUpdateResponse>(`/vms/${vmid}/nics/${encodeURIComponent(id)}`);
 
+// --- the task log ------------------------------------------------------------
+
+export type TaskStatus = "ok" | "error";
+
+/// One thing that was asked of a machine — the Tasks table's row. Refusals are
+/// in the history too, wearing `error` and the domain's own reason.
+export interface TaskView {
+  id: number;
+  vmid: number;
+  /// The verb, as the API spells it: `start`, `stop`, `update`, …
+  action: string;
+  /// One sentence describing what was asked.
+  detail: string;
+  /// Who asked, as `user@realm`.
+  user: string;
+  /// Unix seconds.
+  time: number;
+  status: TaskStatus;
+  error?: string | null;
+}
+
+export interface TasksResponse {
+  tasks: TaskView[];
+}
+
+/// What has been done to one machine, newest first.
+export const fetchVmTasks = (vmid: number): Promise<TasksResponse> =>
+  apiFetch<TasksResponse>(`/vms/${vmid}/tasks`);
+
 // --- the console viewer ------------------------------------------------------
 
 export const fetchConsole = (vmid: number): Promise<ConsoleInfo> =>

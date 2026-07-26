@@ -56,12 +56,17 @@ export function LifecycleControls({
   vm,
   busy,
   compact = false,
+  menu = true,
   onDone,
 }: {
   vm: VmView;
   busy: boolean;
   /// Icon-only, for a table row.
   compact?: boolean;
+  /// Compact only: whether the remaining verbs hide behind a drop-down. Off in
+  /// the machine table, where one obvious control is the whole point of the
+  /// cell and everything else is a click away on the machine's own page.
+  menu?: boolean;
   onDone: (message: string) => void;
 }) {
   const [confirming, setConfirming] = useState<Verb | null>(null);
@@ -120,15 +125,17 @@ export function LifecycleControls({
   return (
     <>
       {compact ? (
-        <div className="inline-flex items-center gap-1 justify-end relative">
+        <div className="flex items-center gap-1 justify-end relative">
           {control(primary, vm.actions[primary])}
-          <Button
-            kind="ghost"
-            size="sm"
-            iconRight={ChevronDown}
-            disabled={busy || working}
-            onClick={() => setMenuOpen((open) => !open)}
-          />
+          {menu && (
+            <Button
+              kind="ghost"
+              size="sm"
+              iconRight={ChevronDown}
+              disabled={busy || working}
+              onClick={() => setMenuOpen((open) => !open)}
+            />
+          )}
           {menuOpen && (
             <>
               <div className="fixed inset-0 z-10" onClick={() => setMenuOpen(false)} />

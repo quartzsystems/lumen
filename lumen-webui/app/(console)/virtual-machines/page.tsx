@@ -5,8 +5,6 @@ import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
   AlertTriangle,
-  Archive,
-  Camera,
   Cpu,
   LayoutDashboard,
   ListChecks,
@@ -27,7 +25,8 @@ import { VmConsole } from "@/components/vm/VmConsole";
 import { StateBadge, Tags } from "@/components/vm/VmBits";
 import { VmHardware } from "@/components/vm/VmHardware";
 import { VmOptions } from "@/components/vm/VmOptions";
-import { VmOverview, VmStubSection } from "@/components/vm/VmOverview";
+import { VmOverview } from "@/components/vm/VmOverview";
+import { VmTasks } from "@/components/vm/VmTasks";
 import { useConsole } from "@/lib/ConsoleContext";
 import { useSecondaryNav } from "@/lib/SecondaryNavContext";
 import { useVms } from "@/lib/VmContext";
@@ -40,15 +39,13 @@ import {
   type VmView,
 } from "@/lib/vmClient";
 
-/// The detail page's sections. Snapshots, backups, and tasks are stubs at this
-/// stage; they are listed anyway so the shape of the page is visible and so
-/// filling them in stays purely additive.
+/// The detail page's sections. Snapshots and backups will join the list when
+/// there is something real behind them — a nav item that answers "not
+/// implemented yet" is a promise the page cannot keep.
 const SECTIONS = [
   { id: "overview", label: "Overview", icon: LayoutDashboard },
   { id: "console", label: "Console", icon: Monitor },
   { id: "hardware", label: "Hardware", icon: Cpu },
-  { id: "snapshots", label: "Snapshots", icon: Camera },
-  { id: "backups", label: "Backups", icon: Archive },
   { id: "options", label: "Options", icon: Settings2 },
   { id: "tasks", label: "Tasks", icon: ListChecks },
 ] as const;
@@ -326,14 +323,8 @@ function VmSection({
       return <VmOptions key={vm.vmid} vm={vm} busy={busy} onChanged={onChanged} />;
     case "console":
       return <VmConsole vm={vm} busy={busy} onAction={onChanged} />;
-    case "snapshots":
-      return (
-        <VmStubSection title="Snapshots" note="taken from the pool the machine's disks live on." />
-      );
-    case "backups":
-      return <VmStubSection title="Backups" note="scheduled and restored from here." />;
     case "tasks":
-      return <VmStubSection title="Tasks" note="a record of what has been done to this machine." />;
+      return <VmTasks vm={vm} />;
   }
 }
 
@@ -481,16 +472,18 @@ function VmTable({
       searchPlaceholder="Search machines…"
       emptyMessage="No machines on this node yet."
       onRefresh={onRefresh}
-      // Open, the one obvious lifecycle control, and the menu holding the
-      // rest. Three controls need more than the default cell, and a fixed
-      // layout will not find the room on its own.
-      actionsWidth={158}
+      // Open and the one obvious lifecycle control. Everything else lives on
+      // the machine's own page — a menu in a table cell earns its keep only
+      // when the row is the only place to act, and it no longer is. The cell
+      // is one flex container so both buttons centre on the same axis instead
+      // of sitting on the text baseline.
+      actionsWidth={110}
       actions={(vm) => (
-        <div className="inline-flex items-center gap-1 justify-end">
+        <div className="flex items-center gap-1 justify-end">
           <Button kind="ghost" size="sm" onClick={() => onOpen(vm)}>
             Open
           </Button>
-          <LifecycleControls vm={vm} busy={busy} compact onDone={onAction} />
+          <LifecycleControls vm={vm} busy={busy} compact menu={false} onDone={onAction} />
         </div>
       )}
     />

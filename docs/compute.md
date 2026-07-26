@@ -834,9 +834,12 @@ requires a `<Suspense>` boundary or the export fails at prerender with an
 opaque error — `VirtualMachinesPage` is the boundary and `VirtualMachines` is
 the component behind it.
 
-Snapshots, Backups, and Tasks render as stubs in the existing `StubPage` voice.
-Console is the viewer described above. The detached window lives at `/console`,
-outside the `(console)` route group so it inherits no chrome.
+Tasks is the control plane's task log (`GET /api/vms/{vmid}/tasks`): every
+mutating VM route records what was asked, by whom, and what the node answered —
+refusals included. Snapshots and Backups are not in the nav yet; they return
+when there is something real behind them. Console is the viewer described
+above. The detached window lives at `/console`, outside the `(console)` route
+group so it inherits no chrome.
 
 ### Create Virtual Machine: tabs, not a wizard
 
@@ -1169,5 +1172,6 @@ console, for the reason above. Snapshots, backups, migration, templates,
 cloning, clustering, high availability, resource pools, and per-machine
 permissions.
 
-In the console, **Virtual Machines** (Overview, Console, Hardware, Options) and
-**Storage** are implemented. Snapshots, Backups, and Tasks are stubs.
+In the console, **Virtual Machines** (Overview, Console, Hardware, Options,
+Tasks) and **Storage** are implemented. Snapshots and Backups are not offered
+yet.

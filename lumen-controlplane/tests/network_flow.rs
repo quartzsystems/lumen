@@ -106,6 +106,7 @@ async fn harness(tag: &str) -> Harness {
         network,
         storage,
         virt,
+        tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
     }));
 
     // Sign in once; every networking route requires the session.

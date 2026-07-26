@@ -292,10 +292,20 @@ fn render_document(config: &VmConfig, uuid: Option<&str>) -> String {
     // part 2: adding it later would mean redefining every domain that already
     // exists, and a redefine is the one operation an operator has no reason to
     // expect.
+    //
+    // Both spellings of the socket, on purpose. The `socket` attribute is the
+    // legacy form; the `<listen type='socket'>` child is the canonical one,
+    // and it is what the hypervisor itself writes back. A machine defined on a
+    // real EL10 node with only the attribute came back stored as
+    // `autoport='yes'` with `<listen type='address'/>` — the socket silently
+    // gone, and with it the console. Writing the canonical child is the fix;
+    // keeping the attribute as well costs one line and means a libvirt that
+    // honors either spelling honors this document.
+    let socket = text(&vnc_socket_path(config.vmid));
     let _ = writeln!(
         out,
-        "    <graphics type='vnc' socket='{}'/>",
-        text(&vnc_socket_path(config.vmid))
+        "    <graphics type='vnc' socket='{socket}'>\n      \
+         <listen type='socket' socket='{socket}'/>\n    </graphics>"
     );
     let _ = writeln!(
         out,
@@ -1319,6 +1329,19 @@ mod tests {
             xml.contains(&format!("socket='{}'", vnc_socket_path(101))),
             "{xml}"
         );
+        // The canonical spelling, not only the legacy attribute. A machine
+        // defined on a real EL10 node with the attribute alone came back
+        // stored as `autoport='yes'` with no socket anywhere — a console that
+        // never existed, on a machine created that morning. The listen child
+        // is the form the hypervisor itself writes, so it is the one it
+        // cannot mistake.
+        assert!(
+            xml.contains(&format!(
+                "<listen type='socket' socket='{}'/>",
+                vnc_socket_path(101)
+            )),
+            "{xml}"
+        );
         assert_eq!(
             vnc_socket_path(101),
             "/var/lib/libvirt/qemu/lumen-101-vnc.sock"
@@ -1477,11 +1500,12 @@ mod tests {
         assert!(has_screen(&with));
 
         // A machine from before consoles: no <graphics>, no <video>.
+        let socket = vnc_socket_path(config.vmid);
         let without = with
             .replace(
                 &format!(
-                    "    <graphics type='vnc' socket='{}'/>\n",
-                    vnc_socket_path(config.vmid)
+                    "    <graphics type='vnc' socket='{socket}'>\n      \
+                     <listen type='socket' socket='{socket}'/>\n    </graphics>\n"
                 ),
                 "",
             )

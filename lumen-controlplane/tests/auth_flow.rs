@@ -75,6 +75,7 @@ fn test_app() -> axum::Router {
         network,
         storage,
         virt,
+        tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
     };
     app(Arc::new(state))
 }

@@ -108,6 +108,17 @@ install -d -m 0700 %{buildroot}%{_sharedstatedir}/lumen-controlplane
 # Deliberately not suffixed with "|| :". If this module does not load, three
 # separate features fail later with nothing pointing here; a loud scriptlet
 # warning at install time is the cheapest place to find that out.
+#
+# This scriptlet is NOT how the appliance gets the module, and must not be
+# relied on as though it were. The installer builds the target with
+# `dnf --installroot` from a live environment booted `selinux=0`, where
+# semodule has no target store to write and nothing to load into — and RPM
+# reports a failed %post as a warning that dnf installs straight past. So the
+# appliance would come up enforcing with the module absent and the install
+# reporting success. `lumen-installer`'s plan loads it into the chroot itself
+# and fails the install if it did not land; see its "Load the security policy
+# module" step. What remains here is the other path: installing or upgrading
+# this package on a node that is already running, where %post works properly.
 %{_sbindir}/semodule -X 200 -i \
     %{_datadir}/selinux/packages/%{name}/lumen-controlplane.pp
 

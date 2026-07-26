@@ -64,6 +64,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/vms/{vmid}", get(vms::get))
         .route("/api/vms/{vmid}", patch(vms::update))
         .route("/api/vms/{vmid}", delete(vms::delete))
+        .route("/api/vms/{vmid}/tasks", get(vms::tasks))
         .route("/api/vms/{vmid}/start", post(vms::start))
         .route("/api/vms/{vmid}/shutdown", post(vms::shutdown))
         .route("/api/vms/{vmid}/stop", post(vms::stop))
