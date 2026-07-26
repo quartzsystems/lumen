@@ -19,10 +19,22 @@ use lumen_zfs::StorageService;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Every domain crate, not just this one. The daemon delegates its
+    // privileged work to lumen_sys and its real work to lumen_zfs, lumen_virt,
+    // and lumen_net, so a filter naming only `lumen_controlplane` silently
+    // drops the lines that say what was run and why it failed — "running
+    // outside the sandbox", "privileged command failed", "pool created",
+    // "could not open the console socket". docs/system.md sends an operator to
+    // `journalctl -u lumen-controlplane` to diagnose exactly those failures,
+    // and until this listed them that journal was guaranteed to be empty of
+    // them. RUST_LOG still overrides the lot.
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "lumen_controlplane=info,tower_http=info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "lumen_controlplane=info,lumen_sys=info,lumen_zfs=info,lumen_virt=info,\
+                 lumen_net=info,tower_http=info"
+                    .into()
+            }),
         )
         .init();
 

@@ -59,11 +59,25 @@
 
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::Mutex;
+use tokio::time::timeout;
+
+/// How long a privileged command may take before it is given up on.
+///
+/// Nothing delegated here legitimately takes minutes: `useradd` writes three
+/// files, and `zpool create` labels its disks and returns. Without a bound, a
+/// command that blocks — a disk that will not settle, a bus that took the job
+/// and never answered — leaves the HTTP request that asked for it pending for
+/// as long as the browser is willing to wait, and the console sits on
+/// "Creating…" with no error, no progress, and nothing to do but reload the
+/// page. A sentence after two minutes is worse than a fast answer and far
+/// better than silence.
+const DEADLINE: Duration = Duration::from_secs(120);
 
 /// What ran, and what it said.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,12 +180,16 @@ pub trait Exec: Send + Sync {
 pub struct SystemdRun {
     /// Overridable so a test can point at something that is not `systemd-run`.
     program: String,
+    /// How long to wait before giving up. A field rather than the constant so
+    /// a test does not have to take two minutes to prove the bound exists.
+    deadline: Duration,
 }
 
 impl Default for SystemdRun {
     fn default() -> Self {
         Self {
             program: "systemd-run".to_string(),
+            deadline: DEADLINE,
         }
     }
 }
@@ -184,7 +202,14 @@ impl SystemdRun {
     pub fn with_program(program: impl Into<String>) -> Self {
         Self {
             program: program.into(),
+            ..Self::default()
         }
+    }
+
+    /// Wait a different length of time. For tests.
+    pub fn with_deadline(mut self, deadline: Duration) -> Self {
+        self.deadline = deadline;
+        self
     }
 
     /// The invocation, as an argument array.
@@ -249,7 +274,25 @@ impl SystemdRun {
             drop(child.stdin.take());
         }
 
-        let output = child.wait_with_output().await?;
+        // Bounded, because the alternative is an HTTP request that never
+        // answers. Dropping the future drops the child, and `kill_on_drop`
+        // ends `systemd-run` — but *not* the transient unit, which is a child
+        // of PID 1 and outlives the process that asked for it. The message
+        // says so rather than implying the command was called off, because
+        // "create the storage pool" may well still be in progress.
+        let output = match timeout(self.deadline, child.wait_with_output()).await {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "gave up waiting for {} after {} seconds. It was handed to systemd as a \
+                     transient unit, which is still running it — `systemctl list-units 'run-*'` \
+                     shows it and `journalctl -u lumen-controlplane` has the command that was \
+                     sent. Nothing was undone.",
+                    request.description,
+                    self.deadline.as_secs()
+                ));
+            }
+        };
         Ok(Outcome {
             status: output.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -745,6 +788,45 @@ mod tests {
             None
         );
         assert_eq!(systemd_refused(""), None);
+    }
+
+    /// A command that never returns has to become a sentence, not a request
+    /// that hangs until the operator reloads the page — the real cases being a
+    /// disk that will not settle and a bus that took the job and never
+    /// answered.
+    ///
+    /// A script rather than `sleep` itself: the stand-in is invoked in
+    /// `systemd-run`'s place, so it is handed `--quiet --collect --wait …`
+    /// first, and every real program exits on those rather than blocking. This
+    /// one ignores its arguments, which is the whole reason it exists.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_command_that_never_returns_is_given_up_on() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = std::env::temp_dir().join(format!("lumen-sys-blocks-{}", std::process::id()));
+        std::fs::write(&script, "#!/bin/sh\nsleep 60\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let exec = SystemdRun::with_program(script.to_string_lossy().into_owned())
+            .with_deadline(Duration::from_millis(150));
+        let err = exec
+            .run(Request::new(
+                "create the storage pool \"tank\"",
+                "/usr/sbin/zpool",
+            ))
+            .await
+            .unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("gave up waiting"), "{message}");
+        // Named, so the operator knows which operation is unaccounted for.
+        assert!(message.contains("create the storage pool"), "{message}");
+        // And told where it went, because killing systemd-run does not stop
+        // the transient unit it started.
+        assert!(message.contains("run-*"), "{message}");
+
+        let _ = std::fs::remove_file(&script);
     }
 
     #[tokio::test]

@@ -158,6 +158,15 @@ export interface VmView {
   machine: string;
   firmware: Firmware;
   video: VideoModel;
+  /// Whether the machine's stored document actually gives it a screen.
+  ///
+  /// Not the same question as `video`, and the difference is why the console
+  /// page must not simply print the card: a document with no display device in
+  /// it reads back as the default, so `video` says "virtio" for a machine that
+  /// has no graphics device and no VNC server at all. False means there is
+  /// nothing for the viewer to connect to until the machine is saved and fully
+  /// restarted.
+  has_screen: boolean;
   boot_order: BootDevice[];
   start_on_boot: boolean;
   guest_agent: boolean;

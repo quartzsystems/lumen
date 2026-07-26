@@ -274,7 +274,21 @@ export function VmHardware({
           <Fact label="Machine type">
             <Mono>{vm.machine}</Mono>
           </Fact>
-          <Fact label="Graphics">{VIDEO_LABEL[vm.video]}</Fact>
+          {/* Not simply the card. A machine whose document has no display
+              device reads back as the default one, so printing `video` here
+              told an operator "VirtIO GPU" about a machine with no graphics
+              device and no console socket — and then the console said there
+              was no screen, which reads as a broken appliance rather than as a
+              machine that needs saving. */}
+          <Fact label="Graphics">
+            {vm.has_screen ? (
+              VIDEO_LABEL[vm.video]
+            ) : (
+              <span style={{ color: "var(--qz-warn)" }}>
+                none yet <span className="qz-dim">— save to give it {VIDEO_LABEL[vm.video]}</span>
+              </span>
+            )}
+          </Fact>
           <Fact label="Boot order">
             <Mono>{vm.boot_order.length > 0 ? vm.boot_order.join(" → ") : "—"}</Mono>
           </Fact>

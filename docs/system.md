@@ -106,6 +106,32 @@ invocation is an array handed to `execve`, and
 `an_argument_is_an_argument_and_never_part_of_a_sentence` pins it with an
 argument that would be a disaster in a shell.
 
+### `--wait` is bounded, because the alternative is a page that never answers
+
+`--wait` blocks until the unit is over, and nothing here legitimately takes
+minutes: `useradd` writes three files and `zpool create` labels its disks and
+returns. So the wait carries a two-minute deadline
+(`exec::DEADLINE`, pinned by `a_command_that_never_returns_is_given_up_on`).
+
+Without it a command that blocks — a disk that will not settle, a bus that took
+the job and never answered — leaves the HTTP request that asked for it pending
+for as long as the browser is willing to wait. What an operator sees is a
+dialog stuck on *Creating…*: no error, no progress, and nothing to do but
+reload the page and guess whether the pool was made. That is strictly worse
+than a slow answer.
+
+Giving up ends `systemd-run`, but **not** the transient unit — it is a child of
+PID 1 and outlives the process that asked for it. The message says so and names
+`systemctl list-units 'run-*'`, because "gave up waiting" must not be read as
+"nothing happened".
+
+The same bound is on the storage domain's *reads* (`lumen_zfs`'s
+`backend::cli::DEADLINE`, thirty seconds). `zpool list` answers in milliseconds
+on a healthy node and not at all on one with a disk that has stopped
+responding, and several of those run before a pool is ever created — so an
+unbounded read there hangs the create request without a single command having
+been delegated, which looks exactly like a hung `zpool create` and is not one.
+
 ### `--pipe` needs an SELinux rule, and the missing one is invisible
 
 `--pipe` is the flag with a cost. Passing the daemon's standard input, output,
@@ -421,6 +447,15 @@ All three go through the same delegation, and all three fail together when the
 module is missing. If any of them reports `Internal server error`, run
 `semodule -DB`, reproduce, `ausearch -m AVC,USER_AVC -ts recent`, `semodule -B`
 — the denial is `dontaudit`ed and there is otherwise nothing in any log.
+
+`journalctl -u lumen-controlplane` is the other half of that, and it only
+became useful in this release: the default log filter named `lumen_controlplane`
+and nothing else, so every line from the crates that do the work — `lumen_sys`,
+`lumen_zfs`, `lumen_virt`, `lumen_net` — was dropped before it reached the
+journal. "running outside the sandbox", "privileged command failed", and
+"could not open the console socket" are all in that set, which meant the journal
+an operator was sent to was guaranteed to be empty of exactly the lines they
+were sent to find. `main.rs` now lists all five; `RUST_LOG` still overrides it.
 
 ### 1. An account, end to end
 

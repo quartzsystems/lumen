@@ -29,9 +29,11 @@
 
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::process::Command;
+use tokio::time::timeout;
 
 use lumen_sys::exec::{Exec, Request as ExecRequest};
 
@@ -48,6 +50,17 @@ use crate::model::{
 /// fields out from under the parser.
 const POOL_COLUMNS: &str = "name,size,alloc,free,frag,dedup,health,readonly";
 const DATASET_COLUMNS: &str = "name,type,used,avail,refer,volsize,volblocksize,mountpoint";
+
+/// How long one of these may take before it is given up on.
+///
+/// These are the *reads* — `zpool list`, `zfs list` — and they answer in
+/// milliseconds on a healthy node. They do not answer at all on an unhealthy
+/// one: a pool with a disk that has stopped responding blocks in the kernel,
+/// and `zpool list` blocks with it. Several of these run before a pool is ever
+/// created (`create_pool` observes the existing pools first), so an unbounded
+/// read here hangs the create request without a single command having been
+/// delegated — which looks exactly like a hung `zpool create` and is not one.
+const DEADLINE: Duration = Duration::from_secs(30);
 
 pub struct CliBackend {
     zfs: String,
@@ -156,18 +169,32 @@ impl CliBackend {
     /// carrying what the tool actually said, because "storage command failed"
     /// helps nobody.
     async fn run(&self, program: &str, args: &[&str]) -> Result<String> {
-        let output = Command::new(program)
+        let invocation = Command::new(program)
             .args(args)
             .stdin(Stdio::null())
             .kill_on_drop(true)
-            .output()
-            .await
-            .map_err(|err| {
+            .output();
+
+        // Bounded: see DEADLINE. `kill_on_drop` means giving up also ends the
+        // process, which is safe precisely because everything routed through
+        // here is a read — there is no half-finished write to leave behind.
+        let output = match timeout(DEADLINE, invocation).await {
+            Ok(result) => result.map_err(|err| {
                 ZfsError::Backend(anyhow::Error::from(err).context(format!(
                     "running {program} {} — is the storage software installed?",
                     args.join(" ")
                 )))
-            })?;
+            })?,
+            Err(_) => {
+                return Err(ZfsError::Backend(anyhow::anyhow!(
+                    "{program} {} did not answer within {} seconds. That is usually a pool with a \
+                     disk that has stopped responding — `zpool status` from a shell on the node \
+                     will say which, and will block in the same place if so.",
+                    args.join(" "),
+                    DEADLINE.as_secs()
+                )));
+            }
+        };
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();

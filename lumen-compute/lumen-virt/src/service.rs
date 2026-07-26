@@ -158,10 +158,23 @@ pub struct VmActions {
     pub console: Action,
 }
 
-fn actions_for(state: DomainState, name: &str) -> VmActions {
+/// `has_screen` is whether the machine's stored document declares a graphics
+/// device — see [`VmView::has_screen`]. It is not derivable from the state, and
+/// without it the console is offered on a machine that has nothing listening,
+/// so the viewer opens, fails, and reports it as though the connection had
+/// dropped.
+fn actions_for(state: DomainState, name: &str, has_screen: bool) -> VmActions {
     let running = state.is_running();
     let off_reason = format!("\"{name}\" is not running.");
     let no_screen = format!("\"{name}\" is not running, so it has no console.");
+    // The same sentence `VirtService::console` refuses with, for the same
+    // reason the one above is duplicated there: a viewer that raced a machine
+    // into this state should read the words it would have read anyway.
+    let never_had_a_screen = format!(
+        "\"{name}\" is running without a screen. It was defined before this appliance gave \
+         machines a console, so its document has no graphics device — save its configuration, \
+         then stop and start it, and the console will be there."
+    );
     let on_reason = format!("\"{name}\" is already running.");
     VmActions {
         start: if running {
@@ -196,10 +209,12 @@ fn actions_for(state: DomainState, name: &str) -> VmActions {
         } else {
             Action::yes()
         },
-        console: if running {
-            Action::yes()
-        } else {
+        console: if !running {
             Action::no(no_screen)
+        } else if !has_screen {
+            Action::no(never_had_a_screen)
+        } else {
+            Action::yes()
         },
     }
 }
@@ -225,6 +240,16 @@ pub struct VmView {
     pub firmware: Firmware,
     /// The graphics card, which is what the console page is looking at.
     pub video: VideoModel,
+    /// Whether the stored document actually gives the machine a screen.
+    ///
+    /// Not the same question as [`VmView::video`], and the difference is the
+    /// whole point: a document with no display device in it reads back as the
+    /// default card, so `video` says "virtio" for a machine that has no
+    /// graphics device at all. False here means the machine predates consoles
+    /// and has nothing for a viewer to connect to until it is saved and fully
+    /// restarted — which is what the console must say instead of naming a card
+    /// the machine does not have.
+    pub has_screen: bool,
     pub boot_order: Vec<BootDevice>,
     pub start_on_boot: bool,
     pub guest_agent: bool,
@@ -690,6 +715,10 @@ impl VirtService {
         let config = &machine.config;
         let observed = &machine.observed;
         let runtime = observed.runtime;
+        // Asked of the document rather than of `config.video`, which cannot
+        // tell "virtio-gpu" from "no display device at all" — see
+        // [`domain_xml::has_screen`].
+        let has_screen = domain_xml::has_screen(&observed.xml);
 
         // What is stored but has not reached the running machine. Compared
         // against what it is actually doing, not against a guess.
@@ -724,6 +753,7 @@ impl VirtService {
             machine: config.machine.clone(),
             firmware: config.firmware,
             video: config.video,
+            has_screen,
             boot_order: config.boot_order.clone(),
             start_on_boot: observed.autostart,
             guest_agent: config.guest_agent,
@@ -741,7 +771,7 @@ impl VirtService {
             total_disk_bytes: config.total_disk_bytes(),
             vnc_socket: console_socket_of(observed, config.vmid),
             pending_reboot: pending,
-            actions: actions_for(observed.state, &config.name),
+            actions: actions_for(observed.state, &config.name, has_screen),
         }
     }
 
@@ -1061,6 +1091,25 @@ impl VirtService {
             if changed {
                 pending.push(format!("{what} (takes effect when the machine restarts)"));
             }
+        }
+
+        // A machine that had no screen has just been given one, and no
+        // comparison above can notice: a document with no display device reads
+        // back as the default card, so `video` is equal on both sides even
+        // though one side has a graphics device and the other never did. Ask
+        // the document instead — the save has already rewritten it, and
+        // `render` always writes a `<graphics>` element.
+        //
+        // Worth its own sentence rather than folding into "graphics card",
+        // because the remedy is stricter than the usual one. A reboot keeps
+        // the same hypervisor process and therefore the same running document;
+        // only a full stop and start builds a machine with the socket on it.
+        if !domain_xml::has_screen(&machine.observed.xml) {
+            pending.push(
+                "the console (this machine had no screen; it needs a full stop and start, not a \
+                 reboot)"
+                    .to_string(),
+            );
         }
         (applied, pending)
     }
@@ -1867,6 +1916,85 @@ mod tests {
             h.service.console(999).await.unwrap_err(),
             VirtError::NotFound(_)
         ));
+    }
+
+    /// A machine defined before this appliance put a screen on one.
+    ///
+    /// The trap this pins is that its document parses as having the default
+    /// graphics card, because a document with no `<video>` in it always does.
+    /// So the console named a card the machine did not have, offered a viewer
+    /// against a socket nothing ever created, and — because `video` compared
+    /// equal on both sides of a save — reported nothing waiting for a restart
+    /// afterwards. Three things agreeing that the machine was fine, and a
+    /// console that would not open.
+    #[tokio::test]
+    async fn a_machine_that_predates_consoles_is_not_reported_as_having_a_card() {
+        let h = harness("no-screen").await;
+        let vm = h.service.create(create("web01")).await.unwrap();
+
+        // Rewind its document to what such a machine carries: neither device,
+        // because both arrived in the same release.
+        let stored = h.virt.live_xml("web01").await.unwrap();
+        let no_video = stored.replace(
+            "    <video>\n      <model type='virtio'/>\n    </video>\n",
+            "",
+        );
+        let before_consoles = no_video
+            .lines()
+            .filter(|line| !line.contains("<graphics"))
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
+        assert!(!before_consoles.contains("<video>"), "{before_consoles}");
+        assert!(!before_consoles.contains("<graphics"), "{before_consoles}");
+        assert!(!domain_xml::has_screen(&before_consoles));
+        h.virt.define(&before_consoles).await.unwrap();
+
+        let vm = h.service.get(vm.vmid).await.unwrap();
+        // The card still reads as the default. That is not a bug to fix in the
+        // parser — it is what the next save will write — it is the reason the
+        // console must ask the document instead.
+        assert_eq!(vm.video, VideoModel::Virtio);
+        assert!(!vm.has_screen);
+
+        // Running, and the console is refused with the remedy rather than
+        // offered as a viewer that opens and dies.
+        let running = h.service.start(vm.vmid).await.unwrap();
+        assert!(!running.actions.console.allowed);
+        let reason = running.actions.console.reason.clone().unwrap();
+        assert!(reason.contains("without a screen"), "{reason}");
+        assert!(reason.contains("stop and start"), "{reason}");
+        // The refusal and the disabled control say the same thing, as they do
+        // for a machine that is simply switched off.
+        assert_eq!(
+            h.service.console(vm.vmid).await.unwrap_err().to_string(),
+            reason
+        );
+
+        // Saving gives it a screen and says so — even though not one field of
+        // the configuration changed. This is the half that was missing: with
+        // `video` equal on both sides nothing was reported as pending, so an
+        // operator was told the save was complete and had no reason to
+        // restart.
+        let saved = h
+            .service
+            .update(
+                vm.vmid,
+                VmPatch {
+                    video: Some(VideoModel::Virtio),
+                    ..VmPatch::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(saved.vm.has_screen);
+        assert!(
+            saved
+                .pending_reboot
+                .iter()
+                .any(|note| note.contains("full stop and start")),
+            "{:?}",
+            saved.pending_reboot
+        );
     }
 
     #[tokio::test]

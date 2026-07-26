@@ -132,6 +132,25 @@ pub fn vnc_socket_of(xml: &str) -> Option<String> {
         .filter(|socket| !socket.trim().is_empty())
 }
 
+/// Whether this document gives the machine a screen at all.
+///
+/// The distinction [`VmConfig::video`] cannot make. A document with no
+/// `<video>` in it reads back as the default card — see the note on
+/// `config.video` in [`read`] — so a machine that predates consoles and a
+/// machine deliberately set to virtio-gpu are the same value by the time
+/// anything sees a `VmConfig`. That is fine for rendering, where the default
+/// is what the next save will write, and wrong everywhere an operator is being
+/// told what the machine *has*: the console page showed "VirtIO GPU" for a
+/// machine with no display device and no VNC server on it, which reads as a
+/// broken console rather than as a machine that needs saving.
+///
+/// So this asks the document rather than the parsed configuration, and it asks
+/// about `<graphics>` rather than `<video>` — the VNC server is the half the
+/// viewer connects to, and it is the half [`vnc_socket_of`] has to find.
+pub fn has_screen(xml: &str) -> bool {
+    vnc_socket_of(xml).is_some()
+}
+
 /// Everything the document carries, on the way back in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedDomain {
@@ -1404,6 +1423,38 @@ mod tests {
         let without = render(&config).replace(&video_block(VideoModel::Vga), "");
         assert!(!without.contains("<video>"), "{without}");
         assert_eq!(parse(&without).unwrap().config.video, VideoModel::Virtio);
+    }
+
+    /// …and that default is precisely why the card cannot be asked whether the
+    /// machine has a screen. Both documents below parse to `Virtio`; only one
+    /// of them has anything for a viewer to connect to, and telling an
+    /// operator the second one has a VirtIO GPU is how "save it and restart"
+    /// reads as "the console is broken".
+    #[test]
+    fn the_card_cannot_answer_whether_there_is_a_screen_but_the_document_can() {
+        let config = sample();
+        let with = render(&config);
+        assert!(has_screen(&with));
+
+        // A machine from before consoles: no <graphics>, no <video>.
+        let without = with
+            .replace(
+                &format!(
+                    "    <graphics type='vnc' socket='{}'/>\n",
+                    vnc_socket_path(config.vmid)
+                ),
+                "",
+            )
+            .replace(&format!("    {}\n", video_block(VideoModel::Virtio)), "");
+        assert!(!without.contains("<graphics"), "{without}");
+        assert!(!without.contains("<video>"), "{without}");
+
+        // The card says the same thing for both. The document does not.
+        assert_eq!(
+            parse(&with).unwrap().config.video,
+            parse(&without).unwrap().config.video
+        );
+        assert!(!has_screen(&without));
     }
 
     /// Operator text goes into the document as text, not as markup.
