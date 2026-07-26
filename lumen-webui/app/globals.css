@@ -731,6 +731,19 @@ body {
   min-height: max(460px, calc(100vh - 300px));
   background: #000;
 }
+/* Where noVNC hangs its own screen, and the reason it is a separate box rather
+   than the one above: noVNC's div is `height: 100%`, and a percentage height
+   resolves against the parent's *computed* height, which for a `flex: 1` item
+   is `auto` unless something above it has a height of its own. The detached
+   window has one — `h-screen` — so the viewer looked right there; the machine
+   page does not, so noVNC measured itself as zero pixels tall, scaled the guest
+   to fit that, and drew nothing on a black box the right size. Anchoring the
+   mount to the screen's own box gives that percentage something to be a
+   percentage of, either way round. */
+.qz-console-mount {
+  position: absolute;
+  inset: 0;
+}
 /* Full screen means the guest's screen, not the page's: the toolbar comes with
    it, because Ctrl-Alt-Del and the way back out are on it. */
 .qz-console:fullscreen {

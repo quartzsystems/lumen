@@ -431,7 +431,11 @@ export function ConsoleScreen({
         </div>
       </div>
 
-      <div className="qz-console-screen" ref={screenRef} onClick={() => rfbRef.current?.focus()}>
+      <div className="qz-console-screen" onClick={() => rfbRef.current?.focus()}>
+        {/* noVNC's alone: it appends its screen here and the teardown empties
+            it, and neither of those should be reaching into a box React is
+            also drawing the veil into. */}
+        <div className="qz-console-mount" ref={screenRef} />
         {status.kind !== "connected" && (
           <div className="qz-console-veil">
             {status.kind === "opening" ? (
