@@ -801,7 +801,23 @@ body {
   color: var(--qz-fg-3);
 }
 
-/* --- Scrollbars --- */
-::-webkit-scrollbar { width: 10px; }
+/* --- Scrollbars ---
+   The Quartz treatment: no track, and a thumb the colour of a border.
+   Quartz Command and QuartzFire declare the width, the thumb, and the track
+   exactly as below — those three lines are shared verbatim and must stay that
+   way.
+
+   The three additions are the axes and engines those lines leave out rather
+   than a different look. `width` alone styles vertical scrollbars only, so a
+   horizontal one kept the platform's height and sat noticeably thicker than
+   every vertical bar beside it; `height` is the same ten pixels. The corner
+   where two bars meet is its own pseudo-element and stayed the browser's
+   default grey against a transparent track. And `::-webkit-` has never
+   existed in Firefox, which needs the standard properties to be told any of
+   this — they inherit, so `:root` reaches every scroll container on the
+   page. */
+::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-thumb { background: var(--qz-ink-5); border-radius: 999px; }
 ::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-corner { background: transparent; }
+:root { scrollbar-width: thin; scrollbar-color: var(--qz-ink-5) transparent; }

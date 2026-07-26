@@ -167,6 +167,17 @@ impl TaskLog {
             .cloned()
             .collect()
     }
+
+    /// The whole node's history, newest first, capped at `limit`.
+    ///
+    /// What the dashboard's log panel reads. Unlike [`Self::for_vm`] this one
+    /// takes a limit, because the caller is showing a window onto the log
+    /// rather than the whole of one machine's past — and [`CAPACITY`] entries
+    /// is more than any panel wants to be handed.
+    pub fn recent(&self, limit: usize) -> Vec<TaskRecord> {
+        let inner = self.inner.lock().expect("task log lock poisoned");
+        inner.records.iter().rev().take(limit).cloned().collect()
+    }
 }
 
 fn append(path: &PathBuf, record: &TaskRecord) -> std::io::Result<()> {
@@ -234,6 +245,17 @@ mod tests {
         assert_eq!(tasks[1].action, "start");
         assert_eq!(tasks[1].status, TaskStatus::Ok);
         assert!(log.for_vm(999).is_empty());
+
+        // The node-wide view is every machine's history in one sequence,
+        // newest first, and the limit cuts from the old end rather than the
+        // new one.
+        let recent = log.recent(10);
+        assert_eq!(recent.len(), 3);
+        assert_eq!(recent[0].action, "reset");
+        assert_eq!(recent[2].action, "start");
+        assert_eq!(log.recent(2).len(), 2);
+        assert_eq!(log.recent(2)[0].action, "reset");
+        assert!(log.recent(0).is_empty());
     }
 
     #[test]

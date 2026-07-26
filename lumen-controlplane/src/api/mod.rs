@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod console;
 pub mod network;
+pub mod nodes;
 pub mod request;
 pub mod storage;
 pub mod system;
@@ -89,6 +90,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/vms/{vmid}/disks/{id}", delete(vms::detach_disk))
         .route("/api/vms/{vmid}/nics", post(vms::attach_nic))
         .route("/api/vms/{vmid}/nics/{id}", delete(vms::detach_nic))
+        // The same log as /api/vms/{vmid}/tasks, unfiltered and windowed —
+        // what the dashboard shows as activity across every machine. Not
+        // under /api/vms because it is not about one machine.
+        .route("/api/tasks", get(vms::recent_tasks))
+        // The nodes themselves: what each has, and what is running on it. The
+        // dashboard's compute panel and the Infrastructure section read this.
+        .route("/api/nodes", get(nodes::list))
         // The node itself: its local accounts, and its power state. Every
         // account route passes the session's own principal down, which is what
         // lets the domain refuse to lock the operator out of their own console

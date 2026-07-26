@@ -17,8 +17,10 @@ import { formatBytes, validationErrorsOf } from "@/lib/vmClient";
 import {
   createPool,
   fetchDevices,
+  recommendedVdev,
   usableBytes,
   VDEV_INFO,
+  vdevOptionsFor,
   type BlockDevice,
   type Compression,
   type PoolView,
@@ -45,7 +47,13 @@ export function CreatePoolDialog({
   const [loadError, setLoadError] = useState("");
 
   const [name, setName] = useState("");
-  const [vdev, setVdev] = useState<VdevKind>("mirror");
+  /// The arrangement the operator picked for themselves, or null while they
+  /// are happy with what the disk count recommends. Kept separate from the
+  /// arrangement in force so that adding a disk can move the recommendation
+  /// without overriding somebody who has already decided — and so that an
+  /// explicit choice the new selection cannot build falls back rather than
+  /// standing as an error.
+  const [vdevChoice, setVdevChoice] = useState<VdevKind | null>(null);
   const [chosen, setChosen] = useState<string[]>([]);
   const [compression, setCompression] = useState<Compression>("lz4");
   const [autotrim, setAutotrim] = useState(true);
@@ -80,6 +88,15 @@ export function CreatePoolDialog({
   // acknowledgement on, and the reason it names the disk.
   const occupied = picked.filter((device) => device.in_use);
   const smallest = picked.length > 0 ? Math.min(...picked.map((device) => device.size)) : 0;
+
+  // Everything about the arrangement is derived from how many disks are
+  // ticked, so there is no effect to keep in step and no moment where the
+  // list and the selection disagree.
+  const options = useMemo(() => vdevOptionsFor(picked.length), [picked.length]);
+  const recommended = recommendedVdev(picked.length);
+  const vdev = vdevChoice !== null && options.includes(vdevChoice) ? vdevChoice : recommended;
+  const hidden = (Object.keys(VDEV_INFO) as VdevKind[]).length - options.length;
+
   const spec = VDEV_INFO[vdev];
   const enough = picked.length >= spec.minDisks;
 
@@ -152,11 +169,28 @@ export function CreatePoolDialog({
           />
         </Field>
 
-        <Field label="Arrangement" htmlFor="pool-vdev" hint={spec.note}>
-          <SelectInput id="pool-vdev" value={vdev} onChange={(value) => setVdev(value as VdevKind)}>
-            {(Object.keys(VDEV_INFO) as VdevKind[]).map((kind) => (
+        {/* Only the arrangements the ticked disks can actually be built into,
+            with the conventional one for that many marked. Every disk added or
+            removed re-reads the list, so an arrangement is never on offer only
+            to be refused on submit. */}
+        <Field
+          label="Arrangement"
+          htmlFor="pool-vdev"
+          hint={
+            hidden > 0
+              ? `${spec.note} Arrangements that need more than ${picked.length} disk${picked.length === 1 ? "" : "s"} are not listed.`
+              : spec.note
+          }
+        >
+          <SelectInput
+            id="pool-vdev"
+            value={vdev}
+            onChange={(value) => setVdevChoice(value as VdevKind)}
+          >
+            {options.map((kind) => (
               <option key={kind} value={kind}>
-                {VDEV_INFO[kind].label} — {VDEV_INFO[kind].minDisks}+ disks
+                {VDEV_INFO[kind].label}
+                {kind === recommended && picked.length > 0 ? " — recommended" : ""}
               </option>
             ))}
           </SelectInput>

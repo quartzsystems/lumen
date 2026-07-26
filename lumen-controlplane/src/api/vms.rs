@@ -464,3 +464,33 @@ pub async fn tasks(
         serde_json::json!({ "tasks": state.tasks.for_vm(vmid) }),
     ))
 }
+
+/// How many entries `/api/tasks` answers with when the caller does not say,
+/// and the most it will answer with when they do. The default is a dashboard
+/// panel's worth; the cap is there so a mistyped query cannot ask for the
+/// whole log on every poll.
+const DEFAULT_TASK_LIMIT: usize = 50;
+const MAX_TASK_LIMIT: usize = 500;
+
+/// GET /api/tasks — how many entries to answer with.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskWindow {
+    limit: Option<usize>,
+}
+
+/// GET /api/tasks — everything that has been done on this node, newest first.
+///
+/// The same log [`tasks`] reads, unfiltered: the dashboard shows activity
+/// across every machine, and asking per machine would mean one request per
+/// machine on every poll to rebuild an ordering the log already has.
+pub async fn recent_tasks(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    Query(window): Query<TaskWindow>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let limit = window.limit.unwrap_or(DEFAULT_TASK_LIMIT).min(MAX_TASK_LIMIT);
+    Ok(Json(
+        serde_json::json!({ "tasks": state.tasks.recent(limit) }),
+    ))
+}

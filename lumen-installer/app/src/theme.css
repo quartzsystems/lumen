@@ -281,9 +281,30 @@ scrolledwindow {
     border-radius: 6px;
 }
 
+/* Same treatment as the web console: a trough that is not there, and a
+ * ten-pixel pill the colour of a border (ink-5). GTK sizes the slider off
+ * min-width/min-height rather than off the scrollbar, and it draws a trough
+ * background by default, so both have to be said here to land where the
+ * ::-webkit- rules land in lumen-webui/app/globals.css. */
+scrollbar {
+    background-color: transparent;
+    border: none;
+}
+
+scrollbar trough {
+    background-color: transparent;
+    border: none;
+}
+
 scrollbar slider {
     background-color: #252830;
     border-radius: 999px;
+    min-width: 10px;
+    min-height: 10px;
+}
+
+scrollbar slider:hover {
+    background-color: #2f323c;
 }
 
 separator {

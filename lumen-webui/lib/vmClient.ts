@@ -389,6 +389,13 @@ export interface TasksResponse {
 export const fetchVmTasks = (vmid: number): Promise<TasksResponse> =>
   apiFetch<TasksResponse>(`/vms/${vmid}/tasks`);
 
+/// The same log across every machine, newest first — what the dashboard shows
+/// as recent activity. `limit` is the size of the window, not a page: there is
+/// no paging through the log, and a panel that shows the last few dozen
+/// entries does not want one.
+export const fetchRecentTasks = (limit?: number): Promise<TasksResponse> =>
+  apiFetch<TasksResponse>(limit === undefined ? "/tasks" : `/tasks?limit=${limit}`);
+
 // --- the console viewer ------------------------------------------------------
 
 export const fetchConsole = (vmid: number): Promise<ConsoleInfo> =>

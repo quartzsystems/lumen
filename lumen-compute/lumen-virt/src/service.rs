@@ -321,6 +321,44 @@ pub struct VmsResponse {
     pub nodes: Vec<NodeVms>,
 }
 
+/// One node's capacity, and what the machines on it are holding.
+///
+/// The console's dashboard is what this exists for: a machine count is
+/// something `/api/vms` already answers, but "how much of this node is
+/// spoken for" needs the node's own size, and nothing above this line knew
+/// it. The hypervisor has always reported it — see [`HostInfo`] — it simply
+/// had no way out.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeView {
+    pub node: String,
+    /// Logical processors the node has online.
+    pub cpus: u32,
+    pub memory_mib: u64,
+    /// Memory kept back for the node itself, which no machine may be given.
+    pub reserved_memory_mib: u64,
+    pub hypervisor_version: Option<String>,
+    /// Machines defined here, and how many of them are running.
+    pub machines: u32,
+    pub running: u32,
+    /// What the running machines hold between them, as the hypervisor reports
+    /// it rather than as their documents ask for it — a machine whose memory
+    /// changed but which has not restarted is still holding the old amount.
+    ///
+    /// `used_vcpus` may exceed `cpus`: processors are overcommittable, and an
+    /// operator needs to see that they have been overcommitted rather than a
+    /// number clamped to look healthy.
+    pub used_vcpus: u32,
+    pub used_memory_mib: u64,
+}
+
+/// GET /api/nodes. A list of one today, and a list for the same reason
+/// [`VmsResponse`] groups by node: the shape must not change when clustering
+/// lands.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodesResponse {
+    pub nodes: Vec<NodeView>,
+}
+
 /// The answer to anything that changes a machine.
 #[derive(Debug, Clone, Serialize)]
 pub struct VmUpdateResponse {
@@ -569,6 +607,50 @@ impl VirtService {
             nodes: vec![NodeVms {
                 node: self.node.clone(),
                 vms,
+            }],
+        })
+    }
+
+    /// Every node this appliance manages, with its capacity and its load.
+    ///
+    /// One request to the hypervisor for the node's size and one for its
+    /// domains, so the numbers on the dashboard are the same reading rather
+    /// than two taken a moment apart.
+    pub async fn nodes(&self) -> Result<NodesResponse> {
+        let host = self.backend.host().await?;
+        let (machines, _) = self.machines().await?;
+
+        let running: Vec<&Machine> = machines
+            .iter()
+            .filter(|m| m.observed.state == DomainState::Running)
+            .collect();
+        // The hypervisor's figure where there is one. A machine that is
+        // running has a runtime; falling back to the document covers the gap
+        // between "started" and "the hypervisor has reported it".
+        let used_vcpus = running
+            .iter()
+            .map(|m| m.observed.runtime.map_or(m.config.vcpus, |r| r.vcpus))
+            .sum();
+        let used_memory_mib = running
+            .iter()
+            .map(|m| {
+                m.observed
+                    .runtime
+                    .map_or(m.config.memory_mib, |r| r.memory_kib / 1024)
+            })
+            .sum();
+
+        Ok(NodesResponse {
+            nodes: vec![NodeView {
+                node: self.node.clone(),
+                cpus: host.cpus,
+                memory_mib: host.memory_mib,
+                reserved_memory_mib: crate::state::HOST_MEMORY_RESERVE_MIB,
+                hypervisor_version: host.hypervisor_version,
+                machines: machines.len() as u32,
+                running: running.len() as u32,
+                used_vcpus,
+                used_memory_mib,
             }],
         })
     }
@@ -2508,6 +2590,41 @@ mod tests {
         let ids: Vec<u32> = response.nodes[0].vms.iter().map(|vm| vm.vmid).collect();
         assert_eq!(ids, vec![100, 105]);
         assert_eq!(response.nodes[0].node, h.service.node());
+    }
+
+    /// The node's own size, and how much of it the running machines hold. A
+    /// machine that is merely defined holds nothing — that is the whole
+    /// distinction the dashboard's meters are drawn from.
+    #[tokio::test]
+    async fn a_node_reports_its_capacity_and_only_what_is_running_against_it() {
+        let h = harness("nodes").await;
+
+        let idle = h.service.nodes().await.unwrap();
+        assert_eq!(idle.nodes.len(), 1);
+        let node = &idle.nodes[0];
+        assert_eq!(node.node, h.service.node());
+        assert_eq!(node.cpus, 16);
+        assert_eq!(node.memory_mib, 32_768);
+        assert_eq!(node.reserved_memory_mib, crate::state::HOST_MEMORY_RESERVE_MIB);
+        assert_eq!(node.hypervisor_version.as_deref(), Some("11.10.0"));
+        assert_eq!(node.machines, 0);
+        assert_eq!(node.running, 0);
+        assert_eq!(node.used_vcpus, 0);
+        assert_eq!(node.used_memory_mib, 0);
+
+        // Two machines defined, one of them started. `create` asks for 2
+        // processors and 4 GiB apiece.
+        h.service.create(create("idle")).await.unwrap();
+        let mut started = create("busy");
+        started.start = true;
+        h.service.create(started).await.unwrap();
+
+        let loaded = h.service.nodes().await.unwrap();
+        let node = &loaded.nodes[0];
+        assert_eq!(node.machines, 2);
+        assert_eq!(node.running, 1);
+        assert_eq!(node.used_vcpus, 2);
+        assert_eq!(node.used_memory_mib, 4096);
     }
 
     /// A machine somebody defined with the hypervisor's own tools is not

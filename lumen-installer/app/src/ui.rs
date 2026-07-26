@@ -9,7 +9,7 @@ use crate::sysinfo;
 
 use gtk::glib;
 use gtk::prelude::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::net::Ipv4Addr;
 use std::rc::Rc;
 use std::str::FromStr;
@@ -293,6 +293,27 @@ fn set_strings(dd: &gtk::DropDown, items: &[String]) {
     let refs: Vec<&str> = items.iter().map(String::as_str).collect();
     dd.set_model(Some(&gtk::StringList::new(&refs)));
     dd.set_selected(0);
+}
+
+/// What the layout menu says underneath itself, for this many ticked drives.
+///
+/// It describes the selection rather than listing every layout's minimum,
+/// because the menu no longer offers a layout the selection cannot build —
+/// there is nothing left for a list of minimums to warn about.
+fn topology_hint_text(count: usize) -> String {
+    match count {
+        0 => "Select the drives first. Only the layouts they can be built into are offered."
+            .to_string(),
+        1 => "One drive: a single-disk pool, with no redundancy — nothing to rebuild from if it \
+              fails."
+            .to_string(),
+        2 => "Two drives: a mirror survives either one failing. Capacity follows the smaller."
+            .to_string(),
+        _ => format!(
+            "{count} drives: RAIDZ1 survives one failing, RAIDZ2 survives two. Capacity follows \
+             the smallest drive."
+        ),
+    }
 }
 
 fn form_label(text: &str) -> gtk::Label {
@@ -782,10 +803,86 @@ fn page_disk(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
     let list = gtk::ListBox::new();
     list.set_selection_mode(gtk::SelectionMode::None);
 
+    let topology_dd = string_dropdown(&[]);
+    let topology_hint = gtk::Label::new(None);
+    topology_hint.add_css_class("qz-hint");
+    topology_hint.set_halign(gtk::Align::Start);
+    topology_hint.set_wrap(true);
+
+    // What the menu is currently showing, so a selected index means something:
+    // the menu is rebuilt every time the drive selection changes, and the row
+    // at index 1 is not the same layout from one rebuild to the next.
+    let shown: Rc<RefCell<Vec<PoolTopology>>> = Rc::new(RefCell::new(Vec::new()));
+    // The layout the operator picked for themselves, or None while they are
+    // happy with the recommendation. Selecting more drives moves the
+    // recommendation but must not overrule somebody who has already decided.
+    let explicit: Rc<Cell<Option<PoolTopology>>> = Rc::new(Cell::new(None));
+    // Set while the menu is being rewritten, so the writes below do not read
+    // back as the operator making a choice.
+    let updating = Rc::new(Cell::new(false));
+
+    // Re-offer the layouts the ticked drives can actually be built into, and
+    // mark the conventional one for that many. Everything here is derived from
+    // the count, so the menu can never be showing a layout the selection has
+    // stopped supporting.
+    let refresh: Rc<dyn Fn()> = {
+        let checks = checks.clone();
+        let topology_dd = topology_dd.clone();
+        let topology_hint = topology_hint.clone();
+        let shown = shown.clone();
+        let explicit = explicit.clone();
+        let updating = updating.clone();
+        Rc::new(move || {
+            let count = checks.borrow().iter().filter(|c| c.is_active()).count();
+            let options = PoolTopology::options_for(count);
+            let recommended = PoolTopology::recommended_for(count);
+            // Keep their choice where the selection still supports it, and
+            // fall back rather than leaving an impossible one standing.
+            let want = match explicit.get() {
+                Some(chosen) if options.contains(&chosen) => chosen,
+                _ => recommended,
+            };
+            let labels: Vec<String> = options
+                .iter()
+                .map(|t| {
+                    if *t == recommended && count > 0 {
+                        format!("{} — recommended", t.label())
+                    } else {
+                        t.label().to_string()
+                    }
+                })
+                .collect();
+            let index = options.iter().position(|t| *t == want).unwrap_or(0) as u32;
+
+            updating.set(true);
+            set_strings(&topology_dd, &labels);
+            topology_dd.set_selected(index);
+            updating.set(false);
+
+            *shown.borrow_mut() = options;
+            topology_hint.set_text(&topology_hint_text(count));
+        })
+    };
+
+    {
+        let shown = shown.clone();
+        let explicit = explicit.clone();
+        let updating = updating.clone();
+        topology_dd.connect_selected_notify(move |dd| {
+            if updating.get() {
+                return;
+            }
+            if let Some(picked) = shown.borrow().get(dd.selected() as usize) {
+                explicit.set(Some(*picked));
+            }
+        });
+    }
+
     let populate = {
         let list = list.clone();
         let disks = disks.clone();
         let checks = checks.clone();
+        let refresh = refresh.clone();
         move || {
             while let Some(child) = list.first_child() {
                 list.remove(&child);
@@ -814,6 +911,13 @@ fn page_disk(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
                 );
                 let check = gtk::CheckButton::new();
                 check.set_valign(gtk::Align::Center);
+                {
+                    // Ticking a drive changes which layouts are possible, so
+                    // the menu is re-offered from here rather than only when
+                    // the operator reaches for it.
+                    let refresh = refresh.clone();
+                    check.connect_toggled(move |_| refresh());
+                }
                 let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
                 let title_label = gtk::Label::new(Some(&disk.path));
                 title_label.set_halign(gtk::Align::Start);
@@ -836,6 +940,9 @@ fn page_disk(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
             if let Some(first) = checks.borrow().first() {
                 first.set_active(true);
             }
+            // A rescan that finds the same one drive already ticked fires no
+            // toggle, so the menu is re-offered here either way.
+            refresh();
         }
     };
     populate();
@@ -854,16 +961,6 @@ fn page_disk(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
         let populate = populate.clone();
         rescan.connect_clicked(move |_| populate());
     }
-
-    let topology_labels: Vec<&str> = PoolTopology::ALL.iter().map(|t| t.label()).collect();
-    let topology_dd = string_dropdown(&topology_labels);
-    let topology_hint = gtk::Label::new(Some(
-        "Mirror needs 2 or more drives, RAIDZ1 needs 3, RAIDZ2 needs 4. \
-         Pool capacity follows the smallest drive.",
-    ));
-    topology_hint.add_css_class("qz-hint");
-    topology_hint.set_halign(gtk::Align::Start);
-    topology_hint.set_wrap(true);
 
     let error = gtk::Label::new(None);
     error.add_css_class("qz-error");
@@ -894,6 +991,7 @@ fn page_disk(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
         let disks = disks.clone();
         let checks = checks.clone();
         let topology_dd = topology_dd.clone();
+        let shown = shown.clone();
         let error = error.clone();
         next.connect_clicked(move |_| {
             let disks = disks.borrow();
@@ -904,23 +1002,28 @@ fn page_disk(stack: &gtk::Stack, draft: &Rc<RefCell<Draft>>) -> gtk::Box {
                 .filter(|(_, check)| check.is_active())
                 .filter_map(|(i, _)| disks.get(i))
                 .collect();
-            let topology = PoolTopology::ALL[topology_dd.selected() as usize];
             if selected.is_empty() {
                 error.set_text("Select at least one target drive.");
                 return;
             }
-            if topology == PoolTopology::Single && selected.len() != 1 {
-                error.set_text(
-                    "Single disk uses exactly one drive — pick a RAID layout for several.",
-                );
+            // The menu only offers layouts the selection supports, so the two
+            // checks that used to live here cannot fire from the menu any
+            // more. They stay as the backstop they always were: this reads an
+            // index into a model that is rebuilt as drives are ticked, and a
+            // pool is not the place to find out that the two got out of step.
+            // Read it out before matching, so the menu's borrow ends here
+            // rather than spanning the branches below.
+            let picked = shown.borrow().get(topology_dd.selected() as usize).copied();
+            let Some(topology) = picked else {
+                error.set_text("Select a pool layout.");
                 return;
-            }
-            if selected.len() < topology.min_disks() {
+            };
+            if !topology.fits(selected.len()) {
                 error.set_text(&format!(
-                    "{} needs at least {} drives ({} selected).",
+                    "{} cannot be built from {} drive{}.",
                     topology.label(),
-                    topology.min_disks(),
-                    selected.len()
+                    selected.len(),
+                    if selected.len() == 1 { "" } else { "s" }
                 ));
                 return;
             }

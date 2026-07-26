@@ -197,6 +197,38 @@ export const usableBytes = (vdev: VdevKind, disks: number, smallest: number): nu
   return smallest * Math.max(0, disks - VDEV_INFO[vdev].parity);
 };
 
+/// The arrangements this many disks can actually be built into.
+///
+/// The picker offers only these. An arrangement that needs more disks than
+/// are chosen is not a choice — it is a thing to be told off for choosing,
+/// and a form that offers an option only to reject it has wasted a step.
+///
+/// With nothing chosen yet there is nothing to narrow by, so the whole list
+/// shows: that is the operator reading what the appliance can build, before
+/// they have said anything for it to be measured against.
+export const vdevOptionsFor = (disks: number): VdevKind[] => {
+  const all = Object.keys(VDEV_INFO) as VdevKind[];
+  return disks === 0 ? all : all.filter((kind) => disks >= VDEV_INFO[kind].minDisks);
+};
+
+/// What to build this many disks into, unless the operator says otherwise.
+///
+/// The long-standing ZFS shape: two disks mirror, and past that the parity
+/// grows with the width, because the wider the group the longer a rebuild
+/// takes and the more likely a second disk goes during it. The boundaries are
+/// the conventional ones — raidz1 to five wide, raidz2 to ten, raidz3 beyond.
+///
+/// Mirrored in `PoolTopology::recommended_for` in the installer
+/// (lumen-installer/app/src/config.rs), which offers the same arrangements
+/// under its own names and must give the same answer.
+export const recommendedVdev = (disks: number): VdevKind => {
+  if (disks <= 1) return "stripe";
+  if (disks === 2) return "mirror";
+  if (disks <= 5) return "raidz1";
+  if (disks <= 10) return "raidz2";
+  return "raidz3";
+};
+
 export const fetchIsos = (): Promise<IsosResponse> => apiFetch<IsosResponse>("/storage/iso");
 
 export const createIsoStore = (pool: string): Promise<IsoStoreView> =>

@@ -94,6 +94,9 @@ distinction, and a copy-pasteable `curl` walkthrough):
 | `/api/vms/:vmid/nics/:id`               | DELETE | Detach it (`:id` is the hardware address)    |
 | `/api/vms/:vmid/console`                | GET    | Where the console is, or why there is none   |
 | `/api/vms/:vmid/console/ws`             | GET    | The console stream — a WebSocket             |
+| `/api/vms/:vmid/tasks`                  | GET    | What has been done to this machine, newest first |
+| `/api/tasks`                            | GET    | The same log across every machine; `?limit=` windows it |
+| `/api/nodes`                            | GET    | Each node's processors, memory, and what is running against them |
 | `/api/storage/pools`                    | GET    | Pools, grouped by node                       |
 | `/api/storage/pools`                    | POST   | Build a pool                                 |
 | `/api/storage/pools/:pool`              | DELETE | Destroy one, and everything on it            |

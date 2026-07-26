@@ -74,6 +74,52 @@ impl PoolTopology {
             Self::Raidz2 => 4,
         }
     }
+
+    /// Whether this many drives can actually be built into this layout.
+    ///
+    /// Not simply `disks >= min_disks`: a single-disk pool is *exactly* one
+    /// disk, and offering it for four would silently build a pool that used
+    /// one of them. The Review button has always refused that; this is the
+    /// same rule moved to where it stops the choice being made.
+    pub fn fits(self, disks: usize) -> bool {
+        match self {
+            Self::Single => disks == 1,
+            other => disks >= other.min_disks(),
+        }
+    }
+
+    /// The layouts this many drives can be built into, in menu order.
+    ///
+    /// With nothing selected there is nothing to narrow by, so the whole menu
+    /// shows — that is the operator reading what the installer offers before
+    /// they have picked anything for it to be measured against.
+    pub fn options_for(disks: usize) -> Vec<PoolTopology> {
+        if disks == 0 {
+            return Self::ALL.to_vec();
+        }
+        Self::ALL.iter().copied().filter(|t| t.fits(disks)).collect()
+    }
+
+    /// What to build this many drives into, unless the operator says
+    /// otherwise.
+    ///
+    /// The long-standing ZFS shape: two drives mirror, and past that the
+    /// parity grows with the width, because the wider the group the longer a
+    /// rebuild takes and the more likely a second drive goes during it.
+    ///
+    /// Mirrored in `recommendedVdev` in the console
+    /// (lumen-webui/lib/storageClient.ts), which offers the same arrangements
+    /// under their ZFS names and must give the same answer. The console also
+    /// offers RAIDZ3, which the installer does not: a boot pool that wide is
+    /// not something to set up on the way past.
+    pub fn recommended_for(disks: usize) -> PoolTopology {
+        match disks {
+            0 | 1 => Self::Single,
+            2 => Self::Mirror,
+            3..=5 => Self::Raidz1,
+            _ => Self::Raidz2,
+        }
+    }
 }
 
 /// Accepts a dotted-quad netmask ("255.255.240.0") or a bare prefix
@@ -142,6 +188,52 @@ impl BuildPins {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The menu never offers a layout the ticked drives cannot be built into,
+    /// and one drive is offered exactly one choice.
+    #[test]
+    fn the_menu_offers_only_what_the_drives_can_build() {
+        assert_eq!(PoolTopology::options_for(1), vec![PoolTopology::Single]);
+        assert_eq!(PoolTopology::options_for(2), vec![PoolTopology::Mirror]);
+        assert_eq!(
+            PoolTopology::options_for(3),
+            vec![PoolTopology::Mirror, PoolTopology::Raidz1]
+        );
+        assert_eq!(
+            PoolTopology::options_for(4),
+            vec![
+                PoolTopology::Mirror,
+                PoolTopology::Raidz1,
+                PoolTopology::Raidz2
+            ]
+        );
+        // A single-disk pool is exactly one disk, so it drops off the moment
+        // there is a second — unlike every other minimum, which is a floor.
+        assert!(!PoolTopology::options_for(2).contains(&PoolTopology::Single));
+        // Nothing ticked narrows nothing.
+        assert_eq!(PoolTopology::options_for(0), PoolTopology::ALL.to_vec());
+    }
+
+    #[test]
+    fn the_recommendation_is_always_one_of_the_options() {
+        for count in 1..=12 {
+            let recommended = PoolTopology::recommended_for(count);
+            assert!(
+                PoolTopology::options_for(count).contains(&recommended),
+                "{count} drives recommends {recommended:?}, which is not on offer"
+            );
+        }
+    }
+
+    #[test]
+    fn the_recommendation_follows_the_drive_count() {
+        assert_eq!(PoolTopology::recommended_for(1), PoolTopology::Single);
+        assert_eq!(PoolTopology::recommended_for(2), PoolTopology::Mirror);
+        assert_eq!(PoolTopology::recommended_for(3), PoolTopology::Raidz1);
+        assert_eq!(PoolTopology::recommended_for(5), PoolTopology::Raidz1);
+        assert_eq!(PoolTopology::recommended_for(6), PoolTopology::Raidz2);
+        assert_eq!(PoolTopology::recommended_for(12), PoolTopology::Raidz2);
+    }
 
     #[test]
     fn parses_build_pins() {
