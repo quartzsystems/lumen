@@ -361,6 +361,11 @@ fn render_metadata(out: &mut String, config: &VmConfig, started_at: Option<u64>)
             text(&config.tags.join(","))
         );
     }
+    if config.ha {
+        // Present means on; absent means off. A boolean that is always
+        // written invites a third state nobody meant.
+        out.push_str("      <lumen:ha>1</lumen:ha>\n");
+    }
     if let Some(started) = started_at {
         let _ = writeln!(out, "      <lumen:started>{started}</lumen:started>");
     }
@@ -830,6 +835,7 @@ fn read(xml: &str) -> Result<(ParsedDomain, Option<u32>)> {
                     }
                     "domain/cpu/model" => cpu_named = Some(value),
                     "domain/metadata/vm/vmid" => vmid = value.parse().ok(),
+                    "domain/metadata/vm/ha" => config.ha = value.trim() == "1",
                     "domain/metadata/vm/description" => config.description = Some(value),
                     "domain/metadata/vm/tags" => {
                         config.tags = value
@@ -1069,6 +1075,7 @@ mod tests {
             boot_order: vec![BootDevice::Disk, BootDevice::Network],
             start_on_boot: false,
             guest_agent: true,
+            ha: true,
             tags: vec!["production".into(), "web".into()],
             os_id: Some("http://almalinux.org/almalinux/10".into()),
             disks: vec![disk(

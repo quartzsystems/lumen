@@ -54,6 +54,27 @@ pub struct VolumeResizeBacking {
     pub zvol_bytes: u64,
 }
 
+/// One member's snapshot of its backing zvol — taking one, rolling back to
+/// one, or dropping one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VolumeSnapshot {
+    pub zvol: String,
+    pub snapshot: String,
+}
+
+/// A re-rendered resource file with [`SECRET_PLACEHOLDER`] where the
+/// shared-secret goes — the member substitutes its own on arrival, because
+/// the secret never leaves the nodes that hold it. The 2→3 policy flip's
+/// payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VolumeApply {
+    pub resource: String,
+    pub resource_file: String,
+}
+
+/// The marker `VolumeApply::resource_file` carries in place of the secret.
+pub const SECRET_PLACEHOLDER: &str = "@@LUMEN-SECRET@@";
+
 #[async_trait]
 pub trait VolumePeers: Send + Sync {
     /// Make one member carry its replica, whole or not at all.
@@ -85,6 +106,44 @@ pub trait VolumePeers: Send + Sync {
         resource: &str,
         allow: bool,
     ) -> Result<()>;
+
+    /// Snapshot one member's backing zvol.
+    async fn snapshot_backing(
+        &self,
+        node: &EnvironmentNode,
+        payload: &VolumeSnapshot,
+    ) -> Result<()>;
+
+    /// Roll one member's backing zvol back — the rollback workflow's
+    /// destructive middle, run on exactly one member while the resource is
+    /// down everywhere.
+    async fn rollback_backing(
+        &self,
+        node: &EnvironmentNode,
+        payload: &VolumeSnapshot,
+    ) -> Result<()>;
+
+    /// Drop one member's snapshot.
+    async fn drop_snapshot(&self, node: &EnvironmentNode, payload: &VolumeSnapshot) -> Result<()>;
+
+    /// Take the resource down on one member without touching its file or
+    /// its zvol — the rollback workflow's opening.
+    async fn down_resource(&self, node: &EnvironmentNode, resource: &str) -> Result<()>;
+
+    /// Bring it back up.
+    async fn up_resource(&self, node: &EnvironmentNode, resource: &str) -> Result<()>;
+
+    /// Declare the peers of one member out of date — the member that rolled
+    /// back is the truth, and everyone else resyncs from it.
+    async fn invalidate_remote(&self, node: &EnvironmentNode, resource: &str) -> Result<()>;
+
+    /// Reconnect one member, discarding its own writes when it is the
+    /// split-brain victim.
+    async fn reconnect(&self, node: &EnvironmentNode, resource: &str, discard: bool) -> Result<()>;
+
+    /// Hand one member a re-rendered resource file (secret placeholder
+    /// included) to substitute, write, and `drbdadm adjust` — live.
+    async fn apply_policy(&self, node: &EnvironmentNode, payload: &VolumeApply) -> Result<()>;
 }
 
 // --- in-memory peers --------------------------------------------------------
@@ -109,9 +168,19 @@ struct MockInner {
     resized: Vec<(String, VolumeResizeBacking)>,
     grown: Vec<(String, String)>,
     two_primaries: Vec<(String, String, bool)>,
+    snapshots: Vec<(String, VolumeSnapshot)>,
+    rollbacks: Vec<(String, VolumeSnapshot)>,
+    dropped_snapshots: Vec<(String, VolumeSnapshot)>,
+    downs: Vec<(String, String)>,
+    ups: Vec<(String, String)>,
+    invalidated: Vec<(String, String)>,
+    reconnects: Vec<(String, String, bool)>,
+    applied: Vec<(String, VolumeApply)>,
     fail_prepare: Option<String>,
     fail_teardown: Option<String>,
     fail_resize: Option<String>,
+    fail_snapshot: Option<String>,
+    fail_up: Option<String>,
 }
 
 impl MockVolumePeers {
@@ -167,6 +236,49 @@ impl MockVolumePeers {
     /// Every two-primaries adjustment, in order: (node, resource, allow).
     pub fn two_primaries(&self) -> Vec<(String, String, bool)> {
         self.inner.lock().unwrap().two_primaries.clone()
+    }
+
+    pub fn fail_snapshot_on(self, node: &str) -> Self {
+        self.inner.lock().unwrap().fail_snapshot = Some(node.to_string());
+        self
+    }
+
+    pub fn fail_up_on(self, node: &str) -> Self {
+        self.inner.lock().unwrap().fail_up = Some(node.to_string());
+        self
+    }
+
+    pub fn snapshots(&self) -> Vec<(String, VolumeSnapshot)> {
+        self.inner.lock().unwrap().snapshots.clone()
+    }
+
+    pub fn rollbacks(&self) -> Vec<(String, VolumeSnapshot)> {
+        self.inner.lock().unwrap().rollbacks.clone()
+    }
+
+    pub fn dropped_snapshots(&self) -> Vec<(String, VolumeSnapshot)> {
+        self.inner.lock().unwrap().dropped_snapshots.clone()
+    }
+
+    pub fn downs(&self) -> Vec<(String, String)> {
+        self.inner.lock().unwrap().downs.clone()
+    }
+
+    pub fn ups(&self) -> Vec<(String, String)> {
+        self.inner.lock().unwrap().ups.clone()
+    }
+
+    pub fn invalidated(&self) -> Vec<(String, String)> {
+        self.inner.lock().unwrap().invalidated.clone()
+    }
+
+    /// Every reconnect, in order: (node, resource, discarded).
+    pub fn reconnects(&self) -> Vec<(String, String, bool)> {
+        self.inner.lock().unwrap().reconnects.clone()
+    }
+
+    pub fn applied(&self) -> Vec<(String, VolumeApply)> {
+        self.inner.lock().unwrap().applied.clone()
     }
 }
 
@@ -257,6 +369,92 @@ impl VolumePeers for MockVolumePeers {
             resource.to_string(),
             allow,
         ));
+        Ok(())
+    }
+
+    async fn snapshot_backing(
+        &self,
+        node: &EnvironmentNode,
+        payload: &VolumeSnapshot,
+    ) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.fail_snapshot.as_deref() == Some(node.name.as_str()) {
+            return Err(DrbdError::Conflict(format!(
+                "the snapshot on \"{}\" failed",
+                node.name
+            )));
+        }
+        inner.snapshots.push((node.name.clone(), payload.clone()));
+        Ok(())
+    }
+
+    async fn rollback_backing(
+        &self,
+        node: &EnvironmentNode,
+        payload: &VolumeSnapshot,
+    ) -> Result<()> {
+        self.inner
+            .lock()
+            .unwrap()
+            .rollbacks
+            .push((node.name.clone(), payload.clone()));
+        Ok(())
+    }
+
+    async fn drop_snapshot(&self, node: &EnvironmentNode, payload: &VolumeSnapshot) -> Result<()> {
+        self.inner
+            .lock()
+            .unwrap()
+            .dropped_snapshots
+            .push((node.name.clone(), payload.clone()));
+        Ok(())
+    }
+
+    async fn down_resource(&self, node: &EnvironmentNode, resource: &str) -> Result<()> {
+        self.inner
+            .lock()
+            .unwrap()
+            .downs
+            .push((node.name.clone(), resource.to_string()));
+        Ok(())
+    }
+
+    async fn up_resource(&self, node: &EnvironmentNode, resource: &str) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.fail_up.as_deref() == Some(node.name.as_str()) {
+            return Err(DrbdError::Conflict(format!(
+                "\"{}\" would not come back up",
+                node.name
+            )));
+        }
+        inner.ups.push((node.name.clone(), resource.to_string()));
+        Ok(())
+    }
+
+    async fn invalidate_remote(&self, node: &EnvironmentNode, resource: &str) -> Result<()> {
+        self.inner
+            .lock()
+            .unwrap()
+            .invalidated
+            .push((node.name.clone(), resource.to_string()));
+        Ok(())
+    }
+
+    async fn reconnect(&self, node: &EnvironmentNode, resource: &str, discard: bool) -> Result<()> {
+        self.inner.lock().unwrap().reconnects.push((
+            node.name.clone(),
+            resource.to_string(),
+            discard,
+        ));
+        Ok(())
+    }
+
+    async fn apply_policy(&self, node: &EnvironmentNode, payload: &VolumeApply) -> Result<()> {
+        self.inner
+            .lock()
+            .unwrap()
+            .applied
+            .push((node.name.clone(), payload.clone()));
         Ok(())
     }
 }

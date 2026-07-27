@@ -253,6 +253,8 @@ pub struct VmView {
     pub boot_order: Vec<BootDevice>,
     pub start_on_boot: bool,
     pub guest_agent: bool,
+    /// Restart on a surviving member after this node is confirmed lost.
+    pub ha: bool,
     /// What the machine was built to run, in libosinfo's words. Metadata; the
     /// console shows it and nothing reads it to decide anything.
     pub os_id: Option<String>,
@@ -425,6 +427,12 @@ pub struct VmCreate {
     pub start_on_boot: bool,
     #[serde(default = "default_true")]
     pub guest_agent: bool,
+    /// Restart on a surviving member after this node is confirmed lost.
+    /// Meaningful only for a machine whose disks are all replicated; the HA
+    /// manager checks that at restart time, because disks change after
+    /// creation.
+    #[serde(default)]
+    pub ha: bool,
     #[serde(default)]
     pub tags: Vec<String>,
     /// The guest this machine is for, as a libosinfo identifier. Checked
@@ -529,6 +537,7 @@ pub struct VmPatch {
     pub boot_order: Option<Vec<BootDevice>>,
     pub start_on_boot: Option<bool>,
     pub guest_agent: Option<bool>,
+    pub ha: Option<bool>,
     pub tags: Option<Vec<String>>,
 }
 
@@ -880,6 +889,7 @@ impl VirtService {
             boot_order: config.boot_order.clone(),
             start_on_boot: observed.autostart,
             guest_agent: config.guest_agent,
+            ha: config.ha,
             os_id: config.os_id.clone(),
             disks: config.disks.clone(),
             cdroms: config.cdroms.clone(),
@@ -983,6 +993,7 @@ impl VirtService {
                 .unwrap_or_else(|| VmConfig::default().boot_order),
             start_on_boot: request.start_on_boot,
             guest_agent: request.guest_agent,
+            ha: request.ha,
             tags: tidy_tags(request.tags),
             os_id: tidy(request.os_id),
             disks: Vec::new(),
@@ -1172,6 +1183,9 @@ impl VirtService {
         }
         if let Some(agent) = patch.guest_agent {
             config.guest_agent = agent;
+        }
+        if let Some(ha) = patch.ha {
+            config.ha = ha;
         }
         if let Some(tags) = patch.tags {
             config.tags = tidy_tags(tags);
@@ -1598,6 +1612,25 @@ impl VirtService {
     /// definition replication pushes to the cluster's other members.
     pub async fn definition(&self, vmid: u32) -> Result<String> {
         Ok(self.machine(vmid).await?.observed.xml)
+    }
+
+    /// Define-and-start a machine from a replicated definition — the HA
+    /// manager's one verb, after the machine's node is confirmed lost. The
+    /// document is defined verbatim: its disks are `/dev/drbd` devices that
+    /// exist here too, which is the whole reason it can move.
+    pub async fn adopt(&self, xml: &str) -> Result<VmView> {
+        let _guard = self.gate.lock().await;
+        let parsed = domain_xml::parse(xml)?;
+        let vmid = parsed.config.vmid;
+        if self.machine(vmid).await.is_ok() {
+            return Err(VirtError::Conflict(format!(
+                "Machine {vmid} is already defined on this node."
+            )));
+        }
+        self.backend.define(xml).await?;
+        self.start_domain(&parsed.config).await?;
+        tracing::info!(vmid, name = %parsed.config.name, "machine adopted and started");
+        self.get(vmid).await
     }
 
     pub async fn attach_disk(&self, vmid: u32, request: DiskCreate) -> Result<VmUpdateResponse> {
@@ -2188,6 +2221,7 @@ mod tests {
             boot_order: None,
             start_on_boot: false,
             guest_agent: true,
+            ha: false,
             tags: Vec::new(),
             os_id: None,
             cdroms: Vec::new(),

@@ -64,6 +64,22 @@ impl DrbdBackend for UnavailableBackend {
     async fn set_two_primaries(&self, _resource: &str, _allow: bool) -> Result<()> {
         self.error()
     }
+
+    async fn invalidate_remote(&self, _resource: &str) -> Result<()> {
+        self.error()
+    }
+
+    async fn reconnect(&self, _resource: &str, _discard: bool) -> Result<()> {
+        self.error()
+    }
+
+    async fn read_resource(&self, _resource: &str) -> Result<String> {
+        self.error()
+    }
+
+    async fn adjust(&self, _resource: &str) -> Result<()> {
+        self.error()
+    }
 }
 
 #[cfg(test)]

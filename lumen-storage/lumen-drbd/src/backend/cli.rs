@@ -182,6 +182,58 @@ impl DrbdBackend for CliBackend {
         )
         .await
     }
+
+    async fn invalidate_remote(&self, resource: &str) -> Result<()> {
+        self.drbdadm(
+            "declare the peers of a volume out of date",
+            &format!("invalidating the peers of {resource} failed"),
+            &["invalidate-remote", resource],
+        )
+        .await
+    }
+
+    async fn read_resource(&self, resource: &str) -> Result<String> {
+        let path = Self::resource_path(resource);
+        tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|err| DrbdError::Conflict(format!("{path} is not readable ({err}).")))
+    }
+
+    async fn adjust(&self, resource: &str) -> Result<()> {
+        self.drbdadm(
+            "apply a volume's configuration live",
+            &format!("adjusting {resource} failed"),
+            &["adjust", resource],
+        )
+        .await
+    }
+
+    async fn reconnect(&self, resource: &str, discard: bool) -> Result<()> {
+        // A StandAlone side may refuse the disconnect ("not connected") —
+        // that is the state we are here to leave, not an error.
+        let _ = self
+            .drbdadm(
+                "disconnect a volume before reconnecting",
+                &format!("disconnecting {resource} failed"),
+                &["disconnect", resource],
+            )
+            .await;
+        if discard {
+            self.drbdadm(
+                "reconnect a volume, discarding this node's writes",
+                &format!("reconnecting {resource} (discarding) failed"),
+                &["connect", "--discard-my-data", resource],
+            )
+            .await
+        } else {
+            self.drbdadm(
+                "reconnect a volume",
+                &format!("reconnecting {resource} failed"),
+                &["connect", resource],
+            )
+            .await
+        }
+    }
 }
 
 #[cfg(test)]

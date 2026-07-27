@@ -64,10 +64,12 @@ pub use networks::{
     ManagementNetwork, Subnet, Uplink, VlanMode,
 };
 pub use service::{
-    ClusterHealth, ClusterNodeView, ClusterService, ClusterView, EnvironmentResponse,
+    AddNodePlan, ClusterHealth, ClusterNodeView, ClusterService, ClusterView, EnvironmentResponse,
     EnvironmentView, FenceSummaryView, FenceTestView, JoinOutcome, MintedToken, UnassignedNodeView,
 };
 pub use state::{ClusterState, FenceDeviceState, FenceTest, NodeState, QuorumState, RingLink};
-pub use store::{EnvironmentStore, Identity};
+pub use store::{EnvironmentStore, Identity, StoredDefinition};
 pub use topology::{ClusterTopology, FenceDevice, ReplicationPolicy};
-pub use validate::{Acknowledgements, ClusterCreate, ValidationCode, ValidationError};
+pub use validate::{
+    Acknowledgements, ClusterCreate, MemberCreate, ValidationCode, ValidationError,
+};

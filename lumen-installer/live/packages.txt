@@ -39,6 +39,12 @@ zfs
 kmod-zfs
 zfs-dracut
 
+# DRBD (kABI kmod, ELRepo; pinned in iso/pins.env). Not used by the live
+# environment itself — installed so the same kABI gate that proves kmod-zfs
+# resolves against the pinned kernel proves kmod-drbd9x too, before an ISO
+# that cannot form a cluster ever ships.
+kmod-drbd9x
+
 # GUI stack (same as EL10 Anaconda: gnome-kiosk on Wayland + GTK4).
 # gnome-session drives the gnome-kiosk-script session (see lumen-kiosk.service).
 gnome-kiosk

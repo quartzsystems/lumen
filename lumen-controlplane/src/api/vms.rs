@@ -117,6 +117,9 @@ fn changed_fields(patch: &VmPatch) -> Vec<&'static str> {
     if patch.video.is_some() {
         fields.push("graphics");
     }
+    if patch.ha.is_some() {
+        fields.push("high availability");
+    }
     if patch.boot_order.is_some() {
         fields.push("boot order");
     }

@@ -1,15 +1,16 @@
 # Lumen clustering
 
 The environment, its clusters, and the machinery that keeps a cluster honest:
-membership, quorum, and fencing. Three stages in: the model, the topology
-engine, and the read path came first; the workflows second — joining an
+membership, quorum, and fencing. The program built up in stages: the model,
+the topology engine, and the read path; the workflows — joining an
 environment with a one-time token, and building (or destroying) a cluster
-transactionally, per node, per step, unwound completely on failure. This
-release completes fencing: the create writes one `fence_ipmilan` device per
-member into the CIB, every direction can be live-tested from the console —
-guarded, and recorded either way — and the break-glass confirm-peer-dead
-exists for the one state that has no automatic resolution. What still lands
-after is listed at the end.
+transactionally, per node, per step, unwound completely on failure; fencing
+— one `fence_ipmilan` device per member in the CIB, every direction
+live-testable from the console, and the break-glass confirm-peer-dead for
+the one state with no automatic resolution; replicated volumes and the
+machines on them (docs/storage.md); and finally the 2→3 scale-out, which
+grows a running cluster by a node and flips it out of the two-node regime
+live. What deliberately remains is listed at the end.
 
 ```
 lumen-storage/
@@ -347,6 +348,39 @@ The wizard shows the same truth: the plan is laid out before anything runs —
 every step pending, per node — and failure appends visible unwind steps
 rather than replacing the history with an apology.
 
+### Adding a node reconfigures the survivors live, and the regime flips as a consequence
+
+The 2→3 scale-out (any N→N+1 up to five, but 2→3 is the one that changes
+the rules) is the create's shape run against a cluster that is already
+serving: preflight the newcomer, prepare it with a **regenerated**
+corosync.conf and the cluster's existing authkey, push the same new conf to
+every existing member over the peer channel — each writes it and reloads
+with `corosync-cfgtool -R`, no restart, membership grows under the running
+stack — start the newcomer, wait for the grown cluster to form, re-set the
+properties for the new size, and write the record last, exactly as a create
+does. A failure unwinds the newcomer and pushes the **old** configuration
+back to every member that took the new one, so the cluster ends the failed
+attempt exactly as it began.
+
+The regime flip is not a step of its own — it falls out of the one topology
+engine: the regenerated conf simply stops carrying `two_node` and
+`wait_for_all`, the properties pass sets `no-quorum-policy=stop`, and the
+fence-race delays that decided a two-node partition are flattened
+(`pcs stonith update … pcmk_delay_base=0s`) because majority quorum now
+answers that question. The newcomer gets its fence device written into the
+CIB like everyone else's; the **live** fence test remains a separate,
+deliberate operator act from the Nodes page — auto-firing a power cycle
+from inside a grow workflow would bypass everything the acknowledgement
+design exists for, a recorded deviation from the spec's "test it during the
+add". After the cluster domain finishes, the control plane chains the
+replicated-volume policy flip (docs/storage.md) — the dependency points
+that way, so the chaining lives above both.
+
+Existing volumes and machines keep running through all of it: the
+reconfigure is a reload, the delays flatten under a formed cluster, and the
+volume policy applies with `drbdadm adjust`. The newcomer is new capacity —
+no volume moves to it by itself.
+
 ### Joining signs everyone out, and that is the join working
 
 The environment shares one web-session secret, distributed at join and
@@ -398,6 +432,7 @@ one level upward: grouped by cluster, then by node.
 | GET | `/api/environment/clusters/pending` | The create in flight (or last finished): per node, per step |
 | DELETE | `/api/environment/clusters/:name` | Destroy — every member torn down, `i_understand_this_may_lose_data` required |
 | DELETE | `/api/environment/nodes/:name` | Remove an unassigned node from the environment |
+| POST | `/api/environment/clusters/:name/nodes` | Add a node to a running cluster — `202`, then poll the same pending feed a create uses |
 | POST | `/api/environment/clusters/:name/fence/:node/test` | Guarded live fence test — the node really power-cycles; `i_understand_this_power_cycles_the_node` required |
 | POST | `/api/environment/clusters/:name/nodes/:node/confirm-dead` | Break-glass — only for an unfenced-unreachable node; `i_have_verified_the_node_is_powered_off` required |
 
@@ -406,10 +441,12 @@ no `environment` object and itself as the one entry in `unassigned` — the
 console renders one shape either way.
 
 The peer surface — `/api/peer/join`, `/api/peer/membership`,
-`/api/peer/preflight`, `/api/peer/cluster/{prepare,start,teardown}` — is one
-control plane answering another: peer-ticket authenticated, except join,
-whose one-time token is the authentication. Nothing under `/api/peer` is for
-a browser, and no browser session opens any of it.
+`/api/peer/preflight`, `/api/peer/cluster/{prepare,start,teardown,`
+`reconfigure}`, plus the volume and definition verbs listed in
+docs/storage.md — is one control plane answering another: peer-ticket
+authenticated, except join, whose one-time token is the authentication.
+Nothing under `/api/peer` is for a browser, and no browser session opens
+any of it.
 
 ---
 
@@ -429,6 +466,10 @@ everything about to be generated; and then the create itself, live — per
 node, per step, fence devices included, because a wizard that closes on
 submit turns a five-minute workflow into a spinner. Destroy is the
 typed-name confirmation the console uses everywhere destruction is meant.
+A cluster below five nodes with unassigned nodes available carries **Add
+node** on its card: one form — the newcomer, its preflight, its seats, its
+BMC — then the same live per-step progress as a create, regime change
+included.
 
 **Infrastructure → Nodes** is every node the console can see: the current
 node's card first, then each cluster's members grouped under the cluster's
@@ -477,22 +518,25 @@ completing the handshake over real TLS — the fingerprint pin and the
 certificate chain. That is the manual test: two nodes, mint on one, paste on
 the other, and `openssl s_client` against both afterwards shows the same CA.
 
-## Out of scope for this stage
+## Out of scope
 
-Replicated volumes have landed — `lumen-drbd`, documented in
-docs/storage.md, riding this crate's membership record and topology policy
-— and so have machines on replicated disks, live migration, and the
-domain-definition replication HA will restart from. Still in the order it
-lands: External-network realization (bridges
-on every member) and the typed-networks page; the HA manager; adding a node
-to an existing cluster and the 2→3 scale-out, and with them removing a
-member from a live cluster (a node holding volume replicas cannot leave —
-the record now knows enough to refuse); the environment-wide console
-federation — aggregated reads with per-node freshness, proxied writes — for
-which the peer channel built here is the transport; and gossip beyond the
-once-a-minute record exchange. A removed node also keeps its stale
-environment state until it re-joins somewhere; a "leave and reset" for the
-node itself rides the federation stage. One fencing consequence of the
-missing federation is worth naming: a fence test runs from a member of the
-cluster it tests, so testing every direction of a two-node cluster means
-signing into each node once — the proxied-writes stage dissolves that.
+The clustering program this document set out — environment, clusters,
+fencing, replicated volumes, HA, snapshots, split-brain recovery, and the
+2→3 scale-out — is complete. What deliberately remains, in the order it
+would land: External-network realization (bridges on every member) and the
+typed-networks page; **removing** a member from a live cluster (a node
+holding volume replicas cannot leave — the record knows enough to refuse,
+and the workflow is the scale-out run backwards plus that refusal); the
+environment-wide console federation — aggregated reads with per-node
+freshness, proxied writes — for which the peer channel built here is the
+transport; and gossip beyond the once-a-minute record exchange. A removed
+node keeps its stale environment state until it re-joins somewhere; a
+"leave and reset" for the node itself rides the federation stage. One
+fencing consequence of the missing federation is worth naming: a fence
+test runs from a member of the cluster it tests, so testing every
+direction of a cluster means signing into each node once — the
+proxied-writes stage dissolves that. And one packaging loose end is
+recorded in docs/storage.md: the libvirt Core-network listener that live
+migration assumes ships as a firewalld service definition only, its
+enablement being a security decision this program declined to make
+silently.

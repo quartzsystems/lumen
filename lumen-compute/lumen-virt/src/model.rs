@@ -58,6 +58,12 @@ pub struct VmConfig {
     pub start_on_boot: bool,
     #[serde(default = "default_true")]
     pub guest_agent: bool,
+    /// High availability: restart this machine on a surviving member after
+    /// its node is confirmed lost. Rides the domain `<metadata>` like every
+    /// other per-machine fact — libvirt stays the source of truth — and the
+    /// replicated copy of the definition is what a survivor restarts from.
+    #[serde(default)]
+    pub ha: bool,
     #[serde(default)]
     pub tags: Vec<String>,
     /// What the guest is, in libosinfo's words — `http://almalinux.org/almalinux/10`.
@@ -100,6 +106,7 @@ impl Default for VmConfig {
             boot_order: vec![BootDevice::Disk],
             start_on_boot: false,
             guest_agent: true,
+            ha: false,
             tags: Vec::new(),
             os_id: None,
             disks: Vec::new(),

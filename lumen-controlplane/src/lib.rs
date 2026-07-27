@@ -1,6 +1,7 @@
 pub mod api;
 pub mod config;
 pub mod error;
+pub mod ha;
 pub mod peers;
 pub mod realm;
 pub mod security;

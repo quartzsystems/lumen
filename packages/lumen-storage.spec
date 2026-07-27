@@ -17,11 +17,26 @@ URL:            https://quartz.systems/
 BuildArch:      noarch
 
 Source0:        50-lumen-storage.preset
+Source1:        50-lumen-cluster.preset
+Source2:        lumen-cluster.xml
+Source3:        lumen-replication.xml
 
 Requires:       systemd
 # The pool tooling the management daemon reads through, and which the
 # installed appliance already roots its own filesystem on.
 Requires:       zfs
+# The cluster stack the management daemon drives through its command lines:
+# membership and quorum (corosync), fencing and the CIB (pacemaker, pcs, the
+# one fence agent this appliance uses), and synchronous replication (the
+# DRBD 9 module and its userland, mirrored from ELRepo with a kABI gate in
+# the ISO build). Installed everywhere, running nowhere until a cluster
+# exists — the preset below is what keeps that true.
+Requires:       corosync
+Requires:       pacemaker
+Requires:       pcs
+Requires:       fence-agents-ipmilan
+Requires:       drbd9x-utils
+Requires:       kmod-drbd9x
 %{?systemd_requires}
 BuildRequires:  systemd-rpm-macros
 
@@ -48,9 +63,21 @@ the node itself.
 # config file, and an operator who turns a service off keeps it off.
 install -D -p -m 0644 %{SOURCE0} \
     %{buildroot}%{_prefix}/lib/systemd/system-preset/50-lumen-storage.preset
+install -D -p -m 0644 %{SOURCE1} \
+    %{buildroot}%{_prefix}/lib/systemd/system-preset/50-lumen-cluster.preset
+# Service definitions only — nothing here opens a port. The cluster
+# workflows bind these to the cluster's own interfaces when one is built,
+# which is the only place they mean anything.
+install -D -p -m 0644 %{SOURCE2} \
+    %{buildroot}%{_prefix}/lib/firewalld/services/lumen-cluster.xml
+install -D -p -m 0644 %{SOURCE3} \
+    %{buildroot}%{_prefix}/lib/firewalld/services/lumen-replication.xml
 
 %files
 %{_prefix}/lib/systemd/system-preset/50-lumen-storage.preset
+%{_prefix}/lib/systemd/system-preset/50-lumen-cluster.preset
+%{_prefix}/lib/firewalld/services/lumen-cluster.xml
+%{_prefix}/lib/firewalld/services/lumen-replication.xml
 
 # A preset file is only advice until something acts on it, and nothing on an
 # installed node ever runs `systemctl preset-all` again. This is that something:
@@ -64,8 +91,18 @@ install -D -p -m 0644 %{SOURCE0} \
 %post
 %systemd_post zfs-zed.service zfs-import-cache.service zfs-import.target \
     zfs-mount.service zfs-volume-wait.service zfs.target
+# The cluster stack's presets say "disable": applying them on first install
+# is what makes "installed everywhere, running nowhere" the recorded default
+# rather than an accident of nothing having enabled them yet.
+%systemd_post corosync.service pacemaker.service pcsd.service
 
 %changelog
+* Sun Jul 27 2026 Quartz Systems Engineering <engineering@quartz.systems> - 0.6.0-1
+- Cluster and replication stack: corosync, pacemaker, the one fence agent,
+  and the DRBD module and userland, with presets keeping the daemons off
+  until a cluster exists, and the two firewalld service definitions the
+  cluster networks bind
+
 * Fri Jul 24 2026 Quartz Systems Engineering <engineering@quartz.systems> - 0.3.0-1
 - Initial lumen-storage package: pulls in the pool tooling and ships the
   policy that starts the node's pool services, event reporting included

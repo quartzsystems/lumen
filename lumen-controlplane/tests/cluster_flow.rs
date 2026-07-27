@@ -219,6 +219,7 @@ async fn every_environment_route_requires_a_session() {
         (Method::GET, "/api/environment/clusters/pending"),
         (Method::DELETE, "/api/environment/clusters/alpha"),
         (Method::DELETE, "/api/environment/nodes/spare-1"),
+        (Method::POST, "/api/environment/clusters/alpha/nodes"),
         (
             Method::POST,
             "/api/environment/clusters/alpha/fence/alpha-2/test",
@@ -847,6 +848,62 @@ async fn break_glass_confirms_only_an_unfenced_unreachable_peer() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert!(refused["error"].as_str().unwrap().contains("not waiting"));
+}
+
+#[tokio::test]
+async fn a_node_add_validates_before_anything_runs() {
+    let harness = harness(
+        "add-node",
+        MockBackend::environment(),
+        MockPeers::new(),
+        Some(&alpha_membership()),
+    );
+    let cookie = sign_in(&harness.router).await;
+    let member = serde_json::json!({
+        "node": "ghost",
+        "core_interface": "nic1",
+        "core_address": "10.10.0.3",
+        "management_interface": "nic0",
+        "management_address": "192.168.10.3",
+        "bmc_address": "10.20.0.3",
+        "bmc_username": "ADMIN",
+        "bmc_password": "pw",
+    });
+    // A stranger is refused before any workflow starts.
+    let (status, answer) = request(
+        &harness.router,
+        Method::POST,
+        "/api/environment/clusters/alpha/nodes",
+        Some(&cookie),
+        None,
+        Some(member),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert!(answer["error"]
+        .as_str()
+        .unwrap()
+        .contains("has not joined this environment"));
+    // And an unknown cluster is a 404, not a workflow.
+    let (status, _) = request(
+        &harness.router,
+        Method::POST,
+        "/api/environment/clusters/ghost/nodes",
+        Some(&cookie),
+        None,
+        Some(serde_json::json!({
+            "node": "alpha-2",
+            "core_interface": "nic1",
+            "core_address": "10.10.0.9",
+            "management_interface": "nic0",
+            "management_address": "192.168.10.9",
+            "bmc_address": "10.20.0.9",
+            "bmc_username": "ADMIN",
+            "bmc_password": "pw",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

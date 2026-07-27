@@ -84,6 +84,13 @@ chroot "$ROOT" depmod -a "$KVER"
 chroot "$ROOT" /sbin/modprobe --dry-run -S "$KVER" zfs \
     || die "kmod-zfs does not resolve against $KVER (kABI mismatch — check iso/pins.env)"
 
+echo "==> kABI gate: kmod-drbd9x must resolve against $KVER"
+# Same gate, same reasoning, second kmod: both track kABI, both have real
+# EL10 history of lagging point-release kernels, and both now move with the
+# kernel as one pinned set.
+chroot "$ROOT" /sbin/modprobe --dry-run -S "$KVER" drbd \
+    || die "kmod-drbd9x does not resolve against $KVER (kABI mismatch — check iso/pins.env)"
+
 echo "==> Installing lumen-installer + overlay"
 install -m 0755 "$INSTALLER_BINARY" "$ROOT/usr/bin/lumen-installer"
 cp -r "$LIVE_DIR/overlay/." "$ROOT/"

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<service>
+  <short>Lumen Cluster</short>
+  <description>Cluster membership and quorum: corosync knet on both rings, UDP ports 5405 and 5406. Bind this service to the cluster's Core and Management interfaces only; it has no business on an External network.</description>
+  <port protocol="udp" port="5405"/>
+  <port protocol="udp" port="5406"/>
+</service>

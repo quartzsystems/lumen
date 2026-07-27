@@ -30,6 +30,8 @@ struct Inner {
     /// Every pool this backend was asked to build, with its request — so a
     /// test can assert on the arrangement rather than on a pool existing.
     created: Vec<PoolRequest>,
+    /// Snapshots by dataset path, oldest first.
+    snapshots: std::collections::HashMap<String, Vec<crate::model::SnapshotInfo>>,
 }
 
 pub struct MockBackend {
@@ -390,6 +392,69 @@ impl ZfsBackend for MockBackend {
             pool.allocated = pool.allocated.saturating_sub(size);
         }
         Ok(())
+    }
+
+    async fn snapshot_volume(&self, path: &str, snapshot: &str) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.datasets.iter().any(|d| d.name == path) {
+            return Err(ZfsError::NotFound(format!("No volume named \"{path}\".")));
+        }
+        let snapshots = inner.snapshots.entry(path.to_string()).or_default();
+        if snapshots.iter().any(|s| s.name == snapshot) {
+            return Err(ZfsError::Conflict(format!(
+                "\"{path}@{snapshot}\" already exists."
+            )));
+        }
+        let created = 1_785_000_000 + snapshots.len() as u64;
+        snapshots.push(crate::model::SnapshotInfo {
+            name: snapshot.to_string(),
+            used: 0,
+            created,
+        });
+        Ok(())
+    }
+
+    async fn rollback_volume(&self, path: &str, snapshot: &str) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(snapshots) = inner.snapshots.get_mut(path) else {
+            return Err(ZfsError::NotFound(format!("\"{path}\" has no snapshots.")));
+        };
+        let Some(index) = snapshots.iter().position(|s| s.name == snapshot) else {
+            return Err(ZfsError::NotFound(format!(
+                "No snapshot named \"{snapshot}\" on \"{path}\"."
+            )));
+        };
+        // -r semantics: everything after the target goes with the rollback.
+        snapshots.truncate(index + 1);
+        Ok(())
+    }
+
+    async fn destroy_snapshot(&self, path: &str, snapshot: &str) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(snapshots) = inner.snapshots.get_mut(path) else {
+            return Err(ZfsError::NotFound(format!(
+                "No snapshot named \"{snapshot}\" on \"{path}\"."
+            )));
+        };
+        let before = snapshots.len();
+        snapshots.retain(|s| s.name != snapshot);
+        if snapshots.len() == before {
+            return Err(ZfsError::NotFound(format!(
+                "No snapshot named \"{snapshot}\" on \"{path}\"."
+            )));
+        }
+        Ok(())
+    }
+
+    async fn snapshots(&self, path: &str) -> Result<Vec<crate::model::SnapshotInfo>> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .snapshots
+            .get(path)
+            .cloned()
+            .unwrap_or_default())
     }
 
     async fn resize_volume(&self, path: &str, size: u64) -> Result<()> {

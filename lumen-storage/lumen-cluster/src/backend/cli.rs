@@ -329,6 +329,43 @@ impl ClusterBackend for CliBackend {
         )
         .await
     }
+
+    async fn authkey(&self) -> Result<String> {
+        // Root can read /etc under the sandbox — it is writes /etc refuses.
+        tokio::fs::read_to_string(COROSYNC_AUTHKEY)
+            .await
+            .map_err(|err| {
+                ClusterError::Conflict(format!(
+                    "This node's cluster key is not readable ({err}) — is it actually a member?"
+                ))
+            })
+    }
+
+    async fn reload_corosync(&self) -> Result<()> {
+        self.run_privileged(
+            "reloading corosync failed".into(),
+            ExecRequest::new("reload the cluster configuration", &self.cfgtool).args(["-R"]),
+        )
+        .await
+    }
+
+    async fn update_fence_delay(&self, device: &str, delay_secs: u32) -> Result<()> {
+        let delay = format!("pcmk_delay_base={delay_secs}s");
+        self.run_privileged(
+            format!("updating the fence delay of {device} failed"),
+            ExecRequest::new("update a fence device's race delay", PCS)
+                .args(["stonith", "update", device, &delay]),
+        )
+        .await
+    }
+
+    async fn remove_fence_device(&self, device: &str) -> Result<()> {
+        self.run_privileged(
+            format!("removing the fence device {device} failed"),
+            ExecRequest::new("remove a fence device", PCS).args(["stonith", "delete", device]),
+        )
+        .await
+    }
 }
 
 /// The CIB XML for one `fence_ipmilan` primitive. Rendered here, next to the

@@ -23,6 +23,7 @@ export function VmOptions({
   const [tags, setTags] = useState(vm.tags.join(", "));
   const [startOnBoot, setStartOnBoot] = useState(vm.start_on_boot);
   const [guestAgent, setGuestAgent] = useState(vm.guest_agent);
+  const [ha, setHa] = useState(vm.ha);
   // Here rather than on the hardware page, the way Proxmox files it: boot
   // order is about the machine, not about any one device — each hardware
   // dialog edits exactly the thing its row names.
@@ -36,6 +37,7 @@ export function VmOptions({
     tags !== vm.tags.join(", ") ||
     startOnBoot !== vm.start_on_boot ||
     guestAgent !== vm.guest_agent ||
+    ha !== vm.ha ||
     bootOrder !== vm.boot_order.join(", ");
 
   const submit = async () => {
@@ -51,6 +53,7 @@ export function VmOptions({
           .filter(Boolean),
         start_on_boot: startOnBoot,
         guest_agent: guestAgent,
+        ha,
         boot_order: bootOrder
           .split(",")
           .map((entry) => entry.trim())
@@ -79,6 +82,7 @@ export function VmOptions({
     setTags(vm.tags.join(", "));
     setStartOnBoot(vm.start_on_boot);
     setGuestAgent(vm.guest_agent);
+    setHa(vm.ha);
     setBootOrder(vm.boot_order.join(", "));
     setErrors({});
   };
@@ -165,6 +169,14 @@ export function VmOptions({
           <label className="flex items-center gap-[10px] cursor-pointer select-none">
             <Switch on={guestAgent} onChange={setGuestAgent} />
             <span className="text-[13px] text-[var(--qz-fg-2)]">Guest agent channel</span>
+          </label>
+
+          <label className="flex items-center gap-[10px] cursor-pointer select-none">
+            <Switch on={ha} onChange={setHa} />
+            <span className="text-[13px] text-[var(--qz-fg-2)]">
+              High availability — restart on a surviving member after this node is confirmed
+              lost. Needs every disk replicated.
+            </span>
           </label>
 
           {errors.management && <ErrorText msg={errors.management} />}

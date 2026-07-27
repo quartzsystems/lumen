@@ -159,6 +159,17 @@ pub struct TeardownPayload {
     pub core_interface: Option<String>,
 }
 
+/// A regenerated configuration for a member already in the cluster — the
+/// scale-out's reach into the running nodes: write it, reload corosync.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconfigurePayload {
+    pub cluster: String,
+    pub corosync_conf: String,
+    /// The cluster's existing key, unchanged — rewritten alongside the conf
+    /// because they travel as one file pair everywhere else.
+    pub authkey: String,
+}
+
 /// What a joining node sends the issuer, over the fingerprint-pinned
 /// connection the token authorises.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,6 +217,11 @@ pub trait PeerChannel: Send + Sync {
     async fn start(&self, node: &EnvironmentNode) -> Result<()>;
     async fn teardown(&self, node: &EnvironmentNode, payload: &TeardownPayload) -> Result<()>;
 
+    /// Push a regenerated configuration to a running member and reload its
+    /// corosync — the scale-out's write to the nodes already in.
+    async fn reconfigure(&self, node: &EnvironmentNode, payload: &ReconfigurePayload)
+        -> Result<()>;
+
     /// Push a membership record to a peer; the peer reconciles and answers
     /// with its own. Both directions of gossip are this one call.
     async fn push_membership(
@@ -214,10 +230,14 @@ pub trait PeerChannel: Send + Sync {
         membership: &EnvironmentMembership,
     ) -> Result<EnvironmentMembership>;
 
-    /// Hand a peer one machine's domain document to keep — the HA manager's
+    /// Hand a peer one machine's definition to keep — the HA manager's
     /// restart inventory, filled at define time because libvirt on a dead
-    /// node cannot be asked for it.
-    async fn store_definition(&self, node: &EnvironmentNode, vmid: u32, xml: &str) -> Result<()>;
+    /// node cannot be asked for it. The definition carries its home node.
+    async fn store_definition(
+        &self,
+        node: &EnvironmentNode,
+        definition: &crate::store::StoredDefinition,
+    ) -> Result<()>;
 
     /// Tell a peer to forget one.
     async fn drop_definition(&self, node: &EnvironmentNode, vmid: u32) -> Result<()>;
@@ -300,7 +320,15 @@ impl ProgressHandle {
         }
     }
 
-    fn set_step(&self, step: &str, node: Option<&str>, state: StepState, detail: Option<String>) {
+    /// Update one step. `pub(crate)`: the create engine here and the
+    /// scale-out engine in the service both drive the same progress.
+    pub(crate) fn set_step(
+        &self,
+        step: &str,
+        node: Option<&str>,
+        state: StepState,
+        detail: Option<String>,
+    ) {
         self.update(|progress| {
             if let Some(entry) = progress
                 .steps
@@ -322,6 +350,11 @@ impl ProgressHandle {
             progress.phase = phase;
             progress.error = error;
         });
+    }
+
+    /// Close the workflow out — the scale-out engine's ending.
+    pub(crate) fn finish_workflow(&self, phase: WorkflowPhase, error: Option<String>) {
+        self.finish(phase, error);
     }
 }
 
@@ -741,9 +774,10 @@ struct MockPeersInner {
     prepared: Vec<(String, PreparePayload)>,
     started: Vec<String>,
     torn_down: Vec<(String, TeardownPayload)>,
+    reconfigured: Vec<(String, ReconfigurePayload)>,
     grant: Option<JoinGrant>,
     join_requests: Vec<(String, String, JoinRequest)>,
-    definitions: Vec<(String, u32, String)>,
+    definitions: Vec<(String, crate::store::StoredDefinition)>,
     dropped_definitions: Vec<(String, u32)>,
 }
 
@@ -809,12 +843,16 @@ impl MockPeers {
         self.inner.lock().unwrap().torn_down.clone()
     }
 
+    pub fn reconfigured(&self) -> Vec<(String, ReconfigurePayload)> {
+        self.inner.lock().unwrap().reconfigured.clone()
+    }
+
     pub fn join_requests(&self) -> Vec<(String, String, JoinRequest)> {
         self.inner.lock().unwrap().join_requests.clone()
     }
 
-    /// Every definition pushed to a peer: (node, vmid, xml).
-    pub fn definitions(&self) -> Vec<(String, u32, String)> {
+    /// Every definition pushed to a peer: (peer, definition).
+    pub fn definitions(&self) -> Vec<(String, crate::store::StoredDefinition)> {
         self.inner.lock().unwrap().definitions.clone()
     }
 
@@ -934,6 +972,19 @@ impl PeerChannel for MockPeers {
         Ok(())
     }
 
+    async fn reconfigure(
+        &self,
+        node: &EnvironmentNode,
+        payload: &ReconfigurePayload,
+    ) -> Result<()> {
+        self.inner
+            .lock()
+            .unwrap()
+            .reconfigured
+            .push((node.name.clone(), payload.clone()));
+        Ok(())
+    }
+
     async fn push_membership(
         &self,
         _node: &EnvironmentNode,
@@ -942,12 +993,16 @@ impl PeerChannel for MockPeers {
         Ok(membership.clone())
     }
 
-    async fn store_definition(&self, node: &EnvironmentNode, vmid: u32, xml: &str) -> Result<()> {
+    async fn store_definition(
+        &self,
+        node: &EnvironmentNode,
+        definition: &crate::store::StoredDefinition,
+    ) -> Result<()> {
         self.inner
             .lock()
             .unwrap()
             .definitions
-            .push((node.name.clone(), vmid, xml.to_string()));
+            .push((node.name.clone(), definition.clone()));
         Ok(())
     }
 

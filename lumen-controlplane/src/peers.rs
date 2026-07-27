@@ -26,12 +26,14 @@ use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use http_body_util::BodyExt;
 use lumen_cluster::environment::der_fingerprint;
+use lumen_cluster::join::ReconfigurePayload;
 use lumen_cluster::{
     ClusterError, ClusterService, EnvironmentMembership, EnvironmentNode, JoinGrant, JoinRequest,
     PeerChannel, PreflightReport, PreparePayload, TeardownPayload,
 };
 use lumen_drbd::{
-    DrbdError, DrbdService, VolumePeers, VolumePrepare, VolumeResizeBacking, VolumeTeardown,
+    DrbdError, DrbdService, VolumeApply, VolumePeers, VolumePrepare, VolumeResizeBacking,
+    VolumeSnapshot, VolumeTeardown,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -85,6 +87,29 @@ impl HttpPeerChannel {
                 "the peer channel was never bound to the volume service"
             ))
         })
+    }
+
+    /// One volume verb over the wire: ticketed, CA-verified, answer
+    /// discarded — the shape every remote half below shares.
+    async fn volume_verb<Req: Serialize>(
+        &self,
+        node: &EnvironmentNode,
+        path: &str,
+        body: &Req,
+        deadline: Duration,
+    ) -> Result<(), DrbdError> {
+        let _: serde_json::Value = self
+            .call(
+                &node.address,
+                path,
+                body,
+                self.ca_client_config().map_err(DrbdError::from)?,
+                Some(self.peer_ticket().map_err(DrbdError::from)?),
+                deadline,
+            )
+            .await
+            .map_err(DrbdError::from)?;
+        Ok(())
     }
 
     fn service(&self) -> Result<&Arc<ClusterService>, ClusterError> {
@@ -408,20 +433,40 @@ impl PeerChannel for HttpPeerChannel {
         .await
     }
 
+    async fn reconfigure(
+        &self,
+        node: &EnvironmentNode,
+        payload: &ReconfigurePayload,
+    ) -> Result<(), ClusterError> {
+        if self.is_local(node) {
+            return self.service()?.peer_reconfigure(payload).await;
+        }
+        let _: serde_json::Value = self
+            .call(
+                &node.address,
+                "/api/peer/cluster/reconfigure",
+                payload,
+                self.ca_client_config()?,
+                Some(self.peer_ticket()?),
+                SLOW_CALL_DEADLINE,
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn store_definition(
         &self,
         node: &EnvironmentNode,
-        vmid: u32,
-        xml: &str,
+        definition: &lumen_cluster::StoredDefinition,
     ) -> Result<(), ClusterError> {
         if self.is_local(node) {
-            return self.service()?.peer_store_definition(vmid, xml);
+            return self.service()?.peer_store_definition(definition);
         }
         let _: serde_json::Value = self
             .call(
                 &node.address,
                 "/api/peer/definition/store",
-                &serde_json::json!({ "vmid": vmid, "xml": xml }),
+                definition,
                 self.ca_client_config()?,
                 Some(self.peer_ticket()?),
                 CALL_DEADLINE,
@@ -566,17 +611,142 @@ impl VolumePeers for HttpPeerChannel {
                 .peer_two_primaries(resource, allow)
                 .await;
         }
-        let _: serde_json::Value = self
-            .call(
-                &node.address,
-                "/api/peer/volume/two-primaries",
-                &serde_json::json!({ "resource": resource, "allow": allow }),
-                self.ca_client_config().map_err(DrbdError::from)?,
-                Some(self.peer_ticket().map_err(DrbdError::from)?),
-                CALL_DEADLINE,
-            )
+        self.volume_verb(
+            node,
+            "/api/peer/volume/two-primaries",
+            &serde_json::json!({ "resource": resource, "allow": allow }),
+            CALL_DEADLINE,
+        )
+        .await
+    }
+
+    async fn snapshot_backing(
+        &self,
+        node: &EnvironmentNode,
+        payload: &VolumeSnapshot,
+    ) -> Result<(), DrbdError> {
+        if self.is_local(node) {
+            return self.volume_service()?.peer_snapshot_backing(payload).await;
+        }
+        self.volume_verb(node, "/api/peer/volume/snapshot", payload, CALL_DEADLINE)
             .await
-            .map_err(DrbdError::from)?;
-        Ok(())
+    }
+
+    async fn rollback_backing(
+        &self,
+        node: &EnvironmentNode,
+        payload: &VolumeSnapshot,
+    ) -> Result<(), DrbdError> {
+        if self.is_local(node) {
+            return self.volume_service()?.peer_rollback_backing(payload).await;
+        }
+        self.volume_verb(
+            node,
+            "/api/peer/volume/rollback-backing",
+            payload,
+            SLOW_CALL_DEADLINE,
+        )
+        .await
+    }
+
+    async fn drop_snapshot(
+        &self,
+        node: &EnvironmentNode,
+        payload: &VolumeSnapshot,
+    ) -> Result<(), DrbdError> {
+        if self.is_local(node) {
+            return self.volume_service()?.peer_drop_snapshot(payload).await;
+        }
+        self.volume_verb(
+            node,
+            "/api/peer/volume/drop-snapshot",
+            payload,
+            CALL_DEADLINE,
+        )
+        .await
+    }
+
+    async fn down_resource(&self, node: &EnvironmentNode, resource: &str) -> Result<(), DrbdError> {
+        if self.is_local(node) {
+            return self.volume_service()?.peer_down(resource).await;
+        }
+        self.volume_verb(
+            node,
+            "/api/peer/volume/down",
+            &serde_json::json!({ "resource": resource }),
+            CALL_DEADLINE,
+        )
+        .await
+    }
+
+    async fn up_resource(&self, node: &EnvironmentNode, resource: &str) -> Result<(), DrbdError> {
+        if self.is_local(node) {
+            return self.volume_service()?.peer_up(resource).await;
+        }
+        self.volume_verb(
+            node,
+            "/api/peer/volume/up",
+            &serde_json::json!({ "resource": resource }),
+            CALL_DEADLINE,
+        )
+        .await
+    }
+
+    async fn invalidate_remote(
+        &self,
+        node: &EnvironmentNode,
+        resource: &str,
+    ) -> Result<(), DrbdError> {
+        if self.is_local(node) {
+            return self
+                .volume_service()?
+                .peer_invalidate_remote(resource)
+                .await;
+        }
+        self.volume_verb(
+            node,
+            "/api/peer/volume/invalidate-remote",
+            &serde_json::json!({ "resource": resource }),
+            CALL_DEADLINE,
+        )
+        .await
+    }
+
+    async fn reconnect(
+        &self,
+        node: &EnvironmentNode,
+        resource: &str,
+        discard: bool,
+    ) -> Result<(), DrbdError> {
+        if self.is_local(node) {
+            return self
+                .volume_service()?
+                .peer_reconnect(resource, discard)
+                .await;
+        }
+        self.volume_verb(
+            node,
+            "/api/peer/volume/reconnect",
+            &serde_json::json!({ "resource": resource, "discard": discard }),
+            CALL_DEADLINE,
+        )
+        .await
+    }
+
+    async fn apply_policy(
+        &self,
+        node: &EnvironmentNode,
+        payload: &VolumeApply,
+    ) -> Result<(), DrbdError> {
+        if self.is_local(node) {
+            return self.volume_service()?.peer_apply_policy(payload).await;
+        }
+        self.volume_verb(
+            node,
+            "/api/peer/volume/apply-policy",
+            payload,
+            CALL_DEADLINE,
+        )
+        .await
     }
 }

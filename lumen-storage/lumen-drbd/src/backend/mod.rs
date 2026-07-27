@@ -67,4 +67,24 @@ pub trait DrbdBackend: Send + Sync {
     /// member just before the migration and closes it again on every path
     /// out, success or failure.
     async fn set_two_primaries(&self, resource: &str, allow: bool) -> Result<()>;
+
+    /// `drbdadm invalidate-remote` — declare every peer's replica out of
+    /// date, so the next resync flows *from* this node. The rollback
+    /// workflow's closing step: the node that rolled back is the truth.
+    async fn invalidate_remote(&self, resource: &str) -> Result<()>;
+
+    /// Tear the connection down and bring it back, optionally discarding
+    /// this node's own writes — split-brain resolution's verb. `discard` is
+    /// what makes this node the victim: its divergent history goes, and it
+    /// resyncs from the survivor.
+    async fn reconnect(&self, resource: &str, discard: bool) -> Result<()>;
+
+    /// This node's copy of a resource file — read so the 2→3 policy flip
+    /// can re-render everything *around* the shared-secret it must never
+    /// see leave the node.
+    async fn read_resource(&self, resource: &str) -> Result<String>;
+
+    /// `drbdadm adjust` — apply the on-disk configuration to the running
+    /// resource, live. What makes the policy flip interruption-free.
+    async fn adjust(&self, resource: &str) -> Result<()>;
 }

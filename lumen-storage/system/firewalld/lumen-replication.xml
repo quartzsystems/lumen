@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<service>
+  <short>Lumen Replication</short>
+  <description>Replicated storage and live migration on the cluster's Core network: DRBD resources on TCP 7788 to 7799 (one port per volume), the hypervisor's peer connection on 16509, and the migration data stream on 49152 to 49215. Bind this service to Core interfaces only — replication never rides Management or an External network.</description>
+  <port protocol="tcp" port="7788-7799"/>
+  <port protocol="tcp" port="16509"/>
+  <port protocol="tcp" port="49152-49215"/>
+</service>

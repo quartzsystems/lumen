@@ -1,9 +1,10 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { AlertTriangle, Plus, ShieldAlert, Trash2 } from "lucide-react";
+import { AlertTriangle, Plus, ShieldAlert, Trash2, UserPlus } from "lucide-react";
 import { Page, PageBody, PageHeader } from "@/components/PageHeader";
 import { Button } from "@/components/ui/Button";
+import { AddNodeDialog } from "@/components/cluster/AddNodeDialog";
 import { CreateClusterDialog } from "@/components/cluster/CreateClusterDialog";
 import { DestroyClusterDialog } from "@/components/cluster/ClusterDialogs";
 import { ApiError } from "@/lib/authClient";
@@ -30,6 +31,7 @@ export default function ClustersPage() {
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [destroying, setDestroying] = useState<ClusterView | null>(null);
+  const [addingTo, setAddingTo] = useState<ClusterView | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -49,10 +51,10 @@ export default function ClustersPage() {
   useEffect(() => {
     // Polling pauses while a dialog is open, so a refresh cannot move a
     // wizard's pickers out from under the operator mid-choice.
-    if (creating || destroying) return;
+    if (creating || destroying || addingTo) return;
     const timer = setInterval(() => void load(), POLL_MS);
     return () => clearInterval(timer);
-  }, [load, creating, destroying]);
+  }, [load, creating, destroying, addingTo]);
 
   const noEnvironment = environment !== null && !environment.environment;
   const spareNodes = environment?.unassigned.length ?? 0;
@@ -135,6 +137,8 @@ export default function ClustersPage() {
                 <ClusterCard
                   key={cluster.name}
                   cluster={cluster}
+                  canGrow={cluster.nodes.length < 5 && spareNodes > 0}
+                  onAddNode={() => setAddingTo(cluster)}
                   onDestroy={() => setDestroying(cluster)}
                 />
               ))}
@@ -149,6 +153,18 @@ export default function ClustersPage() {
           onClose={() => setCreating(false)}
           onCreated={() => {
             setToast("Cluster created.");
+            void load();
+          }}
+        />
+      )}
+
+      {addingTo && environment && (
+        <AddNodeDialog
+          cluster={addingTo}
+          unassigned={environment.unassigned}
+          onClose={() => setAddingTo(null)}
+          onAdded={() => {
+            setToast(`${addingTo.name} grew by a node.`);
             void load();
           }}
         />
@@ -171,9 +187,13 @@ export default function ClustersPage() {
 
 function ClusterCard({
   cluster,
+  canGrow,
+  onAddNode,
   onDestroy,
 }: {
   cluster: ClusterView;
+  canGrow: boolean;
+  onAddNode: () => void;
   onDestroy: () => void;
 }) {
   const online = cluster.nodes.filter((node) => node.online).length;
@@ -189,6 +209,11 @@ function ClusterCard({
         <span className={`badge badge-${HEALTH_TONE[cluster.health]}`}>
           {HEALTH_LABEL[cluster.health]}
         </span>
+        {canGrow && (
+          <span title="Add a node to this cluster">
+            <Button kind="ghost" size="sm" icon={UserPlus} onClick={onAddNode} />
+          </span>
+        )}
         <Button kind="ghost" size="sm" icon={Trash2} onClick={onDestroy} />
       </header>
 

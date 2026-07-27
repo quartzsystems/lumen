@@ -199,6 +199,47 @@ pub async fn destroy_cluster(
     Ok(Json(serde_json::json!({ "destroyed": true })))
 }
 
+/// POST /api/environment/clusters/{name}/nodes — the 2→3 scale-out: an
+/// unassigned environment node joins a *running* cluster. Validation
+/// answers now; the workflow runs in the background and the create's
+/// pending feed is its progress too. When the regime flips, the volume
+/// replication policies are refreshed right after — chained here, because
+/// the cluster domain cannot reach the storage domain above it.
+pub async fn add_node(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    raw: Body,
+) -> Result<(StatusCode, Json<CreateProgress>), ApiError> {
+    // Deserialized directly, not through `required_body`: its `node` field
+    // names the node being *added*, which is exactly what the cross-node
+    // guard would strip and refuse.
+    let Some(axum::Json(value)) = raw else {
+        return Err(ApiError::BadRequest("A request body is required.".into()));
+    };
+    let request: lumen_cluster::MemberCreate =
+        serde_json::from_value(value).map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    let plan = state.cluster.prepare_add_node(&name, request).await?;
+    let progress = state
+        .cluster
+        .create_progress()
+        .expect("prepare_add_node begins the progress");
+    let cluster_name = name.clone();
+    let state = state.clone();
+    tokio::spawn(async move {
+        if state.cluster.execute_add_node(plan).await.is_ok() {
+            if let Err(err) = state.drbd.refresh_policies(&cluster_name).await {
+                tracing::error!(
+                    cluster = %cluster_name,
+                    "the node joined but the volume policies did not refresh — run the \
+                     scale-out's policy refresh again: {err}"
+                );
+            }
+        }
+    });
+    Ok((StatusCode::ACCEPTED, Json(progress)))
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FenceTestRequest {

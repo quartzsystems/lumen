@@ -27,6 +27,9 @@ struct Inner {
     primed: Vec<String>,
     resized: Vec<String>,
     two_primaries: Vec<(String, bool)>,
+    invalidated: Vec<String>,
+    reconnected: Vec<(String, bool)>,
+    adjusted: Vec<String>,
 }
 
 #[derive(Default)]
@@ -104,6 +107,19 @@ impl MockBackend {
 
     pub fn two_primaries(&self) -> Vec<(String, bool)> {
         self.inner.lock().unwrap().two_primaries.clone()
+    }
+
+    pub fn invalidated(&self) -> Vec<String> {
+        self.inner.lock().unwrap().invalidated.clone()
+    }
+
+    /// Every reconnect, in order: (resource, discarded).
+    pub fn reconnected(&self) -> Vec<(String, bool)> {
+        self.inner.lock().unwrap().reconnected.clone()
+    }
+
+    pub fn adjusted(&self) -> Vec<String> {
+        self.inner.lock().unwrap().adjusted.clone()
     }
 
     fn take_failure(&self) -> Option<DrbdError> {
@@ -289,6 +305,62 @@ impl DrbdBackend for MockBackend {
             .unwrap()
             .two_primaries
             .push((resource.to_string(), allow));
+        Ok(())
+    }
+
+    async fn invalidate_remote(&self, resource: &str) -> Result<()> {
+        if let Some(err) = self.take_failure() {
+            return Err(err);
+        }
+        self.inner
+            .lock()
+            .unwrap()
+            .invalidated
+            .push(resource.to_string());
+        Ok(())
+    }
+
+    async fn read_resource(&self, resource: &str) -> Result<String> {
+        if let Some(err) = self.take_failure() {
+            return Err(err);
+        }
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .written
+            .iter()
+            .rev()
+            .find(|(name, _)| name == resource)
+            .map(|(_, content)| content.clone())
+            .unwrap_or_else(|| {
+                format!("resource \"{resource}\" {{ shared-secret \"mock-secret\"; }}")
+            }))
+    }
+
+    async fn adjust(&self, resource: &str) -> Result<()> {
+        if let Some(err) = self.take_failure() {
+            return Err(err);
+        }
+        self.inner
+            .lock()
+            .unwrap()
+            .adjusted
+            .push(resource.to_string());
+        Ok(())
+    }
+
+    async fn reconnect(&self, resource: &str, discard: bool) -> Result<()> {
+        if let Some(err) = self.take_failure() {
+            return Err(err);
+        }
+        let mut inner = self.inner.lock().unwrap();
+        inner.reconnected.push((resource.to_string(), discard));
+        // A reconnect leaves StandAlone behind: the simulated resource
+        // reports Connected again.
+        if let Some(status) = inner.resources.iter_mut().find(|r| r.name == resource) {
+            for peer in &mut status.connections {
+                peer.connection_state = "Connected".into();
+            }
+        }
         Ok(())
     }
 }

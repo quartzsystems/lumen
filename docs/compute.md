@@ -1186,10 +1186,10 @@ hypervisor is down needs the console more than usual.
 
 `zpool import`, `export`, `scrub`, and `replace` — create and destroy are in,
 through the mechanism [docs/system.md](system.md) describes. The serial
-console, for the reason above. Snapshots, backups, migration, templates,
-cloning, clustering, high availability, resource pools, and per-machine
-permissions.
+console, for the reason above. Backups, templates, cloning, resource pools,
+and per-machine permissions. Clustering, live migration, high availability,
+and replicated-volume snapshots have since landed — docs/cluster.md and
+docs/storage.md are theirs.
 
 In the console, **Virtual Machines** (Overview, Console, Hardware, Options,
-Tasks) and **Storage** are implemented. Snapshots and Backups are not offered
-yet.
+Tasks) and **Storage** are implemented. Backups are not offered yet.

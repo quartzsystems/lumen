@@ -41,7 +41,10 @@ pub use model::{
     backing_size, device_path, resource_name, valid_volume_name, zvol_path, DRBD_PORT_MAX,
     DRBD_PORT_MIN, MAX_REPLICAS, MIN_REPLICAS, VOLBLOCKSIZE,
 };
-pub use peers::{MockVolumePeers, VolumePeers, VolumePrepare, VolumeResizeBacking, VolumeTeardown};
+pub use peers::{
+    MockVolumePeers, VolumeApply, VolumePeers, VolumePrepare, VolumeResizeBacking, VolumeSnapshot,
+    VolumeTeardown,
+};
 pub use service::{
     ClusterVolumes, DrbdService, ReplicaView, ReplicatedVolumesResponse, VolumeCreate,
     VolumeHealth, VolumeMemberCreate, VolumeView,

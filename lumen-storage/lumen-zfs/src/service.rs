@@ -386,6 +386,36 @@ impl StorageService {
         device_path(dataset)
     }
 
+    // --- snapshots --------------------------------------------------------
+
+    /// Snapshot a volume Lumen created. Crash-consistent, and named by the
+    /// caller — the storage domain has no opinion about snapshot schedules.
+    pub async fn snapshot_volume(&self, path: &str, snapshot: &str) -> Result<()> {
+        let _guard = self.gate.lock().await;
+        reject_outside_namespace(path)?;
+        self.backend.snapshot_volume(path, snapshot).await
+    }
+
+    /// Roll a volume back, discarding everything after the snapshot. The
+    /// acknowledgement lives with the caller; the namespace check lives
+    /// here, like every other volume verb.
+    pub async fn rollback_volume(&self, path: &str, snapshot: &str) -> Result<()> {
+        let _guard = self.gate.lock().await;
+        reject_outside_namespace(path)?;
+        self.backend.rollback_volume(path, snapshot).await
+    }
+
+    pub async fn destroy_snapshot(&self, path: &str, snapshot: &str) -> Result<()> {
+        let _guard = self.gate.lock().await;
+        reject_outside_namespace(path)?;
+        self.backend.destroy_snapshot(path, snapshot).await
+    }
+
+    pub async fn volume_snapshots(&self, path: &str) -> Result<Vec<crate::model::SnapshotInfo>> {
+        reject_outside_namespace(path)?;
+        self.backend.snapshots(path).await
+    }
+
     // --- the installation media library -----------------------------------
 
     /// Every pool's library and everything in it.
@@ -869,6 +899,42 @@ mod tests {
         assert!(!service.iso_exists(&path).await.unwrap());
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn snapshots_are_taken_listed_rolled_back_and_removed() {
+        let (service, _) = service();
+        let disk = service
+            .create_volume("boot", "vm-101-disk-0", 1_073_741_824, None)
+            .await
+            .unwrap();
+
+        service.snapshot_volume(&disk.name, "before").await.unwrap();
+        service.snapshot_volume(&disk.name, "after").await.unwrap();
+        let listed = service.volume_snapshots(&disk.name).await.unwrap();
+        assert_eq!(
+            listed.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["before", "after"]
+        );
+
+        // Rolling back to the older snapshot takes the newer one with it —
+        // zfs rollback -r semantics, which is what "roll back" means.
+        service.rollback_volume(&disk.name, "before").await.unwrap();
+        let listed = service.volume_snapshots(&disk.name).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "before");
+
+        service
+            .destroy_snapshot(&disk.name, "before")
+            .await
+            .unwrap();
+        assert!(service
+            .volume_snapshots(&disk.name)
+            .await
+            .unwrap()
+            .is_empty());
+        // Nothing outside the namespace is snapshottable.
+        assert!(service.snapshot_volume("boot", "x").await.is_err());
     }
 
     #[tokio::test]

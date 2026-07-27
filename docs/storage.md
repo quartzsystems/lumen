@@ -187,15 +187,78 @@ An HA restart needs the machine's domain document on the survivor, and
 libvirt on the dead node is exactly what stopped answering. So every define
 — create, update, attach, detach — pushes the stored document to the
 cluster's other members, kept under the environment state directory
-(`<state_dir>/environment/definitions/<vmid>.xml`; the spec named
+(`<state_dir>/environment/definitions/<vmid>.json`; the spec named
 `/var/lib/lumen/`, deviated from because the state directory is writable
 without a transient unit and already holds the environment's other
-replicated state). The push is best-effort beyond the local copy: a peer
-that is down misses it and is caught up by the next define, and failing an
-operator's action over HA prep would make the preparation more important
-than the machine. A delete withdraws the definition everywhere — a stored
-definition for a machine that no longer exists is a machine waiting to be
-wrongly resurrected.
+replicated state). The stored shape is the XML plus the machine's **home
+node** — re-set at every define, so a migration or an HA adoption re-homes
+the definition on every member without a separate bookkeeping step. The
+push is best-effort beyond the local copy: a peer that is down misses it
+and is caught up by the next define, and failing an operator's action over
+HA prep would make the preparation more important than the machine. A
+delete withdraws the definition everywhere — a stored definition for a
+machine that no longer exists is a machine waiting to be wrongly
+resurrected.
+
+### HA acts only on a fence-confirmed death, and nobody coordinates the election
+
+The HA manager is a 15-second sweep inside each control plane, not a
+Pacemaker resource and not a daemon of its own. Its rule for "dead" is
+exactly the cluster's: a node that is offline **and clean** has been fenced
+(or break-glass confirmed) — Pacemaker has vouched nothing there is still
+writing. A node that is *unclean* is lost but not yet fenced, and the sweep
+waits: restarting a machine whose old copy may still be running is the one
+mistake this design exists to make impossible. The sweep also requires the
+cluster quorate from where it stands — a minority partition restarting
+machines is the same mistake wearing quorum's clothes.
+
+Which survivor restarts a machine is decided without any coordination:
+every member runs the same sweep over the same gossiped record, computes
+the same eligible set — survivors holding **all** of the machine's replicas
+— and the lowest-named member elects itself; the rest do nothing. No
+leader, no lock, no message. If two nodes ever did race through a stale
+view, DRBD's refusal of a second writer on an auto-promote device is the
+backstop: the loser's start fails, the machine runs once. A machine
+restarts only if its **HA flag** is set (a per-machine choice on the
+Options page, off by default, carried in the domain document's metadata),
+only from a replicated-disk definition, and lands in the task log as
+`ha-restart` by `ha@lumen` — the events trail the spec asked for, in the
+log the console already has. There is deliberately **no automatic
+failback**: the machine has a working home; moving it again is an
+operator's call, made with the live-migration button that already exists.
+
+### Snapshots are per-member zvol snapshots, taken all-or-none
+
+A replicated volume's snapshot is a ZFS snapshot of the backing zvol on
+**every** member, taken by one workflow that either lands everywhere or is
+unwound where it landed — a snapshot set missing a member is not a partial
+success, it is a rollback source that may not exist when needed. The list
+the console shows is deliberately this node's own vantage (the snapshots
+its own replica holds), because a snapshot set is per-member and pretending
+to a merged view would hide exactly the asymmetry a rollback forces the
+operator to think about.
+
+Rollback is a transaction with one source of truth: refused while the
+device is open anywhere (the machine must be off — rolling back under a
+live guest is corruption by design), the resource is taken down on every
+member, **one** member's zvol is rolled back (`zfs rollback -r`, later
+snapshots on that member go with it — ZFS's own rule, surfaced in the
+dialog rather than hidden), every member comes back up, and the source
+invalidates its peers so DRBD resyncs the rolled-back state outward. The
+"up everywhere" step runs even when the rollback failed, because a volume
+left down everywhere is an outage the operator did not ask for.
+
+### Split-brain recovery reconnects the victim first
+
+DRBD's refusal to merge divergent histories is correct — someone has to
+decide which history survives, and that someone is the operator. The
+guided recovery takes the victim's name (typed back, with the
+acknowledgement), reconnects the **victim first** with `--discard-my-data`,
+and the survivors after: a victim reconnected last would sit StandAlone
+waiting for peers that already gave up on it, and the order is the
+difference between a recovery and a second outage. The victim's divergent
+writes are gone for good; that is the point, and the dialog says so in
+those words.
 
 ### A volume only grows
 
@@ -206,6 +269,21 @@ offers growth. A grow runs every member's backing zvol first, the resource
 once after all of them, then the record — a failure partway leaves some
 zvols with spare room and the volume untouched, so the operator simply
 retries.
+
+### A regime change re-renders every resource, and the secret never travels
+
+When a cluster leaves the two-node regime (the 2→3 scale-out,
+docs/cluster.md), every existing volume's replication policy is wrong: the
+resource files carry `fencing resource-and-stonith` where volume quorum
+should be. The flip re-renders each resource from the record under the new
+topology policy and applies it live with `drbdadm adjust` — no down, no
+resync, no I/O interruption. The one thing the coordinator cannot render is
+each file's shared-secret, which exists only in `/etc/drbd.d/` on the
+members — deliberately, see above. So the re-rendered file travels with a
+placeholder where the secret belongs, and **each member substitutes its own
+secret from its existing file** before writing. The secret never crosses
+the wire a second time, and the placeholder pattern is pinned by the
+refresh tests.
 
 ---
 
@@ -221,14 +299,21 @@ matching `/api/environment`.
 | POST | `/api/storage/replicated` | Create — members chosen (or least-utilized default), record written last |
 | DELETE | `/api/storage/replicated/:cluster/:name` | Destroy every replica; `i_understand_this_may_lose_data` required |
 | POST | `/api/storage/replicated/:cluster/:name/resize` | Grow only |
+| GET | `/api/storage/replicated/:cluster/:name/snapshots` | This node's own replica's snapshots |
+| POST | `/api/storage/replicated/:cluster/:name/snapshots` | Snapshot every member, all-or-none |
+| DELETE | `/api/storage/replicated/:cluster/:name/snapshots/:snapshot` | Drop the snapshot on every member |
+| POST | `/api/storage/replicated/:cluster/:name/rollback` | The transactional rollback — source member named, `i_understand_this_may_lose_data` required |
+| POST | `/api/storage/replicated/:cluster/:name/resolve-split-brain` | The guided recovery — victim named, `i_understand_this_may_lose_data` required |
 | POST | `/api/vms/:vmid/migrate` | Live-migrate to another member of the disks' replica set, under the two-primaries guard |
 
 Machine disks gain the replicated shape on the existing routes: a
 `DiskCreate` with `"replicated": true` and its member seats, on both
-`POST /api/vms` and `POST /api/vms/:vmid/disks`.
+`POST /api/vms` and `POST /api/vms/:vmid/disks`. The HA flag is `"ha"` on
+the same machine create/patch shapes.
 
 The peer surface gains `/api/peer/volume/{prepare,prime,teardown,`
-`resize-backing,grow,two-primaries}` and
+`resize-backing,grow,two-primaries,snapshot,rollback-backing,`
+`drop-snapshot,down,up,invalidate-remote,reconnect,apply-policy}` and
 `/api/peer/definition/{store,drop}` — peer-ticket authenticated like the
 rest of `/api/peer`, never for a browser.
 
@@ -244,6 +329,14 @@ replica seats — preselected on a two-node cluster, because there is exactly
 one possible placement and asking would be ceremony. Destroy is the
 typed-name confirmation; the volume's own name, because replication does not
 protect against the operator.
+
+Each row carries the snapshots dialog — the local replica's list, taking
+one (on every member at once), deleting one, and the guided rollback with
+its source-member choice and acknowledgement inline under the chosen
+snapshot. A volume reading `StandAlone` gains the split-brain recovery
+action beside it: victim chosen, typed back, acknowledged. The machine's HA
+toggle lives where the machine's other options do — the VM's Options tab —
+not here; a volume does not know which machines sit on it.
 
 ## Development
 
@@ -263,15 +356,17 @@ What in-memory tests cannot cover is DRBD itself replicating — that is the
 two-node manual test: create a volume, write on one node, read it on the
 other, pull the Core cable and watch I/O suspend rather than diverge.
 
-## Out of scope for this stage
+## Out of scope
 
-Machines on replicated disks and live migration have landed, and the
-definitions HA will restart from are already replicating. Still in the order
-it lands: the HA manager itself (fence-confirmed restarts, the HA flag, the
-events log — the console's HA toggle arrives with it); snapshots and the
-transactional rollback; the guided split-brain recovery; the 2→3 scale-out;
-and packaging and ISO pins for the DRBD kmod (ELRepo, kABI-gated exactly
-like kmod-zfs) plus the libvirt Core-network listener the migration URI
-assumes. No external storage export, no thin provisioning under
-replication, and no scale past 3 replicas — stated non-goals, not
-omissions.
+The replicated-storage program is complete: the HA manager, snapshots and
+the transactional rollback, the guided split-brain recovery, the 2→3
+scale-out with its policy flip, and the packaging (ELRepo kmod-drbd9x,
+kABI-gated exactly like kmod-zfs; the HighAvailability stack; presets that
+keep every cluster daemon off until a cluster exists) have all landed. One
+loose end is deliberate: the migration URI assumes libvirt listening on the
+Core network, and the packaging ships the firewalld service definition for
+it but does **not** enable the listener — virtproxyd's TCP authentication
+is its own security decision, and turning it on silently for every
+appliance would make it nobody's. No external storage export, no thin
+provisioning under replication, and no scale past 3 replicas — stated
+non-goals, not omissions.

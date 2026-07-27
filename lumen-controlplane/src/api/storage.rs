@@ -185,6 +185,119 @@ pub async fn resize_replicated_volume(
     Ok(Json(serde_json::json!({ "resized": true })))
 }
 
+/// GET /api/storage/replicated/{cluster}/{name}/snapshots — this node's own
+/// replica's snapshots.
+pub async fn volume_snapshots(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    Path((cluster, name)): Path<(String, String)>,
+) -> Result<Json<Vec<lumen_zfs::SnapshotInfo>>, ApiError> {
+    Ok(Json(state.drbd.volume_snapshots(&cluster, &name).await?))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotRequest {
+    pub name: String,
+}
+
+/// POST /api/storage/replicated/{cluster}/{name}/snapshots — snapshot every
+/// replica, or none.
+pub async fn snapshot_volume(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    Path((cluster, name)): Path<(String, String)>,
+    raw: Body,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let request: SnapshotRequest = required_body(raw)?;
+    state
+        .drbd
+        .snapshot_volume(&cluster, &name, &request.name)
+        .await?;
+    Ok(Json(serde_json::json!({ "snapshotted": true })))
+}
+
+/// DELETE /api/storage/replicated/{cluster}/{name}/snapshots/{snapshot}.
+pub async fn delete_volume_snapshot(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    Path((cluster, name, snapshot)): Path<(String, String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state
+        .drbd
+        .delete_snapshot(&cluster, &name, &snapshot)
+        .await?;
+    Ok(Json(serde_json::json!({ "deleted": true })))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RollbackRequest {
+    pub snapshot: String,
+    /// The member whose snapshot becomes the one truth.
+    pub source: String,
+    #[serde(default)]
+    pub i_understand_this_may_lose_data: bool,
+}
+
+/// POST /api/storage/replicated/{cluster}/{name}/rollback — the
+/// transactional rollback: machine off, resource down everywhere, one
+/// member rolled back, up everywhere, peers resync from the source.
+pub async fn rollback_volume(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    Path((cluster, name)): Path<(String, String)>,
+    raw: Body,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let request: RollbackRequest = required_body(raw)?;
+    state
+        .drbd
+        .rollback_volume(
+            &cluster,
+            &name,
+            &request.snapshot,
+            &request.source,
+            lumen_cluster::Acknowledgements {
+                may_lose_data: request.i_understand_this_may_lose_data,
+            },
+        )
+        .await?;
+    Ok(Json(serde_json::json!({ "rolled_back": true })))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SplitBrainRequest {
+    /// The member whose divergent writes are discarded.
+    pub victim: String,
+    #[serde(default)]
+    pub i_understand_this_may_lose_data: bool,
+}
+
+/// POST /api/storage/replicated/{cluster}/{name}/resolve-split-brain — the
+/// guided recovery: victim named, its writes discarded, every side
+/// reconnected.
+pub async fn resolve_split_brain(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    Path((cluster, name)): Path<(String, String)>,
+    raw: Body,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let request: SplitBrainRequest = required_body(raw)?;
+    state
+        .drbd
+        .resolve_split_brain(
+            &cluster,
+            &name,
+            &request.victim,
+            lumen_cluster::Acknowledgements {
+                may_lose_data: request.i_understand_this_may_lose_data,
+            },
+        )
+        .await?;
+    Ok(Json(serde_json::json!({ "resolved": true })))
+}
+
 /// GET /api/storage/iso — the media libraries and everything in them.
 pub async fn isos(
     _session: Session,

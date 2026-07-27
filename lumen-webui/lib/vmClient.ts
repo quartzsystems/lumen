@@ -170,6 +170,8 @@ export interface VmView {
   boot_order: BootDevice[];
   start_on_boot: boolean;
   guest_agent: boolean;
+  /// Restart on a surviving member after this node is confirmed lost.
+  ha: boolean;
   /// What the machine was built to run, as a libosinfo identifier.
   os_id: string | null;
   disks: VmDisk[];
@@ -302,6 +304,7 @@ export interface VmPatch {
   boot_order?: BootDevice[];
   start_on_boot?: boolean;
   guest_agent?: boolean;
+  ha?: boolean;
   tags?: string[];
 }
 

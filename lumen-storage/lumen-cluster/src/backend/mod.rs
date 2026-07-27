@@ -104,4 +104,21 @@ pub trait ClusterBackend: Send + Sync {
     /// only an unclean node, never this node, an explicit acknowledgement —
     /// are the service's; this is just the confirmation.
     async fn confirm_node_dead(&self, target: &str) -> Result<()>;
+
+    /// This node's corosync authentication key, for handing to a node
+    /// joining a *running* cluster — the key was generated at create and
+    /// lives only in `/etc/corosync/authkey` on the members.
+    async fn authkey(&self) -> Result<String>;
+
+    /// `corosync-cfgtool -R` — tell the running corosync to re-read its
+    /// configuration. How a live cluster learns about a new member without
+    /// restarting.
+    async fn reload_corosync(&self) -> Result<()>;
+
+    /// Change one fence device's race delay — the 2→3 scale-out flips the
+    /// two-node asymmetry off, because majority quorum decides from then on.
+    async fn update_fence_delay(&self, device: &str, delay_secs: u32) -> Result<()>;
+
+    /// Remove one fence device — the scale-out unwind's half.
+    async fn remove_fence_device(&self, device: &str) -> Result<()>;
 }

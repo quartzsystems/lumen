@@ -403,12 +403,17 @@ async fn a_machines_definition_replicates_to_co_members_and_is_withdrawn() {
     let vmid = vm["vmid"].as_u64().unwrap() as u32;
 
     // The definition went to the cluster's other member and stayed here too
-    // — the HA manager's restart inventory, filled at define time.
+    // — the HA manager's restart inventory, filled at define time, home
+    // node riding along.
     let pushed = harness.cluster_peers.definitions();
     assert_eq!(pushed.len(), 1, "{pushed:?}");
     assert_eq!(pushed[0].0, "alpha-2");
-    assert_eq!(pushed[0].1, vmid);
-    assert!(pushed[0].2.contains("web01"), "the document itself travels");
+    assert_eq!(pushed[0].1.vmid, vmid);
+    assert_eq!(pushed[0].1.node, "alpha-1", "the home travels with it");
+    assert!(
+        pushed[0].1.xml.contains("web01"),
+        "the document itself travels"
+    );
     assert_eq!(harness.cluster.stored_definitions().unwrap().len(), 1);
 
     // Deleting the machine withdraws it everywhere: a stored definition for
@@ -434,7 +439,7 @@ async fn a_machines_definition_replicates_to_co_members_and_is_withdrawn() {
 #[tokio::test]
 async fn peer_definition_routes_take_peer_tickets_and_store() {
     let harness = harness("peer-definitions", &alpha_membership());
-    let body = serde_json::json!({ "vmid": 42, "xml": "<domain/>" });
+    let body = serde_json::json!({ "vmid": 42, "node": "alpha-2", "xml": "<domain/>" });
 
     let (status, _) = request(
         &harness.router,
@@ -458,10 +463,10 @@ async fn peer_definition_routes_take_peer_tickets_and_store() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        harness.cluster.stored_definitions().unwrap(),
-        vec![(42, "<domain/>".to_string())]
-    );
+    let stored = harness.cluster.stored_definitions().unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].vmid, 42);
+    assert_eq!(stored[0].node, "alpha-2");
 
     let (status, _) = request(
         &harness.router,

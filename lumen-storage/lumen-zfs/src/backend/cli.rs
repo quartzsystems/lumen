@@ -507,6 +507,72 @@ impl ZfsBackend for CliBackend {
         self.run(&self.zfs, &["set", &volsize, path]).await?;
         Ok(())
     }
+
+    async fn snapshot_volume(&self, path: &str, snapshot: &str) -> Result<()> {
+        reject_outside_namespace(path)?;
+        let target = format!("{path}@{snapshot}");
+        self.run(&self.zfs, &["snapshot", &target]).await?;
+        Ok(())
+    }
+
+    async fn rollback_volume(&self, path: &str, snapshot: &str) -> Result<()> {
+        reject_outside_namespace(path)?;
+        let target = format!("{path}@{snapshot}");
+        // -r discards the snapshots after the one rolled back to — the only
+        // way zfs will roll back past them, and exactly what "roll back"
+        // means. The acknowledgement for that lives with the caller.
+        self.run(&self.zfs, &["rollback", "-r", &target]).await?;
+        Ok(())
+    }
+
+    async fn destroy_snapshot(&self, path: &str, snapshot: &str) -> Result<()> {
+        reject_outside_namespace(path)?;
+        let target = format!("{path}@{snapshot}");
+        self.run(&self.zfs, &["destroy", &target]).await?;
+        Ok(())
+    }
+
+    async fn snapshots(&self, path: &str) -> Result<Vec<crate::model::SnapshotInfo>> {
+        reject_outside_namespace(path)?;
+        let stdout = self
+            .run(
+                &self.zfs,
+                &[
+                    "list",
+                    "-H",
+                    "-p",
+                    "-t",
+                    "snapshot",
+                    "-o",
+                    "name,used,creation",
+                    "-s",
+                    "creation",
+                    path,
+                ],
+            )
+            .await?;
+        Ok(parse_snapshots(&stdout))
+    }
+}
+
+/// `zfs list -H -p -t snapshot -o name,used,creation`: tab-separated, one
+/// snapshot per line, the name carrying the dataset before the `@`.
+fn parse_snapshots(stdout: &str) -> Vec<crate::model::SnapshotInfo> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let full = fields.next()?;
+            let name = full.split_once('@')?.1.to_string();
+            let used = fields.next()?.trim().parse().unwrap_or(0);
+            let created = fields.next()?.trim().parse().unwrap_or(0);
+            Some(crate::model::SnapshotInfo {
+                name,
+                used,
+                created,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

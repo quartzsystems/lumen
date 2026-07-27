@@ -60,6 +60,18 @@ impl ZfsBackend for UnavailableBackend {
     async fn resize_volume(&self, _path: &str, _size: u64) -> Result<()> {
         self.error()
     }
+    async fn snapshot_volume(&self, _path: &str, _snapshot: &str) -> Result<()> {
+        self.error()
+    }
+    async fn rollback_volume(&self, _path: &str, _snapshot: &str) -> Result<()> {
+        self.error()
+    }
+    async fn destroy_snapshot(&self, _path: &str, _snapshot: &str) -> Result<()> {
+        self.error()
+    }
+    async fn snapshots(&self, _path: &str) -> Result<Vec<crate::model::SnapshotInfo>> {
+        self.error()
+    }
     async fn ensure_namespace(&self, _pool: &str) -> Result<()> {
         self.error()
     }

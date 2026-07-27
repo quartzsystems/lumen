@@ -31,6 +31,9 @@ struct Inner {
     fence_devices_created: Vec<(crate::topology::FenceDevice, String)>,
     fenced: Vec<String>,
     confirmed_dead: Vec<String>,
+    reloads: usize,
+    delay_updates: Vec<(String, u32)>,
+    fence_devices_removed: Vec<String>,
 }
 
 pub struct MockBackend {
@@ -202,6 +205,18 @@ impl MockBackend {
 
     pub fn confirmed_dead(&self) -> Vec<String> {
         self.inner.lock().unwrap().confirmed_dead.clone()
+    }
+
+    pub fn reloads(&self) -> usize {
+        self.inner.lock().unwrap().reloads
+    }
+
+    pub fn delay_updates(&self) -> Vec<(String, u32)> {
+        self.inner.lock().unwrap().delay_updates.clone()
+    }
+
+    pub fn fence_devices_removed(&self) -> Vec<String> {
+        self.inner.lock().unwrap().fence_devices_removed.clone()
     }
 
     fn take_failure(&self) -> Option<ClusterError> {
@@ -466,6 +481,54 @@ impl ClusterBackend for MockBackend {
             }
         }
         inner.confirmed_dead.push(target.to_string());
+        Ok(())
+    }
+
+    async fn authkey(&self) -> Result<String> {
+        if let Some(err) = self.take_failure() {
+            return Err(err);
+        }
+        // The key the simulated members were created with — the newcomer
+        // has to be handed the running cluster's, not a fresh one.
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .written_configs
+            .last()
+            .map(|(_, key)| key.clone())
+            .unwrap_or_else(|| "mock-cluster-key".to_string()))
+    }
+
+    async fn reload_corosync(&self) -> Result<()> {
+        if let Some(err) = self.take_failure() {
+            return Err(err);
+        }
+        self.inner.lock().unwrap().reloads += 1;
+        Ok(())
+    }
+
+    async fn update_fence_delay(&self, device: &str, delay_secs: u32) -> Result<()> {
+        if let Some(err) = self.take_failure() {
+            return Err(err);
+        }
+        self.inner
+            .lock()
+            .unwrap()
+            .delay_updates
+            .push((device.to_string(), delay_secs));
+        Ok(())
+    }
+
+    async fn remove_fence_device(&self, device: &str) -> Result<()> {
+        if let Some(err) = self.take_failure() {
+            return Err(err);
+        }
+        let mut inner = self.inner.lock().unwrap();
+        for state in inner.clusters.values_mut() {
+            state.fence_devices.retain(|d| d.device != device);
+        }
+        inner.fence_devices_removed.push(device.to_string());
         Ok(())
     }
 }

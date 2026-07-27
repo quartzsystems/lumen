@@ -236,7 +236,7 @@ async fn main() -> Result<()> {
         )
     };
 
-    let router = app(Arc::new(AppState {
+    let state = Arc::new(AppState {
         config,
         jwt_secret,
         tls: tls_config.clone(),
@@ -248,7 +248,25 @@ async fn main() -> Result<()> {
         cluster,
         drbd,
         tasks: lumen_controlplane::tasks::TaskLog::open(state_dir.join("vm-tasks.jsonl")),
-    }));
+    });
+
+    // The HA manager: one sweep every fifteen seconds. Quiet when there is
+    // nothing lost; when a member is lost *and clean* — fenced, confirmed
+    // dead, or shut down — the elected survivor restarts its HA machines
+    // from the replicated definitions. See src/ha.rs for the rules.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                lumen_controlplane::ha::sweep(&state).await;
+            }
+        });
+    }
+
+    let router = app(state);
 
     match tls_config {
         None => {

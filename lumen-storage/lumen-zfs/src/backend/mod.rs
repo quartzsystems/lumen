@@ -58,6 +58,21 @@ pub trait ZfsBackend: Send + Sync {
     /// so the refusal lives at every layer.
     async fn resize_volume(&self, path: &str, size: u64) -> Result<()>;
 
+    /// Snapshot a volume: `zfs snapshot <path>@<name>`. Crash-consistent —
+    /// the state a machine would find after a power cut at that instant.
+    async fn snapshot_volume(&self, path: &str, snapshot: &str) -> Result<()>;
+
+    /// Roll a volume back to a snapshot, discarding everything after it —
+    /// later snapshots included (`zfs rollback -r`). The acknowledgement
+    /// lives with the caller; this is the mechanism.
+    async fn rollback_volume(&self, path: &str, snapshot: &str) -> Result<()>;
+
+    /// Remove one snapshot.
+    async fn destroy_snapshot(&self, path: &str, snapshot: &str) -> Result<()>;
+
+    /// The snapshots of one volume, oldest first.
+    async fn snapshots(&self, path: &str) -> Result<Vec<crate::model::SnapshotInfo>>;
+
     /// Create the `<pool>/lumen` parent if it is not there yet. Idempotent.
     async fn ensure_namespace(&self, pool: &str) -> Result<()>;
 

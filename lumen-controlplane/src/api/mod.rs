@@ -125,6 +125,12 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/environment/nodes/{name}",
             delete(cluster::remove_node),
         )
+        // The 2→3 scale-out: add an unassigned node to a running cluster —
+        // 202, then poll the same pending feed a create uses.
+        .route(
+            "/api/environment/clusters/{name}/nodes",
+            post(cluster::add_node),
+        )
         // Fencing: the guarded live test per direction, and the break-glass
         // confirmation for a node that is unreachable and could not be
         // fenced. Both are operator actions, never peer calls.
@@ -145,6 +151,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/peer/cluster/prepare", post(peer::prepare))
         .route("/api/peer/cluster/start", post(peer::start))
         .route("/api/peer/cluster/teardown", post(peer::teardown))
+        .route("/api/peer/cluster/reconfigure", post(peer::reconfigure))
         .route("/api/peer/volume/prepare", post(peer::prepare_volume))
         .route("/api/peer/volume/prime", post(peer::prime_volume))
         .route("/api/peer/volume/teardown", post(peer::teardown_volume))
@@ -156,6 +163,29 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/peer/volume/two-primaries",
             post(peer::volume_two_primaries),
+        )
+        .route(
+            "/api/peer/volume/snapshot",
+            post(peer::snapshot_volume_backing),
+        )
+        .route(
+            "/api/peer/volume/rollback-backing",
+            post(peer::rollback_volume_backing),
+        )
+        .route(
+            "/api/peer/volume/drop-snapshot",
+            post(peer::drop_volume_snapshot),
+        )
+        .route("/api/peer/volume/down", post(peer::down_volume))
+        .route("/api/peer/volume/up", post(peer::up_volume))
+        .route(
+            "/api/peer/volume/invalidate-remote",
+            post(peer::invalidate_remote_volume),
+        )
+        .route("/api/peer/volume/reconnect", post(peer::reconnect_volume))
+        .route(
+            "/api/peer/volume/apply-policy",
+            post(peer::apply_volume_policy),
         )
         .route("/api/peer/definition/store", post(peer::store_definition))
         .route("/api/peer/definition/drop", post(peer::drop_definition))
@@ -196,6 +226,26 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/storage/replicated/{cluster}/{name}/resize",
             post(storage::resize_replicated_volume),
+        )
+        .route(
+            "/api/storage/replicated/{cluster}/{name}/snapshots",
+            get(storage::volume_snapshots),
+        )
+        .route(
+            "/api/storage/replicated/{cluster}/{name}/snapshots",
+            post(storage::snapshot_volume),
+        )
+        .route(
+            "/api/storage/replicated/{cluster}/{name}/snapshots/{snapshot}",
+            delete(storage::delete_volume_snapshot),
+        )
+        .route(
+            "/api/storage/replicated/{cluster}/{name}/rollback",
+            post(storage::rollback_volume),
+        )
+        .route(
+            "/api/storage/replicated/{cluster}/{name}/resolve-split-brain",
+            post(storage::resolve_split_brain),
         )
         .route("/api/storage/iso", get(storage::isos))
         .route("/api/storage/iso/{pool}", post(storage::create_iso_store))

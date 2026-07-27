@@ -610,10 +610,14 @@ export function CreateClusterDialog({
   );
 }
 
-const STEP_LABEL: Record<string, string> = {
+export const STEP_LABEL: Record<string, string> = {
   preflight: "Preflight",
   generate: "Generate configuration",
   prepare: "Prepare",
+  // The two steps only a node-add has: every existing member takes the new
+  // membership live, and the two-node fence delays are flattened away.
+  reconfigure: "Push new membership",
+  delays: "Flatten fence delays",
   start: "Start cluster stack",
   form: "Wait for the cluster to form",
   properties: "Set cluster properties",
@@ -622,7 +626,7 @@ const STEP_LABEL: Record<string, string> = {
   unwind: "Unwind",
 };
 
-function ProgressRow({ step }: { step: StepProgress }) {
+export function ProgressRow({ step }: { step: StepProgress }) {
   const tone =
     step.state === "done"
       ? "ok"

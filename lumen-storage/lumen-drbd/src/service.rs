@@ -31,7 +31,9 @@ use crate::model::{
     allocate_minor, allocate_port, backing_size, device_path, resource_name, valid_volume_name,
     zvol_path, MAX_REPLICAS, MIN_REPLICAS, VOLBLOCKSIZE,
 };
-use crate::peers::{VolumePeers, VolumePrepare, VolumeResizeBacking, VolumeTeardown};
+use crate::peers::{
+    VolumePeers, VolumePrepare, VolumeResizeBacking, VolumeSnapshot, VolumeTeardown,
+};
 use crate::render::{generate_secret, resource_file, RenderSeat};
 use crate::state::ResourceStatus;
 
@@ -617,6 +619,424 @@ impl DrbdService {
         self.backend.set_two_primaries(resource, allow).await
     }
 
+    pub async fn peer_snapshot_backing(&self, payload: &VolumeSnapshot) -> Result<()> {
+        self.storage
+            .snapshot_volume(&payload.zvol, &payload.snapshot)
+            .await
+            .map_err(DrbdError::from)
+    }
+
+    pub async fn peer_rollback_backing(&self, payload: &VolumeSnapshot) -> Result<()> {
+        self.storage
+            .rollback_volume(&payload.zvol, &payload.snapshot)
+            .await
+            .map_err(DrbdError::from)
+    }
+
+    pub async fn peer_drop_snapshot(&self, payload: &VolumeSnapshot) -> Result<()> {
+        self.storage
+            .destroy_snapshot(&payload.zvol, &payload.snapshot)
+            .await
+            .map_err(DrbdError::from)
+    }
+
+    pub async fn peer_down(&self, resource: &str) -> Result<()> {
+        self.backend.down(resource).await
+    }
+
+    pub async fn peer_up(&self, resource: &str) -> Result<()> {
+        self.backend.up(resource).await
+    }
+
+    pub async fn peer_invalidate_remote(&self, resource: &str) -> Result<()> {
+        self.backend.invalidate_remote(resource).await
+    }
+
+    pub async fn peer_reconnect(&self, resource: &str, discard: bool) -> Result<()> {
+        self.backend.reconnect(resource, discard).await
+    }
+
+    // --- snapshots and recovery ---------------------------------------------
+
+    /// Snapshot a volume on every replica. Each member's snapshot is
+    /// crash-consistent at its own instant — with protocol C those instants
+    /// are a heartbeat apart — and a rollback later picks *one* of them and
+    /// resyncs the rest from it, which is why per-member snapshots are the
+    /// right shape and a coordinated freeze would be machinery without a
+    /// customer.
+    pub async fn snapshot_volume(&self, cluster: &str, name: &str, snapshot: &str) -> Result<()> {
+        let _guard = self.gate.lock().await;
+        if !valid_volume_name(snapshot) {
+            return Err(DrbdError::invalid(ValidationError::new(
+                ValidationCode::InvalidVolumeName,
+                Some("snapshot"),
+                format!(
+                    "\"{snapshot}\" is not a usable snapshot name — lowercase letters, digits, \
+                     and hyphens, starting with a letter."
+                ),
+            )));
+        }
+        let membership = self.membership()?;
+        let volume = self.recorded_volume(&membership, cluster, name)?.clone();
+
+        let mut taken: Vec<(EnvironmentNode, VolumeSnapshot)> = Vec::new();
+        for seat in &volume.replicas {
+            let Some(node) = membership.node(&seat.node).cloned() else {
+                continue;
+            };
+            let payload = VolumeSnapshot {
+                zvol: zvol_path(&seat.pool, cluster, name),
+                snapshot: snapshot.to_string(),
+            };
+            if let Err(err) = self.peers.snapshot_backing(&node, &payload).await {
+                // A snapshot on some replicas and not others is a trap for
+                // the rollback that would use it: unwind what was taken.
+                for (node, payload) in taken.iter().rev() {
+                    if let Err(unwind_err) = self.peers.drop_snapshot(node, payload).await {
+                        tracing::warn!(%node.name, "the snapshot unwind failed: {unwind_err}");
+                    }
+                }
+                return Err(DrbdError::Conflict(format!(
+                    "The snapshot on {} failed, so it was not taken anywhere: {err}",
+                    node.name
+                )));
+            }
+            taken.push((node, payload));
+        }
+        tracing::info!(cluster, volume = name, snapshot, "volume snapshotted");
+        Ok(())
+    }
+
+    /// The snapshots of this node's own replica. Honest about vantage, like
+    /// every read here: a node without a replica is told where to ask.
+    pub async fn volume_snapshots(
+        &self,
+        cluster: &str,
+        name: &str,
+    ) -> Result<Vec<lumen_zfs::SnapshotInfo>> {
+        let membership = self.membership()?;
+        let volume = self.recorded_volume(&membership, cluster, name)?;
+        let Some(seat) = volume.seat(self.node()) else {
+            return Err(DrbdError::Conflict(format!(
+                "This node holds no replica of \"{name}\" — its snapshots are known on {}.",
+                volume
+                    .replicas
+                    .iter()
+                    .map(|s| s.node.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        };
+        self.storage
+            .volume_snapshots(&zvol_path(&seat.pool, cluster, name))
+            .await
+            .map_err(DrbdError::from)
+    }
+
+    /// Drop a snapshot from every replica. All must let go, or the answer
+    /// says who did not.
+    pub async fn delete_snapshot(&self, cluster: &str, name: &str, snapshot: &str) -> Result<()> {
+        let _guard = self.gate.lock().await;
+        let membership = self.membership()?;
+        let volume = self.recorded_volume(&membership, cluster, name)?.clone();
+        let mut failures = Vec::new();
+        for seat in &volume.replicas {
+            let Some(node) = membership.node(&seat.node).cloned() else {
+                continue;
+            };
+            let payload = VolumeSnapshot {
+                zvol: zvol_path(&seat.pool, cluster, name),
+                snapshot: snapshot.to_string(),
+            };
+            if let Err(err) = self.peers.drop_snapshot(&node, &payload).await {
+                failures.push(format!("{}: {err}", node.name));
+            }
+        }
+        if !failures.is_empty() {
+            return Err(DrbdError::Conflict(format!(
+                "Not every replica dropped the snapshot. {}",
+                failures.join(" ")
+            )));
+        }
+        Ok(())
+    }
+
+    /// Roll a volume back to a snapshot: one transactional workflow, never
+    /// raw primitives. The machine using the volume must be off — DRBD's
+    /// role says whether anything holds the device open — then: resource
+    /// down on every member, `zfs rollback` on the chosen source, resource
+    /// up everywhere, and the source declared the one truth
+    /// (`invalidate-remote`), so the peers resync from it. The other
+    /// members' own snapshots are left in place; the resync overwrites their
+    /// live data either way.
+    pub async fn rollback_volume(
+        &self,
+        cluster: &str,
+        name: &str,
+        snapshot: &str,
+        source: &str,
+        ack: Acknowledgements,
+    ) -> Result<()> {
+        let _guard = self.gate.lock().await;
+        if !ack.may_lose_data {
+            return Err(DrbdError::invalid(ValidationError::new(
+                ValidationCode::UnacknowledgedDestructiveOperation,
+                Some("i_understand_this_may_lose_data"),
+                "Rolling back discards everything written since the snapshot, on every \
+                 replica. Acknowledge that to proceed.",
+            )));
+        }
+        let membership = self.membership()?;
+        let volume = self.recorded_volume(&membership, cluster, name)?.clone();
+        let Some(source_seat) = volume.seat(source).cloned() else {
+            return Err(DrbdError::NotFound(format!(
+                "\"{source}\" holds no replica of \"{name}\"."
+            )));
+        };
+        let resource = resource_name(cluster, name);
+
+        // The device must be closed everywhere. This node's DRBD can answer
+        // for the whole resource — its own role and every peer's — so the
+        // check requires running from a member holding a replica.
+        if volume.seat(self.node()).is_none() {
+            return Err(DrbdError::Conflict(format!(
+                "A rollback runs from a member holding a replica of \"{name}\" — open that \
+                 node's console."
+            )));
+        }
+        let statuses = self.backend.status().await?;
+        if let Some(status) = statuses.iter().find(|s| s.name == resource) {
+            let open_somewhere = status.role == "Primary"
+                || status.connections.iter().any(|p| p.peer_role == "Primary");
+            if open_somewhere {
+                return Err(DrbdError::Conflict(format!(
+                    "\"{name}\" is open somewhere — the machine using it must be off before a \
+                     rollback."
+                )));
+            }
+        }
+
+        let nodes: Vec<(EnvironmentNode, VolumeSeat)> = volume
+            .replicas
+            .iter()
+            .filter_map(|seat| {
+                membership
+                    .node(&seat.node)
+                    .cloned()
+                    .map(|n| (n, seat.clone()))
+            })
+            .collect();
+
+        // Down everywhere. A member that will not go down stops the whole
+        // workflow before anything destructive has happened.
+        let mut downed: Vec<&EnvironmentNode> = Vec::new();
+        let mut failure: Option<DrbdError> = None;
+        for (node, _) in &nodes {
+            match self.peers.down_resource(node, &resource).await {
+                Ok(()) => downed.push(node),
+                Err(err) => {
+                    failure = Some(DrbdError::Conflict(format!(
+                        "Taking the volume down on {} failed, so nothing was rolled back: {err}",
+                        node.name
+                    )));
+                    break;
+                }
+            }
+        }
+
+        // The destructive step, on exactly one member.
+        if failure.is_none() {
+            let source_node = membership
+                .node(&source_seat.node)
+                .cloned()
+                .expect("the seat came from the record");
+            let payload = VolumeSnapshot {
+                zvol: zvol_path(&source_seat.pool, cluster, name),
+                snapshot: snapshot.to_string(),
+            };
+            if let Err(err) = self.peers.rollback_backing(&source_node, &payload).await {
+                failure = Some(DrbdError::Conflict(format!(
+                    "The rollback on {source} failed: {err}"
+                )));
+            }
+        }
+
+        // Up everywhere that went down — after a successful rollback and
+        // after a failed one alike; a volume left down is a second outage.
+        let mut up_failures = Vec::new();
+        for node in downed.iter().rev() {
+            if let Err(err) = self.peers.up_resource(node, &resource).await {
+                up_failures.push(format!("{}: {err}", node.name));
+            }
+        }
+        if let Some(err) = failure {
+            return Err(err);
+        }
+        if !up_failures.is_empty() {
+            return Err(DrbdError::Conflict(format!(
+                "The rollback ran, but the volume did not come back up everywhere — bring it \
+                 up by hand before using it. {}",
+                up_failures.join(" ")
+            )));
+        }
+
+        // The source is the truth now; everyone else resyncs from it.
+        let source_node = membership
+            .node(&source_seat.node)
+            .cloned()
+            .expect("the seat came from the record");
+        self.peers
+            .invalidate_remote(&source_node, &resource)
+            .await?;
+        tracing::info!(
+            cluster,
+            volume = name,
+            snapshot,
+            source,
+            "volume rolled back"
+        );
+        Ok(())
+    }
+
+    /// Re-render every volume of a cluster with its *current* replication
+    /// policy and apply it live — the 2→3 scale-out's closing move. A
+    /// two-node cluster's volumes carried `fencing resource-and-stonith`;
+    /// at three, majority quorum decides and the mechanisms fall away —
+    /// decided, as always, by the topology engine and nowhere else. The
+    /// shared-secret never travels: the file goes out with a placeholder
+    /// and each member substitutes its own copy before writing.
+    pub async fn refresh_policies(&self, cluster: &str) -> Result<()> {
+        let _guard = self.gate.lock().await;
+        let membership = self.membership()?;
+        let Some(record) = membership.cluster_record(cluster) else {
+            return Err(DrbdError::NotFound(format!(
+                "There is no cluster called \"{cluster}\" in this environment."
+            )));
+        };
+        let topology = ClusterTopology::new(record.definition.clone());
+        let mut failures = Vec::new();
+        for volume in &record.volumes {
+            let resource = resource_name(cluster, &volume.name);
+            let mut seats = Vec::new();
+            for seat in &volume.replicas {
+                let Some(core) = record
+                    .networks
+                    .core
+                    .members
+                    .iter()
+                    .find(|m| m.node == seat.node)
+                else {
+                    continue;
+                };
+                seats.push(RenderSeat {
+                    node: seat.node.clone(),
+                    pool: seat.pool.clone(),
+                    core_address: core.address,
+                });
+            }
+            let policy = topology.replication_policy(volume.replicas.len());
+            let rendered = resource_file(
+                &resource,
+                cluster,
+                volume,
+                &seats,
+                &policy,
+                crate::peers::SECRET_PLACEHOLDER,
+            );
+            for seat in &volume.replicas {
+                let Some(node) = membership.node(&seat.node).cloned() else {
+                    continue;
+                };
+                let payload = crate::peers::VolumeApply {
+                    resource: resource.clone(),
+                    resource_file: rendered.clone(),
+                };
+                if let Err(err) = self.peers.apply_policy(&node, &payload).await {
+                    failures.push(format!("{} on {}: {err}", volume.name, node.name));
+                }
+            }
+        }
+        if !failures.is_empty() {
+            return Err(DrbdError::Conflict(format!(
+                "Not every volume took the new replication policy — re-run this after fixing: \
+                 {}",
+                failures.join(" ")
+            )));
+        }
+        tracing::info!(cluster, "volume replication policies refreshed");
+        Ok(())
+    }
+
+    /// A peer handed this node a re-rendered file: substitute this node's
+    /// own secret for the placeholder, write, and adjust — live.
+    pub async fn peer_apply_policy(&self, payload: &crate::peers::VolumeApply) -> Result<()> {
+        let existing = self.backend.read_resource(&payload.resource).await?;
+        let Some(secret) = extract_secret(&existing) else {
+            return Err(DrbdError::Conflict(format!(
+                "The existing file for {} carries no shared-secret to keep.",
+                payload.resource
+            )));
+        };
+        let rendered = payload
+            .resource_file
+            .replace(crate::peers::SECRET_PLACEHOLDER, &secret);
+        self.backend
+            .write_resource(&payload.resource, &rendered)
+            .await?;
+        self.backend.adjust(&payload.resource).await
+    }
+
+    /// Resolve a split brain: the operator names the victim, whose divergent
+    /// writes are discarded, and every side reconnects. Offered by the
+    /// console only while a connection is StandAlone, and guarded twice —
+    /// the acknowledgement here, the victim's name typed in the dialog.
+    pub async fn resolve_split_brain(
+        &self,
+        cluster: &str,
+        name: &str,
+        victim: &str,
+        ack: Acknowledgements,
+    ) -> Result<()> {
+        let _guard = self.gate.lock().await;
+        if !ack.may_lose_data {
+            return Err(DrbdError::invalid(ValidationError::new(
+                ValidationCode::UnacknowledgedDestructiveOperation,
+                Some("i_understand_this_may_lose_data"),
+                "Resolving a split brain discards everything the victim wrote on its own. \
+                 Acknowledge that to proceed.",
+            )));
+        }
+        let membership = self.membership()?;
+        let volume = self.recorded_volume(&membership, cluster, name)?.clone();
+        if volume.seat(victim).is_none() {
+            return Err(DrbdError::NotFound(format!(
+                "\"{victim}\" holds no replica of \"{name}\"."
+            )));
+        }
+        let resource = resource_name(cluster, name);
+
+        // The victim first, discarding; then the survivors, keeping. Order
+        // matters: a survivor reconnecting first would meet the victim's
+        // divergent generation and refuse again.
+        let victim_node = membership.node(victim).cloned().ok_or_else(|| {
+            DrbdError::Conflict(format!("{victim} is not in the environment record"))
+        })?;
+        self.peers.reconnect(&victim_node, &resource, true).await?;
+        for seat in &volume.replicas {
+            if seat.node == victim {
+                continue;
+            }
+            let Some(node) = membership.node(&seat.node).cloned() else {
+                continue;
+            };
+            if let Err(err) = self.peers.reconnect(&node, &resource, false).await {
+                tracing::warn!(node = %seat.node, "the survivor did not reconnect: {err}");
+            }
+        }
+        tracing::warn!(cluster, volume = name, victim, "split brain resolved");
+        Ok(())
+    }
+
     // --- the compute domain's door ------------------------------------------
 
     /// The cluster this node is a member of — where a machine on this node
@@ -888,6 +1308,15 @@ impl DrbdService {
                 DrbdError::NotFound(format!("\"{cluster}\" has no volume called \"{name}\"."))
             })
     }
+}
+
+/// The shared-secret out of an existing resource file — kept on the node,
+/// substituted into re-rendered files, never sent anywhere.
+fn extract_secret(resource_file: &str) -> Option<String> {
+    let start = resource_file.find("shared-secret \"")? + "shared-secret \"".len();
+    let rest = &resource_file[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
 }
 
 /// `tank/lumen/alpha-v0` → (`tank`, `alpha-v0`): the pieces
@@ -1541,6 +1970,288 @@ mod tests {
         // forgets the record.
         service.destroy_disk(&second.device).await.unwrap();
         assert!(service.disk_of(&second.device).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_lands_on_every_replica_or_on_none() {
+        let backend = Arc::new(MockBackend::appliance());
+        let peers = Arc::new(MockVolumePeers::new().with_backend(backend.clone()));
+        let service = service_with(backend, peers.clone(), &alpha_membership(), "snap");
+        service
+            .create_volume(create_request("vm-101-disk-0", 1 << 30))
+            .await
+            .unwrap();
+
+        service
+            .snapshot_volume("alpha", "vm-101-disk-0", "before-upgrade")
+            .await
+            .unwrap();
+        let taken = peers.snapshots();
+        assert_eq!(taken.len(), 2, "{taken:?}");
+        assert!(taken
+            .iter()
+            .all(|(_, s)| s.snapshot == "before-upgrade"
+                && s.zvol == "boot/lumen/alpha-vm-101-disk-0"));
+
+        // A bad name is a validation answer, not a half-taken snapshot.
+        let err = service
+            .snapshot_volume("alpha", "vm-101-disk-0", "Bad Name")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DrbdError::Invalid(_)));
+    }
+
+    #[tokio::test]
+    async fn a_failed_snapshot_unwinds_the_ones_already_taken() {
+        let backend = Arc::new(MockBackend::appliance());
+        let peers = Arc::new(
+            MockVolumePeers::new()
+                .with_backend(backend.clone())
+                .fail_snapshot_on("alpha-2"),
+        );
+        let service = service_with(backend, peers.clone(), &alpha_membership(), "snap-unwind");
+        service
+            .create_volume(create_request("vm-101-disk-0", 1 << 30))
+            .await
+            .unwrap();
+
+        let err = service
+            .snapshot_volume("alpha", "vm-101-disk-0", "before")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not taken anywhere"), "{err}");
+        // The one that succeeded was dropped again.
+        assert_eq!(peers.dropped_snapshots().len(), 1);
+        assert_eq!(peers.dropped_snapshots()[0].0, "alpha-1");
+    }
+
+    /// The rollback workflow, in its exact order: down everywhere, roll back
+    /// the chosen source, up everywhere, and the source declared the truth.
+    #[tokio::test]
+    async fn a_rollback_is_one_transaction_with_the_source_as_the_truth() {
+        let backend = Arc::new(MockBackend::appliance());
+        let peers = Arc::new(MockVolumePeers::new().with_backend(backend.clone()));
+        let service = service_with(
+            backend.clone(),
+            peers.clone(),
+            &alpha_membership(),
+            "rollback",
+        );
+        service
+            .create_volume(create_request("vm-101-disk-0", 1 << 30))
+            .await
+            .unwrap();
+
+        // Refused without the acknowledgement.
+        let refused = service
+            .rollback_volume(
+                "alpha",
+                "vm-101-disk-0",
+                "before",
+                "alpha-2",
+                Acknowledgements::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(refused, DrbdError::Invalid(_)));
+
+        service
+            .rollback_volume(
+                "alpha",
+                "vm-101-disk-0",
+                "before",
+                "alpha-2",
+                Acknowledgements {
+                    may_lose_data: true,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(peers.downs().len(), 2, "down everywhere first");
+        let rollbacks = peers.rollbacks();
+        assert_eq!(rollbacks.len(), 1, "the destructive step runs once");
+        assert_eq!(rollbacks[0].0, "alpha-2");
+        assert_eq!(peers.ups().len(), 2, "up everywhere after");
+        let invalidated = peers.invalidated();
+        assert_eq!(
+            invalidated,
+            vec![("alpha-2".to_string(), "alpha-vm-101-disk-0".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rollback_is_refused_while_the_device_is_open() {
+        let backend = Arc::new(MockBackend::appliance());
+        let peers = Arc::new(MockVolumePeers::new().with_backend(backend.clone()));
+        let service = service_with(
+            backend.clone(),
+            peers.clone(),
+            &alpha_membership(),
+            "rollback-open",
+        );
+        service
+            .create_volume(create_request("vm-101-disk-0", 1 << 30))
+            .await
+            .unwrap();
+
+        // Simulate the machine holding the device open: this node Primary.
+        let mut open = crate::backend::mock::healthy_resource("alpha-vm-101-disk-0", "alpha-2", 1);
+        open.role = "Primary".into();
+        backend.register(open);
+
+        let err = service
+            .rollback_volume(
+                "alpha",
+                "vm-101-disk-0",
+                "before",
+                "alpha-1",
+                Acknowledgements {
+                    may_lose_data: true,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("must be off"), "{err}");
+        assert!(peers.downs().is_empty(), "nothing was touched");
+    }
+
+    /// The 2→3 policy flip: every volume re-rendered with the quorum
+    /// regime's policy — mechanisms gone for a two-replica volume — with a
+    /// placeholder where the secret goes, and the peer side substituting
+    /// its own before writing.
+    #[tokio::test]
+    async fn the_policy_flip_rerenders_without_the_secret_ever_leaving() {
+        // The membership a completed scale-out leaves: three members in the
+        // definition, the old two-replica volume still recorded.
+        let mut membership = alpha_membership();
+        let (node3, core3) = seat("alpha-3", 3);
+        membership.nodes.push(lumen_cluster::EnvironmentNode {
+            name: "alpha-3".into(),
+            address: "192.168.10.3:8443".into(),
+            controlplane_version: "0.3.0".into(),
+            cluster: Some("alpha".into()),
+        });
+        let record = membership
+            .clusters
+            .iter_mut()
+            .find(|r| r.definition.name == "alpha")
+            .unwrap();
+        record.definition.nodes.push(node3);
+        record.definition.preferred_node = None;
+        record.networks.core.members.push(core3);
+        record.volumes.push(VolumeRecord {
+            name: "vm-101-disk-0".into(),
+            size_bytes: 1 << 30,
+            zvol_bytes: backing_size(1 << 30, 2),
+            port: 7788,
+            minor: 1,
+            replicas: vec![
+                VolumeSeat {
+                    node: "alpha-1".into(),
+                    pool: "boot".into(),
+                },
+                VolumeSeat {
+                    node: "alpha-2".into(),
+                    pool: "boot".into(),
+                },
+            ],
+        });
+
+        let backend = Arc::new(MockBackend::appliance());
+        let peers = Arc::new(MockVolumePeers::new());
+        let service = service_with(backend.clone(), peers.clone(), &membership, "policy-flip");
+
+        service.refresh_policies("alpha").await.unwrap();
+        let applied = peers.applied();
+        assert_eq!(applied.len(), 2, "one push per replica");
+        let file = &applied[0].1.resource_file;
+        assert!(
+            file.contains("@@LUMEN-SECRET@@"),
+            "the secret never travels"
+        );
+        assert!(
+            !file.contains("fencing resource-and-stonith"),
+            "the two-node mechanism fell away"
+        );
+        assert!(
+            !file.contains("quorum majority"),
+            "two replicas at three nodes carry neither"
+        );
+
+        // The peer side keeps its own secret: placeholder in, local secret
+        // out, adjusted live.
+        service
+            .peer_apply_policy(&crate::peers::VolumeApply {
+                resource: "alpha-vm-101-disk-0".into(),
+                resource_file: file.clone(),
+            })
+            .await
+            .unwrap();
+        let written = backend.written();
+        let last = &written.last().unwrap().1;
+        assert!(last.contains("mock-secret"), "{last}");
+        assert!(!last.contains("@@LUMEN-SECRET@@"));
+        assert_eq!(backend.adjusted(), vec!["alpha-vm-101-disk-0"]);
+    }
+
+    #[tokio::test]
+    async fn a_split_brain_resolution_discards_the_victim_first() {
+        let backend = Arc::new(MockBackend::appliance());
+        let peers = Arc::new(MockVolumePeers::new().with_backend(backend.clone()));
+        let service = service_with(backend, peers.clone(), &alpha_membership(), "split-brain");
+        service
+            .create_volume(create_request("vm-101-disk-0", 1 << 30))
+            .await
+            .unwrap();
+
+        let refused = service
+            .resolve_split_brain(
+                "alpha",
+                "vm-101-disk-0",
+                "alpha-2",
+                Acknowledgements::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(refused, DrbdError::Invalid(_)));
+
+        service
+            .resolve_split_brain(
+                "alpha",
+                "vm-101-disk-0",
+                "alpha-2",
+                Acknowledgements {
+                    may_lose_data: true,
+                },
+            )
+            .await
+            .unwrap();
+        let reconnects = peers.reconnects();
+        assert_eq!(reconnects.len(), 2, "{reconnects:?}");
+        assert_eq!(
+            (reconnects[0].0.as_str(), reconnects[0].2),
+            ("alpha-2", true),
+            "the victim reconnects first, discarding"
+        );
+        assert_eq!(
+            (reconnects[1].0.as_str(), reconnects[1].2),
+            ("alpha-1", false)
+        );
+
+        // A stranger cannot be named the victim.
+        let err = service
+            .resolve_split_brain(
+                "alpha",
+                "vm-101-disk-0",
+                "ghost",
+                Acknowledgements {
+                    may_lose_data: true,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("holds no replica"), "{err}");
     }
 
     #[tokio::test]

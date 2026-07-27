@@ -106,6 +106,76 @@ export const resizeReplicatedVolume = (
     },
   );
 
+// --- snapshots and recovery --------------------------------------------------
+
+export interface SnapshotInfo {
+  /// The snapshot's own name — the part after the `@`.
+  name: string;
+  /// Bytes the snapshot holds that the live volume no longer does.
+  used: number;
+  /// Unix seconds.
+  created: number;
+}
+
+export const fetchVolumeSnapshots = (
+  cluster: string,
+  name: string,
+): Promise<SnapshotInfo[]> =>
+  apiFetch<SnapshotInfo[]>(
+    `/storage/replicated/${encodeURIComponent(cluster)}/${encodeURIComponent(name)}/snapshots`,
+  );
+
+export const snapshotVolume = (
+  cluster: string,
+  name: string,
+  snapshot: string,
+): Promise<void> =>
+  apiFetch<void>(
+    `/storage/replicated/${encodeURIComponent(cluster)}/${encodeURIComponent(name)}/snapshots`,
+    { method: "POST", body: JSON.stringify({ name: snapshot }) },
+  );
+
+export const deleteVolumeSnapshot = (
+  cluster: string,
+  name: string,
+  snapshot: string,
+): Promise<void> =>
+  apiFetch<void>(
+    `/storage/replicated/${encodeURIComponent(cluster)}/${encodeURIComponent(name)}/snapshots/${encodeURIComponent(snapshot)}`,
+    { method: "DELETE" },
+  );
+
+export const rollbackVolume = (
+  cluster: string,
+  name: string,
+  snapshot: string,
+  source: string,
+): Promise<void> =>
+  apiFetch<void>(
+    `/storage/replicated/${encodeURIComponent(cluster)}/${encodeURIComponent(name)}/rollback`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        snapshot,
+        source,
+        i_understand_this_may_lose_data: true,
+      }),
+    },
+  );
+
+export const resolveSplitBrain = (
+  cluster: string,
+  name: string,
+  victim: string,
+): Promise<void> =>
+  apiFetch<void>(
+    `/storage/replicated/${encodeURIComponent(cluster)}/${encodeURIComponent(name)}/resolve-split-brain`,
+    {
+      method: "POST",
+      body: JSON.stringify({ victim, i_understand_this_may_lose_data: true }),
+    },
+  );
+
 // --- display helpers ---------------------------------------------------------
 
 export const VOLUME_HEALTH_TONE: Record<VolumeHealth, "ok" | "warn" | "crit" | "muted"> = {

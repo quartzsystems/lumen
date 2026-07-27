@@ -1,0 +1,15 @@
+# Lumen: the cluster stack ships installed and OFF.
+#
+# A node that is not in a cluster must not start half of one at boot — a
+# corosync with no configuration flaps, and a pacemaker with no corosync
+# fails. The cluster-create and node-add workflows are the only things that
+# enable these (systemctl enable --now, per member), and cluster destroy
+# disables them again. The preset records that default so a fresh install
+# and an upgrade agree.
+#
+# pcsd stays off for a stronger reason: Lumen deliberately does not use
+# `pcs cluster setup`, so nothing ever needs the daemon or its hacluster
+# account — see docs/cluster.md, "pcs configures; it does not install".
+disable corosync.service
+disable pacemaker.service
+disable pcsd.service

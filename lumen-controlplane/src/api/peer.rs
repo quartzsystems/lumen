@@ -20,7 +20,7 @@ use crate::AppState;
 use lumen_cluster::{
     EnvironmentMembership, JoinGrant, JoinRequest, PreflightReport, PreparePayload, TeardownPayload,
 };
-use lumen_drbd::{VolumePrepare, VolumeResizeBacking, VolumeTeardown};
+use lumen_drbd::{VolumePrepare, VolumeResizeBacking, VolumeSnapshot, VolumeTeardown};
 
 /// POST /api/peer/join — the issuer's half of an environment join. The
 /// token in the body is the authentication; there is no ticket to hold yet.
@@ -78,6 +78,17 @@ pub async fn teardown(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     state.cluster.peer_teardown(&payload).await?;
     Ok(Json(serde_json::json!({ "torn_down": true })))
+}
+
+/// POST /api/peer/cluster/reconfigure — take a regenerated configuration
+/// and reload corosync, live. The scale-out's reach into a running member.
+pub async fn reconfigure(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<lumen_cluster::join::ReconfigurePayload>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state.cluster.peer_reconfigure(&payload).await?;
+    Ok(Json(serde_json::json!({ "reconfigured": true })))
 }
 
 // --- replicated volumes -----------------------------------------------------
@@ -160,25 +171,114 @@ pub async fn volume_two_primaries(
     Ok(Json(serde_json::json!({ "adjusted": true })))
 }
 
+/// POST /api/peer/volume/snapshot — snapshot this member's backing zvol.
+pub async fn snapshot_volume_backing(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<VolumeSnapshot>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state.drbd.peer_snapshot_backing(&payload).await?;
+    Ok(Json(serde_json::json!({ "snapshotted": true })))
+}
+
+/// POST /api/peer/volume/rollback-backing — roll this member's zvol back.
+pub async fn rollback_volume_backing(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<VolumeSnapshot>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state.drbd.peer_rollback_backing(&payload).await?;
+    Ok(Json(serde_json::json!({ "rolled_back": true })))
+}
+
+/// POST /api/peer/volume/drop-snapshot — drop this member's snapshot.
+pub async fn drop_volume_snapshot(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<VolumeSnapshot>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state.drbd.peer_drop_snapshot(&payload).await?;
+    Ok(Json(serde_json::json!({ "dropped": true })))
+}
+
+/// POST /api/peer/volume/down — take the resource down here.
+pub async fn down_volume(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<ResourceRef>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state.drbd.peer_down(&payload.resource).await?;
+    Ok(Json(serde_json::json!({ "down": true })))
+}
+
+/// POST /api/peer/volume/up — bring it back up.
+pub async fn up_volume(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<ResourceRef>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state.drbd.peer_up(&payload.resource).await?;
+    Ok(Json(serde_json::json!({ "up": true })))
+}
+
+/// POST /api/peer/volume/invalidate-remote — this member is the truth;
+/// everyone else resyncs from it.
+pub async fn invalidate_remote_volume(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<ResourceRef>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state.drbd.peer_invalidate_remote(&payload.resource).await?;
+    Ok(Json(serde_json::json!({ "invalidated": true })))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ReconnectRef {
+    pub resource: String,
+    #[serde(default)]
+    pub discard: bool,
+}
+
+/// POST /api/peer/volume/reconnect — reconnect, discarding this member's
+/// own writes when it is the split-brain victim.
+pub async fn reconnect_volume(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<ReconnectRef>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state
+        .drbd
+        .peer_reconnect(&payload.resource, payload.discard)
+        .await?;
+    Ok(Json(serde_json::json!({ "reconnected": true })))
+}
+
+/// POST /api/peer/volume/apply-policy — substitute this node's own secret
+/// into the re-rendered file, write it, and adjust the resource live.
+pub async fn apply_volume_policy(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<lumen_drbd::VolumeApply>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state.drbd.peer_apply_policy(&payload).await?;
+    Ok(Json(serde_json::json!({ "applied": true })))
+}
+
 // --- replicated machine definitions -----------------------------------------
 
 #[derive(Debug, serde::Deserialize)]
 pub struct DefinitionRef {
     pub vmid: u32,
-    #[serde(default)]
-    pub xml: String,
 }
 
-/// POST /api/peer/definition/store — keep a machine's domain document, so an
-/// HA restart can define it here after its node dies.
+/// POST /api/peer/definition/store — keep a machine's definition, home node
+/// included, so an HA restart can define it here after its node dies.
 pub async fn store_definition(
     _peer: PeerSession,
     State(state): State<Arc<AppState>>,
-    Json(payload): Json<DefinitionRef>,
+    Json(payload): Json<lumen_cluster::StoredDefinition>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    state
-        .cluster
-        .peer_store_definition(payload.vmid, &payload.xml)?;
+    state.cluster.peer_store_definition(&payload)?;
     Ok(Json(serde_json::json!({ "stored": true })))
 }
 

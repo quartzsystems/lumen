@@ -196,6 +196,14 @@ export const createCluster = (request: ClusterCreateRequest): Promise<CreateProg
 export const fetchCreateProgress = (): Promise<CreateProgress> =>
   apiFetch<CreateProgress>("/environment/clusters/pending");
 
+/// 202 with the same progress feed a create publishes; poll
+/// fetchCreateProgress until the phase leaves "running".
+export const addClusterNode = (
+  cluster: string,
+  member: MemberCreate,
+): Promise<CreateProgress> =>
+  post(`/environment/clusters/${encodeURIComponent(cluster)}/nodes`, member);
+
 export const destroyCluster = (name: string, acknowledge: boolean): Promise<void> =>
   apiFetch<void>(`/environment/clusters/${encodeURIComponent(name)}`, {
     method: "DELETE",

@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { AlertTriangle, Expand, Plus, Trash2 } from "lucide-react";
+import { AlertTriangle, Camera, Expand, Plus, Trash2, Unplug } from "lucide-react";
 import { DataTable, Dash, type Column } from "@/components/console/DataTable";
 import { Button } from "@/components/ui/Button";
 import { ModalHeader, ModalShell } from "@/components/ui/Modal";
@@ -18,13 +18,19 @@ import { useConsole } from "@/lib/ConsoleContext";
 import { fetchEnvironment, type EnvironmentResponse } from "@/lib/clusterClient";
 import {
   createReplicatedVolume,
+  deleteVolumeSnapshot,
   destroyReplicatedVolume,
   fetchReplicatedVolumes,
+  fetchVolumeSnapshots,
   resizeReplicatedVolume,
+  resolveSplitBrain,
+  rollbackVolume,
+  snapshotVolume,
   VOLUME_HEALTH_LABEL,
   VOLUME_HEALTH_TONE,
   type ReplicatedVolumesResponse,
   type ReplicatedVolumeView,
+  type SnapshotInfo,
 } from "@/lib/drbdClient";
 import { formatBytes } from "@/lib/vmClient";
 
@@ -43,6 +49,8 @@ export function ReplicatedVolumesSection() {
   const [creating, setCreating] = useState(false);
   const [destroying, setDestroying] = useState<ReplicatedVolumeView | null>(null);
   const [growing, setGrowing] = useState<ReplicatedVolumeView | null>(null);
+  const [snapshotting, setSnapshotting] = useState<ReplicatedVolumeView | null>(null);
+  const [resolving, setResolving] = useState<ReplicatedVolumeView | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -67,10 +75,10 @@ export function ReplicatedVolumesSection() {
   useEffect(() => {
     // Polling pauses while a dialog is open, so a refresh cannot move a
     // picker out from under the operator mid-choice.
-    if (creating || destroying || growing) return;
+    if (creating || destroying || growing || snapshotting || resolving) return;
     const timer = setInterval(() => void load(), POLL_MS);
     return () => clearInterval(timer);
-  }, [load, creating, destroying, growing]);
+  }, [load, creating, destroying, growing, snapshotting, resolving]);
 
   const clusters = environment?.clusters ?? [];
   // Volumes exist only inside a cluster; a standalone node has nothing to
@@ -95,6 +103,8 @@ export function ReplicatedVolumesSection() {
         onCreate={() => setCreating(true)}
         onDestroy={setDestroying}
         onGrow={setGrowing}
+        onSnapshots={setSnapshotting}
+        onResolve={setResolving}
       />
 
       {creating && environment && (
@@ -130,6 +140,30 @@ export function ReplicatedVolumesSection() {
           onGrown={() => {
             setToast(`${growing.name} grown.`);
             setGrowing(null);
+            void load();
+          }}
+        />
+      )}
+
+      {snapshotting && (
+        <SnapshotsDialog
+          volume={snapshotting}
+          onClose={() => setSnapshotting(null)}
+          onRolledBack={() => {
+            setToast(`${snapshotting.name} rolled back — peers resync from the source.`);
+            setSnapshotting(null);
+            void load();
+          }}
+        />
+      )}
+
+      {resolving && (
+        <ResolveSplitBrainDialog
+          volume={resolving}
+          onClose={() => setResolving(null)}
+          onResolved={() => {
+            setToast(`${resolving.name} reconnected — the victim resyncs from the survivors.`);
+            setResolving(null);
             void load();
           }}
         />
@@ -243,12 +277,16 @@ function VolumeTable({
   onCreate,
   onDestroy,
   onGrow,
+  onSnapshots,
+  onResolve,
 }: {
   rows: ReplicatedVolumeView[];
   onRefresh: () => Promise<void>;
   onCreate: () => void;
   onDestroy: (volume: ReplicatedVolumeView) => void;
   onGrow: (volume: ReplicatedVolumeView) => void;
+  onSnapshots: (volume: ReplicatedVolumeView) => void;
+  onResolve: (volume: ReplicatedVolumeView) => void;
 }) {
   return (
     <DataTable
@@ -264,9 +302,24 @@ function VolumeTable({
           Create
         </Button>
       }
-      actionsWidth={96}
+      actionsWidth={136}
       actions={(volume) => (
         <span className="inline-flex items-center gap-1">
+          {/* StandAlone means the replicas stopped talking and each kept its
+              own history — the guided recovery is the only way forward. */}
+          {volume.health === "stand_alone" && (
+            <span title="Split-brain: pick the side whose writes are discarded">
+              <Button
+                kind="ghost"
+                size="sm"
+                icon={Unplug}
+                onClick={() => onResolve(volume)}
+              />
+            </span>
+          )}
+          <span title="Snapshots — point-in-time copies on every member">
+            <Button kind="ghost" size="sm" icon={Camera} onClick={() => onSnapshots(volume)} />
+          </span>
           <span title="Grow the volume — a replicated volume only grows">
             <Button kind="ghost" size="sm" icon={Expand} onClick={() => onGrow(volume)} />
           </span>
@@ -578,6 +631,311 @@ function GrowVolumeDialog({
           submitLabel="Grow volume"
           savingLabel="Growing…"
           onSubmit={() => void grow()}
+        />
+      </div>
+    </ModalShell>
+  );
+}
+
+const formatSnapshotTime = (created: number): string =>
+  new Date(created * 1000).toLocaleString();
+
+/// Snapshots of one volume: the list this node's own replica holds, taking a
+/// new one (on every member, all-or-none), deleting one, and the guided
+/// rollback. The list is deliberately this node's vantage — a snapshot set is
+/// per-member, and pretending to a merged view would hide exactly the
+/// asymmetry a rollback needs the operator to think about.
+function SnapshotsDialog({
+  volume,
+  onClose,
+  onRolledBack,
+}: {
+  volume: ReplicatedVolumeView;
+  onClose: () => void;
+  onRolledBack: () => void;
+}) {
+  const [snapshots, setSnapshots] = useState<SnapshotInfo[] | null>(null);
+  const [newName, setNewName] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  // The rollback confirmation, opened per-snapshot.
+  const [rollingBack, setRollingBack] = useState<string | null>(null);
+  const [source, setSource] = useState("");
+  const [acked, setAcked] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      setSnapshots(await fetchVolumeSnapshots(volume.cluster, volume.name));
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) return;
+      setError(err instanceof Error ? err.message : "Could not read the snapshots.");
+    }
+  }, [volume.cluster, volume.name]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const run = async (work: () => Promise<void>, fallback: string) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await work();
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) return;
+      setError(err instanceof Error ? err.message : fallback);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const take = () =>
+    run(async () => {
+      await snapshotVolume(volume.cluster, volume.name, newName.trim());
+      setNewName("");
+      await load();
+    }, "The snapshot could not be taken.");
+
+  const remove = (snapshot: string) =>
+    run(async () => {
+      await deleteVolumeSnapshot(volume.cluster, volume.name, snapshot);
+      if (rollingBack === snapshot) setRollingBack(null);
+      await load();
+    }, "The snapshot could not be deleted.");
+
+  const rollback = () =>
+    run(async () => {
+      await rollbackVolume(volume.cluster, volume.name, rollingBack ?? "", source);
+      onRolledBack();
+    }, "The rollback did not complete.");
+
+  const nameOk = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(newName.trim());
+
+  return (
+    <ModalShell onClose={onClose} maxWidth={560}>
+      <ModalHeader
+        title={`Snapshots of ${volume.name}`}
+        subtitle="Taken on every member at once, all-or-none. Rolling back rewinds the whole volume to one member's copy."
+        onClose={onClose}
+      />
+      <div className="flex flex-col gap-4">
+        {error && (
+          <div className="callout callout-crit">
+            <AlertTriangle size={17} className="flex-shrink-0 text-[var(--qz-danger)] mt-[1px]" />
+            <div className="text-[13px] text-[var(--qz-fg-2)]">{error}</div>
+          </div>
+        )}
+
+        <div className="flex items-end gap-2">
+          <div className="flex-1">
+            <Field label="New snapshot" htmlFor="snapshot-name">
+              <TextInput
+                id="snapshot-name"
+                value={newName}
+                onChange={setNewName}
+                mono
+                placeholder="pre-upgrade"
+              />
+            </Field>
+          </div>
+          <button
+            type="button"
+            className="btn btn-primary btn-sm mb-[2px]"
+            disabled={busy || !nameOk}
+            onClick={() => void take()}
+          >
+            {busy ? "Working…" : "Take snapshot"}
+          </button>
+        </div>
+
+        {snapshots === null && !error && (
+          <div className="text-[13px] text-[var(--qz-fg-4)]">Reading snapshots…</div>
+        )}
+        {snapshots !== null && snapshots.length === 0 && (
+          <div className="text-[13px] text-[var(--qz-fg-4)]">
+            No snapshots yet. One is a point-in-time copy of the volume on every member.
+          </div>
+        )}
+
+        {snapshots !== null && snapshots.length > 0 && (
+          <ul className="m-0 p-0 flex flex-col gap-2" style={{ listStyle: "none" }}>
+            {snapshots.map((snapshot) => (
+              <li key={snapshot.name} className="surface p-3 flex flex-col gap-3">
+                <div className="flex items-center gap-3">
+                  <span className="qz-mono text-[13px] text-[var(--qz-fg-1)] flex-1 truncate">
+                    {snapshot.name}
+                  </span>
+                  <span className="text-[12px] text-[var(--qz-fg-4)]">
+                    {formatSnapshotTime(snapshot.created)} · {formatBytes(snapshot.used)} held
+                  </span>
+                  <button
+                    type="button"
+                    className="btn btn-ghost btn-sm"
+                    disabled={busy}
+                    onClick={() =>
+                      setRollingBack(rollingBack === snapshot.name ? null : snapshot.name)
+                    }
+                  >
+                    Roll back…
+                  </button>
+                  <span title="Delete this snapshot on every member">
+                    <Button
+                      kind="ghost"
+                      size="sm"
+                      icon={Trash2}
+                      onClick={() => void remove(snapshot.name)}
+                    />
+                  </span>
+                </div>
+
+                {rollingBack === snapshot.name && (
+                  <div className="flex flex-col gap-3 border-t border-[var(--qz-border)] pt-3">
+                    <p className="text-[12px] text-[var(--qz-fg-3)] m-0">
+                      The whole volume rewinds to this snapshot as one member holds it, and every
+                      later snapshot on that member goes with it. The machine using this volume
+                      must be powered off — the rollback refuses while the device is open.
+                    </p>
+                    <Field
+                      label="Source member"
+                      hint="Whose copy of the snapshot becomes the one truth — the others resync from it."
+                    >
+                      <SelectInput mono value={source} onChange={setSource}>
+                        <option value="">Choose…</option>
+                        {volume.replicas.map((replica) => (
+                          <option key={replica.node} value={replica.node}>
+                            {replica.node}
+                          </option>
+                        ))}
+                      </SelectInput>
+                    </Field>
+                    <label className="qz-check">
+                      <input
+                        type="checkbox"
+                        checked={acked}
+                        onChange={() => setAcked(!acked)}
+                        style={{ accentColor: "var(--qz-danger)" }}
+                      />
+                      <span className="text-[13px] text-[var(--qz-fg-2)]">
+                        I understand everything written since this snapshot is lost, on every
+                        member.
+                      </span>
+                    </label>
+                    <div className="flex justify-end">
+                      <button
+                        type="button"
+                        className="btn btn-danger btn-sm"
+                        disabled={busy || source === "" || !acked}
+                        onClick={() => void rollback()}
+                      >
+                        {busy ? "Rolling back…" : "Roll back the volume"}
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </ModalShell>
+  );
+}
+
+/// The guided split-brain recovery: name the victim, lose its divergent
+/// writes, reconnect every side. The dialog exists because DRBD's refusal to
+/// merge divergent histories is correct — someone has to decide which
+/// history survives, and that someone is the operator.
+function ResolveSplitBrainDialog({
+  volume,
+  onClose,
+  onResolved,
+}: {
+  volume: ReplicatedVolumeView;
+  onClose: () => void;
+  onResolved: () => void;
+}) {
+  const [victim, setVictim] = useState("");
+  const [typed, setTyped] = useState("");
+  const [acked, setAcked] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const confirmed = victim !== "" && typed.trim() === victim && acked;
+
+  const resolve = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await resolveSplitBrain(volume.cluster, volume.name, victim);
+      onResolved();
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) return;
+      setError(err instanceof Error ? err.message : "The recovery did not complete.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <ModalShell onClose={onClose} maxWidth={560}>
+      <ModalHeader
+        title={`Resolve split-brain on ${volume.name}`}
+        subtitle="The replicas stopped talking and each kept writing its own history. One side's writes must be discarded before they can reconnect."
+        onClose={onClose}
+      />
+      <div className="flex flex-col gap-4">
+        {error && (
+          <div className="callout callout-crit">
+            <AlertTriangle size={17} className="flex-shrink-0 text-[var(--qz-danger)] mt-[1px]" />
+            <div className="text-[13px] text-[var(--qz-fg-2)]">{error}</div>
+          </div>
+        )}
+        <p className="text-[13px] text-[var(--qz-fg-3)] m-0">
+          Before choosing: check which side ran the machine last, and which side's writes matter.
+          The victim's divergent writes are gone for good — it resyncs from the survivors.
+        </p>
+        <Field
+          label="Victim"
+          required
+          hint="The member whose writes are discarded."
+        >
+          <SelectInput mono value={victim} onChange={setVictim}>
+            <option value="">Choose…</option>
+            {volume.replicas.map((replica) => (
+              <option key={replica.node} value={replica.node}>
+                {replica.node}
+              </option>
+            ))}
+          </SelectInput>
+        </Field>
+        <label className="qz-check">
+          <input
+            type="checkbox"
+            checked={acked}
+            onChange={() => setAcked(!acked)}
+            style={{ accentColor: "var(--qz-danger)" }}
+          />
+          <span className="text-[13px] text-[var(--qz-fg-2)]">
+            I understand the victim's unreplicated writes are discarded.
+          </span>
+        </label>
+        {victim && (
+          <Field label={`Type ${victim} to confirm`} htmlFor="split-brain-victim">
+            <TextInput
+              id="split-brain-victim"
+              value={typed}
+              onChange={setTyped}
+              mono
+              placeholder={victim}
+            />
+          </Field>
+        )}
+        <ModalFooter
+          onCancel={onClose}
+          saving={busy}
+          disabled={!confirmed}
+          submitLabel="Discard the victim's writes and reconnect"
+          savingLabel="Reconnecting…"
+          onSubmit={() => void resolve()}
         />
       </div>
     </ModalShell>

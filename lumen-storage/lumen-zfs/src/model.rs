@@ -131,6 +131,17 @@ impl DatasetKind {
     }
 }
 
+/// One snapshot of a volume, as `zfs list -t snapshot` reports it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotInfo {
+    /// The snapshot's own name — the part after the `@`.
+    pub name: String,
+    /// Bytes the snapshot holds that the live volume no longer does.
+    pub used: u64,
+    /// Unix seconds.
+    pub created: u64,
+}
+
 /// One dataset or volume under a pool.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Dataset {

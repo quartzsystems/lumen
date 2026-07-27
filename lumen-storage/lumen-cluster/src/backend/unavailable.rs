@@ -84,6 +84,22 @@ impl ClusterBackend for UnavailableBackend {
     async fn confirm_node_dead(&self, _target: &str) -> Result<()> {
         self.error()
     }
+
+    async fn authkey(&self) -> Result<String> {
+        self.error()
+    }
+
+    async fn reload_corosync(&self) -> Result<()> {
+        self.error()
+    }
+
+    async fn update_fence_delay(&self, _device: &str, _delay_secs: u32) -> Result<()> {
+        self.error()
+    }
+
+    async fn remove_fence_device(&self, _device: &str) -> Result<()> {
+        self.error()
+    }
 }
 
 #[cfg(test)]

@@ -24,7 +24,8 @@ use crate::environment::{
 use crate::error::{ClusterError, Result};
 use crate::join::{
     judge_preflight, run_create, CreateProgress, JoinGrant, JoinRequest, PeerChannel,
-    PreflightReport, PreflightView, PreparePayload, ProgressHandle, TeardownPayload,
+    PreflightReport, PreflightView, PreparePayload, ProgressHandle, StepProgress, StepState,
+    TeardownPayload,
 };
 use crate::model::Regime;
 use crate::state::{hostname, ClusterState, FenceDeviceState, FenceTest, QuorumState, RingLink};
@@ -151,6 +152,27 @@ pub struct MintedToken {
 #[derive(Debug)]
 pub struct JoinOutcome {
     pub session_secret: Vec<u8>,
+}
+
+/// A validated node-add, ready to run: everything `execute_add_node` needs,
+/// computed — and its progress begun — before anything was touched.
+pub struct AddNodePlan {
+    pub cluster: String,
+    old_definition: crate::model::ClusterDefinition,
+    definition: crate::model::ClusterDefinition,
+    networks: crate::networks::ClusterNetworks,
+    newcomer: EnvironmentNode,
+    bmc_password: String,
+    core: crate::join::CoreAssignment,
+}
+
+fn plan_step(name: &str, node: Option<&str>) -> StepProgress {
+    StepProgress {
+        step: name.to_string(),
+        node: node.map(str::to_string),
+        state: StepState::Pending,
+        detail: None,
+    }
 }
 
 /// POST /api/environment/clusters/{name}/fence/{node}/test — what a guarded
@@ -864,6 +886,458 @@ impl ClusterService {
         Ok(())
     }
 
+    // --- scale-out ----------------------------------------------------------
+
+    /// Validate a node-add and lay out its plan. The caller — the control
+    /// plane — spawns [`Self::execute_add_node`] with what this returns, so
+    /// it can chain the volume-policy refresh after the regime flips; the
+    /// progress is begun here, so the first poll already has every step.
+    pub async fn prepare_add_node(
+        self: &Arc<Self>,
+        cluster: &str,
+        request: crate::validate::MemberCreate,
+    ) -> Result<AddNodePlan> {
+        let _guard = self.gate.lock().await;
+        if self.progress.busy() {
+            return Err(ClusterError::Conflict(
+                "A cluster workflow is already running. One at a time — watch it finish first."
+                    .to_string(),
+            ));
+        }
+        let membership = self.require_membership()?;
+        let Some(record) = membership.cluster_record(cluster).cloned() else {
+            return Err(ClusterError::NotFound(format!(
+                "There is no cluster called \"{cluster}\" in this environment."
+            )));
+        };
+        let Some(newcomer) = membership.node(&request.node).cloned() else {
+            return Err(ClusterError::Conflict(format!(
+                "\"{}\" has not joined this environment, so it cannot join a cluster.",
+                request.node
+            )));
+        };
+        if newcomer.cluster.is_some() {
+            return Err(ClusterError::Conflict(format!(
+                "\"{}\" is already in a cluster — a node belongs to at most one.",
+                request.node
+            )));
+        }
+        if record.definition.nodes.len() >= crate::model::MAX_CLUSTER_NODES {
+            return Err(ClusterError::Conflict(format!(
+                "\"{cluster}\" already has {} nodes — the most a cluster holds.",
+                record.definition.nodes.len()
+            )));
+        }
+        if request.bmc_password.is_empty() {
+            return Err(ClusterError::invalid(ValidationError::new(
+                ValidationCode::MissingBmcPassword,
+                Some("fencing"),
+                "The new node needs a BMC password — fencing is not optional.",
+            )));
+        }
+
+        // The grown shape, validated exactly as a create would be.
+        let core_address: std::net::Ipv4Addr = request.core_address.parse().map_err(|_| {
+            ClusterError::invalid(ValidationError::new(
+                ValidationCode::InvalidAddress,
+                Some("core_address"),
+                format!("\"{}\" is not an IPv4 address.", request.core_address),
+            ))
+        })?;
+        let management_address: std::net::Ipv4Addr =
+            request.management_address.parse().map_err(|_| {
+                ClusterError::invalid(ValidationError::new(
+                    ValidationCode::InvalidAddress,
+                    Some("management_address"),
+                    format!("\"{}\" is not an IPv4 address.", request.management_address),
+                ))
+            })?;
+        let old_definition = record.definition.clone();
+        let mut definition = record.definition.clone();
+        definition.nodes.push(crate::model::MemberNode {
+            name: request.node.clone(),
+            ring0: core_address,
+            ring1: management_address,
+            bmc: crate::model::BmcConfig {
+                address: request.bmc_address.clone(),
+                username: request.bmc_username.clone(),
+            },
+        });
+        // A grown cluster is in the quorum regime; a preferred node would be
+        // a setting that does nothing, so the definition sheds it.
+        if definition.regime() == Regime::Quorum {
+            definition.preferred_node = None;
+        }
+        // Validated against a scratch record where this cluster's own seats
+        // are cleared: its existing members are exactly where they should
+        // be, and "already clustered" is for *other* clusters' nodes.
+        let mut scratch = membership.clone();
+        for node in &mut scratch.nodes {
+            if node.cluster.as_deref() == Some(cluster) {
+                node.cluster = None;
+            }
+        }
+        let errors = crate::validate::validate_definition(&definition, &scratch);
+        if !errors.is_empty() {
+            return Err(ClusterError::Invalid(errors));
+        }
+
+        let mut networks = record.networks.clone();
+        networks
+            .core
+            .members
+            .push(crate::networks::AddressedMember {
+                node: request.node.clone(),
+                interface: request.core_interface.clone(),
+                address: core_address,
+            });
+        networks
+            .management
+            .members
+            .push(crate::networks::AddressedMember {
+                node: request.node.clone(),
+                interface: request.management_interface.clone(),
+                address: management_address,
+            });
+
+        // The plan, laid out before anything runs — the first poll already
+        // has every step.
+        let mut steps = vec![
+            plan_step("preflight", Some(&request.node)),
+            plan_step("prepare", Some(&request.node)),
+        ];
+        for member in old_definition.node_names() {
+            steps.push(plan_step("reconfigure", Some(&member)));
+        }
+        steps.push(plan_step("start", Some(&request.node)));
+        steps.push(plan_step("form", None));
+        steps.push(plan_step("properties", None));
+        steps.push(plan_step("delays", None));
+        steps.push(plan_step("fence", Some(&request.node)));
+        steps.push(plan_step("record", None));
+        self.progress.begin(CreateProgress {
+            cluster: cluster.to_string(),
+            phase: crate::join::WorkflowPhase::Running,
+            error: None,
+            steps,
+        });
+
+        Ok(AddNodePlan {
+            cluster: cluster.to_string(),
+            old_definition,
+            definition,
+            networks,
+            newcomer,
+            bmc_password: request.bmc_password,
+            core: crate::join::CoreAssignment {
+                interface: request.core_interface,
+                address: core_address,
+                prefix: record.networks.core.subnet.prefix,
+                mtu: record.networks.core.mtu,
+            },
+        })
+    }
+
+    /// Run a planned node-add to completion or back. The regime flip *is*
+    /// this workflow: the regenerated corosync.conf stops carrying
+    /// `two_node`, the fence delays flatten, and `no-quorum-policy=stop`
+    /// arrives — all from the same topology engine that decided them at
+    /// two. Volume I/O is never interrupted: corosync reloads, nothing
+    /// restarts, and the volume-policy flip that follows is a live
+    /// `drbdadm adjust`, chained by the control plane.
+    pub async fn execute_add_node(self: &Arc<Self>, plan: AddNodePlan) -> Result<()> {
+        let result = self.drive_add_node(&plan).await;
+        match &result {
+            Ok(()) => self
+                .progress
+                .finish_workflow(crate::join::WorkflowPhase::Complete, None),
+            Err(err) => self
+                .progress
+                .finish_workflow(crate::join::WorkflowPhase::Failed, Some(err.to_string())),
+        }
+        result
+    }
+
+    async fn drive_add_node(self: &Arc<Self>, plan: &AddNodePlan) -> Result<()> {
+        let cluster = &plan.cluster;
+        let node_name = plan.newcomer.name.clone();
+
+        // Preflight the newcomer, hard.
+        self.progress
+            .set_step("preflight", Some(&node_name), StepState::Running, None);
+        let report = self.peers.preflight(&plan.newcomer).await?;
+        let view = judge_preflight(&report, &node_name, &self.controlplane_version);
+        if !view.ok {
+            let detail = view.problems.join(" ");
+            self.progress.set_step(
+                "preflight",
+                Some(&node_name),
+                StepState::Failed,
+                Some(detail.clone()),
+            );
+            return Err(ClusterError::Conflict(format!(
+                "Preflight failed. {detail}"
+            )));
+        }
+        self.progress
+            .set_step("preflight", Some(&node_name), StepState::Done, None);
+
+        // The grown configuration, and the running cluster's own key — the
+        // newcomer joins the cluster that exists, not a fresh one.
+        let topology = crate::topology::ClusterTopology::new(plan.definition.clone());
+        let conf = topology.corosync_conf();
+        let authkey = self.backend.authkey().await?;
+        let old_conf =
+            crate::topology::ClusterTopology::new(plan.old_definition.clone()).corosync_conf();
+
+        // Prepare the newcomer whole.
+        self.progress
+            .set_step("prepare", Some(&node_name), StepState::Running, None);
+        let payload = crate::join::PreparePayload {
+            cluster: cluster.clone(),
+            corosync_conf: conf.clone(),
+            authkey: authkey.clone(),
+            core: plan.core.clone(),
+        };
+        if let Err(err) = self.peers.prepare(&plan.newcomer, &payload).await {
+            self.progress.set_step(
+                "prepare",
+                Some(&node_name),
+                StepState::Failed,
+                Some(err.to_string()),
+            );
+            self.unwind_add_node(plan, &old_conf, false).await;
+            return Err(ClusterError::Conflict(format!(
+                "Preparing {node_name} failed: {err}"
+            )));
+        }
+        self.progress
+            .set_step("prepare", Some(&node_name), StepState::Done, None);
+
+        // Reconfigure the running members: new conf, live reload — the
+        // stack never stops, which is what keeps volume I/O flowing.
+        let membership = self.require_membership()?;
+        for member_name in plan.old_definition.node_names() {
+            let Some(member) = membership.node(&member_name).cloned() else {
+                continue;
+            };
+            self.progress
+                .set_step("reconfigure", Some(&member.name), StepState::Running, None);
+            let payload = crate::join::ReconfigurePayload {
+                cluster: cluster.clone(),
+                corosync_conf: conf.clone(),
+                authkey: authkey.clone(),
+            };
+            if let Err(err) = self.peers.reconfigure(&member, &payload).await {
+                self.progress.set_step(
+                    "reconfigure",
+                    Some(&member.name),
+                    StepState::Failed,
+                    Some(err.to_string()),
+                );
+                self.unwind_add_node(plan, &old_conf, true).await;
+                return Err(ClusterError::Conflict(format!(
+                    "Reconfiguring {} failed: {err}",
+                    member.name
+                )));
+            }
+            self.progress
+                .set_step("reconfigure", Some(&member.name), StepState::Done, None);
+        }
+
+        // Start the newcomer and wait for the grown cluster to form.
+        self.progress
+            .set_step("start", Some(&node_name), StepState::Running, None);
+        if let Err(err) = self.peers.start(&plan.newcomer).await {
+            self.progress.set_step(
+                "start",
+                Some(&node_name),
+                StepState::Failed,
+                Some(err.to_string()),
+            );
+            self.unwind_add_node(plan, &old_conf, true).await;
+            return Err(ClusterError::Conflict(format!(
+                "Starting the stack on {node_name} failed: {err}"
+            )));
+        }
+        self.progress
+            .set_step("start", Some(&node_name), StepState::Done, None);
+
+        self.progress
+            .set_step("form", None, StepState::Running, None);
+        let deadline = std::time::Instant::now() + crate::join::FORM_DEADLINE;
+        loop {
+            match self.backend.cluster_state(cluster).await {
+                Ok(state)
+                    if state.quorum.quorate
+                        && plan
+                            .definition
+                            .nodes
+                            .iter()
+                            .all(|n| state.node(&n.name).is_some_and(|s| s.online)) =>
+                {
+                    break;
+                }
+                _ if std::time::Instant::now() > deadline => {
+                    self.progress.set_step(
+                        "form",
+                        None,
+                        StepState::Failed,
+                        Some("the grown cluster never formed".into()),
+                    );
+                    self.unwind_add_node(plan, &old_conf, true).await;
+                    return Err(ClusterError::Conflict(format!(
+                        "The cluster never saw {node_name} join within {} seconds.",
+                        crate::join::FORM_DEADLINE.as_secs()
+                    )));
+                }
+                _ => tokio::time::sleep(self.form_poll).await,
+            }
+        }
+        self.progress.set_step("form", None, StepState::Done, None);
+
+        // The quorum regime's properties, and the delays flattened —
+        // majority decides now, so no fence race needs biasing.
+        self.progress
+            .set_step("properties", None, StepState::Running, None);
+        if let Err(err) = self
+            .backend
+            .set_pacemaker_properties(&topology.pacemaker_properties())
+            .await
+        {
+            self.progress
+                .set_step("properties", None, StepState::Failed, Some(err.to_string()));
+            self.unwind_add_node(plan, &old_conf, true).await;
+            return Err(ClusterError::Conflict(format!(
+                "Setting cluster properties failed: {err}"
+            )));
+        }
+        self.progress
+            .set_step("properties", None, StepState::Done, None);
+
+        self.progress
+            .set_step("delays", None, StepState::Running, None);
+        for device in topology.fence_devices() {
+            if device.target == node_name {
+                continue;
+            }
+            if let Err(err) = self
+                .backend
+                .update_fence_delay(&device.id, device.delay_base_secs)
+                .await
+            {
+                self.progress
+                    .set_step("delays", None, StepState::Failed, Some(err.to_string()));
+                self.unwind_add_node(plan, &old_conf, true).await;
+                return Err(ClusterError::Conflict(format!(
+                    "Flattening the fence delays failed: {err}"
+                )));
+            }
+        }
+        self.progress
+            .set_step("delays", None, StepState::Done, None);
+
+        // The newcomer's fence device — created untested, and the warning
+        // pins until its guarded live test runs. The test stays a deliberate
+        // operator act (the M3 decision): a workflow that power-cycles a
+        // node as a side effect would bypass the acknowledgement the test
+        // was designed around.
+        self.progress
+            .set_step("fence", Some(&node_name), StepState::Running, None);
+        let device = topology
+            .fence_devices()
+            .into_iter()
+            .find(|d| d.target == node_name)
+            .expect("the grown topology has a device per member");
+        if let Err(err) = self
+            .backend
+            .create_fence_device(&device, &plan.bmc_password)
+            .await
+        {
+            self.progress.set_step(
+                "fence",
+                Some(&node_name),
+                StepState::Failed,
+                Some(err.to_string()),
+            );
+            self.unwind_add_node(plan, &old_conf, true).await;
+            return Err(ClusterError::Conflict(format!(
+                "Creating the fence device for {node_name} failed: {err}"
+            )));
+        }
+        self.progress
+            .set_step("fence", Some(&node_name), StepState::Done, None);
+
+        // Record, last.
+        self.progress
+            .set_step("record", None, StepState::Running, None);
+        {
+            let _guard = self.gate.lock().await;
+            let mut membership = self.require_membership()?;
+            if let Some(node) = membership.nodes.iter_mut().find(|n| n.name == node_name) {
+                node.cluster = Some(cluster.clone());
+            }
+            if let Some(record) = membership
+                .clusters
+                .iter_mut()
+                .find(|r| r.definition.name == *cluster)
+            {
+                record.definition = plan.definition.clone();
+                record.networks = plan.networks.clone();
+            }
+            membership.version += 1;
+            self.store.save_membership(&membership)?;
+        }
+        self.gossip_once().await;
+        self.progress
+            .set_step("record", None, StepState::Done, None);
+        tracing::info!(cluster = %cluster, node = %node_name, "node added to the cluster");
+        Ok(())
+    }
+
+    /// Put everything back: the newcomer torn down, the old configuration
+    /// pushed to the members that had already been reconfigured.
+    /// Best-effort throughout — the unwind reports, it does not fail.
+    async fn unwind_add_node(&self, plan: &AddNodePlan, old_conf: &str, reconfigured: bool) {
+        let payload = crate::join::TeardownPayload {
+            cluster: plan.cluster.clone(),
+            core_interface: Some(plan.core.interface.clone()),
+        };
+        if let Err(err) = self.peers.teardown(&plan.newcomer, &payload).await {
+            tracing::error!(node = %plan.newcomer.name, "the newcomer did not unwind: {err}");
+        }
+        if !reconfigured {
+            return;
+        }
+        let Ok(authkey) = self.backend.authkey().await else {
+            return;
+        };
+        let Ok(membership) = self.require_membership() else {
+            return;
+        };
+        for member_name in plan.old_definition.node_names() {
+            let Some(member) = membership.node(&member_name).cloned() else {
+                continue;
+            };
+            let payload = crate::join::ReconfigurePayload {
+                cluster: plan.cluster.clone(),
+                corosync_conf: old_conf.to_string(),
+                authkey: authkey.clone(),
+            };
+            if let Err(err) = self.peers.reconfigure(&member, &payload).await {
+                tracing::error!(node = %member.name, "the old configuration did not restore: {err}");
+            }
+        }
+    }
+
+    /// A peer pushed a regenerated configuration: write it, reload corosync.
+    pub async fn peer_reconfigure(&self, payload: &crate::join::ReconfigurePayload) -> Result<()> {
+        self.backend
+            .write_cluster_config(&payload.corosync_conf, &payload.authkey)
+            .await?;
+        self.backend.reload_corosync().await
+    }
+
     // --- fencing ------------------------------------------------------------
 
     /// Live-test one fence direction: actually power-cycle `target` through
@@ -1020,16 +1494,23 @@ impl ClusterService {
 
     // --- replicated machine definitions -------------------------------------
 
-    /// Keep a machine's domain document on every member of this node's
-    /// cluster — the HA manager's restart inventory, filled at define time
-    /// because libvirt on a dead node cannot be asked for it. Best-effort
-    /// beyond the local copy: a peer that is down misses this push and is
-    /// caught up by the next define, and failing the operator's action over
-    /// it would make HA prep more important than the machine.
+    /// Keep a machine's definition on every member of this node's cluster —
+    /// the HA manager's restart inventory, filled at define time because
+    /// libvirt on a dead node cannot be asked for it. The home node is this
+    /// one: definitions replicate from where the machine lives, so a
+    /// migration or an HA restart moves the recorded home with it.
+    /// Best-effort beyond the local copy: a peer that is down misses this
+    /// push and is caught up by the next define, and failing the operator's
+    /// action over it would make HA prep more important than the machine.
     pub async fn replicate_definition(&self, vmid: u32, xml: &str) -> Result<()> {
-        self.store.save_definition(vmid, xml)?;
+        let definition = crate::store::StoredDefinition {
+            vmid,
+            node: self.node.clone(),
+            xml: xml.to_string(),
+        };
+        self.store.save_definition(&definition)?;
         for member in self.co_members()? {
-            if let Err(err) = self.peers.store_definition(&member, vmid, xml).await {
+            if let Err(err) = self.peers.store_definition(&member, &definition).await {
                 tracing::warn!(
                     vmid,
                     peer = %member.name,
@@ -1076,8 +1557,8 @@ impl ClusterService {
     }
 
     /// A peer handed this node a definition to keep.
-    pub fn peer_store_definition(&self, vmid: u32, xml: &str) -> Result<()> {
-        self.store.save_definition(vmid, xml)
+    pub fn peer_store_definition(&self, definition: &crate::store::StoredDefinition) -> Result<()> {
+        self.store.save_definition(definition)
     }
 
     /// A peer told this node to forget one.
@@ -1086,7 +1567,7 @@ impl ClusterService {
     }
 
     /// The stored definitions — the HA manager reads these when a node dies.
-    pub fn stored_definitions(&self) -> Result<Vec<(u32, String)>> {
+    pub fn stored_definitions(&self) -> Result<Vec<crate::store::StoredDefinition>> {
         self.store.definitions()
     }
 
@@ -2009,34 +2490,197 @@ mod tests {
             .replicate_definition(101, "<domain>web01</domain>")
             .await
             .unwrap();
-        // The local copy exists, and exactly the cluster's other members —
-        // not beta-1, not the spare — were pushed to.
-        assert_eq!(
-            service.stored_definitions().unwrap(),
-            vec![(101, "<domain>web01</domain>".to_string())]
-        );
+        // The local copy exists with this node as home, and exactly the
+        // cluster's other members — not beta-1, not the spare — were pushed.
+        let stored = service.stored_definitions().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].vmid, 101);
+        assert_eq!(stored[0].node, "alpha-1", "home travels with it");
+        assert_eq!(stored[0].xml, "<domain>web01</domain>");
         let pushed = peers.definitions();
         assert_eq!(pushed.len(), 1, "{pushed:?}");
         assert_eq!(pushed[0].0, "alpha-2");
-        assert_eq!(pushed[0].1, 101);
+        assert_eq!(pushed[0].1.vmid, 101);
+        assert_eq!(pushed[0].1.node, "alpha-1");
 
-        // The peer side stores what it is handed.
+        // The peer side stores what it is handed, home included.
         service
-            .peer_store_definition(102, "<domain>db01</domain>")
+            .peer_store_definition(&crate::store::StoredDefinition {
+                vmid: 102,
+                node: "alpha-2".into(),
+                xml: "<domain>db01</domain>".into(),
+            })
             .unwrap();
         assert_eq!(service.stored_definitions().unwrap().len(), 2);
 
         service.withdraw_definition(101).await.unwrap();
-        assert_eq!(
-            service.stored_definitions().unwrap(),
-            vec![(102, "<domain>db01</domain>".to_string())]
-        );
+        let stored = service.stored_definitions().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].vmid, 102);
         assert_eq!(
             peers.dropped_definitions(),
             vec![("alpha-2".to_string(), 101)]
         );
         // Withdrawing what is already gone is the goal state, not an error.
         service.withdraw_definition(101).await.unwrap();
+    }
+
+    // --- scale-out ----------------------------------------------------------
+
+    fn spare_member() -> crate::validate::MemberCreate {
+        crate::validate::MemberCreate {
+            node: "spare-1".into(),
+            core_interface: "nic1".into(),
+            core_address: "10.10.0.3".into(),
+            management_interface: "nic0".into(),
+            management_address: "192.168.10.3".into(),
+            bmc_address: "10.20.0.3".into(),
+            bmc_username: "ADMIN".into(),
+            bmc_password: "fence-pw".into(),
+        }
+    }
+
+    fn scale_out_membership() -> EnvironmentMembership {
+        let mut membership = membership_of(&[
+            ("alpha-1", Some("alpha")),
+            ("alpha-2", Some("alpha")),
+            ("spare-1", None),
+        ]);
+        let (definition, networks, _) = create_request(&["alpha-1", "alpha-2"]).build().unwrap();
+        membership
+            .clusters
+            .push(ClusterRecord::new(definition, networks));
+        membership
+    }
+
+    #[tokio::test]
+    async fn a_node_add_grows_the_cluster_and_flips_the_regime() {
+        let backend = Arc::new(MockBackend::environment());
+        // The grown cluster as corosync will see it once the newcomer is in
+        // — pre-seeded, because the mock peers here deliberately do not
+        // rewrite the backend (that would shrink alpha to the one prepared
+        // node).
+        backend.register_cluster(crate::backend::mock::formed_cluster(
+            "alpha",
+            &["alpha-1", "alpha-2", "spare-1"],
+        ));
+        let peers =
+            Arc::new(MockPeers::new().with_healthy_node("spare-1", "0.3.0", &["nic0", "nic1"]));
+        let service = Arc::new(
+            ClusterService::new(
+                backend.clone() as Arc<dyn ClusterBackend>,
+                peers.clone(),
+                network(),
+                &test_dir("scale-out"),
+                "0.3.0",
+            )
+            .with_node("alpha-1")
+            .with_form_poll(Duration::from_millis(5))
+            .with_environment(&scale_out_membership()),
+        );
+
+        let plan = service
+            .prepare_add_node("alpha", spare_member())
+            .await
+            .unwrap();
+        service.execute_add_node(plan).await.unwrap();
+
+        // The newcomer was prepared with the *grown* configuration — no
+        // two_node, three members — and every running member reloaded it.
+        let prepared = peers.prepared();
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(prepared[0].0, "spare-1");
+        assert!(!prepared[0].1.corosync_conf.contains("two_node"));
+        assert!(prepared[0].1.corosync_conf.contains("spare-1"));
+        let reconfigured = peers.reconfigured();
+        assert_eq!(reconfigured.len(), 2, "{reconfigured:?}");
+        assert!(reconfigured
+            .iter()
+            .all(|(_, p)| !p.corosync_conf.contains("two_node")));
+
+        // The regime flipped everywhere it shows: delays flattened, the
+        // minority-stops policy set, the newcomer's device created.
+        assert!(backend
+            .delay_updates()
+            .iter()
+            .any(|(device, delay)| device == "fence-alpha-1" && *delay == 0));
+        assert!(backend
+            .properties_set()
+            .contains(&("no-quorum-policy".into(), "stop".into())));
+        let created = backend.fence_devices_created();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].0.target, "spare-1");
+        assert_eq!(created[0].0.delay_base_secs, 0);
+
+        // The record grew, last: three members, no preferred node, the
+        // newcomer assigned.
+        let record = service.environment_record().unwrap().unwrap();
+        let alpha = record.cluster_record("alpha").unwrap();
+        assert_eq!(alpha.definition.nodes.len(), 3);
+        assert_eq!(alpha.definition.preferred_node, None);
+        assert_eq!(
+            record.node("spare-1").unwrap().cluster.as_deref(),
+            Some("alpha")
+        );
+        let progress = service.create_progress().unwrap();
+        assert_eq!(progress.phase, WorkflowPhase::Complete, "{progress:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_node_add_unwinds_and_restores_the_old_configuration() {
+        let backend = Arc::new(MockBackend::environment());
+        let peers = Arc::new(
+            MockPeers::new()
+                .with_healthy_node("spare-1", "0.3.0", &["nic0", "nic1"])
+                .fail_start_on("spare-1"),
+        );
+        let service = Arc::new(
+            ClusterService::new(
+                backend.clone() as Arc<dyn ClusterBackend>,
+                peers.clone(),
+                network(),
+                &test_dir("scale-out-unwind"),
+                "0.3.0",
+            )
+            .with_node("alpha-1")
+            .with_form_poll(Duration::from_millis(5))
+            .with_environment(&scale_out_membership()),
+        );
+
+        let plan = service
+            .prepare_add_node("alpha", spare_member())
+            .await
+            .unwrap();
+        let err = service.execute_add_node(plan).await.unwrap_err();
+        assert!(err.to_string().contains("spare-1"), "{err}");
+
+        // The newcomer was torn down, and the members that had taken the
+        // grown configuration got the old one back — two_node included.
+        let torn = peers.torn_down();
+        assert_eq!(torn.len(), 1);
+        assert_eq!(torn[0].0, "spare-1");
+        let reconfigured = peers.reconfigured();
+        assert_eq!(reconfigured.len(), 4, "grown twice, restored twice");
+        assert!(reconfigured[2..]
+            .iter()
+            .all(|(_, p)| p.corosync_conf.contains("two_node")));
+
+        // And the record never grew.
+        let record = service.environment_record().unwrap().unwrap();
+        assert_eq!(
+            record
+                .cluster_record("alpha")
+                .unwrap()
+                .definition
+                .nodes
+                .len(),
+            2
+        );
+        assert!(record.node("spare-1").unwrap().cluster.is_none());
+        assert_eq!(
+            service.create_progress().unwrap().phase,
+            WorkflowPhase::Failed
+        );
     }
 
     #[tokio::test]

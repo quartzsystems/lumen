@@ -47,6 +47,9 @@ fi
 if [ -z "${ALMA_BASEOS_URL:-}" ] || [ -z "${ALMA_APPSTREAM_URL:-}" ]; then
     die "iso/pins.env is missing ALMA_BASEOS_URL / ALMA_APPSTREAM_URL"
 fi
+if [ -z "${DRBD_REPO_URL:-}" ] || [ -z "${ALMA_HA_URL:-}" ]; then
+    die "iso/pins.env is missing DRBD_REPO_URL / ALMA_HA_URL"
+fi
 
 # The package set the installed target gets. It is used twice: once to work
 # out what has to be mirrored onto the media, and once by the offline gate
@@ -57,6 +60,11 @@ TARGET_PACKAGES=(
     e2fsprogs dosfstools NetworkManager chrony firewalld openssh-server
     policycoreutils selinux-policy-targeted
     libvirt-daemon-kvm qemu-kvm edk2-ovmf osinfo-db
+    # The cluster and replication stack: corosync/pacemaker from the
+    # HighAvailability repo, the fence agent from AppStream, DRBD from the
+    # pinned ELRepo mirror. Presets ship in lumen-storage keeping the
+    # daemons off until a cluster exists.
+    corosync pacemaker pcs fence-agents-ipmilan drbd9x-utils kmod-drbd9x
     lumen-release lumen-networking lumen-storage lumen-compute
     lumen-controlplane
 )
@@ -169,6 +177,25 @@ for rpm in "$zfs_dl"/*.rpm; do
 done
 mv "$zfs_dl"/*.rpm "$TREE/lumen/"
 
+echo "==> Mirroring DRBD 9 kABI subset from $DRBD_REPO_URL"
+drbd_dl="$WORK/drbd-download"
+mkdir -p "$drbd_dl"
+dnf download --quiet --disablerepo='*' \
+    --repofrompath="drbd,$DRBD_REPO_URL" --setopt=drbd.gpgcheck=0 \
+    --exclude='*-debuginfo' \
+    --destdir "$drbd_dl" \
+    "drbd9x-utils*" "kmod-drbd9x*" \
+    || die "DRBD download failed — is $DRBD_REPO_URL reachable and does it carry drbd9x?"
+
+echo "==> Gate: DRBD RPM signatures (pinned key)"
+rpmkeys --import "$REPO_ROOT/iso/keys/RPM-GPG-KEY-elrepo.org"
+for rpm in "$drbd_dl"/*.rpm; do
+    sig="$(rpmkeys --checksig "$rpm")"
+    grep -q "signatures OK" <<<"$sig" \
+        || die "RPM signature check failed: $sig"
+done
+mv "$drbd_dl"/*.rpm "$TREE/lumen/"
+
 echo "==> Creating lumen repo"
 createrepo_c --quiet "$TREE/lumen"
 
@@ -209,6 +236,7 @@ mirror_out="$(dnf -y --installroot="$mirror_root" --releasever=10 --downloadonly
     --setopt=media.priority=1 --setopt=lumen.priority=1 \
     --repofrompath="alma-baseos,$ALMA_BASEOS_URL" --setopt=alma-baseos.gpgcheck=0 \
     --repofrompath="alma-appstream,$ALMA_APPSTREAM_URL" --setopt=alma-appstream.gpgcheck=0 \
+    --repofrompath="alma-ha,$ALMA_HA_URL" --setopt=alma-ha.gpgcheck=0 \
     install "${TARGET_PACKAGES[@]}" 2>&1)"
 mirror_rc=$?
 set -e

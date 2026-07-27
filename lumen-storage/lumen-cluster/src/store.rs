@@ -31,6 +31,18 @@ pub struct JoinTokenRecord {
     pub expires_at: u64,
 }
 
+/// One machine's replicated definition: the domain document and the node it
+/// was defined on — its home, which is what tells the HA manager whose
+/// machines a dead node was carrying.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredDefinition {
+    pub vmid: u32,
+    /// The node the machine runs on — updated every time the definition
+    /// replicates, so a migration or an HA restart moves it.
+    pub node: String,
+    pub xml: String,
+}
+
 /// The environment's credential material, held by every member: any node can
 /// mint a token and sign a join, so every node carries the CA.
 #[derive(Debug, Clone)]
@@ -131,17 +143,19 @@ impl EnvironmentStore {
         self.root.join("definitions")
     }
 
-    /// Keep one machine's domain document, so an HA restart can define the
+    /// Keep one machine's definition, so an HA restart can define the
     /// machine on a survivor — libvirt on a dead node cannot be asked for
     /// it. Overwrites: the newest definition is the only one worth having.
-    pub fn save_definition(&self, vmid: u32, xml: &str) -> Result<()> {
+    pub fn save_definition(&self, definition: &StoredDefinition) -> Result<()> {
         let dir = self.definitions_dir();
         std::fs::create_dir_all(&dir).map_err(|err| {
             ClusterError::Backend(anyhow::anyhow!("could not create {}: {err}", dir.display()))
         })?;
-        let path = dir.join(format!("{vmid}.xml"));
-        let tmp = dir.join(format!("{vmid}.xml.tmp"));
-        std::fs::write(&tmp, xml).map_err(|err| {
+        let vmid = definition.vmid;
+        let path = dir.join(format!("{vmid}.json"));
+        let tmp = dir.join(format!("{vmid}.json.tmp"));
+        let text = serde_json::to_string_pretty(definition).map_err(ClusterError::backend)?;
+        std::fs::write(&tmp, text).map_err(|err| {
             ClusterError::Backend(anyhow::anyhow!("could not write {}: {err}", tmp.display()))
         })?;
         std::fs::rename(&tmp, &path).map_err(|err| {
@@ -155,7 +169,7 @@ impl EnvironmentStore {
     /// Forget one. A definition that is already gone is the goal state, not
     /// an error.
     pub fn remove_definition(&self, vmid: u32) -> Result<()> {
-        match std::fs::remove_file(self.definitions_dir().join(format!("{vmid}.xml"))) {
+        match std::fs::remove_file(self.definitions_dir().join(format!("{vmid}.json"))) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(ClusterError::Backend(anyhow::anyhow!(
@@ -165,7 +179,7 @@ impl EnvironmentStore {
     }
 
     /// Every stored definition — the HA manager's restart inventory.
-    pub fn definitions(&self) -> Result<Vec<(u32, String)>> {
+    pub fn definitions(&self) -> Result<Vec<StoredDefinition>> {
         let dir = self.definitions_dir();
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
@@ -177,25 +191,24 @@ impl EnvironmentStore {
                 )))
             }
         };
-        let mut definitions = Vec::new();
+        let mut definitions: Vec<StoredDefinition> = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
-            let Some(vmid) = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .and_then(|s| s.parse::<u32>().ok())
-            else {
-                continue;
-            };
-            if path.extension().and_then(|e| e.to_str()) != Some("xml") {
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let xml = std::fs::read_to_string(&path).map_err(|err| {
+            let text = std::fs::read_to_string(&path).map_err(|err| {
                 ClusterError::Backend(anyhow::anyhow!("could not read {}: {err}", path.display()))
             })?;
-            definitions.push((vmid, xml));
+            let definition = serde_json::from_str(&text).map_err(|err| {
+                ClusterError::Backend(anyhow::anyhow!(
+                    "{} does not hold what it should: {err}",
+                    path.display()
+                ))
+            })?;
+            definitions.push(definition);
         }
-        definitions.sort_by_key(|(vmid, _)| *vmid);
+        definitions.sort_by_key(|d| d.vmid);
         Ok(definitions)
     }
 

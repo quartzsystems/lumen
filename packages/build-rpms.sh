@@ -130,9 +130,14 @@ cp "$REPO_ROOT"/branding/release/lumen-release.in \
 # distinct source name so it cannot collide in the flat SOURCES dir.
 cp "$REPO_ROOT/lumen-networking/system/NetworkManager/00-lumen.conf" \
    "$TOPDIR/SOURCES/lumen-nm-00-lumen.conf"
-# Service policy for the two domains that delegate their privileged work.
+# Service policy for the two domains that delegate their privileged work,
+# plus the cluster stack's keep-it-off preset and the firewalld service
+# definitions the cluster networks bind.
 cp "$REPO_ROOT/lumen-compute/system/systemd/50-lumen-compute.preset" \
    "$REPO_ROOT/lumen-storage/system/systemd/50-lumen-storage.preset" \
+   "$REPO_ROOT/lumen-storage/system/systemd/50-lumen-cluster.preset" \
+   "$REPO_ROOT/lumen-storage/system/firewalld/lumen-cluster.xml" \
+   "$REPO_ROOT/lumen-storage/system/firewalld/lumen-replication.xml" \
    "$TOPDIR/SOURCES/"
 
 for spec in "$REPO_ROOT"/packages/*.spec; do
