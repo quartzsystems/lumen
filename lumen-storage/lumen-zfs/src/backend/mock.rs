@@ -391,6 +391,34 @@ impl ZfsBackend for MockBackend {
         }
         Ok(())
     }
+
+    async fn resize_volume(&self, path: &str, size: u64) -> Result<()> {
+        if !is_lumen_volume(path) {
+            return Err(ZfsError::Conflict(format!(
+                "\"{path}\" is outside the namespace this appliance manages."
+            )));
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let Some(index) = inner.datasets.iter().position(|d| d.name == path) else {
+            return Err(ZfsError::NotFound(format!("No volume named \"{path}\".")));
+        };
+        let old = inner.datasets[index].volsize.unwrap_or(0);
+        let grown = size.saturating_sub(old);
+        let pool_name = path.split('/').next().unwrap_or_default().to_string();
+        if let Some(pool) = inner.pools.iter_mut().find(|p| p.name == pool_name) {
+            if grown > pool.free {
+                return Err(ZfsError::Conflict(format!(
+                    "\"{pool_name}\" has less free space than the growth asks for."
+                )));
+            }
+            pool.free -= grown;
+            pool.allocated += grown;
+        }
+        let dataset = &mut inner.datasets[index];
+        dataset.volsize = Some(size);
+        dataset.used = size;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

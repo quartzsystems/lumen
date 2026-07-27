@@ -704,11 +704,9 @@ async fn drive(
             node.cluster = Some(name.clone());
         }
     }
-    updated.clusters.push(ClusterRecord {
-        definition: definition.clone(),
-        networks: networks.clone(),
-        fence_tests: Default::default(),
-    });
+    updated
+        .clusters
+        .push(ClusterRecord::new(definition.clone(), networks.clone()));
     progress.set_step("record", None, StepState::Done, None);
     Ok(updated)
 }

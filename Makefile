@@ -28,11 +28,13 @@ CP_MANIFEST    := lumen-controlplane/Cargo.toml
 # docs/networking.md and docs/compute.md), so each gets its own
 # fmt/clippy/test invocation, in dependency order: lumen-sys first because it
 # is the most basic (it depends on none of the others); lumen-cluster comes
-# after net because it depends on sys and net.
+# after net because it depends on sys and net; lumen-drbd after cluster and
+# zfs because it is built on both.
 SYS_MANIFEST     := lumen-system/lumen-sys/Cargo.toml
 NET_MANIFEST     := lumen-networking/lumen-net/Cargo.toml
 ZFS_MANIFEST     := lumen-storage/lumen-zfs/Cargo.toml
 CLUSTER_MANIFEST := lumen-storage/lumen-cluster/Cargo.toml
+DRBD_MANIFEST    := lumen-storage/lumen-drbd/Cargo.toml
 VIRT_MANIFEST    := lumen-compute/lumen-virt/Cargo.toml
 
 .PHONY: all rpms installer controlplane webui iso test lint clean
@@ -77,6 +79,8 @@ test:
 		--target-dir build/cargo-target-zfs
 	cargo test --manifest-path $(CLUSTER_MANIFEST) \
 		--target-dir build/cargo-target-cluster
+	cargo test --manifest-path $(DRBD_MANIFEST) \
+		--target-dir build/cargo-target-drbd
 	cargo test --manifest-path $(VIRT_MANIFEST) \
 		--target-dir build/cargo-target-virt
 	cargo test --manifest-path $(CP_MANIFEST) \
@@ -100,6 +104,9 @@ lint:
 	cargo fmt --manifest-path $(CLUSTER_MANIFEST) --check
 	cargo clippy --manifest-path $(CLUSTER_MANIFEST) --all-targets \
 		--target-dir build/cargo-target-cluster -- -D warnings
+	cargo fmt --manifest-path $(DRBD_MANIFEST) --check
+	cargo clippy --manifest-path $(DRBD_MANIFEST) --all-targets \
+		--target-dir build/cargo-target-drbd -- -D warnings
 	cargo fmt --manifest-path $(VIRT_MANIFEST) --check
 	cargo clippy --manifest-path $(VIRT_MANIFEST) --all-targets \
 		--target-dir build/cargo-target-virt -- -D warnings

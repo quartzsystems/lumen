@@ -29,6 +29,10 @@ lumen-zfs = { path = "../lumen-storage/lumen-zfs" }
 # The clustering domain: the environment, its clusters, quorum, and fencing.
 # Reads corosync and Pacemaker through their command lines; nothing is linked.
 lumen-cluster = { path = "../lumen-storage/lumen-cluster" }
+# Replicated volumes: DRBD 9 resources over each member's zvols. Built on the
+# two domains above it; reads drbdsetup, hands drbdadm to systemd, links
+# nothing.
+lumen-drbd = { path = "../lumen-storage/lumen-drbd" }
 # The peer channel: one control plane calling another over TLS. hyper and
 # hyper-util are already under axum; tokio-rustls is already under
 # axum-server; http-body-util already backs the tests. Naming them makes the

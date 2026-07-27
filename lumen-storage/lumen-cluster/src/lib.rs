@@ -47,7 +47,9 @@ pub mod store;
 pub mod topology;
 pub mod validate;
 
-pub use environment::{ClusterRecord, EnvironmentMembership, EnvironmentNode, JoinToken};
+pub use environment::{
+    ClusterRecord, EnvironmentMembership, EnvironmentNode, JoinToken, VolumeRecord, VolumeSeat,
+};
 pub use error::{ClusterError, Result};
 pub use join::{
     CreateProgress, JoinGrant, JoinRequest, MockPeers, PeerChannel, PreflightReport, PreflightView,

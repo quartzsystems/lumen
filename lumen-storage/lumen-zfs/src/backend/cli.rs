@@ -500,6 +500,13 @@ impl ZfsBackend for CliBackend {
         self.run(&self.zfs, &["destroy", path]).await?;
         Ok(())
     }
+
+    async fn resize_volume(&self, path: &str, size: u64) -> Result<()> {
+        reject_outside_namespace(path)?;
+        let volsize = format!("volsize={size}");
+        self.run(&self.zfs, &["set", &volsize, path]).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -15,6 +15,7 @@ use tower_http::trace::TraceLayer;
 
 use config::Config;
 use lumen_cluster::ClusterService;
+use lumen_drbd::DrbdService;
 use lumen_net::NetworkService;
 use lumen_sys::SysService;
 use lumen_virt::VirtService;
@@ -50,6 +51,10 @@ pub struct AppState {
     pub virt: Arc<VirtService>,
     /// The environment and its clusters: membership, quorum, fencing.
     pub cluster: Arc<ClusterService>,
+    /// Replicated volumes: DRBD resources over each member's zvols. Built on
+    /// the cluster and storage domains, which is why it is constructed after
+    /// both.
+    pub drbd: Arc<DrbdService>,
     /// What has been done to each machine — the console's Tasks table.
     pub tasks: tasks::TaskLog,
 }

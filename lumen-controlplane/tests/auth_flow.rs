@@ -74,6 +74,12 @@ fn test_app() -> axum::Router {
         &state_dir,
         "test",
     ));
+    let drbd = Arc::new(lumen_drbd::DrbdService::new(
+        Arc::new(lumen_drbd::backend::mock::MockBackend::appliance()),
+        Arc::new(lumen_drbd::MockVolumePeers::new()),
+        cluster.clone(),
+        storage.clone(),
+    ));
     let state = AppState {
         config,
         jwt_secret: lumen_controlplane::security::session_secret(
@@ -86,6 +92,7 @@ fn test_app() -> axum::Router {
         storage,
         virt,
         cluster,
+        drbd,
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
     };
     app(Arc::new(state))

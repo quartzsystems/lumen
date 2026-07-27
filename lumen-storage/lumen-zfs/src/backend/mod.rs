@@ -53,6 +53,11 @@ pub trait ZfsBackend: Send + Sync {
     /// Remove a volume. Refuses anything that is not a Lumen volume.
     async fn destroy_volume(&self, path: &str) -> Result<()>;
 
+    /// Grow a volume to a new size. Grow only — `zfs set volsize` can shrink,
+    /// but a shrunk disk under a running guest is data loss with extra steps,
+    /// so the refusal lives at every layer.
+    async fn resize_volume(&self, path: &str, size: u64) -> Result<()>;
+
     /// Create the `<pool>/lumen` parent if it is not there yet. Idempotent.
     async fn ensure_namespace(&self, pool: &str) -> Result<()>;
 

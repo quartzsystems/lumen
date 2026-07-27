@@ -20,6 +20,7 @@ use crate::AppState;
 use lumen_cluster::{
     EnvironmentMembership, JoinGrant, JoinRequest, PreflightReport, PreparePayload, TeardownPayload,
 };
+use lumen_drbd::{VolumePrepare, VolumeResizeBacking, VolumeTeardown};
 
 /// POST /api/peer/join — the issuer's half of an environment join. The
 /// token in the body is the authentication; there is no ticket to hold yet.
@@ -77,4 +78,64 @@ pub async fn teardown(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     state.cluster.peer_teardown(&payload).await?;
     Ok(Json(serde_json::json!({ "torn_down": true })))
+}
+
+// --- replicated volumes -----------------------------------------------------
+
+/// The two volume verbs that take only a resource name.
+#[derive(Debug, serde::Deserialize)]
+pub struct ResourceRef {
+    pub resource: String,
+}
+
+/// POST /api/peer/volume/prepare — carry a replica: zvol, resource file,
+/// metadata, up. Whole or not at all.
+pub async fn prepare_volume(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<VolumePrepare>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state.drbd.peer_prepare(&payload).await?;
+    Ok(Json(serde_json::json!({ "prepared": true })))
+}
+
+/// POST /api/peer/volume/prime — skip the initial sync of a fresh volume.
+pub async fn prime_volume(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<ResourceRef>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state.drbd.peer_prime(&payload.resource).await?;
+    Ok(Json(serde_json::json!({ "primed": true })))
+}
+
+/// POST /api/peer/volume/teardown — resource down, file gone, zvol
+/// destroyed.
+pub async fn teardown_volume(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<VolumeTeardown>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state.drbd.peer_teardown(&payload).await?;
+    Ok(Json(serde_json::json!({ "torn_down": true })))
+}
+
+/// POST /api/peer/volume/resize-backing — grow this member's backing zvol.
+pub async fn resize_volume_backing(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<VolumeResizeBacking>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state.drbd.peer_resize_backing(&payload).await?;
+    Ok(Json(serde_json::json!({ "resized": true })))
+}
+
+/// POST /api/peer/volume/grow — let the resource take its grown backing.
+pub async fn grow_volume(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<ResourceRef>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state.drbd.peer_grow(&payload.resource).await?;
+    Ok(Json(serde_json::json!({ "grown": true })))
 }

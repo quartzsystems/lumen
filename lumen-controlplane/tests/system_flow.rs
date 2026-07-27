@@ -156,6 +156,12 @@ async fn harness(tag: &str, signed_in_as: &str) -> Harness {
         &dir.0,
         "test",
     ));
+    let drbd = Arc::new(lumen_drbd::DrbdService::new(
+        Arc::new(lumen_drbd::backend::mock::MockBackend::appliance()),
+        Arc::new(lumen_drbd::MockVolumePeers::new()),
+        cluster.clone(),
+        storage.clone(),
+    ));
     let router = app(Arc::new(AppState {
         config,
         jwt_secret: lumen_controlplane::security::session_secret(TICKET_SECRET.to_vec()),
@@ -166,6 +172,7 @@ async fn harness(tag: &str, signed_in_as: &str) -> Harness {
         storage,
         virt,
         cluster,
+        drbd,
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
     }));
 

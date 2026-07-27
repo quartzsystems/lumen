@@ -141,6 +141,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/peer/cluster/prepare", post(peer::prepare))
         .route("/api/peer/cluster/start", post(peer::start))
         .route("/api/peer/cluster/teardown", post(peer::teardown))
+        .route("/api/peer/volume/prepare", post(peer::prepare_volume))
+        .route("/api/peer/volume/prime", post(peer::prime_volume))
+        .route("/api/peer/volume/teardown", post(peer::teardown_volume))
+        .route(
+            "/api/peer/volume/resize-backing",
+            post(peer::resize_volume_backing),
+        )
+        .route("/api/peer/volume/grow", post(peer::grow_volume))
         // The node itself: its local accounts, and its power state. Every
         // account route passes the session's own principal down, which is what
         // lets the domain refuse to lock the operator out of their own console
@@ -163,6 +171,22 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/storage/pools/{pool}", delete(storage::destroy_pool))
         .route("/api/storage/devices", get(storage::devices))
         .route("/api/storage/pools/{pool}/volumes", get(storage::volumes))
+        // Replicated volumes: DRBD resources over each cluster member's
+        // zvols, grouped by cluster; see src/api/storage.rs and
+        // docs/cluster.md.
+        .route("/api/storage/replicated", get(storage::replicated_volumes))
+        .route(
+            "/api/storage/replicated",
+            post(storage::create_replicated_volume),
+        )
+        .route(
+            "/api/storage/replicated/{cluster}/{name}",
+            delete(storage::destroy_replicated_volume),
+        )
+        .route(
+            "/api/storage/replicated/{cluster}/{name}/resize",
+            post(storage::resize_replicated_volume),
+        )
         .route("/api/storage/iso", get(storage::isos))
         .route("/api/storage/iso/{pool}", post(storage::create_iso_store))
         // No body limit on the upload, and only on the upload: an installation

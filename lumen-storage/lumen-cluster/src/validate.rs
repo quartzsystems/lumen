@@ -57,10 +57,15 @@ pub enum ValidationCode {
     InvalidVip,
     InvalidBridgeName,
     InvalidVlan,
-    // Volumes. Produced by `validate_volume_members`; the invariant the
-    // topology property tests hold for every N.
+    // Volumes. Produced by `validate_volume_members` here and by
+    // `lumen-drbd`'s own validation — the codes live in one place because
+    // the console matches on them in one place.
     VolumeMemberOutsideCluster,
     TooFewVolumeMembers,
+    TooManyVolumeMembers,
+    InvalidVolumeName,
+    DuplicateVolumeName,
+    InvalidVolumeSize,
 }
 
 impl ValidationCode {
@@ -98,6 +103,10 @@ impl ValidationCode {
             ValidationCode::InvalidVlan => "invalid_vlan",
             ValidationCode::VolumeMemberOutsideCluster => "volume_member_outside_cluster",
             ValidationCode::TooFewVolumeMembers => "too_few_volume_members",
+            ValidationCode::TooManyVolumeMembers => "too_many_volume_members",
+            ValidationCode::InvalidVolumeName => "invalid_volume_name",
+            ValidationCode::DuplicateVolumeName => "duplicate_volume_name",
+            ValidationCode::InvalidVolumeSize => "invalid_volume_size",
         }
     }
 }

@@ -1018,6 +1018,68 @@ impl ClusterService {
         Ok(())
     }
 
+    // --- the storage domain's door ------------------------------------------
+
+    /// The whole membership record, read-only, for the replicated-storage
+    /// domain built on top of this one: it needs the cluster definitions,
+    /// Core addresses, and volume records to render and validate against,
+    /// and re-deriving them through the view types would mean parsing our
+    /// own presentation.
+    pub fn environment_record(&self) -> Result<Option<EnvironmentMembership>> {
+        self.membership()
+    }
+
+    /// Record a replicated volume on its cluster — written by `lumen-drbd`
+    /// **after** the volume exists on every member, the same record-last rule
+    /// as a cluster create. Replaces an existing record of the same name,
+    /// which is what a resize is.
+    pub async fn commit_volume(
+        &self,
+        cluster: &str,
+        volume: crate::environment::VolumeRecord,
+    ) -> Result<()> {
+        let _guard = self.gate.lock().await;
+        let mut membership = self.require_membership()?;
+        let Some(record) = membership
+            .clusters
+            .iter_mut()
+            .find(|r| r.definition.name == cluster)
+        else {
+            return Err(ClusterError::NotFound(format!(
+                "There is no cluster called \"{cluster}\" in this environment."
+            )));
+        };
+        record.volumes.retain(|v| v.name != volume.name);
+        record.volumes.push(volume);
+        membership.version += 1;
+        self.store.save_membership(&membership)?;
+        drop(_guard);
+        self.gossip_once().await;
+        Ok(())
+    }
+
+    /// Forget a replicated volume — after every replica is gone, mirroring
+    /// the destroy rule for clusters.
+    pub async fn forget_volume(&self, cluster: &str, name: &str) -> Result<()> {
+        let _guard = self.gate.lock().await;
+        let mut membership = self.require_membership()?;
+        let Some(record) = membership
+            .clusters
+            .iter_mut()
+            .find(|r| r.definition.name == cluster)
+        else {
+            return Err(ClusterError::NotFound(format!(
+                "There is no cluster called \"{cluster}\" in this environment."
+            )));
+        };
+        record.volumes.retain(|v| v.name != name);
+        membership.version += 1;
+        self.store.save_membership(&membership)?;
+        drop(_guard);
+        self.gossip_once().await;
+        Ok(())
+    }
+
     // --- assembly ---------------------------------------------------------
 
     async fn cluster_view(&self, name: &str, membership: &EnvironmentMembership) -> ClusterView {
@@ -1622,11 +1684,9 @@ mod tests {
             membership_of(&[("alpha-1", Some("alpha")), ("alpha-2", Some("alpha"))]);
         let request = create_request(&["alpha-1", "alpha-2"]);
         let (definition, networks, _) = request.build().unwrap();
-        membership.clusters.push(crate::environment::ClusterRecord {
-            definition,
-            networks,
-            fence_tests: Default::default(),
-        });
+        membership
+            .clusters
+            .push(crate::environment::ClusterRecord::new(definition, networks));
 
         let peers = Arc::new(MockPeers::new());
         let service = Arc::new(
@@ -1703,11 +1763,9 @@ mod tests {
         let mut membership =
             membership_of(&[("alpha-1", Some("alpha")), ("alpha-2", Some("alpha"))]);
         let (definition, networks, _) = create_request(&["alpha-1", "alpha-2"]).build().unwrap();
-        membership.clusters.push(ClusterRecord {
-            definition,
-            networks,
-            fence_tests: Default::default(),
-        });
+        membership
+            .clusters
+            .push(ClusterRecord::new(definition, networks));
         membership
     }
 
@@ -1851,6 +1909,54 @@ mod tests {
             service.cluster("alpha").await.unwrap().health,
             ClusterHealth::Degraded
         );
+    }
+
+    #[tokio::test]
+    async fn volume_records_ride_the_cluster_record_and_replace_by_name() {
+        use crate::environment::{VolumeRecord, VolumeSeat};
+        let service = fence_harness(Arc::new(MockBackend::environment()));
+        let volume = VolumeRecord {
+            name: "vm-101-disk-0".into(),
+            size_bytes: 10 << 30,
+            zvol_bytes: (10 << 30) + (4 << 20),
+            port: 7788,
+            minor: 1,
+            replicas: vec![
+                VolumeSeat {
+                    node: "alpha-1".into(),
+                    pool: "tank".into(),
+                },
+                VolumeSeat {
+                    node: "alpha-2".into(),
+                    pool: "tank".into(),
+                },
+            ],
+        };
+        service
+            .commit_volume("alpha", volume.clone())
+            .await
+            .unwrap();
+        let record = service.environment_record().unwrap().unwrap();
+        let alpha = record.cluster_record("alpha").unwrap();
+        assert_eq!(alpha.volume("vm-101-disk-0").unwrap().port, 7788);
+        let version = record.version;
+
+        // Replacing by name is what a resize commit is.
+        let mut grown = volume;
+        grown.size_bytes = 20 << 30;
+        service.commit_volume("alpha", grown).await.unwrap();
+        let record = service.environment_record().unwrap().unwrap();
+        assert!(record.version > version, "every commit bumps the record");
+        assert_eq!(record.cluster_record("alpha").unwrap().volumes.len(), 1);
+
+        service
+            .forget_volume("alpha", "vm-101-disk-0")
+            .await
+            .unwrap();
+        let record = service.environment_record().unwrap().unwrap();
+        assert!(record.cluster_record("alpha").unwrap().volumes.is_empty());
+        // An unknown cluster is a refusal, not a silent no-op.
+        assert!(service.forget_volume("ghost", "x").await.is_err());
     }
 
     #[tokio::test]

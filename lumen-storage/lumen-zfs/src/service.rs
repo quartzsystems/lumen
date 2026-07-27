@@ -359,6 +359,28 @@ impl StorageService {
         self.backend.destroy_volume(path).await
     }
 
+    /// Grow a volume Lumen created. Grow only: a shrunk block device under a
+    /// running guest is data loss with extra steps, so shrinking is refused
+    /// here and everywhere above.
+    pub async fn resize_volume(&self, path: &str, size: u64) -> Result<()> {
+        let _guard = self.gate.lock().await;
+        reject_outside_namespace(path)?;
+        let current = self
+            .backend
+            .datasets(path.split('/').next().unwrap_or_default())
+            .await?
+            .into_iter()
+            .find(|d| d.name == path)
+            .ok_or_else(|| ZfsError::NotFound(format!("No volume named \"{path}\".")))?;
+        if size <= current.volsize.unwrap_or(0) {
+            return Err(ZfsError::Conflict(format!(
+                "A volume only grows: \"{path}\" is already {} bytes.",
+                current.volsize.unwrap_or(0)
+            )));
+        }
+        self.backend.resize_volume(path, size).await
+    }
+
     /// The block device a volume appears as, for the domain definition.
     pub fn device_path(&self, dataset: &str) -> String {
         device_path(dataset)
@@ -847,6 +869,37 @@ mod tests {
         assert!(!service.iso_exists(&path).await.unwrap());
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_volume_grows_but_never_shrinks() {
+        let (service, _) = service();
+        let disk = service
+            .create_volume("boot", "vm-101-disk-0", 8_589_934_592, Some(16_384))
+            .await
+            .unwrap();
+
+        service
+            .resize_volume(&disk.name, 17_179_869_184)
+            .await
+            .unwrap();
+        let volumes = service.volumes("boot").await.unwrap();
+        let grown = volumes
+            .volumes
+            .iter()
+            .find(|v| v.name == disk.name)
+            .unwrap();
+        assert_eq!(grown.volsize, Some(17_179_869_184));
+
+        // The same size and a smaller size are both refusals.
+        let err = service
+            .resize_volume(&disk.name, 17_179_869_184)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("only grows"), "{err}");
+        assert!(service.resize_volume(&disk.name, 1024).await.is_err());
+        // And nothing outside the namespace is resizable.
+        assert!(service.resize_volume("boot", 1 << 40).await.is_err());
     }
 
     /// The library is shaped like a volume and must never be destroyed as one.

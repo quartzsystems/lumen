@@ -57,6 +57,9 @@ impl ZfsBackend for UnavailableBackend {
     async fn destroy_volume(&self, _path: &str) -> Result<()> {
         self.error()
     }
+    async fn resize_volume(&self, _path: &str, _size: u64) -> Result<()> {
+        self.error()
+    }
     async fn ensure_namespace(&self, _pool: &str) -> Result<()> {
         self.error()
     }

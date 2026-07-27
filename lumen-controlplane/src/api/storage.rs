@@ -15,6 +15,7 @@ use axum::extract::{Path, State};
 use axum::Json;
 use futures_util::StreamExt;
 
+use lumen_drbd::{ReplicatedVolumesResponse, VolumeCreate, VolumeView};
 use lumen_zfs::service::{DevicesResponse, IsosResponse, PoolView, PoolsResponse, VolumesResponse};
 use lumen_zfs::{Acknowledgements, IsoStoreView, PoolCreate};
 
@@ -115,6 +116,73 @@ pub async fn volumes(
     Path(pool): Path<String>,
 ) -> Result<Json<VolumesResponse>, ApiError> {
     Ok(Json(state.storage.volumes(&pool).await?))
+}
+
+// --- replicated volumes -----------------------------------------------------
+
+/// GET /api/storage/replicated — every cluster's replicated volumes, grouped
+/// by cluster, definitions joined with whatever this node's DRBD can see.
+pub async fn replicated_volumes(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<ReplicatedVolumesResponse>, ApiError> {
+    Ok(Json(state.drbd.volumes().await?))
+}
+
+/// POST /api/storage/replicated — create a replicated volume: every member
+/// prepared whole, the initial sync skipped, the record written last. The
+/// answer is the volume as this node then sees it.
+pub async fn create_replicated_volume(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    raw: Body,
+) -> Result<Json<VolumeView>, ApiError> {
+    let request: VolumeCreate = required_body(raw)?;
+    Ok(Json(state.drbd.create_volume(request).await?))
+}
+
+/// DELETE /api/storage/replicated/{cluster}/{name} — destroy every replica,
+/// then forget the volume. `i_understand_this_may_lose_data` required.
+pub async fn destroy_replicated_volume(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    Path((cluster, name)): Path<(String, String)>,
+    raw: Body,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let request: DestroyPoolRequest = body(raw)?;
+    state
+        .drbd
+        .destroy_volume(
+            &cluster,
+            &name,
+            lumen_cluster::Acknowledgements {
+                may_lose_data: request.i_understand_this_may_lose_data,
+            },
+        )
+        .await?;
+    Ok(Json(serde_json::json!({ "destroyed": true })))
+}
+
+/// POST /api/storage/replicated/{cluster}/{name}/resize — grow the volume:
+/// every backing zvol, then the resource, then the record. Grow only.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResizeVolumeRequest {
+    pub size_bytes: u64,
+}
+
+pub async fn resize_replicated_volume(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    Path((cluster, name)): Path<(String, String)>,
+    raw: Body,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let request: ResizeVolumeRequest = required_body(raw)?;
+    state
+        .drbd
+        .resize_volume(&cluster, &name, request.size_bytes)
+        .await?;
+    Ok(Json(serde_json::json!({ "resized": true })))
 }
 
 /// GET /api/storage/iso — the media libraries and everything in them.

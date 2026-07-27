@@ -7,6 +7,8 @@ use lumen_cluster::ClusterService;
 use lumen_controlplane::config::Config;
 use lumen_controlplane::realm::{lumen::LumenRealm, RealmRegistry};
 use lumen_controlplane::{app, security, tls, AppState};
+use lumen_drbd::backend::cli::CliBackend as DrbdCliBackend;
+use lumen_drbd::DrbdService;
 use lumen_net::backend::nm::NmBackend;
 use lumen_net::backend::unavailable::UnavailableBackend;
 use lumen_net::NetworkService;
@@ -34,7 +36,7 @@ async fn main() -> Result<()> {
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
                 "lumen_controlplane=info,lumen_sys=info,lumen_zfs=info,lumen_virt=info,\
-                 lumen_net=info,lumen_cluster=info,tower_http=info"
+                 lumen_net=info,lumen_cluster=info,lumen_drbd=info,tower_http=info"
                     .into()
             }),
         )
@@ -161,6 +163,20 @@ async fn main() -> Result<()> {
     ));
     peers.bind(cluster.clone());
 
+    // Replicated storage, on top of clustering and local storage: the
+    // record and the replication policy come from the cluster domain, the
+    // backing zvols from the storage domain, and DRBD itself through its
+    // command line — no probe for the same reason clustering has none: a
+    // node without DRBD is the ordinary standalone appliance, and the
+    // volume view carries the reason if it is ever asked anyway.
+    let drbd = Arc::new(DrbdService::new(
+        Arc::new(DrbdCliBackend::new(exec.clone())),
+        peers.clone(),
+        cluster.clone(),
+        storage.clone(),
+    ));
+    peers.bind_volumes(drbd.clone());
+
     // Membership gossip: push our record to every peer once a minute and
     // adopt anything newer that comes back. Quiet by design — the
     // environment view is what reports an unreachable peer.
@@ -229,6 +245,7 @@ async fn main() -> Result<()> {
         storage,
         virt,
         cluster,
+        drbd,
         tasks: lumen_controlplane::tasks::TaskLog::open(state_dir.join("vm-tasks.jsonl")),
     }));
 

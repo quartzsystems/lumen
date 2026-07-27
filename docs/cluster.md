@@ -13,7 +13,8 @@ after is listed at the end.
 
 ```
 lumen-storage/
-└── lumen-cluster/     the clustering domain (Rust library crate)
+├── lumen-cluster/     the clustering domain (Rust library crate)
+└── lumen-drbd/        replicated volumes on top of it — see docs/storage.md
 lumen-controlplane/
 ├── src/api/cluster.rs thin HTTP handlers over lumen-cluster
 ├── src/api/peer.rs    one control plane answering another
@@ -249,9 +250,10 @@ would be a takeover, not a sync.
 This is deliberately not Raft and not a CRDT. The record changes when an
 operator runs a workflow — a few times a year, not a few times a second —
 and the cost of losing a concurrent write is re-running a workflow, never
-data: volumes and machines live in their cluster and in libvirt, not here.
-Consensus machinery would be a great deal of surface for a document that a
-version counter already keeps agreed.
+data: the record carries definitions (nodes, clusters, replicated-volume
+placements), while the data itself lives in its cluster's zvols and in
+libvirt, not here. Consensus machinery would be a great deal of surface for
+a document that a version counter already keeps agreed.
 
 ### The token pins the issuer before anything secret moves
 
@@ -357,10 +359,10 @@ point.
 
 ### A node with no cluster stack is standalone, not broken
 
-The clustering backend is the one domain in `main.rs` constructed without a
-probe or an unavailable fallback. A fresh appliance has no corosync, no
-membership record, and no environment — and that is its ordinary state, not
-a failure to report. The backend answers "no environment", the service
+The clustering backend — and the replicated-storage backend built on it —
+is constructed in `main.rs` without a probe or an unavailable fallback. A
+fresh appliance has no corosync, no membership record, and no environment —
+and that is its ordinary state, not a failure to report. The backend answers "no environment", the service
 answers with the node itself as the one unassigned node, and the console
 renders the same shape it will render for a six-node environment. A
 *corrupt* membership record, by contrast, is an error that names the file —
@@ -449,8 +451,8 @@ never disagree about what a card says.
 ## Development
 
 ```sh
-make test    # installer + all five domain crates + control plane
-make lint    # shellcheck, rpmlint, fmt/clippy for seven manifests
+make test    # installer + all six domain crates + control plane
+make lint    # shellcheck, rpmlint, fmt/clippy for eight manifests
 ```
 
 `lumen-cluster` needs no system libraries: state is read through the cluster
@@ -477,15 +479,19 @@ the other, and `openssl s_client` against both afterwards shows the same CA.
 
 ## Out of scope for this stage
 
-In the order it lands: External-network realization (bridges on every
-member) and the typed-networks page; replicated volumes (`lumen-drbd`); the
-HA manager; adding a node to an existing cluster and the 2→3 scale-out, and
-with them removing a member from a live cluster; the environment-wide
-console federation — aggregated reads with per-node freshness, proxied
-writes — for which the peer channel built here is the transport; and gossip
-beyond the once-a-minute record exchange. A removed node also keeps its
-stale environment state until it re-joins somewhere; a "leave and reset" for
-the node itself rides the federation stage. One fencing consequence of the
+Replicated volumes have landed — `lumen-drbd`, documented in
+docs/storage.md, riding this crate's membership record and topology
+policy. Still in the order it lands: machines on replicated disks and live
+migration (`lumen-virt` integration); External-network realization (bridges
+on every member) and the typed-networks page; the HA manager; adding a node
+to an existing cluster and the 2→3 scale-out, and with them removing a
+member from a live cluster (a node holding volume replicas cannot leave —
+the record now knows enough to refuse); the environment-wide console
+federation — aggregated reads with per-node freshness, proxied writes — for
+which the peer channel built here is the transport; and gossip beyond the
+once-a-minute record exchange. A removed node also keeps its stale
+environment state until it re-joins somewhere; a "leave and reset" for the
+node itself rides the federation stage. One fencing consequence of the
 missing federation is worth naming: a fence test runs from a member of the
 cluster it tests, so testing every direction of a two-node cluster means
 signing into each node once — the proxied-writes stage dissolves that.

@@ -7,6 +7,7 @@ import { DataTable, Dash, type Column, type FilterDef } from "@/components/conso
 import { Button } from "@/components/ui/Button";
 import { Meter } from "@/components/vm/VmBits";
 import { CreatePoolDialog, DestroyPoolDialog } from "@/components/storage/CreatePoolDialog";
+import { ReplicatedVolumesSection } from "@/components/storage/ReplicatedVolumes";
 import { ApiError } from "@/lib/authClient";
 import { useConsole } from "@/lib/ConsoleContext";
 import { titleCase, titleCaseOptions } from "@/lib/labels";
@@ -127,6 +128,10 @@ export default function StoragePage() {
               />
             </section>
           ))}
+
+          {/* Cluster-scoped storage: present only when this node is in an
+              environment with clusters, and absent — not empty — otherwise. */}
+          <ReplicatedVolumesSection />
         </div>
       </PageBody>
 

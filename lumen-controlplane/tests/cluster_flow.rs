@@ -111,6 +111,13 @@ fn harness(
     if let Some(membership) = membership {
         cluster = cluster.with_environment(membership);
     }
+    let cluster = Arc::new(cluster);
+    let drbd = Arc::new(lumen_drbd::DrbdService::new(
+        Arc::new(lumen_drbd::backend::mock::MockBackend::appliance()),
+        Arc::new(lumen_drbd::MockVolumePeers::new()),
+        cluster.clone(),
+        storage.clone(),
+    ));
     let state = AppState {
         config,
         jwt_secret: security::session_secret(TICKET_SECRET.to_vec()),
@@ -120,7 +127,8 @@ fn harness(
         network,
         storage,
         virt,
-        cluster: Arc::new(cluster),
+        cluster,
+        drbd,
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
     };
     Harness {
@@ -545,6 +553,12 @@ async fn a_cluster_create_reports_per_node_per_step_progress_and_completes() {
         .with_form_poll(Duration::from_millis(5))
         .with_environment(&membership),
     );
+    let drbd = Arc::new(lumen_drbd::DrbdService::new(
+        Arc::new(lumen_drbd::backend::mock::MockBackend::appliance()),
+        Arc::new(lumen_drbd::MockVolumePeers::new()),
+        cluster.clone(),
+        storage.clone(),
+    ));
     let router = app(Arc::new(AppState {
         config,
         jwt_secret: security::session_secret(TICKET_SECRET.to_vec()),
@@ -555,6 +569,7 @@ async fn a_cluster_create_reports_per_node_per_step_progress_and_completes() {
         storage,
         virt,
         cluster,
+        drbd,
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
     }));
 
@@ -629,11 +644,9 @@ async fn destroy_needs_the_acknowledgement_and_tears_every_member_down() {
     let request_body: lumen_cluster::ClusterCreate =
         serde_json::from_value(create_body(&["alpha-1", "alpha-2"])).unwrap();
     let (definition, networks, _) = request_body.build().unwrap();
-    membership.clusters.push(lumen_cluster::ClusterRecord {
-        definition,
-        networks,
-        fence_tests: Default::default(),
-    });
+    membership
+        .clusters
+        .push(lumen_cluster::ClusterRecord::new(definition, networks));
 
     let harness = harness(
         "destroy",
@@ -693,11 +706,9 @@ fn alpha_membership() -> EnvironmentMembership {
     let request_body: lumen_cluster::ClusterCreate =
         serde_json::from_value(create_body(&["alpha-1", "alpha-2"])).unwrap();
     let (definition, networks, _) = request_body.build().unwrap();
-    membership.clusters.push(lumen_cluster::ClusterRecord {
-        definition,
-        networks,
-        fence_tests: Default::default(),
-    });
+    membership
+        .clusters
+        .push(lumen_cluster::ClusterRecord::new(definition, networks));
     membership
 }
 
