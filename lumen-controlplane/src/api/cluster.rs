@@ -1,19 +1,28 @@
 //! Thin HTTP handlers over `lumen_cluster::ClusterService`.
 //!
-//! Read-only at this stage: the environment and its clusters, grouped by
-//! cluster and then by node. The workflows — environment join, cluster
-//! create, fencing — land in later stages and will follow the same
-//! deserialize → one service call → serialize discipline.
+//! The reads present the environment, grouped by cluster and then by node.
+//! The writes are the environment's workflows: minting a join token (which
+//! bootstraps the environment on first use), joining, building a cluster —
+//! polled per node, per step — and destroying one. The two pieces the
+//! handlers own, because the control plane owns them everywhere: swapping
+//! the live session secret after a join, and reloading the TLS listener onto
+//! the environment certificate.
 
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use axum::Json;
+use serde::Deserialize;
 
+use crate::api::request::{body, required_body, Body};
 use crate::error::ApiError;
 use crate::security::Session;
 use crate::AppState;
-use lumen_cluster::{ClusterView, EnvironmentResponse};
+use lumen_cluster::{
+    Acknowledgements, ClusterCreate, ClusterView, CreateProgress, EnvironmentResponse, MintedToken,
+    PreflightView,
+};
 
 /// GET /api/environment — the whole environment: every cluster, every node,
 /// and the unassigned nodes, in one answer. A node that never joined an
@@ -33,4 +42,215 @@ pub async fn cluster(
     Path(name): Path<String>,
 ) -> Result<Json<ClusterView>, ApiError> {
     Ok(Json(state.cluster.cluster(&name).await?))
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MintTokenRequest {
+    /// Where the joining node should dial, `host:port`. Defaults to this
+    /// node's own management address — the override exists for a node
+    /// reached through a NAT the default could not know about.
+    #[serde(default)]
+    pub address: Option<String>,
+}
+
+/// POST /api/environment/tokens — mint a one-time join token. The first
+/// mint on a fresh node bootstraps the environment, and the listener starts
+/// serving the environment certificate the same moment — before the token
+/// leaves this node, because the token pins that certificate.
+pub async fn mint_token(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    raw: Body,
+) -> Result<Json<MintedToken>, ApiError> {
+    let request: MintTokenRequest = body(raw)?;
+    let address = match request.address {
+        Some(address) => address,
+        None => local_address(&state).await?,
+    };
+    let minted = state.cluster.mint_token(&address).await?;
+    if minted.bootstrapped {
+        adopt_environment_tls(&state).await;
+    }
+    Ok(Json(minted))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JoinBody {
+    /// The pasted token, whole.
+    pub token: String,
+    /// This node's own `host:port`, when the default derivation would name
+    /// the wrong interface.
+    #[serde(default)]
+    pub address: Option<String>,
+}
+
+/// POST /api/environment/join — join an environment with a pasted token.
+/// The session secret becomes the environment's, which signs every session
+/// out — including the operator's own. The answer says so, because the
+/// login page appearing right after is the join *working*, and it must not
+/// read as a failure.
+pub async fn join(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    raw: Body,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let request: JoinBody = required_body(raw)?;
+    let address = match request.address {
+        Some(address) => address,
+        None => local_address(&state).await?,
+    };
+    let outcome = state.cluster.join(&request.token, &address).await?;
+
+    // The environment's secret replaces this node's, live and on disk, so a
+    // restart keeps the environment sessions rather than resurrecting the
+    // old ones.
+    {
+        let mut secret = state.jwt_secret.write().expect("secret lock");
+        *secret = outcome.session_secret.clone();
+    }
+    if let Err(err) = crate::security::store_secret(
+        &state.config.state_dir.join("session-secret"),
+        &outcome.session_secret,
+    ) {
+        tracing::error!("the environment secret did not persist: {err:#}");
+    }
+    adopt_environment_tls(&state).await;
+
+    Ok(Json(serde_json::json!({
+        "joined": true,
+        "note": "This console's sessions are now the environment's. Sign in again — the same \
+                 password works on every environment node."
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreflightRequest {
+    pub nodes: Vec<String>,
+}
+
+/// POST /api/environment/preflight — could these nodes form a cluster right
+/// now? The wizard's first page, with per-node reasons and each node's
+/// links for the NIC pickers.
+pub async fn preflight(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    raw: Body,
+) -> Result<Json<Vec<PreflightView>>, ApiError> {
+    let request: PreflightRequest = required_body(raw)?;
+    Ok(Json(state.cluster.preflight(&request.nodes).await?))
+}
+
+/// POST /api/environment/clusters — start a create. Validation answers now;
+/// the workflow runs in the background and `GET
+/// /api/environment/clusters/pending` is the wizard's progress feed.
+pub async fn create_cluster(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    raw: Body,
+) -> Result<(StatusCode, Json<CreateProgress>), ApiError> {
+    let request: ClusterCreate = required_body(raw)?;
+    let progress = state.cluster.create_cluster(request).await?;
+    Ok((StatusCode::ACCEPTED, Json(progress)))
+}
+
+/// GET /api/environment/clusters/pending — the create in flight, or the
+/// last one finished. 404 when none was ever started.
+pub async fn create_progress(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<CreateProgress>, ApiError> {
+    state
+        .cluster
+        .create_progress()
+        .map(Json)
+        .ok_or_else(|| ApiError::NotFound("No cluster create has been started.".to_string()))
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DestroyRequest {
+    #[serde(default)]
+    pub i_understand_this_may_lose_data: bool,
+}
+
+impl DestroyRequest {
+    fn ack(&self) -> Acknowledgements {
+        Acknowledgements {
+            may_lose_data: self.i_understand_this_may_lose_data,
+        }
+    }
+}
+
+/// DELETE /api/environment/clusters/{name} — tear the cluster down on every
+/// member and forget it. Every member must clean up for the record to
+/// change; a destroy that loses a node halfway reports it and leaves the
+/// cluster recorded.
+pub async fn destroy_cluster(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    raw: Body,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let request: DestroyRequest = body(raw)?;
+    state.cluster.destroy_cluster(&name, request.ack()).await?;
+    Ok(Json(serde_json::json!({ "destroyed": true })))
+}
+
+/// DELETE /api/environment/nodes/{name} — remove an unassigned node from
+/// the environment.
+pub async fn remove_node(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state.cluster.remove_node(&name).await?;
+    Ok(Json(serde_json::json!({ "removed": true })))
+}
+
+/// This node's `host:port` as a joining or joined peer should dial it: the
+/// management address the networking domain observes, and the port this
+/// listener is on.
+async fn local_address(state: &AppState) -> Result<String, ApiError> {
+    let port = state
+        .config
+        .listen
+        .rsplit_once(':')
+        .map(|(_, port)| port)
+        .unwrap_or("8443");
+    let observed = state.network.observe().await.map_err(ApiError::from)?;
+    let host = observed
+        .addressed()
+        .find(|link| link.state.is_up())
+        .or_else(|| observed.addressed().next())
+        .and_then(|link| link.addresses.first())
+        .and_then(|cidr| cidr.split('/').next())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            ApiError::Conflict(
+                "This node has no management address yet, so peers could not reach it. \
+                 Configure networking first, or pass \"address\" explicitly."
+                    .to_string(),
+            )
+        })?;
+    Ok(format!("{host}:{port}"))
+}
+
+/// Point the TLS listener at the environment's certificate, once one exists.
+/// Best-effort: a reload failure is loud in the journal but must not fail
+/// the operation that caused it — the old certificate keeps serving.
+async fn adopt_environment_tls(state: &AppState) {
+    let Some(tls) = &state.tls else {
+        return;
+    };
+    let (cert, key) = state.cluster.serving_cert_paths();
+    if !cert.is_file() {
+        return;
+    }
+    match tls.reload_from_pem_file(&cert, &key).await {
+        Ok(()) => tracing::info!("serving the environment certificate"),
+        Err(err) => tracing::error!("could not reload TLS onto the environment certificate: {err}"),
+    }
 }

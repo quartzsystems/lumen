@@ -1,14 +1,17 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { AlertTriangle, Plus } from "lucide-react";
+import { AlertTriangle, Plus, Trash2 } from "lucide-react";
 import { Page, PageBody, PageHeader } from "@/components/PageHeader";
 import { DataTable, Dash, type Column } from "@/components/console/DataTable";
 import { Button } from "@/components/ui/Button";
+import { AddNodeDialog } from "@/components/cluster/ClusterDialogs";
 import { ApiError } from "@/lib/authClient";
+import { useConsole } from "@/lib/ConsoleContext";
 import {
   fetchEnvironment,
   nodeTone,
+  removeNode,
   type ClusterNodeView,
   type EnvironmentResponse,
   type UnassignedNodeView,
@@ -20,8 +23,10 @@ const POLL_MS = 5000;
 /// members, then the unassigned nodes — which are valid standalone
 /// hypervisors, not nodes in a broken state.
 export default function NodesPage() {
+  const { setToast } = useConsole();
   const [environment, setEnvironment] = useState<EnvironmentResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [adding, setAdding] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -39,9 +44,22 @@ export default function NodesPage() {
   }, [load]);
 
   useEffect(() => {
+    // Paused while the Add Node dialog is open: a poll must not redraw the
+    // token out from under the operator copying it.
+    if (adding) return;
     const timer = setInterval(() => void load(), POLL_MS);
     return () => clearInterval(timer);
-  }, [load]);
+  }, [load, adding]);
+
+  const remove = async (node: UnassignedNodeView) => {
+    try {
+      await removeNode(node.node);
+      setToast(`${node.node} removed from the environment.`);
+      await load();
+    } catch (err) {
+      setToast(err instanceof Error ? err.message : "Could not remove the node.");
+    }
+  };
 
   // The current node's own card, wherever it lives.
   const self = useMemo(() => {
@@ -60,12 +78,9 @@ export default function NodesPage() {
         title="Nodes"
         description="Every node this console can see, grouped by the cluster it belongs to."
         actions={
-          // The join-token flow lands with a later stage.
-          <span title="The environment join workflow has not landed yet.">
-            <Button kind="primary" size="sm" icon={Plus} disabled>
-              Add Node
-            </Button>
-          </span>
+          <Button kind="primary" size="sm" icon={Plus} onClick={() => setAdding(true)}>
+            Add Node
+          </Button>
         }
       />
 
@@ -101,11 +116,21 @@ export default function NodesPage() {
               <h2 className="text-[13px] font-semibold text-[var(--qz-fg-2)] m-0">
                 {environment.environment ? "Unassigned" : "This node"}
               </h2>
-              <UnassignedTable rows={environment.unassigned} onRefresh={load} />
+              <UnassignedTable rows={environment.unassigned} onRefresh={load} onRemove={remove} />
             </section>
           )}
         </div>
       </PageBody>
+
+      {adding && (
+        <AddNodeDialog
+          hasEnvironment={Boolean(environment?.environment)}
+          onClose={() => {
+            setAdding(false);
+            void load();
+          }}
+        />
+      )}
     </Page>
   );
 }
@@ -328,10 +353,16 @@ const unassignedColumns: Column<UnassignedNodeView>[] = [
 function UnassignedTable({
   rows,
   onRefresh,
+  onRemove,
 }: {
   rows: UnassignedNodeView[];
   onRefresh: () => Promise<void>;
+  onRemove: (node: UnassignedNodeView) => Promise<void>;
 }) {
+  // Inline confirm, like staging a link deletion: the trash flips into a
+  // ✓/✕ pair rather than opening a modal for a reversible act — the node
+  // can simply join again.
+  const [confirming, setConfirming] = useState<string | null>(null);
   return (
     <DataTable
       rows={rows}
@@ -341,6 +372,43 @@ function UnassignedTable({
       searchPlaceholder="Search nodes…"
       emptyMessage="Every node is in a cluster."
       onRefresh={onRefresh}
+      actionsWidth={96}
+      actions={(node) =>
+        node.local ? (
+          // A node does not remove itself; the backend refuses, and the
+          // control says why before it is tried.
+          <span title="A node does not remove itself — do this from another environment node." />
+        ) : confirming === node.node ? (
+          <span className="inline-flex items-center gap-1">
+            <button
+              type="button"
+              className="btn btn-danger btn-sm"
+              onClick={() => {
+                setConfirming(null);
+                void onRemove(node);
+              }}
+            >
+              Remove
+            </button>
+            <button
+              type="button"
+              className="btn btn-ghost btn-sm"
+              onClick={() => setConfirming(null)}
+            >
+              Keep
+            </button>
+          </span>
+        ) : (
+          <span title="Remove from the environment">
+            <Button
+              kind="ghost"
+              size="sm"
+              icon={Trash2}
+              onClick={() => setConfirming(node.node)}
+            />
+          </span>
+        )
+      }
     />
   );
 }

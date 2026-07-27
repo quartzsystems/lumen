@@ -67,18 +67,25 @@ fn test_app() -> axum::Router {
         Arc::new(lumen_sys::backend::mock::MockPower::appliance()),
         Arc::new(lumen_sys::exec::MockExec::new()),
     ));
+    let cluster = Arc::new(lumen_cluster::ClusterService::new(
+        Arc::new(lumen_cluster::backend::mock::MockBackend::appliance()),
+        Arc::new(lumen_cluster::MockPeers::new()),
+        network.clone(),
+        &state_dir,
+        "test",
+    ));
     let state = AppState {
         config,
-        jwt_secret: b"test-secret-test-secret-test-secret!".to_vec(),
+        jwt_secret: lumen_controlplane::security::session_secret(
+            b"test-secret-test-secret-test-secret!".to_vec(),
+        ),
+        tls: None,
         realms: RealmRegistry::new().register(Box::new(MockRealm)),
         sys,
         network,
         storage,
         virt,
-        cluster: Arc::new(lumen_cluster::ClusterService::new(
-            Arc::new(lumen_cluster::backend::mock::MockBackend::appliance()),
-            "test",
-        )),
+        cluster,
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
     };
     app(Arc::new(state))

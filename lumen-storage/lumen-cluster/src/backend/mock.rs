@@ -1,5 +1,6 @@
-//! An in-memory environment: multiple clusters, partitions, and fence
-//! outcomes, none of it touching the machine the tests run on.
+//! An in-memory node and its clusters: partitions, fence outcomes, and every
+//! local operation recorded instead of run — nothing touches the machine the
+//! tests run on.
 //!
 //! Compiled unconditionally — the control plane's integration tests build
 //! their `AppState` around this backend, and a `cfg(test)` item would be
@@ -10,16 +11,22 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use super::ClusterBackend;
-use crate::environment::{EnvironmentMembership, EnvironmentNode};
+use super::{ClusterBackend, LocalPreflight};
+use crate::environment::{ClusterRecord, EnvironmentMembership, EnvironmentNode};
 use crate::error::{ClusterError, Result};
 use crate::state::{ClusterState, FenceDeviceState, FenceTest, NodeState, QuorumState, RingLink};
 
 #[derive(Debug, Default)]
 struct Inner {
-    membership: Option<EnvironmentMembership>,
     clusters: HashMap<String, ClusterState>,
+    preflight: LocalPreflight,
     fail_next: Option<String>,
+    // What the node was asked to do, for assertions.
+    written_configs: Vec<(String, String)>,
+    stack_enabled: bool,
+    config_removed: bool,
+    properties: Vec<(String, String)>,
+    vips: Vec<(String, String)>,
 }
 
 pub struct MockBackend {
@@ -27,49 +34,37 @@ pub struct MockBackend {
 }
 
 impl MockBackend {
-    /// A fresh appliance: no environment, no clusters — today's single node.
+    /// A fresh appliance: no clusters, a healthy clock — today's single node.
     pub fn appliance() -> Self {
         MockBackend {
-            inner: Mutex::new(Inner::default()),
+            inner: Mutex::new(Inner {
+                preflight: LocalPreflight {
+                    time_synchronized: true,
+                    time_offset_ms: Some(2),
+                    already_clustered: false,
+                },
+                ..Inner::default()
+            }),
         }
     }
 
-    /// The full acceptance scenario: one environment holding a two-node
-    /// cluster (`alpha`, preferred node `alpha-1`), a three-node cluster
-    /// (`beta`), and one unassigned node (`spare-1`). Every fence device
-    /// healthy and tested. Local node is whatever the service says it is —
-    /// the scenario includes `alpha-1` so tests usually claim to be it.
+    /// The acceptance scenario's cluster states: a healthy two-node `alpha`
+    /// and three-node `beta`, fence devices tested. Pair it with
+    /// [`environment_membership`] seeded into the service's store.
     pub fn environment() -> Self {
-        let membership = EnvironmentMembership {
-            id: "env-mock".into(),
-            version: 7,
-            nodes: vec![
-                node_record("alpha-1", "192.168.10.1", Some("alpha")),
-                node_record("alpha-2", "192.168.10.2", Some("alpha")),
-                node_record("beta-1", "192.168.20.1", Some("beta")),
-                node_record("beta-2", "192.168.20.2", Some("beta")),
-                node_record("beta-3", "192.168.20.3", Some("beta")),
-                node_record("spare-1", "192.168.10.9", None),
-            ],
-        };
-
-        let mut clusters = HashMap::new();
-        clusters.insert(
-            "alpha".into(),
-            healthy_cluster("alpha", &["alpha-1", "alpha-2"], true),
-        );
-        clusters.insert(
-            "beta".into(),
-            healthy_cluster("beta", &["beta-1", "beta-2", "beta-3"], false),
-        );
-
-        MockBackend {
-            inner: Mutex::new(Inner {
-                membership: Some(membership),
-                clusters,
-                fail_next: None,
-            }),
+        let backend = MockBackend::appliance();
+        {
+            let mut inner = backend.inner.lock().unwrap();
+            inner.clusters.insert(
+                "alpha".into(),
+                healthy_cluster("alpha", &["alpha-1", "alpha-2"], true),
+            );
+            inner.clusters.insert(
+                "beta".into(),
+                healthy_cluster("beta", &["beta-1", "beta-2", "beta-3"], false),
+            );
         }
+        backend
     }
 
     /// Partition a node away: offline, unclean (lost and not yet fenced),
@@ -139,13 +134,6 @@ impl MockBackend {
         self
     }
 
-    /// Replace the membership record, for tests that need a shape the named
-    /// scenarios do not cover.
-    pub fn with_membership(self, membership: EnvironmentMembership) -> Self {
-        self.inner.lock().unwrap().membership = Some(membership);
-        self
-    }
-
     /// Make a cluster stop answering, as a cluster whose members are all
     /// down would: the record still names it, its state cannot be read.
     pub fn with_unreachable_cluster(self, cluster: &str) -> Self {
@@ -153,9 +141,44 @@ impl MockBackend {
         self
     }
 
+    /// Shape this node's own preflight answers.
+    pub fn with_local_preflight(self, preflight: LocalPreflight) -> Self {
+        self.inner.lock().unwrap().preflight = preflight;
+        self
+    }
+
+    /// Make a cluster observable, the way corosync forming does on a real
+    /// node. `MockPeers` calls this when every member has started.
+    pub fn register_cluster(&self, state: ClusterState) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.clusters.insert(state.name.clone(), state);
+    }
+
     /// The next call fails with this reason, once.
     pub fn fail_next(&self, reason: impl Into<String>) {
         self.inner.lock().unwrap().fail_next = Some(reason.into());
+    }
+
+    // --- assertion accessors ------------------------------------------------
+
+    pub fn written_configs(&self) -> Vec<(String, String)> {
+        self.inner.lock().unwrap().written_configs.clone()
+    }
+
+    pub fn stack_enabled(&self) -> bool {
+        self.inner.lock().unwrap().stack_enabled
+    }
+
+    pub fn config_removed(&self) -> bool {
+        self.inner.lock().unwrap().config_removed
+    }
+
+    pub fn properties_set(&self) -> Vec<(String, String)> {
+        self.inner.lock().unwrap().properties.clone()
+    }
+
+    pub fn vips_created(&self) -> Vec<(String, String)> {
+        self.inner.lock().unwrap().vips.clone()
     }
 
     fn take_failure(&self) -> Option<ClusterError> {
@@ -168,6 +191,47 @@ impl MockBackend {
     }
 }
 
+/// The acceptance scenario's membership record: a two-node cluster, a
+/// three-node cluster, and one unassigned node. Seed it into a service's
+/// store next to [`MockBackend::environment`].
+pub fn environment_membership() -> EnvironmentMembership {
+    EnvironmentMembership {
+        id: "env-mock".into(),
+        version: 7,
+        nodes: vec![
+            node_record("alpha-1", "192.168.10.1", Some("alpha")),
+            node_record("alpha-2", "192.168.10.2", Some("alpha")),
+            node_record("beta-1", "192.168.20.1", Some("beta")),
+            node_record("beta-2", "192.168.20.2", Some("beta")),
+            node_record("beta-3", "192.168.20.3", Some("beta")),
+            node_record("spare-1", "192.168.10.9", None),
+        ],
+        clusters: Vec::new(),
+    }
+}
+
+/// A membership record for tests that need a particular shape.
+pub fn membership_of(nodes: &[(&str, Option<&str>)]) -> EnvironmentMembership {
+    EnvironmentMembership {
+        id: "env-mock".into(),
+        version: 1,
+        nodes: nodes
+            .iter()
+            .map(|(name, cluster)| node_record(name, "192.168.10.1", *cluster))
+            .collect(),
+        clusters: Vec::new(),
+    }
+}
+
+/// A membership record whose clusters carry stored definitions too.
+pub fn with_cluster_record(
+    mut membership: EnvironmentMembership,
+    record: ClusterRecord,
+) -> EnvironmentMembership {
+    membership.clusters.push(record);
+    membership
+}
+
 fn node_record(name: &str, address: &str, cluster: Option<&str>) -> EnvironmentNode {
     EnvironmentNode {
         name: name.into(),
@@ -175,6 +239,15 @@ fn node_record(name: &str, address: &str, cluster: Option<&str>) -> EnvironmentN
         controlplane_version: "0.3.0".into(),
         cluster: cluster.map(str::to_string),
     }
+}
+
+/// A cluster the moment it forms: every member online, quorate, no fence
+/// devices yet — exactly what a just-created cluster looks like before the
+/// fencing stage runs.
+pub fn formed_cluster(name: &str, nodes: &[&str]) -> ClusterState {
+    let mut state = healthy_cluster(name, nodes, nodes.len() == 2);
+    state.fence_devices.clear();
+    state
 }
 
 fn healthy_cluster(name: &str, nodes: &[&str], two_node: bool) -> ClusterState {
@@ -227,13 +300,6 @@ fn healthy_cluster(name: &str, nodes: &[&str], two_node: bool) -> ClusterState {
 
 #[async_trait]
 impl ClusterBackend for MockBackend {
-    async fn membership(&self) -> Result<Option<EnvironmentMembership>> {
-        if let Some(err) = self.take_failure() {
-            return Err(err);
-        }
-        Ok(self.inner.lock().unwrap().membership.clone())
-    }
-
     async fn cluster_state(&self, name: &str) -> Result<ClusterState> {
         if let Some(err) = self.take_failure() {
             return Err(err);
@@ -248,6 +314,80 @@ impl ClusterBackend for MockBackend {
                 ClusterError::NotFound(format!("There is no cluster called \"{name}\"."))
             })
     }
+
+    async fn local_preflight(&self) -> Result<LocalPreflight> {
+        if let Some(err) = self.take_failure() {
+            return Err(err);
+        }
+        Ok(self.inner.lock().unwrap().preflight.clone())
+    }
+
+    async fn write_cluster_config(&self, conf: &str, authkey: &str) -> Result<()> {
+        if let Some(err) = self.take_failure() {
+            return Err(err);
+        }
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .written_configs
+            .push((conf.to_string(), authkey.to_string()));
+        inner.preflight.already_clustered = true;
+        Ok(())
+    }
+
+    async fn enable_stack(&self) -> Result<()> {
+        if let Some(err) = self.take_failure() {
+            return Err(err);
+        }
+        self.inner.lock().unwrap().stack_enabled = true;
+        Ok(())
+    }
+
+    async fn disable_stack(&self) -> Result<()> {
+        if let Some(err) = self.take_failure() {
+            return Err(err);
+        }
+        self.inner.lock().unwrap().stack_enabled = false;
+        Ok(())
+    }
+
+    async fn remove_cluster_config(&self) -> Result<()> {
+        if let Some(err) = self.take_failure() {
+            return Err(err);
+        }
+        let mut inner = self.inner.lock().unwrap();
+        inner.config_removed = true;
+        inner.preflight.already_clustered = false;
+        Ok(())
+    }
+
+    async fn set_pacemaker_properties(&self, properties: &[(String, String)]) -> Result<()> {
+        if let Some(err) = self.take_failure() {
+            return Err(err);
+        }
+        self.inner
+            .lock()
+            .unwrap()
+            .properties
+            .extend(properties.iter().cloned());
+        Ok(())
+    }
+
+    async fn create_vip(
+        &self,
+        cluster: &str,
+        address: std::net::Ipv4Addr,
+        prefix: u8,
+    ) -> Result<()> {
+        if let Some(err) = self.take_failure() {
+            return Err(err);
+        }
+        self.inner
+            .lock()
+            .unwrap()
+            .vips
+            .push((cluster.to_string(), format!("{address}/{prefix}")));
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -255,16 +395,17 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn the_appliance_scenario_is_a_node_that_never_joined() {
+    async fn the_appliance_scenario_is_a_node_that_never_clustered() {
         let backend = MockBackend::appliance();
-        assert_eq!(backend.membership().await.unwrap(), None);
         assert!(backend.cluster_state("alpha").await.is_err());
+        let preflight = backend.local_preflight().await.unwrap();
+        assert!(preflight.time_synchronized && !preflight.already_clustered);
     }
 
     #[tokio::test]
     async fn the_environment_scenario_matches_the_acceptance_shape() {
         let backend = MockBackend::environment();
-        let membership = backend.membership().await.unwrap().unwrap();
+        let membership = environment_membership();
         assert_eq!(membership.nodes.len(), 6);
         assert_eq!(membership.cluster_names(), vec!["alpha", "beta"]);
         assert_eq!(membership.unassigned().count(), 1);
@@ -300,10 +441,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preparing_a_node_is_visible_to_its_own_preflight() {
+        let backend = MockBackend::appliance();
+        backend
+            .write_cluster_config("totem {}", "key")
+            .await
+            .unwrap();
+        assert!(backend.local_preflight().await.unwrap().already_clustered);
+        backend.remove_cluster_config().await.unwrap();
+        assert!(!backend.local_preflight().await.unwrap().already_clustered);
+    }
+
+    #[tokio::test]
     async fn a_failure_is_injected_once() {
         let backend = MockBackend::environment();
         backend.fail_next("the ring is on fire");
-        assert!(backend.membership().await.is_err());
-        assert!(backend.membership().await.is_ok());
+        assert!(backend.cluster_state("alpha").await.is_err());
+        assert!(backend.cluster_state("alpha").await.is_ok());
     }
 }

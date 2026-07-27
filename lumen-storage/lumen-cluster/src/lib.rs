@@ -38,15 +38,21 @@
 pub mod backend;
 pub mod environment;
 pub mod error;
+pub mod join;
 pub mod model;
 pub mod networks;
 pub mod service;
 pub mod state;
+pub mod store;
 pub mod topology;
 pub mod validate;
 
-pub use environment::{EnvironmentMembership, EnvironmentNode};
+pub use environment::{ClusterRecord, EnvironmentMembership, EnvironmentNode, JoinToken};
 pub use error::{ClusterError, Result};
+pub use join::{
+    CreateProgress, JoinGrant, JoinRequest, MockPeers, PeerChannel, PreflightReport, PreflightView,
+    PreparePayload, ProgressHandle, TeardownPayload,
+};
 pub use model::{
     valid_cluster_name, valid_node_name, BmcConfig, ClusterDefinition, MemberNode, Regime,
     COROSYNC_PORT, FENCE_RACE_DELAY_SECS, MAX_CLUSTER_NODES, MIN_CLUSTER_NODES,
@@ -57,8 +63,9 @@ pub use networks::{
 };
 pub use service::{
     ClusterHealth, ClusterNodeView, ClusterService, ClusterView, EnvironmentResponse,
-    EnvironmentView, FenceSummaryView, UnassignedNodeView,
+    EnvironmentView, FenceSummaryView, JoinOutcome, MintedToken, UnassignedNodeView,
 };
 pub use state::{ClusterState, FenceDeviceState, FenceTest, NodeState, QuorumState, RingLink};
+pub use store::{EnvironmentStore, Identity};
 pub use topology::{ClusterTopology, FenceDevice, ReplicationPolicy};
-pub use validate::{ValidationCode, ValidationError};
+pub use validate::{Acknowledgements, ClusterCreate, ValidationCode, ValidationError};

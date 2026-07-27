@@ -6,12 +6,24 @@
 //! The codes are part of the API — the console matches on them to pin a
 //! message to the field that caused it — so renaming one is a breaking change.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::environment::EnvironmentMembership;
 use crate::model::{
-    valid_cluster_name, valid_node_name, ClusterDefinition, MAX_CLUSTER_NODES, MIN_CLUSTER_NODES,
+    valid_cluster_name, valid_node_name, BmcConfig, ClusterDefinition, MemberNode,
+    MAX_CLUSTER_NODES, MIN_CLUSTER_NODES,
 };
+use crate::networks::{
+    AddressedMember, ClusterNetworks, CoreNetwork, ExternalNetwork, ManagementNetwork, Subnet,
+    Uplink, VlanMode,
+};
+
+/// `i_understand_this_may_lose_data` from a request body, in the repo's
+/// standing shape: absent is `false`, and `false` refuses the operation.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub struct Acknowledgements {
+    pub may_lose_data: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -28,8 +40,10 @@ pub enum ValidationCode {
     PreferredNodeNeedsTwoNodes,
     DuplicateRingAddress,
     MissingBmc,
+    UnacknowledgedDestructiveOperation,
     // Networks. Produced by `networks::validate_networks`.
     InvalidSubnet,
+    InvalidAddress,
     OverlappingSubnets,
     NetworkMemberMissing,
     NetworkMemberNotInCluster,
@@ -63,7 +77,11 @@ impl ValidationCode {
             ValidationCode::PreferredNodeNeedsTwoNodes => "preferred_node_needs_two_nodes",
             ValidationCode::DuplicateRingAddress => "duplicate_ring_address",
             ValidationCode::MissingBmc => "missing_bmc",
+            ValidationCode::UnacknowledgedDestructiveOperation => {
+                "unacknowledged_destructive_operation"
+            }
             ValidationCode::InvalidSubnet => "invalid_subnet",
+            ValidationCode::InvalidAddress => "invalid_address",
             ValidationCode::OverlappingSubnets => "overlapping_subnets",
             ValidationCode::NetworkMemberMissing => "network_member_missing",
             ValidationCode::NetworkMemberNotInCluster => "network_member_not_in_cluster",
@@ -303,6 +321,188 @@ pub fn validate_definition(
     errors
 }
 
+// --- the create request -----------------------------------------------------
+
+/// POST /api/environment/clusters, exactly as the wizard sends it. Addresses
+/// arrive as strings and are parsed here, so a typo is a validation error
+/// pinned to its field rather than a 400 about JSON.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterCreate {
+    pub name: String,
+    #[serde(default)]
+    pub preferred_node: Option<String>,
+    pub core: CoreCreate,
+    pub management: ManagementCreate,
+    pub members: Vec<MemberCreate>,
+    #[serde(default)]
+    pub external: Vec<ExternalCreate>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoreCreate {
+    pub subnet: String,
+    /// Jumbo frames are the default recommendation on a dedicated link.
+    #[serde(default = "default_core_mtu")]
+    pub mtu: u32,
+}
+
+fn default_core_mtu() -> u32 {
+    9000
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagementCreate {
+    pub subnet: String,
+    #[serde(default)]
+    pub vip: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemberCreate {
+    pub node: String,
+    pub core_interface: String,
+    pub core_address: String,
+    pub management_interface: String,
+    pub management_address: String,
+    pub bmc_address: String,
+    pub bmc_username: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalCreate {
+    pub name: String,
+    pub bridge: String,
+    #[serde(flatten)]
+    pub vlan: VlanMode,
+    pub uplinks: Vec<Uplink>,
+}
+
+impl ClusterCreate {
+    /// Parse the request into the model, collecting every malformed field
+    /// rather than stopping at the first. Rule checking is the callers':
+    /// `validate_definition` and `networks::validate_networks`.
+    pub fn build(
+        &self,
+    ) -> std::result::Result<(ClusterDefinition, ClusterNetworks), Vec<ValidationError>> {
+        let mut errors = Vec::new();
+
+        let core_subnet = self.core.subnet.parse::<Subnet>().map_err(|reason| {
+            errors.push(ValidationError::new(
+                ValidationCode::InvalidSubnet,
+                Some("core.subnet"),
+                reason,
+            ))
+        });
+        let management_subnet = self.management.subnet.parse::<Subnet>().map_err(|reason| {
+            errors.push(ValidationError::new(
+                ValidationCode::InvalidSubnet,
+                Some("management.subnet"),
+                reason,
+            ))
+        });
+        let vip = match &self.management.vip {
+            None => None,
+            Some(text) => match text.parse::<std::net::Ipv4Addr>() {
+                Ok(address) => Some(address),
+                Err(_) => {
+                    errors.push(ValidationError::new(
+                        ValidationCode::InvalidAddress,
+                        Some("management.vip"),
+                        format!("\"{text}\" is not an IPv4 address."),
+                    ));
+                    None
+                }
+            },
+        };
+
+        let mut parse_member_address =
+            |value: &str, field: &str| match value.parse::<std::net::Ipv4Addr>() {
+                Ok(address) => Some(address),
+                Err(_) => {
+                    errors.push(ValidationError::new(
+                        ValidationCode::InvalidAddress,
+                        Some(field),
+                        format!("\"{value}\" is not an IPv4 address."),
+                    ));
+                    None
+                }
+            };
+
+        let mut nodes = Vec::new();
+        let mut core_members = Vec::new();
+        let mut management_members = Vec::new();
+        for member in &self.members {
+            let core_address = parse_member_address(&member.core_address, "core.members");
+            let management_address =
+                parse_member_address(&member.management_address, "management.members");
+            let (Some(core_address), Some(management_address)) = (core_address, management_address)
+            else {
+                continue;
+            };
+            nodes.push(MemberNode {
+                name: member.node.clone(),
+                ring0: core_address,
+                ring1: management_address,
+                bmc: BmcConfig {
+                    address: member.bmc_address.clone(),
+                    username: member.bmc_username.clone(),
+                },
+            });
+            core_members.push(AddressedMember {
+                node: member.node.clone(),
+                interface: member.core_interface.clone(),
+                address: core_address,
+            });
+            management_members.push(AddressedMember {
+                node: member.node.clone(),
+                interface: member.management_interface.clone(),
+                address: management_address,
+            });
+        }
+
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+        let (Ok(core_subnet), Ok(management_subnet)) = (core_subnet, management_subnet) else {
+            return Err(errors);
+        };
+
+        let definition = ClusterDefinition {
+            name: self.name.clone(),
+            nodes,
+            preferred_node: self.preferred_node.clone(),
+        };
+        let networks = ClusterNetworks {
+            core: CoreNetwork {
+                subnet: core_subnet,
+                mtu: self.core.mtu,
+                members: core_members,
+            },
+            management: ManagementNetwork {
+                subnet: management_subnet,
+                vip,
+                members: management_members,
+            },
+            external: self
+                .external
+                .iter()
+                .map(|external| ExternalNetwork {
+                    name: external.name.clone(),
+                    bridge: external.bridge.clone(),
+                    vlan: external.vlan.clone(),
+                    uplinks: external.uplinks.clone(),
+                })
+                .collect(),
+        };
+        Ok((definition, networks))
+    }
+}
+
 /// The placement rule the topology property tests hold for every N: a
 /// replicated volume's members are cluster members, and there are at least
 /// two of them. `lumen-drbd` calls this before anything touches a zvol.
@@ -365,6 +565,7 @@ mod tests {
                     cluster: None,
                 })
                 .collect(),
+            clusters: Vec::new(),
         }
     }
 

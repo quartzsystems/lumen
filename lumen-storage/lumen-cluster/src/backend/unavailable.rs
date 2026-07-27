@@ -7,8 +7,7 @@
 
 use async_trait::async_trait;
 
-use super::ClusterBackend;
-use crate::environment::EnvironmentMembership;
+use super::{ClusterBackend, LocalPreflight};
 use crate::error::{ClusterError, Result};
 use crate::state::ClusterState;
 
@@ -33,11 +32,40 @@ impl UnavailableBackend {
 
 #[async_trait]
 impl ClusterBackend for UnavailableBackend {
-    async fn membership(&self) -> Result<Option<EnvironmentMembership>> {
+    async fn cluster_state(&self, _name: &str) -> Result<ClusterState> {
         self.error()
     }
 
-    async fn cluster_state(&self, _name: &str) -> Result<ClusterState> {
+    async fn local_preflight(&self) -> Result<LocalPreflight> {
+        self.error()
+    }
+
+    async fn write_cluster_config(&self, _conf: &str, _authkey: &str) -> Result<()> {
+        self.error()
+    }
+
+    async fn enable_stack(&self) -> Result<()> {
+        self.error()
+    }
+
+    async fn disable_stack(&self) -> Result<()> {
+        self.error()
+    }
+
+    async fn remove_cluster_config(&self) -> Result<()> {
+        self.error()
+    }
+
+    async fn set_pacemaker_properties(&self, _properties: &[(String, String)]) -> Result<()> {
+        self.error()
+    }
+
+    async fn create_vip(
+        &self,
+        _cluster: &str,
+        _address: std::net::Ipv4Addr,
+        _prefix: u8,
+    ) -> Result<()> {
         self.error()
     }
 }
@@ -49,9 +77,10 @@ mod tests {
     #[tokio::test]
     async fn every_call_explains_itself() {
         let backend = UnavailableBackend::new("the state directory is unreadable");
-        let err = backend.membership().await.unwrap_err();
+        let err = backend.cluster_state("alpha").await.unwrap_err();
         assert!(err.to_string().contains("unavailable"));
         assert!(err.to_string().contains("unreadable"));
-        assert!(backend.cluster_state("alpha").await.is_err());
+        assert!(backend.local_preflight().await.is_err());
+        assert!(backend.enable_stack().await.is_err());
     }
 }

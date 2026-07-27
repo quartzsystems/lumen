@@ -1,10 +1,13 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { AlertTriangle, Plus, ShieldAlert } from "lucide-react";
+import { AlertTriangle, Plus, ShieldAlert, Trash2 } from "lucide-react";
 import { Page, PageBody, PageHeader } from "@/components/PageHeader";
 import { Button } from "@/components/ui/Button";
+import { CreateClusterDialog } from "@/components/cluster/CreateClusterDialog";
+import { DestroyClusterDialog } from "@/components/cluster/ClusterDialogs";
 import { ApiError } from "@/lib/authClient";
+import { useConsole } from "@/lib/ConsoleContext";
 import {
   fetchEnvironment,
   HEALTH_LABEL,
@@ -22,8 +25,11 @@ const POLL_MS = 5000;
 /// quorum/fencing/replication domain of 2–5 nodes; the environment above it is
 /// administration only and never a data path.
 export default function ClustersPage() {
+  const { setToast } = useConsole();
   const [environment, setEnvironment] = useState<EnvironmentResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [destroying, setDestroying] = useState<ClusterView | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -41,11 +47,20 @@ export default function ClustersPage() {
   }, [load]);
 
   useEffect(() => {
+    // Polling pauses while a dialog is open, so a refresh cannot move a
+    // wizard's pickers out from under the operator mid-choice.
+    if (creating || destroying) return;
     const timer = setInterval(() => void load(), POLL_MS);
     return () => clearInterval(timer);
-  }, [load]);
+  }, [load, creating, destroying]);
 
   const noEnvironment = environment !== null && !environment.environment;
+  const spareNodes = environment?.unassigned.length ?? 0;
+  const createBlocked = noEnvironment
+    ? "Join or bootstrap an environment first — Infrastructure → Nodes → Add Node."
+    : spareNodes < 2
+      ? "A cluster needs at least two unassigned environment nodes."
+      : null;
 
   return (
     <Page>
@@ -53,10 +68,16 @@ export default function ClustersPage() {
         title="Clusters"
         description="Every cluster in this environment: quorum, membership, and fencing at a glance."
         actions={
-          // The create wizard lands with a later stage; until then the
-          // control says why it is grey rather than being silently absent.
-          <span title="Cluster creation has not landed yet.">
-            <Button kind="primary" size="sm" icon={Plus} disabled>
+          // A disabled control explains itself rather than being silently
+          // grey.
+          <span title={createBlocked ?? undefined}>
+            <Button
+              kind="primary"
+              size="sm"
+              icon={Plus}
+              disabled={createBlocked !== null}
+              onClick={() => setCreating(true)}
+            >
               Create Cluster
             </Button>
           </span>
@@ -84,7 +105,8 @@ export default function ClustersPage() {
               <p className="text-[13px] text-[var(--qz-fg-4)] mt-2 mb-0 max-w-[520px] mx-auto">
                 It keeps working as a standalone hypervisor. An environment is one administrative
                 domain over several nodes — one sign-in, one console, every node visible — and
-                clusters are built inside it from two to five nodes each.
+                clusters are built inside it from two to five nodes each. Start on
+                Infrastructure → Nodes → Add Node.
               </p>
             </div>
           )}
@@ -110,17 +132,50 @@ export default function ClustersPage() {
               style={{ gridTemplateColumns: "repeat(auto-fill, minmax(340px, 1fr))" }}
             >
               {environment.clusters.map((cluster) => (
-                <ClusterCard key={cluster.name} cluster={cluster} />
+                <ClusterCard
+                  key={cluster.name}
+                  cluster={cluster}
+                  onDestroy={() => setDestroying(cluster)}
+                />
               ))}
             </div>
           )}
         </div>
       </PageBody>
+
+      {creating && environment && (
+        <CreateClusterDialog
+          unassigned={environment.unassigned}
+          onClose={() => setCreating(false)}
+          onCreated={() => {
+            setToast("Cluster created.");
+            void load();
+          }}
+        />
+      )}
+
+      {destroying && (
+        <DestroyClusterDialog
+          cluster={destroying}
+          onClose={() => setDestroying(null)}
+          onDestroyed={() => {
+            setToast(`${destroying.name} destroyed — its nodes are unassigned again.`);
+            setDestroying(null);
+            void load();
+          }}
+        />
+      )}
     </Page>
   );
 }
 
-function ClusterCard({ cluster }: { cluster: ClusterView }) {
+function ClusterCard({
+  cluster,
+  onDestroy,
+}: {
+  cluster: ClusterView;
+  onDestroy: () => void;
+}) {
   const online = cluster.nodes.filter((node) => node.online).length;
   return (
     <section className="surface p-5 flex flex-col gap-4">
@@ -134,13 +189,22 @@ function ClusterCard({ cluster }: { cluster: ClusterView }) {
         <span className={`badge badge-${HEALTH_TONE[cluster.health]}`}>
           {HEALTH_LABEL[cluster.health]}
         </span>
+        <Button kind="ghost" size="sm" icon={Trash2} onClick={onDestroy} />
       </header>
 
       {cluster.error && <div className="text-[12px] text-[var(--qz-fg-4)]">{cluster.error}</div>}
 
       <dl className="qz-facts m-0">
         <dt>Regime</dt>
-        <dd>{REGIME_LABEL[cluster.regime]}</dd>
+        <dd>
+          {REGIME_LABEL[cluster.regime]}
+          {cluster.preferred_node && (
+            <span className="qz-mono text-[12px] text-[var(--qz-fg-4)]">
+              {" "}
+              · prefers {cluster.preferred_node}
+            </span>
+          )}
+        </dd>
         <dt>Nodes</dt>
         <dd>
           {online} of {cluster.nodes.length} online
@@ -166,6 +230,8 @@ function ClusterCard({ cluster }: { cluster: ClusterView }) {
         <dd>
           {cluster.error ? (
             "—"
+          ) : cluster.fence.devices === 0 ? (
+            <span className="badge badge-warn">Not configured yet</span>
           ) : cluster.fence.failed > 0 ? (
             <span className="badge badge-crit">
               {cluster.fence.failed} device{cluster.fence.failed === 1 ? "" : "s"} failing

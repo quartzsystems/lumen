@@ -1,15 +1,19 @@
 # Lumen clustering
 
 The environment, its clusters, and the machinery that keeps a cluster honest:
-membership, quorum, and fencing. This stage is the foundation — the model,
-the topology engine, and the read path. The workflows that build and change
-clusters land in the stages after it and are listed at the end.
+membership, quorum, and fencing. Two stages in: the model, the topology
+engine, and the read path came first; this release adds the workflows —
+joining an environment with a one-time token, and building (or destroying) a
+cluster transactionally, per node, per step, unwound completely on failure.
+What still lands after is listed at the end.
 
 ```
 lumen-storage/
 └── lumen-cluster/     the clustering domain (Rust library crate)
 lumen-controlplane/
-└── src/api/cluster.rs thin HTTP handlers over lumen-cluster
+├── src/api/cluster.rs thin HTTP handlers over lumen-cluster
+├── src/api/peer.rs    one control plane answering another
+└── src/peers.rs       one control plane calling another (TLS client)
 lumen-webui/
 └── app/(console)/infrastructure/{clusters,nodes}
 ```
@@ -20,9 +24,11 @@ A fifth domain, laid out exactly as the other four:
 
 ```
 model.rs        what a cluster is: name, members, preferred node, BMCs
-environment.rs  the membership record and its reconciliation rule
+environment.rs  the membership record, the CA, join tokens
+store.rs        the environment's state on disk: record, identity, tokens
 topology.rs     one renderer, two regimes: corosync.conf, fencing, DRBD policy
 networks.rs     typed cluster networks — Core, Management, External
+join.rs         the workflows: the peer channel, preflight, create + unwind
 state.rs        what corosync and Pacemaker actually report
 validate.rs     pure rules over a definition and the environment
 backend/        the supported command line (cli/), plus mock/ and unavailable/
@@ -97,7 +103,9 @@ machine and a resource agent second-guessing the domain document.
 
 Reads are unprivileged — the status tools answer over sockets the sandbox
 does not cover — so nothing in the read path touches `lumen_sys::exec`. The
-privileged verbs will, when the workflows land.
+writes are the privileged half, and every one of them is a transient unit:
+`install` for the configuration, `systemctl` for the stack, `pcs` for the
+CIB.
 
 ### One topology engine, two regimes
 
@@ -187,6 +195,108 @@ data: volumes and machines live in their cluster and in libvirt, not here.
 Consensus machinery would be a great deal of surface for a document that a
 version counter already keeps agreed.
 
+### The token pins the issuer before anything secret moves
+
+Joining is one pasted string. The token carries where to call, a one-time
+secret, and the SHA-256 of the certificate the issuer serves — so the
+joining node's TLS client accepts exactly that certificate and nothing else,
+*before* the token or anything it unlocks crosses the wire. Without the pin,
+a machine-in-the-middle holding the connection would be handed the
+environment whole: the CA key, the session secret, the membership. With it,
+the trust decision is made by the operator who carried the token from one
+console to the other — the same operator the whole join already trusts.
+
+The same ordering is why minting the first token bootstraps the environment
+*and* swaps the listener onto the environment certificate in the same
+request: the token pins the certificate the issuer will present, so that
+certificate has to be serving before the token leaves the node.
+
+Tokens are one-time and live fifteen minutes. They are stored hashed, so
+reading the token file is not the same as holding a token, and a token that
+reached a **failed** join is spent too — fail-closed, because "try the same
+token again" and "replay the token I captured" are the same operation.
+
+### The grant carries the CA key, deliberately
+
+Every environment node can mint a token and sign a join — that is what
+"minted on any environment node" means — so every node holds the CA key, and
+a join hands it over along with the CA, the node's own certificate and key,
+the session secret, and the membership record. A certificate-signing request
+would keep the newcomer's private key at home and look more proper doing it;
+it would also protect one key on a channel that must already be trusted with
+all of the others. The pin above is what makes the channel worthy of that,
+and the CSR machinery would add parsing and a second round trip to protect
+nothing.
+
+### The peer channel: CA-verified TLS and secret-signed tickets, not client certificates
+
+After the join, peers call each other over TLS verified against the
+environment CA, and every call carries a **peer ticket** — a one-minute JWT
+signed with the environment-shared session secret, `kind: peer`. The server
+is proven by its certificate, the client by its ticket: mutual
+authentication, using material both sides already hold.
+
+The textbook answer is mTLS with client certificates, and it was declined
+on purpose. `axum-server` never surfaces the client's certificate to a
+handler — reaching it means reimplementing the accept loop — and an
+integration test driving the router directly has no TLS in it at all, so
+peer authentication would be untestable exactly where everything else is
+tested. The ticket rides in the request, is testable in the same
+`tower::oneshot` harness as every session check, and its secret is
+distributed precisely as far as the CA key it would be defending against.
+One claim keeps the two ticket populations apart, and
+`a_peer_ticket_is_not_a_session_and_a_session_is_not_a_peer` pins both
+directions.
+
+### pcs configures; it does not install
+
+`pcs cluster setup` was the expected tool and is deliberately not used. It
+requires pcsd running on every member and `pcs host auth` against the
+`hacluster` account — a daemon, an account, and a password added to the
+trust surface so that pcs can write a corosync.conf this crate already
+renders and property-tests. Instead the workflow pushes the rendered conf
+and a fresh authkey to each member over the peer channel, each member writes
+them as a transient unit, and the stack is started with `systemctl`. pcs
+remains the tool for what it is good at — CIB-level operations, which are
+local and need no pcsd — so `pcs property set` and the VIP's
+`pcs resource create` run on the coordinator exactly as `zpool create` runs:
+handed to systemd.
+
+Two write-path details worth their sentences. The configuration travels to
+`/etc/corosync` as the standard input of `install -m 0600 /dev/stdin` —
+content over the pipe, mode and target as typed arguments, no shell, and
+nothing secret in argv, which is the rule since docs/system.md. And the
+authkey is 256 alphanumeric characters rather than raw bytes: ~1500 bits of
+entropy against corosync's need, and text survives every JSON body and pipe
+between the coordinator and `/etc/corosync/authkey` without an encoding
+step or a base64 decoder process.
+
+### The record is written last
+
+A create runs preflight → generate → prepare each member → start each
+member → wait for the cluster to actually form → set properties → **then**
+write the membership record. Any failure before the last step tears down
+exactly the members that were touched — stack stopped and disabled,
+configuration removed, the Core address released — and the record never knew
+the cluster existed. That is what makes "a half-created cluster is not a
+representable state" an invariant rather than an aspiration, and
+`a_failed_create_unwinds_completely` holds it: every node ends unassigned,
+and the error names the node and step that failed.
+
+The wizard shows the same truth: the plan is laid out before anything runs —
+every step pending, per node — and failure appends visible unwind steps
+rather than replacing the history with an apology.
+
+### Joining signs everyone out, and that is the join working
+
+The environment shares one web-session secret, distributed at join and
+swapped into the running control plane the moment the grant lands. Every
+outstanding session on the joining node — including the operator's own — was
+signed with the old secret and dies with it. The console says so before the
+operator clicks, and the login page that follows is the success state: the
+next sign-in works on every node of the environment, which is the entire
+point.
+
 ### A node with no cluster stack is standalone, not broken
 
 The clustering backend is the one domain in `main.rs` constructed without a
@@ -221,10 +331,23 @@ one level upward: grouped by cluster, then by node.
 | ------ | ---- | ------- |
 | GET | `/api/environment` | The whole environment: every cluster with its nodes, quorum, and fencing, plus the unassigned nodes |
 | GET | `/api/environment/clusters/:name` | One cluster, the same view the environment answer carries |
+| POST | `/api/environment/tokens` | Mint a one-time join token; the first mint bootstraps the environment |
+| POST | `/api/environment/join` | Join with a pasted token; every session on this node is re-signed |
+| POST | `/api/environment/preflight` | Judge the named nodes for cluster membership, links included |
+| POST | `/api/environment/clusters` | Start a create — `202`, then poll |
+| GET | `/api/environment/clusters/pending` | The create in flight (or last finished): per node, per step |
+| DELETE | `/api/environment/clusters/:name` | Destroy — every member torn down, `i_understand_this_may_lose_data` required |
+| DELETE | `/api/environment/nodes/:name` | Remove an unassigned node from the environment |
 
 A node that never joined an environment answers `GET /api/environment` with
 no `environment` object and itself as the one entry in `unassigned` — the
 console renders one shape either way.
+
+The peer surface — `/api/peer/join`, `/api/peer/membership`,
+`/api/peer/preflight`, `/api/peer/cluster/{prepare,start,teardown}` — is one
+control plane answering another: peer-ticket authenticated, except join,
+whose one-time token is the authentication. Nothing under `/api/peer` is for
+a browser, and no browser session opens any of it.
 
 ---
 
@@ -233,17 +356,26 @@ console renders one shape either way.
 **Infrastructure → Clusters** is the cluster list — one card per cluster with
 the health pill, regime, node count, quorum state, fencing summary, and the
 pinned untested-fencing warning. The plural is the point: this console
-administers every cluster in the environment, from any node. A node with no
-environment gets an explanation of what an environment is, not an empty
-table. Create Cluster is present and disabled, carrying the reason — the
-wizard lands with a later stage, and a control that says why it is grey beats
-one that is silently absent.
+administers every cluster in the environment, from any node. **Create
+Cluster** is the wizard, as a tabbed dialog like every other creator in the
+console — every tab reachable, invalid ones marked: members with per-node
+preflight results and their reasons inline; networks, with per-member NIC
+pickers fed by what each node's preflight actually reported, proposed Core
+addresses, adopted Management addressing, and the optional VIP; the fencing
+seats; a review of everything about to be generated; and then the create
+itself, live — per node, per step, unwind steps included, because a wizard
+that closes on submit turns a five-minute workflow into a spinner. Destroy
+is the typed-name confirmation the console uses everywhere destruction is
+meant.
 
 **Infrastructure → Nodes** is every node the console can see: the current
 node's card first, then each cluster's members grouped under the cluster's
 name — state, rings, fencing, address, version — then the unassigned nodes as
-their own group, labelled standalone hypervisors rather than leftovers. Add
-Node is disabled the same way Create Cluster is.
+their own group, labelled standalone hypervisors rather than leftovers.
+**Add Node** shows the token flow in both directions — mint here, or paste
+here — because the operator is standing at one console or the other, and the
+page cannot know which. Removing an unassigned node is an inline confirm,
+not a modal: the node can simply join again.
 
 Both pages poll at five seconds and render straight from `/api/environment`;
 the health pill is derived in the service, so the console and the API can
@@ -259,25 +391,37 @@ make lint    # shellcheck, rpmlint, fmt/clippy for seven manifests
 ```
 
 `lumen-cluster` needs no system libraries: state is read through the cluster
-stack's own command-line tools, and there is nothing to link. Its tests never
-form a cluster — the mock backend simulates a full environment (two clusters,
-partitions, fence failures, an unreachable cluster) in memory, and the
-parsers are tested against captured output of the formats EL10 ships:
-corosync 3.1 and pacemaker 2.1. `MockBackend::environment()` is the
+stack's own command-line tools, privileged writes are handed to systemd, and
+there is nothing to link. Its tests never form a cluster and never open a
+socket — the whole workflow engine runs against `MockPeers` (the in-memory
+peer channel) and the mock backend, which is what lets
+`a_failed_create_unwinds_completely` and
+`a_token_admits_a_node_once_and_only_once` run under `cargo test` on a
+laptop. The parsers are tested against captured output of the formats EL10
+ships: corosync 3.1, pacemaker 2.1, chrony 4.6.
+`MockBackend::environment()` plus `environment_membership()` is the
 acceptance scenario — a two-node cluster, a three-node cluster, and one
 unassigned node — and the control plane's `tests/cluster_flow.rs` drives the
-real router over it.
+real router over it: the token bootstrap, the peer-join grant, both
+directions of ticket separation, a polled create, and a refused-then-acked
+destroy.
+
+The one thing the in-memory tests cannot cover is two real control planes
+completing the handshake over real TLS — the fingerprint pin and the
+certificate chain. That is the manual test: two nodes, mint on one, paste on
+the other, and `openssl s_client` against both afterwards shows the same CA.
 
 ## Out of scope for this stage
 
-Everything that changes a cluster, in the order it lands: environment join
-(the one-time token, the CA, the shared session secret, the mTLS peer
-channel and gossip); the cluster-create workflow with per-node preflight and
-full unwind on failure; typed-network realization through lumen-net; fence
-devices, per-direction fence tests, continuous BMC monitoring, and the
-break-glass confirm; replicated volumes (`lumen-drbd`); the HA manager;
-node add/remove and the 2→3 scale-out; the Management VIP; and the
-environment-wide console federation (aggregated reads, proxied writes, the
-environment-shared session secret). The read model in this stage was shaped
-so each of those arrives as new verbs over the same views rather than as a
-reshaping of them.
+In the order it lands: fence devices, per-direction fence tests, continuous
+BMC monitoring, and the break-glass confirm-peer-dead (the wizard already
+collects the BMC seats; nothing yet creates the devices — a fresh cluster's
+card says "Not configured yet" honestly); External-network realization
+(bridges on every member) and the typed-networks page; replicated volumes
+(`lumen-drbd`); the HA manager; adding a node to an existing cluster and the
+2→3 scale-out, and with them removing a member from a live cluster; the
+environment-wide console federation — aggregated reads with per-node
+freshness, proxied writes — for which the peer channel built here is the
+transport; and gossip beyond the once-a-minute record exchange. A removed
+node also keeps its stale environment state until it re-joins somewhere; a
+"leave and reset" for the node itself rides the federation stage.

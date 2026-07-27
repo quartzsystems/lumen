@@ -54,6 +54,16 @@ tracing = "0.1"
 # Pacemaker's one machine-readable status format. The same crate lumen-virt
 # uses for the domain document.
 quick-xml = "0.37"
+# The environment CA and every node's serving certificate — the same crate
+# the control plane already mints its self-signed pair with.
+rcgen = { version = "0.13", features = ["pem"] }
+# Join-token secrets and the environment id.
+rand = "0.8"
+# Token secrets are stored hashed, and a join token pins the issuer's
+# certificate by digest. Pure Rust.
+sha2 = "0.10"
+# The pasted form of a join token, and PEM bodies on the way to a digest.
+base64 = "0.22"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

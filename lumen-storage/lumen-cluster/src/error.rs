@@ -65,3 +65,22 @@ impl From<std::io::Error> for ClusterError {
         ClusterError::Backend(err.into())
     }
 }
+
+/// The networking domain's errors, folded in where cluster workflows drive
+/// it — the shape `lumen_virt` gave `lumen_zfs::ZfsError`. Its validation
+/// failures arrive as a conflict sentence: by the time a cluster workflow
+/// touches a link, the inputs were already validated here, so a refusal from
+/// networking is a state problem, not a form problem.
+impl From<lumen_net::NetError> for ClusterError {
+    fn from(err: lumen_net::NetError) -> Self {
+        match err {
+            lumen_net::NetError::NotFound(message) => ClusterError::NotFound(message),
+            lumen_net::NetError::Conflict(message) => ClusterError::Conflict(message),
+            lumen_net::NetError::Backend(err) => ClusterError::Backend(err),
+            lumen_net::NetError::Invalid(errors) => {
+                let joined: Vec<String> = errors.into_iter().map(|e| e.message).collect();
+                ClusterError::Conflict(joined.join(" "))
+            }
+        }
+    }
+}

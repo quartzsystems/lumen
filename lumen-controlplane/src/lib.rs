@@ -1,6 +1,7 @@
 pub mod api;
 pub mod config;
 pub mod error;
+pub mod peers;
 pub mod realm;
 pub mod security;
 pub mod tasks;
@@ -27,7 +28,13 @@ use realm::RealmRegistry;
 /// runner's NetworkManager, hypervisor, or storage.
 pub struct AppState {
     pub config: Config,
-    pub jwt_secret: Vec<u8>,
+    /// The live session-signing secret, swappable at runtime: joining an
+    /// environment replaces this node's own secret with the shared one.
+    pub jwt_secret: security::SessionSecret,
+    /// The TLS listener's live configuration, for reloading onto the
+    /// environment certificate after a bootstrap or join. `None` in the
+    /// plain-HTTP development mode and under the tests.
+    pub tls: Option<axum_server::tls_rustls::RustlsConfig>,
     pub realms: RealmRegistry,
     /// The node itself: its local accounts and its power state. The most basic
     /// domain, and the one that owns the privileged-command runner the storage

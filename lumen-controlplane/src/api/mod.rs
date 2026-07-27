@@ -3,6 +3,7 @@ pub mod cluster;
 pub mod console;
 pub mod network;
 pub mod nodes;
+pub mod peer;
 pub mod request;
 pub mod storage;
 pub mod system;
@@ -103,7 +104,32 @@ pub fn router(state: Arc<AppState>) -> Router {
         // that never joined an environment still answers, with itself as the
         // one unassigned node; see src/api/cluster.rs and docs/cluster.md.
         .route("/api/environment", get(cluster::environment))
+        .route("/api/environment/tokens", post(cluster::mint_token))
+        .route("/api/environment/join", post(cluster::join))
+        .route("/api/environment/preflight", post(cluster::preflight))
+        .route("/api/environment/clusters", post(cluster::create_cluster))
+        .route(
+            "/api/environment/clusters/pending",
+            get(cluster::create_progress),
+        )
         .route("/api/environment/clusters/{name}", get(cluster::cluster))
+        .route(
+            "/api/environment/clusters/{name}",
+            delete(cluster::destroy_cluster),
+        )
+        .route(
+            "/api/environment/nodes/{name}",
+            delete(cluster::remove_node),
+        )
+        // The peer surface: one control plane answering another, peer-ticket
+        // authenticated — except join, whose one-time token is the
+        // authentication; see src/api/peer.rs.
+        .route("/api/peer/join", post(peer::join))
+        .route("/api/peer/membership", post(peer::membership))
+        .route("/api/peer/preflight", post(peer::preflight))
+        .route("/api/peer/cluster/prepare", post(peer::prepare))
+        .route("/api/peer/cluster/start", post(peer::start))
+        .route("/api/peer/cluster/teardown", post(peer::teardown))
         // The node itself: its local accounts, and its power state. Every
         // account route passes the session's own principal down, which is what
         // lets the domain refuse to lock the operator out of their own console

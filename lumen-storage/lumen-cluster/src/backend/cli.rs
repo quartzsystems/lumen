@@ -1,25 +1,28 @@
-//! The supported command line: what corosync and Pacemaker report, parsed.
+//! The supported command line: reads from the cluster stack's own tools,
+//! writes as transient units through `lumen_sys::exec`.
 //!
-//! Reads only, at this stage, and unprivileged ones — `crm_mon`,
-//! `corosync-quorumtool`, and `corosync-cfgtool` answer root without leaving
-//! the sandbox, because they talk to their daemons over sockets that
-//! `ProtectSystem=strict` does not cover. The privileged verbs (`pcs`, fence
-//! agents) arrive with the join workflow and go through `lumen_sys::exec`.
+//! Reads are unprivileged — `crm_mon`, `corosync-quorumtool`,
+//! `corosync-cfgtool`, and `chronyc` answer root over sockets the sandbox
+//! does not cover. The writes are the privileged half: `/etc/corosync` is
+//! read-only inside `ProtectSystem=strict`, so the configuration is written
+//! by `install` running as a transient unit, the content arriving over the
+//! unit's standard input — typed argument arrays, never an interpolated
+//! shell string, and never file content as an argument.
 //!
 //! Every parser is a free function over `&str`, outside the impl, so it
 //! tests without a process. The fixtures in the tests are the formats EL10
-//! ships: corosync 3.1 and pacemaker 2.1, the HighAvailability stack this
-//! appliance pins.
+//! ships: corosync 3.1, pacemaker 2.1, chrony 4.6.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use lumen_sys::exec::{Exec, Request as ExecRequest};
 use tokio::time::timeout;
 
-use super::ClusterBackend;
-use crate::environment::EnvironmentMembership;
+use super::{ClusterBackend, LocalPreflight};
 use crate::error::{ClusterError, Result};
 use crate::state::{ClusterState, FenceDeviceState, NodeState, QuorumState, RingLink};
 
@@ -28,26 +31,31 @@ use crate::state::{ClusterState, FenceDeviceState, NodeState, QuorumState, RingL
 /// environment view. Same reasoning as `lumen_zfs::backend::cli::DEADLINE`.
 const DEADLINE: Duration = Duration::from_secs(30);
 
-/// The file the join workflow keeps the membership record in, under the
-/// control plane's state directory.
-pub const MEMBERSHIP_FILE: &str = "environment.json";
+const COROSYNC_CONF: &str = "/etc/corosync/corosync.conf";
+const COROSYNC_AUTHKEY: &str = "/etc/corosync/authkey";
+const SYSTEMCTL: &str = "/usr/bin/systemctl";
+const INSTALL: &str = "/usr/bin/install";
+const RM: &str = "/usr/bin/rm";
+const PCS: &str = "/usr/sbin/pcs";
 
 pub struct CliBackend {
     crm_mon: String,
     quorumtool: String,
     cfgtool: String,
+    chronyc: String,
     corosync_conf: PathBuf,
-    membership_path: PathBuf,
+    exec: Arc<dyn Exec>,
 }
 
 impl CliBackend {
-    pub fn new(state_dir: &Path) -> Self {
+    pub fn new(exec: Arc<dyn Exec>) -> Self {
         CliBackend {
             crm_mon: "/usr/sbin/crm_mon".into(),
             quorumtool: "/usr/sbin/corosync-quorumtool".into(),
             cfgtool: "/usr/sbin/corosync-cfgtool".into(),
-            corosync_conf: PathBuf::from("/etc/corosync/corosync.conf"),
-            membership_path: state_dir.join(MEMBERSHIP_FILE),
+            chronyc: "/usr/bin/chronyc".into(),
+            corosync_conf: PathBuf::from(COROSYNC_CONF),
+            exec,
         }
     }
 
@@ -85,31 +93,27 @@ impl CliBackend {
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
+
+    /// A privileged command, delegated to systemd. Same shape as the storage
+    /// domain's: outcome checked, the tool's own last sentence reported.
+    async fn run_privileged(&self, description: String, request: ExecRequest) -> Result<()> {
+        let outcome = self
+            .exec
+            .run(request)
+            .await
+            .map_err(ClusterError::Backend)?;
+        if !outcome.ok() {
+            return Err(ClusterError::Conflict(format!(
+                "{description}: {}",
+                outcome.failure()
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl ClusterBackend for CliBackend {
-    async fn membership(&self) -> Result<Option<EnvironmentMembership>> {
-        let raw = match tokio::fs::read_to_string(&self.membership_path).await {
-            Ok(raw) => raw,
-            // No record is the ordinary standalone appliance.
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => {
-                return Err(ClusterError::backend(anyhow::anyhow!(
-                    "could not read {}: {err}",
-                    self.membership_path.display()
-                )))
-            }
-        };
-        let membership = serde_json::from_str(&raw).map_err(|err| {
-            ClusterError::backend(anyhow::anyhow!(
-                "{} does not hold a membership record: {err}",
-                self.membership_path.display()
-            ))
-        })?;
-        Ok(Some(membership))
-    }
-
     async fn cluster_state(&self, name: &str) -> Result<ClusterState> {
         // This node can only speak for the cluster it is in; the environment
         // view reaches other clusters through their own members.
@@ -160,6 +164,115 @@ impl ClusterBackend for CliBackend {
             nodes,
             fence_devices,
         })
+    }
+
+    async fn local_preflight(&self) -> Result<LocalPreflight> {
+        // chrony first: a node that cannot answer for its clock is refused
+        // by preflight, and the sentence should be chrony's, not a guess.
+        let tracking = self.run(&self.chronyc, &["-c", "tracking"]).await?;
+        let (time_synchronized, time_offset_ms) = parse_chronyc_tracking(&tracking);
+        Ok(LocalPreflight {
+            time_synchronized,
+            time_offset_ms,
+            already_clustered: self.corosync_conf.exists(),
+        })
+    }
+
+    async fn write_cluster_config(&self, conf: &str, authkey: &str) -> Result<()> {
+        // `install` reads the unit's standard input and writes the target
+        // with the mode asked for — content over the pipe, never an
+        // argument, and no shell anywhere. `-D` makes /etc/corosync on a
+        // node where the package did not.
+        self.run_privileged(
+            "writing the cluster configuration failed".into(),
+            ExecRequest::new("write the cluster configuration", INSTALL)
+                .args(["-D", "-m", "0644", "/dev/stdin", COROSYNC_CONF])
+                .stdin(conf),
+        )
+        .await?;
+        self.run_privileged(
+            "writing the cluster key failed".into(),
+            ExecRequest::new("write the cluster authentication key", INSTALL)
+                .args(["-m", "0600", "/dev/stdin", COROSYNC_AUTHKEY])
+                .stdin(authkey),
+        )
+        .await
+    }
+
+    async fn enable_stack(&self) -> Result<()> {
+        self.run_privileged(
+            "starting the cluster stack failed".into(),
+            ExecRequest::new("enable and start the cluster stack", SYSTEMCTL).args([
+                "enable",
+                "--now",
+                "corosync",
+                "pacemaker",
+            ]),
+        )
+        .await
+    }
+
+    async fn disable_stack(&self) -> Result<()> {
+        // Pacemaker first: stopping corosync out from under a running
+        // Pacemaker is a fencing story, not a shutdown.
+        self.run_privileged(
+            "stopping the cluster stack failed".into(),
+            ExecRequest::new("stop and disable the cluster stack", SYSTEMCTL).args([
+                "disable",
+                "--now",
+                "pacemaker",
+                "corosync",
+            ]),
+        )
+        .await
+    }
+
+    async fn remove_cluster_config(&self) -> Result<()> {
+        self.run_privileged(
+            "removing the cluster configuration failed".into(),
+            ExecRequest::new("remove the cluster configuration", RM).args([
+                "-f",
+                COROSYNC_CONF,
+                COROSYNC_AUTHKEY,
+            ]),
+        )
+        .await
+    }
+
+    async fn set_pacemaker_properties(&self, properties: &[(String, String)]) -> Result<()> {
+        if properties.is_empty() {
+            return Ok(());
+        }
+        let mut request =
+            ExecRequest::new("set the cluster properties", PCS).args(["property", "set"]);
+        for (key, value) in properties {
+            request = request.arg(format!("{key}={value}"));
+        }
+        self.run_privileged("setting the cluster properties failed".into(), request)
+            .await
+    }
+
+    async fn create_vip(
+        &self,
+        cluster: &str,
+        address: std::net::Ipv4Addr,
+        prefix: u8,
+    ) -> Result<()> {
+        self.run_privileged(
+            "creating the cluster address failed".into(),
+            ExecRequest::new("create the cluster address", PCS).args([
+                "resource",
+                "create",
+                &format!("{cluster}-vip"),
+                "ocf:heartbeat:IPaddr2",
+                &format!("ip={address}"),
+                &format!("cidr_netmask={prefix}"),
+                "op",
+                "monitor",
+                "interval=10s",
+            ]),
+        )
+        .await
     }
 }
 
@@ -224,6 +337,27 @@ fn parse_cfgtool(output: &str) -> Vec<RingLink> {
         }
     }
     links
+}
+
+/// `chronyc -c tracking`: one CSV line. The two answers preflight needs are
+/// the leap status (the last field) and the system-time offset in seconds
+/// (the fifth) — everything between is for eyes reading `chronyc tracking`
+/// without `-c`.
+fn parse_chronyc_tracking(output: &str) -> (bool, Option<i64>) {
+    let line = output.trim();
+    let fields: Vec<&str> = line.split(',').collect();
+    if fields.len() < 6 {
+        return (false, None);
+    }
+    let synchronized = fields
+        .last()
+        .is_some_and(|leap| leap.trim().eq_ignore_ascii_case("normal"));
+    let offset_ms = fields[4]
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .map(|seconds| (seconds * 1000.0).round() as i64);
+    (synchronized, offset_ms)
 }
 
 /// `crm_mon --output-as=xml`: node membership and the STONITH devices.
@@ -363,6 +497,16 @@ LINK ID 1 udp
 \t\tnodeid:          2:\tdisconnected
 ";
 
+    /// chronyc -c tracking, chrony 4.6 on EL10: synchronized, 23 µs off.
+    const CHRONYC_SYNCED: &str = "A29FC87B,192.168.10.250,2,1753500000.123456789,\
+-0.000023614,0.000012000,0.000150000,0.023,0.001,0.010,0.000250000,0.000800000,64.2,Normal\n";
+
+    /// The same node before chrony has a source: reference 127.127.1.1,
+    /// stratum 0, and the leap status says it plainly.
+    const CHRONYC_UNSYNCED: &str = "7F7F0101,,0,1753500000.000000000,\
+0.000000000,0.000000000,0.000000000,0.000,0.000,0.000,0.000000000,0.000000000,0.0,\
+Not synchronised\n";
+
     /// crm_mon --output-as=xml on EL10 (pacemaker 2.1), trimmed to the
     /// elements this parser reads: a healthy member, a lost-and-unfenced
     /// member, one running fence device and one failed.
@@ -422,6 +566,24 @@ LINK ID 1 udp
     }
 
     #[test]
+    fn a_synchronized_clock_reads_with_its_offset() {
+        let (synced, offset) = parse_chronyc_tracking(CHRONYC_SYNCED);
+        assert!(synced);
+        // -0.000023614 s rounds to 0 ms — the point is the magnitude, and
+        // sub-millisecond is what a healthy LAN looks like.
+        assert_eq!(offset, Some(0));
+    }
+
+    #[test]
+    fn an_unsynchronized_clock_says_so_rather_than_passing() {
+        let (synced, _) = parse_chronyc_tracking(CHRONYC_UNSYNCED);
+        assert!(!synced);
+        // Garbage is "not synchronized", never a panic.
+        assert!(!parse_chronyc_tracking("").0);
+        assert!(!parse_chronyc_tracking("one,two").0);
+    }
+
+    #[test]
     fn crm_mon_yields_members_and_fence_devices_but_never_confuses_the_two() {
         let (nodes, devices) = parse_crm_mon(CRM_MON_XML).unwrap();
         // The <node> inside a <resource> says where it runs; it is not a
@@ -449,23 +611,90 @@ LINK ID 1 udp
         assert!(parse_crm_mon("<unclosed").is_err());
     }
 
+    /// The one command in this crate where getting an argument wrong writes
+    /// the wrong file: content rides standard input, the mode and target are
+    /// arguments, and there is no shell for anything to escape into.
     #[tokio::test]
-    async fn a_node_with_no_record_is_standalone_not_broken() {
-        let dir = std::env::temp_dir().join(format!(
-            "lumen-cluster-test-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let backend = CliBackend::new(&dir);
-        assert_eq!(backend.membership().await.unwrap(), None);
+    async fn the_configuration_is_written_over_stdin_never_as_an_argument() {
+        let exec = lumen_sys::exec::MockExec::working();
+        let backend = CliBackend::new(exec.clone());
+        backend
+            .write_cluster_config("totem { }", "the-key-material")
+            .await
+            .unwrap();
 
-        // A corrupt record is an error that names the file, not a silent
-        // fall back to standalone — losing the environment quietly would be
-        // far worse than an error message.
-        std::fs::write(dir.join(MEMBERSHIP_FILE), "not json").unwrap();
-        let err = backend.membership().await.unwrap_err();
-        assert!(err.to_string().contains(MEMBERSHIP_FILE), "{err}");
-        std::fs::remove_dir_all(&dir).ok();
+        let ran = exec.ran().await;
+        assert_eq!(ran.len(), 2);
+        assert_eq!(ran[0].program, INSTALL);
+        assert_eq!(
+            ran[0].args,
+            vec!["-D", "-m", "0644", "/dev/stdin", COROSYNC_CONF]
+        );
+        assert_eq!(ran[0].stdin.as_deref(), Some("totem { }"));
+        assert_eq!(
+            ran[1].args,
+            vec!["-m", "0600", "/dev/stdin", COROSYNC_AUTHKEY]
+        );
+        // The key is content, not an argument — nothing to leak into a
+        // journal line or /proc.
+        assert_eq!(ran[1].stdin.as_deref(), Some("the-key-material"));
+        assert!(!ran[1].args.iter().any(|a| a.contains("the-key-material")));
+    }
+
+    #[tokio::test]
+    async fn the_stack_is_enabled_started_and_undone_symmetrically() {
+        let exec = lumen_sys::exec::MockExec::working();
+        let backend = CliBackend::new(exec.clone());
+        backend.enable_stack().await.unwrap();
+        backend.disable_stack().await.unwrap();
+        backend.remove_cluster_config().await.unwrap();
+
+        let ran = exec.ran().await;
+        assert!(
+            exec.ran_with(SYSTEMCTL, &["enable", "--now", "corosync", "pacemaker"])
+                .await
+        );
+        // Pacemaker stops before corosync: the reverse is a fencing story.
+        assert!(
+            exec.ran_with(SYSTEMCTL, &["disable", "--now", "pacemaker", "corosync"])
+                .await
+        );
+        assert_eq!(ran[2].program, RM);
+    }
+
+    #[tokio::test]
+    async fn properties_and_the_vip_go_through_pcs() {
+        let exec = lumen_sys::exec::MockExec::working();
+        let backend = CliBackend::new(exec.clone());
+        backend
+            .set_pacemaker_properties(&[
+                ("stonith-enabled".into(), "true".into()),
+                ("no-quorum-policy".into(), "stop".into()),
+            ])
+            .await
+            .unwrap();
+        backend
+            .create_vip("alpha", "192.168.10.100".parse().unwrap(), 24)
+            .await
+            .unwrap();
+
+        let ran = exec.ran().await;
+        assert_eq!(ran[0].program, PCS);
+        assert!(ran[0].args.contains(&"stonith-enabled=true".to_string()));
+        assert!(ran[1].args.contains(&"ip=192.168.10.100".to_string()));
+        assert!(ran[1].args.contains(&"cidr_netmask=24".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_failed_transient_unit_reports_the_tools_own_sentence() {
+        let exec = lumen_sys::exec::MockExec::working();
+        exec.fail_next(
+            1,
+            "Failed to enable unit: Unit corosync.service does not exist.",
+        )
+        .await;
+        let backend = CliBackend::new(exec);
+        let err = backend.enable_stack().await.unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "{err}");
     }
 }

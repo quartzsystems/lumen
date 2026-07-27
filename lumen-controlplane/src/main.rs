@@ -47,7 +47,12 @@ async fn main() -> Result<()> {
         "starting lumen-controlplane"
     );
 
-    let jwt_secret = security::load_or_create_secret(&config.state_dir.join("session-secret"))?;
+    // The session-signing secret lives behind a lock because joining an
+    // environment swaps it for the shared one at runtime — every verifier
+    // reads the cell, so the swap is one write.
+    let jwt_secret = security::session_secret(security::load_or_create_secret(
+        &config.state_dir.join("session-secret"),
+    )?);
 
     // The stock realm registry: just the built-in OS realm for now. Configured
     // realms (LDAP, OIDC, …) will be loaded and appended here.
@@ -102,15 +107,16 @@ async fn main() -> Result<()> {
     // Storage. The real backend runs the supported command line, so a node
     // without the storage software swaps in the unavailable one and the
     // console comes up saying so rather than refusing to start.
-    let zfs_backend: Arc<dyn lumen_zfs::backend::ZfsBackend> = match CliBackend::probe(exec).await {
-        Ok(backend) => Arc::new(backend),
-        Err(err) => {
-            tracing::error!("storage is unavailable: {err}");
-            Arc::new(lumen_zfs::backend::unavailable::UnavailableBackend::new(
-                err.to_string(),
-            ))
-        }
-    };
+    let zfs_backend: Arc<dyn lumen_zfs::backend::ZfsBackend> =
+        match CliBackend::probe(exec.clone()).await {
+            Ok(backend) => Arc::new(backend),
+            Err(err) => {
+                tracing::error!("storage is unavailable: {err}");
+                Arc::new(lumen_zfs::backend::unavailable::UnavailableBackend::new(
+                    err.to_string(),
+                ))
+            }
+        };
     let storage = Arc::new(StorageService::new(zfs_backend));
 
     // Virtual machines. The hypervisor is a privileged daemon reached over its
@@ -139,12 +145,36 @@ async fn main() -> Result<()> {
     // Clustering. No probe and no unavailable fallback: a node without a
     // cluster stack is the ordinary standalone appliance, and the backend
     // answers "no environment" for it rather than being broken. Reads are
-    // unprivileged; the privileged verbs will ride lumen_sys::exec when the
-    // workflows land.
+    // unprivileged; the privileged writes ride the same transient-unit path
+    // as everything else. The peer channel and the service need each other —
+    // the channel short-circuits calls to this node — so the channel is
+    // built first and bound after.
+    let peers = Arc::new(lumen_controlplane::peers::HttpPeerChannel::new(
+        jwt_secret.clone(),
+    ));
     let cluster = Arc::new(ClusterService::new(
-        Arc::new(ClusterCliBackend::new(&config.state_dir)),
+        Arc::new(ClusterCliBackend::new(exec.clone())),
+        peers.clone(),
+        network.clone(),
+        &config.state_dir,
         env!("LUMEN_VERSION"),
     ));
+    peers.bind(cluster.clone());
+
+    // Membership gossip: push our record to every peer once a minute and
+    // adopt anything newer that comes back. Quiet by design — the
+    // environment view is what reports an unreachable peer.
+    {
+        let cluster = cluster.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                cluster.gossip_once().await;
+            }
+        });
+    }
 
     let listen: std::net::SocketAddr = config
         .listen
@@ -155,9 +185,44 @@ async fn main() -> Result<()> {
     let tls_cert = config.tls_cert.clone();
     let tls_key = config.tls_key.clone();
 
+    // The TLS material, resolved before AppState because joining an
+    // environment reloads the listener at runtime through the handle stored
+    // there. An explicitly configured pair always wins; a node that has
+    // joined an environment serves its CA-signed certificate; everything
+    // else gets the minted self-signed pair, exactly as before.
+    let tls_config = if no_tls {
+        None
+    } else {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        let (cert, key) = if tls_cert.is_some() && tls_key.is_some() {
+            tls::cert_paths(&state_dir, tls_cert, tls_key)?
+        } else {
+            let (env_cert, env_key) = cluster.serving_cert_paths();
+            if env_cert.is_file() && env_key.is_file() {
+                (env_cert, env_key)
+            } else {
+                tls::cert_paths(&state_dir, None, None)?
+            }
+        };
+        Some(
+            axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
+                .await
+                .with_context(|| {
+                    format!(
+                        "loading TLS material {} / {}",
+                        cert.display(),
+                        key.display()
+                    )
+                })?,
+        )
+    };
+
     let router = app(Arc::new(AppState {
         config,
         jwt_secret,
+        tls: tls_config.clone(),
         realms,
         sys,
         network,
@@ -167,28 +232,18 @@ async fn main() -> Result<()> {
         tasks: lumen_controlplane::tasks::TaskLog::open(state_dir.join("vm-tasks.jsonl")),
     }));
 
-    if no_tls {
-        tracing::warn!("LUMEN_CP_NO_TLS=1 — serving plain HTTP (development only)");
-        axum_server::bind(listen)
-            .serve(router.into_make_service())
-            .await?;
-    } else {
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .ok();
-        let (cert, key) = tls::cert_paths(&state_dir, tls_cert, tls_key)?;
-        let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
-            .await
-            .with_context(|| {
-                format!(
-                    "loading TLS material {} / {}",
-                    cert.display(),
-                    key.display()
-                )
-            })?;
-        axum_server::bind_rustls(listen, tls_config)
-            .serve(router.into_make_service())
-            .await?;
+    match tls_config {
+        None => {
+            tracing::warn!("LUMEN_CP_NO_TLS=1 — serving plain HTTP (development only)");
+            axum_server::bind(listen)
+                .serve(router.into_make_service())
+                .await?;
+        }
+        Some(tls_config) => {
+            axum_server::bind_rustls(listen, tls_config)
+                .serve(router.into_make_service())
+                .await?;
+        }
     }
     Ok(())
 }

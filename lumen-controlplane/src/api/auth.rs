@@ -65,8 +65,9 @@ pub async fn login(
         Err(AuthFailure::Backend(err)) => return Err(ApiError::Internal(err)),
     }
 
+    let secret = state.jwt_secret.read().expect("secret lock").clone();
     let ticket = security::issue_ticket(
-        &state.jwt_secret,
+        &secret,
         &req.username,
         realm.id(),
         state.config.session_ttl_secs,
@@ -92,9 +93,10 @@ pub async fn me(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
 ) -> Result<Json<SessionUser>, ApiError> {
+    let secret = state.jwt_secret.read().expect("secret lock").clone();
     let claims = jar
         .get(SESSION_COOKIE)
-        .and_then(|c| security::verify_ticket(&state.jwt_secret, c.value()))
+        .and_then(|c| security::verify_ticket(&secret, c.value()))
         .ok_or(ApiError::Unauthorized)?;
     Ok(Json(SessionUser {
         username: claims.sub,

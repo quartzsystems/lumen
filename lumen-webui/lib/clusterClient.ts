@@ -69,6 +69,7 @@ export interface ClusterView {
   regime: Regime;
   health: ClusterHealth;
   quorum: QuorumState;
+  preferred_node?: string;
   nodes: ClusterNodeView[];
   fence: FenceSummary;
   /// Why the cluster could not be asked, when it could not — its nodes are
@@ -98,11 +99,108 @@ export interface EnvironmentResponse {
   unassigned: UnassignedNodeView[];
 }
 
+// --- workflows ---------------------------------------------------------------
+
+export interface MintedToken {
+  token: string;
+  /// Unix seconds.
+  expires_at: number;
+  bootstrapped: boolean;
+}
+
+/// One link as a preflighted node reports it — the wizard's NIC pickers read
+/// these. A subset of lumen-net's ObservedLink; only what the pickers show.
+export interface PreflightLink {
+  name: string;
+  kind: string;
+  carrier: boolean;
+  addresses: string[];
+  mtu?: number | null;
+}
+
+export interface PreflightReport {
+  node: string;
+  controlplane_version: string;
+  hostname: string;
+  time_synchronized: boolean;
+  time_offset_ms?: number;
+  already_clustered: boolean;
+  links: PreflightLink[];
+}
+
+export interface PreflightView {
+  node: string;
+  ok: boolean;
+  problems: string[];
+  report?: PreflightReport;
+}
+
+export interface MemberCreate {
+  node: string;
+  core_interface: string;
+  core_address: string;
+  management_interface: string;
+  management_address: string;
+  bmc_address: string;
+  bmc_username: string;
+}
+
+export interface ClusterCreateRequest {
+  name: string;
+  preferred_node?: string | null;
+  core: { subnet: string; mtu: number };
+  management: { subnet: string; vip?: string | null };
+  members: MemberCreate[];
+}
+
+export type StepState = "pending" | "running" | "done" | "failed" | "unwound";
+export type WorkflowPhase = "running" | "complete" | "failed";
+
+export interface StepProgress {
+  step: string;
+  node?: string;
+  state: StepState;
+  detail?: string;
+}
+
+export interface CreateProgress {
+  cluster: string;
+  phase: WorkflowPhase;
+  error?: string;
+  steps: StepProgress[];
+}
+
 export const fetchEnvironment = (): Promise<EnvironmentResponse> =>
   apiFetch<EnvironmentResponse>("/environment");
 
 export const fetchCluster = (name: string): Promise<ClusterView> =>
   apiFetch<ClusterView>(`/environment/clusters/${encodeURIComponent(name)}`);
+
+const post = <T>(path: string, body?: unknown): Promise<T> =>
+  apiFetch<T>(path, { method: "POST", body: body === undefined ? undefined : JSON.stringify(body) });
+
+export const mintToken = (): Promise<MintedToken> => post<MintedToken>("/environment/tokens");
+
+export const joinEnvironment = (token: string): Promise<{ joined: boolean; note: string }> =>
+  post("/environment/join", { token });
+
+export const preflightNodes = (nodes: string[]): Promise<PreflightView[]> =>
+  post("/environment/preflight", { nodes });
+
+export const createCluster = (request: ClusterCreateRequest): Promise<CreateProgress> =>
+  post("/environment/clusters", request);
+
+export const fetchCreateProgress = (): Promise<CreateProgress> =>
+  apiFetch<CreateProgress>("/environment/clusters/pending");
+
+export const destroyCluster = (name: string, acknowledge: boolean): Promise<void> =>
+  apiFetch<void>(`/environment/clusters/${encodeURIComponent(name)}`, {
+    method: "DELETE",
+    body: JSON.stringify({ i_understand_this_may_lose_data: acknowledge }),
+  });
+
+export const removeNode = (name: string): Promise<void> =>
+  apiFetch<void>(`/environment/nodes/${encodeURIComponent(name)}`, { method: "DELETE" });
 
 // --- display helpers ---------------------------------------------------------
 

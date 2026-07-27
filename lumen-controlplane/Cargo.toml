@@ -29,6 +29,18 @@ lumen-zfs = { path = "../lumen-storage/lumen-zfs" }
 # The clustering domain: the environment, its clusters, quorum, and fencing.
 # Reads corosync and Pacemaker through their command lines; nothing is linked.
 lumen-cluster = { path = "../lumen-storage/lumen-cluster" }
+# The peer channel: one control plane calling another over TLS. hyper and
+# hyper-util are already under axum; tokio-rustls is already under
+# axum-server; http-body-util already backs the tests. Naming them makes the
+# client half importable — no new machinery arrives with these lines, which
+# is the point: the peer client is a socket, a handshake, and one request,
+# not an HTTP framework.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
 # The virtualization domain: the machine model, the domain document, and the
 # hypervisor backend. Linking needs libvirt-devel (EL) / libvirt-dev (Debian);
 # the bindings ship generated, so bindgen and libclang stay out of the
@@ -72,7 +84,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
 
