@@ -188,7 +188,7 @@ dnf download --quiet --disablerepo='*' \
     || die "DRBD download failed — is $DRBD_REPO_URL reachable and does it carry drbd9x?"
 
 echo "==> Gate: DRBD RPM signatures (pinned key)"
-rpmkeys --import "$REPO_ROOT/iso/keys/RPM-GPG-KEY-elrepo.org"
+rpmkeys --import "$REPO_ROOT/iso/keys/RPM-GPG-KEY-v2-elrepo.org"
 for rpm in "$drbd_dl"/*.rpm; do
     sig="$(rpmkeys --checksig "$rpm")"
     grep -q "signatures OK" <<<"$sig" \
