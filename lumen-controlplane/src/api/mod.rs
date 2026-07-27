@@ -121,6 +121,12 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/environment/clusters/{name}",
             delete(cluster::destroy_cluster),
         )
+        // The cluster's typed networks — Core, Management, External — off the
+        // replicated record; the console's Networking → Networks page.
+        .route(
+            "/api/environment/clusters/{name}/networks",
+            get(cluster::cluster_networks),
+        )
         .route(
             "/api/environment/nodes/{name}",
             delete(cluster::remove_node),

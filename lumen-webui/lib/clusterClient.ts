@@ -99,6 +99,58 @@ export interface EnvironmentResponse {
   unassigned: UnassignedNodeView[];
 }
 
+// --- typed networks ----------------------------------------------------------
+
+/// One node's seat on a Core or Management network: the NIC or bond carrying
+/// it, and the address it answers on there.
+export interface AddressedMember {
+  node: string;
+  interface: string;
+  address: string;
+}
+
+/// The Core network: storage replication and corosync ring 0. Subnets are
+/// strings in CIDR form — the one spelling operators, the API, and
+/// corosync.conf all agree on.
+export interface CoreNetwork {
+  subnet: string;
+  mtu: number;
+  members: AddressedMember[];
+}
+
+/// The Management network: the console, corosync ring 1, and the optional
+/// cluster VIP.
+export interface ManagementNetwork {
+  subnet: string;
+  vip: string | null;
+  members: AddressedMember[];
+}
+
+/// One node's uplink into an External network.
+export interface Uplink {
+  node: string;
+  interface: string;
+}
+
+/// An External network: VM traffic over an identically named bridge on every
+/// member, no host addressing. The VLAN mode is flattened onto the object,
+/// exactly as lumen-cluster serializes it.
+export type ExternalNetwork = {
+  name: string;
+  bridge: string;
+  uplinks: Uplink[];
+} & ({ mode: "trunk"; allowed: number[] } | { mode: "access"; vlan: number });
+
+/// Everything a cluster's members share, as one document.
+export interface ClusterNetworks {
+  core: CoreNetwork;
+  management: ManagementNetwork;
+  external: ExternalNetwork[];
+}
+
+export const fetchClusterNetworks = (name: string): Promise<ClusterNetworks> =>
+  apiFetch<ClusterNetworks>(`/environment/clusters/${encodeURIComponent(name)}/networks`);
+
 // --- workflows ---------------------------------------------------------------
 
 export interface MintedToken {

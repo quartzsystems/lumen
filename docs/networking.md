@@ -778,6 +778,9 @@ cluster-wide state or drift detection, and libvirt integration. No database.
 No privileged executor — the point of the NetworkManager-over-D-Bus design is
 that this stage does not need one.
 
-In the console, only **Networking → Overview** and **Networking → Interfaces**
-are implemented. Networks, Fabrics, Routing, Tunnels, Firewall, and
-Diagnostics remain stubs.
+In the console, **Networking → Overview**, **Networking → Interfaces**, and
+**Networking → Networks** are implemented. Networks is the cluster-wide page:
+the typed Core/Management/External definition off the replicated cluster
+record (`lumen-cluster`'s domain, not this crate's — see docs/cluster.md),
+joined with corosync's per-ring link state. Fabrics, Routing, Tunnels,
+Firewall, and Diagnostics remain stubs.

@@ -20,8 +20,8 @@ use crate::error::ApiError;
 use crate::security::Session;
 use crate::AppState;
 use lumen_cluster::{
-    Acknowledgements, ClusterCreate, ClusterView, CreateProgress, EnvironmentResponse,
-    FenceTestView, MintedToken, PreflightView,
+    Acknowledgements, ClusterCreate, ClusterNetworks, ClusterView, CreateProgress,
+    EnvironmentResponse, FenceTestView, MintedToken, PreflightView,
 };
 
 /// GET /api/environment — the whole environment: every cluster, every node,
@@ -42,6 +42,17 @@ pub async fn cluster(
     Path(name): Path<String>,
 ) -> Result<Json<ClusterView>, ApiError> {
     Ok(Json(state.cluster.cluster(&name).await?))
+}
+
+/// GET /api/environment/clusters/{name}/networks — the cluster's typed
+/// networks: Core, Management, and the External list, as the replicated
+/// record carries them. The console's Networks page reads this.
+pub async fn cluster_networks(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<ClusterNetworks>, ApiError> {
+    Ok(Json(state.cluster.cluster_networks(&name)?))
 }
 
 #[derive(Debug, Default, Deserialize)]

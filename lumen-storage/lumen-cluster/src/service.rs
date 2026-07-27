@@ -28,6 +28,7 @@ use crate::join::{
     TeardownPayload,
 };
 use crate::model::Regime;
+use crate::networks::ClusterNetworks;
 use crate::state::{hostname, ClusterState, FenceDeviceState, FenceTest, QuorumState, RingLink};
 use crate::store::{EnvironmentStore, Identity, JoinTokenRecord};
 use crate::validate::{
@@ -326,6 +327,29 @@ impl ClusterService {
             )));
         }
         Ok(self.cluster_view(name, &membership).await)
+    }
+
+    /// One cluster's typed networks — Core, Management, and the External
+    /// list — as the replicated record carries them. This is the definition
+    /// the members share; what each node has realized of it is the
+    /// networking domain's answer, not this one.
+    pub fn cluster_networks(&self, name: &str) -> Result<ClusterNetworks> {
+        let membership = self.require_membership()?;
+        if !membership.cluster_names().iter().any(|c| c == name) {
+            return Err(ClusterError::NotFound(format!(
+                "There is no cluster called \"{name}\" in this environment."
+            )));
+        }
+        // Named but recordless: the membership knows the cluster exists and
+        // its definition has not reached this node yet — a replication gap,
+        // not a wrong name.
+        let record = membership.cluster_record(name).ok_or_else(|| {
+            ClusterError::Conflict(format!(
+                "\"{name}\" has no stored definition on this node yet. Ask another member, or \
+                 ask again once the record has replicated."
+            ))
+        })?;
+        Ok(record.networks.clone())
     }
 
     // --- environment membership -------------------------------------------

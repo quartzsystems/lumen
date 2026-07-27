@@ -522,9 +522,13 @@ the other, and `openssl s_client` against both afterwards shows the same CA.
 
 The clustering program this document set out — environment, clusters,
 fencing, replicated volumes, HA, snapshots, split-brain recovery, and the
-2→3 scale-out — is complete. What deliberately remains, in the order it
-would land: External-network realization (bridges on every member) and the
-typed-networks page; **removing** a member from a live cluster (a node
+2→3 scale-out — is complete. The typed-networks page has since landed:
+`GET /api/environment/clusters/{name}/networks` serves the replicated
+record's `ClusterNetworks`, and **Networking → Networks** presents it per
+cluster, joined with what corosync reports about each ring. What
+deliberately remains, in the order it would land: External-network
+realization (bridges on every member, which is also what would give the
+page's External list something to say); **removing** a member from a live cluster (a node
 holding volume replicas cannot leave — the record knows enough to refuse,
 and the workflow is the scale-out run backwards plus that refusal); the
 environment-wide console federation — aggregated reads with per-node

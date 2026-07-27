@@ -13,7 +13,14 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 use lumen_cluster::backend::mock::{environment_membership, membership_of, MockBackend};
-use lumen_cluster::{ClusterService, EnvironmentMembership, JoinToken, MockPeers};
+use lumen_cluster::networks::{
+    AddressedMember, ClusterNetworks, CoreNetwork, ExternalNetwork, ManagementNetwork, Uplink,
+    VlanMode,
+};
+use lumen_cluster::{
+    BmcConfig, ClusterDefinition, ClusterRecord, ClusterService, EnvironmentMembership, JoinToken,
+    MemberNode, MockPeers,
+};
 use lumen_controlplane::config::Config;
 use lumen_controlplane::realm::{AuthFailure, Realm, RealmKind, RealmRegistry};
 use lumen_controlplane::security;
@@ -212,6 +219,7 @@ async fn every_environment_route_requires_a_session() {
     for (method, path) in [
         (Method::GET, "/api/environment"),
         (Method::GET, "/api/environment/clusters/alpha"),
+        (Method::GET, "/api/environment/clusters/alpha/networks"),
         (Method::POST, "/api/environment/tokens"),
         (Method::POST, "/api/environment/join"),
         (Method::POST, "/api/environment/preflight"),
@@ -295,6 +303,143 @@ async fn the_environment_is_grouped_by_cluster_then_by_node() {
     let unassigned = body["unassigned"].as_array().unwrap();
     assert_eq!(unassigned.len(), 1);
     assert_eq!(unassigned[0]["node"], "spare-1");
+}
+
+/// A membership whose "alpha" record carries the typed networks whole — and
+/// a "beta" the nodes name but no record has replicated for. The External
+/// entry pins the flattened VLAN-mode wire shape the console's types mirror.
+fn membership_with_networks() -> EnvironmentMembership {
+    let mut membership = membership_of(&[
+        ("alpha-1", Some("alpha")),
+        ("alpha-2", Some("alpha")),
+        ("beta-1", Some("beta")),
+    ]);
+    let member = |name: &str, octet: u8| MemberNode {
+        name: name.into(),
+        ring0: std::net::Ipv4Addr::new(10, 10, 0, octet),
+        ring1: std::net::Ipv4Addr::new(192, 168, 10, octet),
+        bmc: BmcConfig {
+            address: format!("10.20.0.{octet}"),
+            username: "ADMIN".into(),
+        },
+    };
+    let seat = |name: &str, interface: &str, a: u8, b: u8, c: u8, octet: u8| AddressedMember {
+        node: name.into(),
+        interface: interface.into(),
+        address: std::net::Ipv4Addr::new(a, b, c, octet),
+    };
+    membership.clusters.push(ClusterRecord::new(
+        ClusterDefinition {
+            name: "alpha".into(),
+            nodes: vec![member("alpha-1", 1), member("alpha-2", 2)],
+            preferred_node: None,
+        },
+        ClusterNetworks {
+            core: CoreNetwork {
+                subnet: "10.10.0.0/24".parse().unwrap(),
+                mtu: 9000,
+                members: vec![
+                    seat("alpha-1", "nic1", 10, 10, 0, 1),
+                    seat("alpha-2", "nic1", 10, 10, 0, 2),
+                ],
+            },
+            management: ManagementNetwork {
+                subnet: "192.168.10.0/24".parse().unwrap(),
+                vip: Some(std::net::Ipv4Addr::new(192, 168, 10, 100)),
+                members: vec![
+                    seat("alpha-1", "br0", 192, 168, 10, 1),
+                    seat("alpha-2", "br0", 192, 168, 10, 2),
+                ],
+            },
+            external: vec![ExternalNetwork {
+                name: "vm-lan".into(),
+                bridge: "vmbr1".into(),
+                vlan: VlanMode::Trunk {
+                    allowed: vec![10, 20],
+                },
+                uplinks: vec![
+                    Uplink {
+                        node: "alpha-1".into(),
+                        interface: "nic2".into(),
+                    },
+                    Uplink {
+                        node: "alpha-2".into(),
+                        interface: "nic2".into(),
+                    },
+                ],
+            }],
+        },
+    ));
+    membership
+}
+
+#[tokio::test]
+async fn the_typed_networks_are_read_off_the_replicated_record() {
+    let harness = harness(
+        "networks",
+        MockBackend::environment(),
+        MockPeers::new(),
+        Some(&membership_with_networks()),
+    );
+    let cookie = sign_in(&harness.router).await;
+    let (status, body) = request(
+        &harness.router,
+        Method::GET,
+        "/api/environment/clusters/alpha/networks",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    assert_eq!(body["core"]["subnet"], "10.10.0.0/24");
+    assert_eq!(body["core"]["mtu"], 9000);
+    assert_eq!(
+        body["core"]["members"][0],
+        serde_json::json!({ "node": "alpha-1", "interface": "nic1", "address": "10.10.0.1" })
+    );
+    assert_eq!(body["management"]["subnet"], "192.168.10.0/24");
+    assert_eq!(body["management"]["vip"], "192.168.10.100");
+    assert_eq!(body["management"]["members"][1]["interface"], "br0");
+    // The VLAN mode is flattened onto the External object — the wire shape
+    // the console's ExternalNetwork type mirrors.
+    assert_eq!(
+        body["external"][0],
+        serde_json::json!({
+            "name": "vm-lan",
+            "bridge": "vmbr1",
+            "mode": "trunk",
+            "allowed": [10, 20],
+            "uplinks": [
+                { "node": "alpha-1", "interface": "nic2" },
+                { "node": "alpha-2", "interface": "nic2" },
+            ],
+        })
+    );
+
+    // A cluster nobody has heard of is a 404; one the membership names but
+    // whose record has not replicated here is a conflict, said as such.
+    let (status, _) = request(
+        &harness.router,
+        Method::GET,
+        "/api/environment/clusters/gamma/networks",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, body) = request(
+        &harness.router,
+        Method::GET,
+        "/api/environment/clusters/beta/networks",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
 }
 
 #[tokio::test]
