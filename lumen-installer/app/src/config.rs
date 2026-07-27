@@ -97,7 +97,11 @@ impl PoolTopology {
         if disks == 0 {
             return Self::ALL.to_vec();
         }
-        Self::ALL.iter().copied().filter(|t| t.fits(disks)).collect()
+        Self::ALL
+            .iter()
+            .copied()
+            .filter(|t| t.fits(disks))
+            .collect()
     }
 
     /// What to build this many drives into, unless the operator says
