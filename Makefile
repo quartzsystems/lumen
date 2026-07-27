@@ -23,15 +23,17 @@ SPECS   := packages/lumen-release.spec packages/lumen-logos.spec \
            packages/lumen-compute.spec
 CARGO_MANIFEST := lumen-installer/app/Cargo.toml
 CP_MANIFEST    := lumen-controlplane/Cargo.toml
-# The four domain crates are path dependencies of the control plane, not
+# The domain crates are path dependencies of the control plane, not
 # workspace members (the manifests are independent by design — see
 # docs/networking.md and docs/compute.md), so each gets its own
-# fmt/clippy/test invocation. lumen-sys is first because it is the most basic:
-# it depends on none of the others, and lumen-zfs depends on it.
-SYS_MANIFEST   := lumen-system/lumen-sys/Cargo.toml
-NET_MANIFEST   := lumen-networking/lumen-net/Cargo.toml
-ZFS_MANIFEST   := lumen-storage/lumen-zfs/Cargo.toml
-VIRT_MANIFEST  := lumen-compute/lumen-virt/Cargo.toml
+# fmt/clippy/test invocation, in dependency order: lumen-sys first because it
+# is the most basic (it depends on none of the others); lumen-cluster comes
+# after net because it depends on sys and net.
+SYS_MANIFEST     := lumen-system/lumen-sys/Cargo.toml
+NET_MANIFEST     := lumen-networking/lumen-net/Cargo.toml
+ZFS_MANIFEST     := lumen-storage/lumen-zfs/Cargo.toml
+CLUSTER_MANIFEST := lumen-storage/lumen-cluster/Cargo.toml
+VIRT_MANIFEST    := lumen-compute/lumen-virt/Cargo.toml
 
 .PHONY: all rpms installer controlplane webui iso test lint clean
 
@@ -73,6 +75,8 @@ test:
 		--target-dir build/cargo-target-net
 	cargo test --manifest-path $(ZFS_MANIFEST) \
 		--target-dir build/cargo-target-zfs
+	cargo test --manifest-path $(CLUSTER_MANIFEST) \
+		--target-dir build/cargo-target-cluster
 	cargo test --manifest-path $(VIRT_MANIFEST) \
 		--target-dir build/cargo-target-virt
 	cargo test --manifest-path $(CP_MANIFEST) \
@@ -93,6 +97,9 @@ lint:
 	cargo fmt --manifest-path $(ZFS_MANIFEST) --check
 	cargo clippy --manifest-path $(ZFS_MANIFEST) --all-targets \
 		--target-dir build/cargo-target-zfs -- -D warnings
+	cargo fmt --manifest-path $(CLUSTER_MANIFEST) --check
+	cargo clippy --manifest-path $(CLUSTER_MANIFEST) --all-targets \
+		--target-dir build/cargo-target-cluster -- -D warnings
 	cargo fmt --manifest-path $(VIRT_MANIFEST) --check
 	cargo clippy --manifest-path $(VIRT_MANIFEST) --all-targets \
 		--target-dir build/cargo-target-virt -- -D warnings

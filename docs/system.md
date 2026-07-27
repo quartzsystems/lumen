@@ -559,8 +559,8 @@ were sent to find. `main.rs` now lists all five; `RUST_LOG` still overrides it.
 ## Development
 
 ```sh
-make test    # installer + all four domain crates + control plane
-make lint    # shellcheck, rpmlint, fmt/clippy for six manifests
+make test    # installer + all five domain crates + control plane
+make lint    # shellcheck, rpmlint, fmt/clippy for seven manifests
 ```
 
 `lumen-sys` needs no system libraries: logind is reached through pure-Rust

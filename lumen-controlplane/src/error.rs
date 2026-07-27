@@ -51,6 +51,12 @@ impl From<Vec<lumen_sys::ValidationError>> for Rejection {
     }
 }
 
+impl From<Vec<lumen_cluster::ValidationError>> for Rejection {
+    fn from(errors: Vec<lumen_cluster::ValidationError>) -> Self {
+        Rejection::of(errors, |e| e.message.as_str())
+    }
+}
+
 /// API error → `{ "error": "..." }` with the matching status. The web UI's
 /// client surfaces the message verbatim, so texts are user-facing.
 #[derive(Debug)]
@@ -149,6 +155,18 @@ impl From<lumen_sys::SysError> for ApiError {
             lumen_sys::SysError::NotFound(message) => ApiError::NotFound(message),
             lumen_sys::SysError::Conflict(message) => ApiError::Conflict(message),
             lumen_sys::SysError::Backend(err) => ApiError::Internal(err),
+        }
+    }
+}
+
+/// The clustering domain's errors, mapped the same way.
+impl From<lumen_cluster::ClusterError> for ApiError {
+    fn from(err: lumen_cluster::ClusterError) -> Self {
+        match err {
+            lumen_cluster::ClusterError::Invalid(errors) => ApiError::Validation(errors.into()),
+            lumen_cluster::ClusterError::NotFound(message) => ApiError::NotFound(message),
+            lumen_cluster::ClusterError::Conflict(message) => ApiError::Conflict(message),
+            lumen_cluster::ClusterError::Backend(err) => ApiError::Internal(err),
         }
     }
 }

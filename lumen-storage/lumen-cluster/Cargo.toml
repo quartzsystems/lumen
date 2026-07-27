@@ -1,0 +1,59 @@
+# lumen-cluster — the Lumen clustering domain: environment membership, cluster
+# topology, quorum, and fencing.
+#
+# A library crate, not a daemon: it compiles into lumen-controlplane the same
+# way lumen-zfs does. It is deliberately NOT a workspace member — the Lumen
+# manifests are independent by design and the Makefile drives each with its own
+# --manifest-path/--target-dir pair; a path dependency needs no workspace. See
+# the note at the top of lumen-networking/lumen-net/Cargo.toml.
+#
+# Nothing here links a cluster library. corosync and Pacemaker are asked what
+# they know through their supported command-line interfaces — crm_mon,
+# corosync-quorumtool, corosync-cfgtool — with typed argument arrays, never an
+# interpolated shell string, and privileged operations (pcs, fence tests) are
+# handed to systemd through lumen_sys::exec exactly as `zpool create` is. That
+# keeps bindgen/libclang out of the toolchain, matching the reasoning behind
+# the in-tree PAM FFI in lumen-controlplane/Cargo.toml.
+
+[package]
+name = "lumen-cluster"
+version = "0.1.0"
+edition = "2021"
+description = "Lumen clustering: environment membership, topology, quorum, fencing"
+license = "MIT"
+
+[dependencies]
+# The system domain, for one thing only: running privileged cluster commands
+# (pcs, fence agents) outside the control plane's sandbox. Reading cluster
+# state needs no privilege and goes through the command line directly.
+# See lumen_sys::exec and docs/system.md.
+lumen-sys = { path = "../../lumen-system/lumen-sys" }
+# The networking domain: a cluster's Core, Management, and External networks
+# are validated against what each node actually has — lumen-net's observed
+# links — and are realized through it. The direction is deliberate: a cluster
+# is built on networks, while a network has no reason to know a cluster exists.
+lumen-net = { path = "../../lumen-networking/lumen-net" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+async-trait = "0.1"
+# "process" is what the real backend needs: argv arrays handed straight to
+# execve, with no shell anywhere in the path. "fs" is for the membership
+# record the join workflow keeps on disk.
+tokio = { version = "1", features = [
+    "process",
+    "fs",
+    "io-util",
+    "sync",
+    "time",
+    "rt",
+    "macros",
+] }
+tracing = "0.1"
+# Pure Rust, no build script of its own: reads `crm_mon --output-as=xml`,
+# Pacemaker's one machine-readable status format. The same crate lumen-virt
+# uses for the domain document.
+quick-xml = "0.37"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

@@ -688,6 +688,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
+name = "lumen-cluster"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "lumen-net",
+ "lumen-sys",
+ "quick-xml",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "lumen-controlplane"
 version = "0.2.0"
 dependencies = [
@@ -700,6 +715,7 @@ dependencies = [
  "http-body-util",
  "jsonwebtoken",
  "libc",
+ "lumen-cluster",
  "lumen-net",
  "lumen-sys",
  "lumen-virt",

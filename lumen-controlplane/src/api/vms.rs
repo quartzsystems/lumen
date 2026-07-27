@@ -489,7 +489,10 @@ pub async fn recent_tasks(
     State(state): State<Arc<AppState>>,
     Query(window): Query<TaskWindow>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let limit = window.limit.unwrap_or(DEFAULT_TASK_LIMIT).min(MAX_TASK_LIMIT);
+    let limit = window
+        .limit
+        .unwrap_or(DEFAULT_TASK_LIMIT)
+        .min(MAX_TASK_LIMIT);
     Ok(Json(
         serde_json::json!({ "tasks": state.tasks.recent(limit) }),
     ))

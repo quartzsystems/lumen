@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
+use lumen_cluster::backend::cli::CliBackend as ClusterCliBackend;
+use lumen_cluster::ClusterService;
 use lumen_controlplane::config::Config;
 use lumen_controlplane::realm::{lumen::LumenRealm, RealmRegistry};
 use lumen_controlplane::{app, security, tls, AppState};
@@ -32,7 +34,7 @@ async fn main() -> Result<()> {
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
                 "lumen_controlplane=info,lumen_sys=info,lumen_zfs=info,lumen_virt=info,\
-                 lumen_net=info,tower_http=info"
+                 lumen_net=info,lumen_cluster=info,tower_http=info"
                     .into()
             }),
         )
@@ -134,6 +136,16 @@ async fn main() -> Result<()> {
         network.clone(),
     ));
 
+    // Clustering. No probe and no unavailable fallback: a node without a
+    // cluster stack is the ordinary standalone appliance, and the backend
+    // answers "no environment" for it rather than being broken. Reads are
+    // unprivileged; the privileged verbs will ride lumen_sys::exec when the
+    // workflows land.
+    let cluster = Arc::new(ClusterService::new(
+        Arc::new(ClusterCliBackend::new(&config.state_dir)),
+        env!("LUMEN_VERSION"),
+    ));
+
     let listen: std::net::SocketAddr = config
         .listen
         .parse()
@@ -151,6 +163,7 @@ async fn main() -> Result<()> {
         network,
         storage,
         virt,
+        cluster,
         tasks: lumen_controlplane::tasks::TaskLog::open(state_dir.join("vm-tasks.jsonl")),
     }));
 

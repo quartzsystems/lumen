@@ -13,6 +13,7 @@ use axum::Router;
 use tower_http::trace::TraceLayer;
 
 use config::Config;
+use lumen_cluster::ClusterService;
 use lumen_net::NetworkService;
 use lumen_sys::SysService;
 use lumen_virt::VirtService;
@@ -40,6 +41,8 @@ pub struct AppState {
     /// bridge to attach to and a volume to boot from — which is why it is
     /// constructed last.
     pub virt: Arc<VirtService>,
+    /// The environment and its clusters: membership, quorum, fencing.
+    pub cluster: Arc<ClusterService>,
     /// What has been done to each machine — the console's Tasks table.
     pub tasks: tasks::TaskLog,
 }

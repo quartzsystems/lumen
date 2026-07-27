@@ -106,6 +106,10 @@ async fn harness(tag: &str) -> Harness {
         network,
         storage,
         virt,
+        cluster: Arc::new(lumen_cluster::ClusterService::new(
+            Arc::new(lumen_cluster::backend::mock::MockBackend::appliance()),
+            "test",
+        )),
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
     }));
 

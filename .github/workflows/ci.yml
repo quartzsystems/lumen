@@ -165,6 +165,35 @@ jobs:
           cargo test --manifest-path lumen-storage/lumen-zfs/Cargo.toml \
             --target-dir build/cargo-target-zfs
 
+  cluster:
+    name: Cluster (Rust, AlmaLinux 10)
+    runs-on: ubuntu-latest
+    container: almalinux:10
+    steps:
+      - name: Install Rust toolchain
+        # No system libraries and no cluster stack: lumen-cluster reads
+        # corosync and Pacemaker through their command lines, and its tests
+        # run against the in-memory backend — CI never forms a cluster.
+        run: dnf -y install rust cargo rustfmt clippy make git-core
+      - uses: actions/checkout@v4
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            build/cargo-target-cluster
+          key: cargo-cluster-${{ hashFiles('lumen-storage/lumen-cluster/Cargo.lock') }}
+      - name: Format
+        run: cargo fmt --manifest-path lumen-storage/lumen-cluster/Cargo.toml --check
+      - name: Clippy
+        run: |
+          cargo clippy --manifest-path lumen-storage/lumen-cluster/Cargo.toml \
+            --all-targets --target-dir build/cargo-target-cluster -- -D warnings
+      - name: Tests
+        run: |
+          cargo test --manifest-path lumen-storage/lumen-cluster/Cargo.toml \
+            --target-dir build/cargo-target-cluster
+
   compute:
     name: Compute (Rust, AlmaLinux 10)
     runs-on: ubuntu-latest

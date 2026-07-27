@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod cluster;
 pub mod console;
 pub mod network;
 pub mod nodes;
@@ -97,6 +98,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         // The nodes themselves: what each has, and what is running on it. The
         // dashboard's compute panel and the Infrastructure section read this.
         .route("/api/nodes", get(nodes::list))
+        // The environment and its clusters — the repo's grouped-by-node shape
+        // extended one level upward: grouped by cluster, then by node. A node
+        // that never joined an environment still answers, with itself as the
+        // one unassigned node; see src/api/cluster.rs and docs/cluster.md.
+        .route("/api/environment", get(cluster::environment))
+        .route("/api/environment/clusters/{name}", get(cluster::cluster))
         // The node itself: its local accounts, and its power state. Every
         // account route passes the session's own principal down, which is what
         // lets the domain refuse to lock the operator out of their own console

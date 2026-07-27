@@ -26,6 +26,9 @@ lumen-net = { path = "../lumen-networking/lumen-net" }
 # The storage domain: pools, datasets, and the volumes a machine's disks live
 # on. Shells out to the supported command line; nothing is linked.
 lumen-zfs = { path = "../lumen-storage/lumen-zfs" }
+# The clustering domain: the environment, its clusters, quorum, and fencing.
+# Reads corosync and Pacemaker through their command lines; nothing is linked.
+lumen-cluster = { path = "../lumen-storage/lumen-cluster" }
 # The virtualization domain: the machine model, the domain document, and the
 # hypervisor backend. Linking needs libvirt-devel (EL) / libvirt-dev (Debian);
 # the bindings ship generated, so bindgen and libclang stay out of the
