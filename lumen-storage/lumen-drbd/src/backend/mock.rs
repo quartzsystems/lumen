@@ -26,6 +26,7 @@ struct Inner {
     down: Vec<String>,
     primed: Vec<String>,
     resized: Vec<String>,
+    two_primaries: Vec<(String, bool)>,
 }
 
 #[derive(Default)]
@@ -99,6 +100,10 @@ impl MockBackend {
 
     pub fn resized(&self) -> Vec<String> {
         self.inner.lock().unwrap().resized.clone()
+    }
+
+    pub fn two_primaries(&self) -> Vec<(String, bool)> {
+        self.inner.lock().unwrap().two_primaries.clone()
     }
 
     fn take_failure(&self) -> Option<DrbdError> {
@@ -272,6 +277,18 @@ impl DrbdBackend for MockBackend {
             .unwrap()
             .resized
             .push(resource.to_string());
+        Ok(())
+    }
+
+    async fn set_two_primaries(&self, resource: &str, allow: bool) -> Result<()> {
+        if let Some(err) = self.take_failure() {
+            return Err(err);
+        }
+        self.inner
+            .lock()
+            .unwrap()
+            .two_primaries
+            .push((resource.to_string(), allow));
         Ok(())
     }
 }

@@ -116,6 +116,14 @@ pub trait VirtBackend: Send + Sync {
     /// from; see [`crate::domain_xml::live_metadata`].
     async fn set_live_metadata(&self, name: &str, metadata_xml: &str) -> Result<()>;
 
+    /// Live-migrate the running machine to the hypervisor at `destination` —
+    /// a `qemu+tcp://<core-address>/system` URI on the cluster's Core
+    /// network. Peer-to-peer, persistent on the destination, undefined here:
+    /// when this answers Ok the machine has one home and it is not this
+    /// node. The two-primaries window around this call is the service's
+    /// business, never the backend's.
+    async fn migrate(&self, name: &str, destination: &str) -> Result<()>;
+
     /// The document of the machine as it is **running**, not as it is stored.
     ///
     /// Every other read in this trait deliberately answers with the stored

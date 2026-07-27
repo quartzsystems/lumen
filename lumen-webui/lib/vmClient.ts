@@ -229,12 +229,27 @@ export interface VmDeleteResponse {
 }
 
 export interface DiskCreate {
-  pool: string;
+  /// The pool a local disk's zvol lives in. Unused for a replicated disk,
+  /// whose members each name their own pool.
+  pool?: string;
   size_gib: number;
   bus?: DiskBus;
   cache?: CacheMode;
   discard?: boolean;
   blocksize?: number;
+  /// Back the disk with a replicated volume instead of a local zvol.
+  replicated?: boolean;
+  /// The replica seats for a replicated disk; the machine's own node must
+  /// hold one.
+  members?: { node: string; pool: string }[];
+}
+
+/// POST /api/vms/{vmid}/migrate. No VmView in the answer on purpose: after a
+/// migration this node has no view of the machine to give.
+export interface VmMigrateResponse {
+  vmid: number;
+  name: string;
+  target: string;
 }
 
 export interface NicCreate {
@@ -339,6 +354,9 @@ export const stopVm = (vmid: number, acknowledge: boolean): Promise<VmView> =>
 
 export const resetVm = (vmid: number, acknowledge: boolean): Promise<VmView> =>
   post<VmView>(`/vms/${vmid}/reset`, { i_understand_this_may_lose_data: acknowledge });
+
+export const migrateVm = (vmid: number, target: string): Promise<VmMigrateResponse> =>
+  post<VmMigrateResponse>(`/vms/${vmid}/migrate`, { target });
 
 export const attachDisk = (vmid: number, body: DiskCreate): Promise<VmUpdateResponse> =>
   post<VmUpdateResponse>(`/vms/${vmid}/disks`, body);

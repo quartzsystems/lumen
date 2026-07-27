@@ -34,6 +34,7 @@ pub mod peers;
 pub mod render;
 pub mod service;
 pub mod state;
+pub mod vm;
 
 pub use error::{DrbdError, Result};
 pub use model::{
@@ -46,3 +47,4 @@ pub use service::{
     VolumeHealth, VolumeMemberCreate, VolumeView,
 };
 pub use state::{DeviceStatus, PeerDeviceStatus, PeerStatus, ResourceStatus};
+pub use vm::{MockVmVolumes, ReplicatedDisk, VmDiskRequest, VmVolumes};

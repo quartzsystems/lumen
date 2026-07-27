@@ -850,6 +850,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64",
+ "lumen-drbd",
  "lumen-net",
  "lumen-zfs",
  "quick-xml",

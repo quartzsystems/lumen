@@ -60,6 +60,10 @@ impl DrbdBackend for UnavailableBackend {
     async fn resize(&self, _resource: &str) -> Result<()> {
         self.error()
     }
+
+    async fn set_two_primaries(&self, _resource: &str, _allow: bool) -> Result<()> {
+        self.error()
+    }
 }
 
 #[cfg(test)]

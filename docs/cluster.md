@@ -480,9 +480,10 @@ the other, and `openssl s_client` against both afterwards shows the same CA.
 ## Out of scope for this stage
 
 Replicated volumes have landed — `lumen-drbd`, documented in
-docs/storage.md, riding this crate's membership record and topology
-policy. Still in the order it lands: machines on replicated disks and live
-migration (`lumen-virt` integration); External-network realization (bridges
+docs/storage.md, riding this crate's membership record and topology policy
+— and so have machines on replicated disks, live migration, and the
+domain-definition replication HA will restart from. Still in the order it
+lands: External-network realization (bridges
 on every member) and the typed-networks page; the HA manager; adding a node
 to an existing cluster and the 2→3 scale-out, and with them removing a
 member from a live cluster (a node holding volume replicas cannot leave —

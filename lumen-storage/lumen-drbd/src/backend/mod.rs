@@ -60,4 +60,11 @@ pub trait DrbdBackend: Send + Sync {
     /// `drbdadm resize` — after every member's backing device has grown,
     /// run once anywhere to let the resource take the new size.
     async fn resize(&self, resource: &str) -> Result<()>;
+
+    /// Open or close this resource's two-primaries window on this node —
+    /// `drbdadm net-options --allow-two-primaries={yes,no}`. Exists for one
+    /// caller: the live-migration guard, which opens the window on every
+    /// member just before the migration and closes it again on every path
+    /// out, success or failure.
+    async fn set_two_primaries(&self, resource: &str, allow: bool) -> Result<()>;
 }

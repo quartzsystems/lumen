@@ -168,6 +168,20 @@ impl DrbdBackend for CliBackend {
         )
         .await
     }
+
+    async fn set_two_primaries(&self, resource: &str, allow: bool) -> Result<()> {
+        let option = if allow {
+            "--allow-two-primaries=yes"
+        } else {
+            "--allow-two-primaries=no"
+        };
+        self.drbdadm(
+            "adjust a volume's two-primaries window",
+            &format!("adjusting the two-primaries window of {resource} failed"),
+            &["net-options", option, resource],
+        )
+        .await
+    }
 }
 
 #[cfg(test)]

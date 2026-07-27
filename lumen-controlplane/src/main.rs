@@ -121,29 +121,6 @@ async fn main() -> Result<()> {
         };
     let storage = Arc::new(StorageService::new(zfs_backend));
 
-    // Virtual machines. The hypervisor is a privileged daemon reached over its
-    // own socket, exactly as networking reaches NetworkManager over the bus —
-    // so the unit's hardening stays as it is. Same failure policy: an operator
-    // whose hypervisor is down needs the console more than usual.
-    let virt_backend: Arc<dyn lumen_virt::backend::VirtBackend> =
-        match LibvirtBackend::connect().await {
-            Ok(backend) => Arc::new(backend),
-            Err(err) => {
-                tracing::error!("virtualization is unavailable: {err}");
-                Arc::new(lumen_virt::backend::unavailable::UnavailableBackend::new(
-                    err.to_string(),
-                ))
-            }
-        };
-    // Constructed last, and given the other two: a machine needs a bridge to
-    // attach to and a volume to boot from, while neither networking nor
-    // storage has any reason to know a machine exists.
-    let virt = Arc::new(VirtService::new(
-        virt_backend,
-        storage.clone(),
-        network.clone(),
-    ));
-
     // Clustering. No probe and no unavailable fallback: a node without a
     // cluster stack is the ordinary standalone appliance, and the backend
     // answers "no environment" for it rather than being broken. Reads are
@@ -176,6 +153,30 @@ async fn main() -> Result<()> {
         storage.clone(),
     ));
     peers.bind_volumes(drbd.clone());
+
+    // Virtual machines. The hypervisor is a privileged daemon reached over its
+    // own socket, exactly as networking reaches NetworkManager over the bus —
+    // so the unit's hardening stays as it is. Same failure policy: an operator
+    // whose hypervisor is down needs the console more than usual.
+    let virt_backend: Arc<dyn lumen_virt::backend::VirtBackend> =
+        match LibvirtBackend::connect().await {
+            Ok(backend) => Arc::new(backend),
+            Err(err) => {
+                tracing::error!("virtualization is unavailable: {err}");
+                Arc::new(lumen_virt::backend::unavailable::UnavailableBackend::new(
+                    err.to_string(),
+                ))
+            }
+        };
+    // Constructed last, and given the other three: a machine needs a bridge
+    // to attach to and a volume — local or replicated — to boot from, while
+    // none of those domains has any reason to know a machine exists.
+    let virt = Arc::new(VirtService::new(
+        virt_backend,
+        storage.clone(),
+        network.clone(),
+        drbd.clone(),
+    ));
 
     // Membership gossip: push our record to every peer once a minute and
     // adopt anything newer that comes back. Quiet by design — the

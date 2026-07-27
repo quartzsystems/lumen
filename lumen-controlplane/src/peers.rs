@@ -407,6 +407,45 @@ impl PeerChannel for HttpPeerChannel {
         )
         .await
     }
+
+    async fn store_definition(
+        &self,
+        node: &EnvironmentNode,
+        vmid: u32,
+        xml: &str,
+    ) -> Result<(), ClusterError> {
+        if self.is_local(node) {
+            return self.service()?.peer_store_definition(vmid, xml);
+        }
+        let _: serde_json::Value = self
+            .call(
+                &node.address,
+                "/api/peer/definition/store",
+                &serde_json::json!({ "vmid": vmid, "xml": xml }),
+                self.ca_client_config()?,
+                Some(self.peer_ticket()?),
+                CALL_DEADLINE,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn drop_definition(&self, node: &EnvironmentNode, vmid: u32) -> Result<(), ClusterError> {
+        if self.is_local(node) {
+            return self.service()?.peer_drop_definition(vmid);
+        }
+        let _: serde_json::Value = self
+            .call(
+                &node.address,
+                "/api/peer/definition/drop",
+                &serde_json::json!({ "vmid": vmid }),
+                self.ca_client_config()?,
+                Some(self.peer_ticket()?),
+                CALL_DEADLINE,
+            )
+            .await?;
+        Ok(())
+    }
 }
 
 /// The volume half of the channel: same socket, same tickets, same local
@@ -506,6 +545,32 @@ impl VolumePeers for HttpPeerChannel {
                 &node.address,
                 "/api/peer/volume/grow",
                 &serde_json::json!({ "resource": resource }),
+                self.ca_client_config().map_err(DrbdError::from)?,
+                Some(self.peer_ticket().map_err(DrbdError::from)?),
+                CALL_DEADLINE,
+            )
+            .await
+            .map_err(DrbdError::from)?;
+        Ok(())
+    }
+
+    async fn two_primaries(
+        &self,
+        node: &EnvironmentNode,
+        resource: &str,
+        allow: bool,
+    ) -> Result<(), DrbdError> {
+        if self.is_local(node) {
+            return self
+                .volume_service()?
+                .peer_two_primaries(resource, allow)
+                .await;
+        }
+        let _: serde_json::Value = self
+            .call(
+                &node.address,
+                "/api/peer/volume/two-primaries",
+                &serde_json::json!({ "resource": resource, "allow": allow }),
                 self.ca_client_config().map_err(DrbdError::from)?,
                 Some(self.peer_ticket().map_err(DrbdError::from)?),
                 CALL_DEADLINE,

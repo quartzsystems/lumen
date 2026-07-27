@@ -73,6 +73,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/vms/{vmid}/stop", post(vms::stop))
         .route("/api/vms/{vmid}/reboot", post(vms::reboot))
         .route("/api/vms/{vmid}/reset", post(vms::reset))
+        // Live migration to another member of the machine's disks' replica
+        // set — the two-primaries window around it is the service's guard;
+        // see src/api/vms.rs and docs/storage.md.
+        .route("/api/vms/{vmid}/migrate", post(vms::migrate))
         // The console viewer. The first says where to connect and why not when
         // there is nowhere; the second is the stream itself. Both are GETs,
         // because an upgrade request is one — see src/api/console.rs.
@@ -149,6 +153,12 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(peer::resize_volume_backing),
         )
         .route("/api/peer/volume/grow", post(peer::grow_volume))
+        .route(
+            "/api/peer/volume/two-primaries",
+            post(peer::volume_two_primaries),
+        )
+        .route("/api/peer/definition/store", post(peer::store_definition))
+        .route("/api/peer/definition/drop", post(peer::drop_definition))
         // The node itself: its local accounts, and its power state. Every
         // account route passes the session's own principal down, which is what
         // lets the domain refuse to lock the operator out of their own console

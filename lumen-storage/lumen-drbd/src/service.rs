@@ -130,7 +130,7 @@ pub struct VolumeCreate {
     pub members: Vec<VolumeMemberCreate>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VolumeMemberCreate {
     pub node: String,
@@ -611,6 +611,115 @@ impl DrbdService {
 
     pub async fn peer_grow(&self, resource: &str) -> Result<()> {
         self.backend.resize(resource).await
+    }
+
+    pub async fn peer_two_primaries(&self, resource: &str, allow: bool) -> Result<()> {
+        self.backend.set_two_primaries(resource, allow).await
+    }
+
+    // --- the compute domain's door ------------------------------------------
+
+    /// The cluster this node is a member of — where a machine on this node
+    /// keeps its replicated disks.
+    pub(crate) fn home_cluster(&self) -> Result<(String, String)> {
+        let membership = self.membership()?;
+        let node = self.node().to_string();
+        let cluster = membership
+            .node(&node)
+            .and_then(|n| n.cluster.clone())
+            .ok_or_else(|| {
+                DrbdError::Conflict(format!(
+                    "\"{node}\" is not a member of a cluster, and a replicated disk needs one."
+                ))
+            })?;
+        Ok((cluster, node))
+    }
+
+    pub(crate) fn membership_or_none(&self) -> Result<Option<EnvironmentMembership>> {
+        self.cluster.environment_record().map_err(DrbdError::from)
+    }
+
+    /// Placement for a machine's disk on `node`: the node itself — its
+    /// device must exist where the machine runs — plus the least-utilized
+    /// other member, each on the pool its existing replicas already use.
+    pub(crate) fn place_for_node(
+        &self,
+        cluster: &str,
+        node: &str,
+    ) -> Result<Vec<VolumeMemberCreate>> {
+        let membership = self.membership()?;
+        let Some(record) = membership.cluster_record(cluster) else {
+            return Err(DrbdError::NotFound(format!(
+                "There is no cluster called \"{cluster}\" in this environment."
+            )));
+        };
+        let pool_of = |n: &str| {
+            record
+                .volumes
+                .iter()
+                .find_map(|v| v.seat(n).map(|s| s.pool.clone()))
+        };
+        let seat_for = |n: &str| -> Result<VolumeMemberCreate> {
+            let Some(pool) = pool_of(n) else {
+                return Err(DrbdError::Conflict(format!(
+                    "\"{n}\" has never held a replica, so there is no pool to infer — choose \
+                     the members and pools explicitly."
+                )));
+            };
+            Ok(VolumeMemberCreate {
+                node: n.to_string(),
+                pool,
+            })
+        };
+
+        let mut members = vec![seat_for(node)?];
+        let mut others: Vec<(String, usize)> = record
+            .definition
+            .node_names()
+            .into_iter()
+            .filter(|n| n != node)
+            .map(|n| {
+                let seats = record
+                    .volumes
+                    .iter()
+                    .filter(|v| v.seat(&n).is_some())
+                    .count();
+                (n, seats)
+            })
+            .collect();
+        others.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        let Some((other, _)) = others.into_iter().next() else {
+            return Err(DrbdError::Conflict(format!(
+                "\"{cluster}\" has no other member to hold the second replica."
+            )));
+        };
+        members.push(seat_for(&other)?);
+        Ok(members)
+    }
+
+    /// Open or close the two-primaries window on every member of one
+    /// volume. The order is not transactional on purpose: the caller — the
+    /// migration guard — closes on every path out, so a half-opened window
+    /// is closed the same way a fully opened one is.
+    pub(crate) async fn adjust_two_primaries(
+        &self,
+        cluster: &str,
+        name: &str,
+        allow: bool,
+    ) -> Result<()> {
+        let membership = self.membership()?;
+        let volume = self.recorded_volume(&membership, cluster, name)?.clone();
+        let resource = resource_name(cluster, name);
+        for seat in &volume.replicas {
+            let Some(node) = membership.node(&seat.node).cloned() else {
+                return Err(DrbdError::Conflict(format!(
+                    "{} is not in the environment record",
+                    seat.node
+                )));
+            };
+            self.peers.two_primaries(&node, &resource, allow).await?;
+        }
+        Ok(())
     }
 
     // --- validation ---------------------------------------------------------
@@ -1339,6 +1448,99 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("lumen namespace"), "{err}");
+    }
+
+    /// The compute domain's door: placement always includes this node,
+    /// devices resolve back to their volumes, and the two-primaries window
+    /// reaches every member in both directions.
+    #[tokio::test]
+    async fn the_compute_door_places_on_this_node_and_works_the_window() {
+        use crate::vm::{VmDiskRequest, VmVolumes};
+        let backend = Arc::new(MockBackend::appliance());
+        let peers = Arc::new(MockVolumePeers::new().with_backend(backend.clone()));
+        let service = service_with(backend, peers.clone(), &alpha_membership(), "vm-door");
+
+        // Nothing to infer from yet: default placement says to choose.
+        let bare = VmDiskRequest {
+            name: "vm-1-disk-0".into(),
+            size_bytes: 1 << 30,
+            members: Vec::new(),
+        };
+        let err = service.create_disk(&bare).await.unwrap_err();
+        assert!(err.to_string().contains("choose"), "{err}");
+
+        // Explicit members must include the machine's own node.
+        let elsewhere = VmDiskRequest {
+            members: vec![VolumeMemberCreate {
+                node: "alpha-2".into(),
+                pool: "boot".into(),
+            }],
+            ..bare.clone()
+        };
+        let err = service.create_disk(&elsewhere).await.unwrap_err();
+        assert!(err.to_string().contains("must hold a replica"), "{err}");
+
+        let disk = service
+            .create_disk(&VmDiskRequest {
+                members: vec![
+                    VolumeMemberCreate {
+                        node: "alpha-1".into(),
+                        pool: "boot".into(),
+                    },
+                    VolumeMemberCreate {
+                        node: "alpha-2".into(),
+                        pool: "boot".into(),
+                    },
+                ],
+                ..bare.clone()
+            })
+            .await
+            .unwrap();
+        assert_eq!(disk.device, "/dev/drbd1");
+        assert_eq!(disk.members, vec!["alpha-1", "alpha-2"]);
+
+        // A second disk can be placed automatically now, on this node.
+        let second = service
+            .create_disk(&VmDiskRequest {
+                name: "vm-1-disk-1".into(),
+                size_bytes: 1 << 30,
+                members: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert!(second.members.contains(&"alpha-1".to_string()));
+
+        // Devices resolve back; a zvol path is simply not ours.
+        let found = service.disk_of(&disk.device).await.unwrap().unwrap();
+        assert_eq!(found.name, "vm-1-disk-0");
+        assert!(service
+            .disk_of("/dev/zvol/boot/lumen/vm-1-disk-0")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            service
+                .common_members(&[disk.device.clone(), second.device.clone()])
+                .await
+                .unwrap(),
+            vec!["alpha-1", "alpha-2"]
+        );
+
+        // The window opens on every member and closes on every member.
+        service.set_two_primaries(&disk.device, true).await.unwrap();
+        service
+            .set_two_primaries(&disk.device, false)
+            .await
+            .unwrap();
+        let adjustments = peers.two_primaries();
+        assert_eq!(adjustments.len(), 4, "{adjustments:?}");
+        assert!(adjustments[..2].iter().all(|(_, _, allow)| *allow));
+        assert!(adjustments[2..].iter().all(|(_, _, allow)| !*allow));
+
+        // Destroy through the door needs no second acknowledgement and
+        // forgets the record.
+        service.destroy_disk(&second.device).await.unwrap();
+        assert!(service.disk_of(&second.device).await.unwrap().is_none());
     }
 
     #[tokio::test]

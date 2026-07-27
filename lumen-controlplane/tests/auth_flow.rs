@@ -62,6 +62,7 @@ fn test_app() -> axum::Router {
         Arc::new(lumen_virt::backend::mock::MockBackend::appliance()),
         storage.clone(),
         network.clone(),
+        Arc::new(lumen_drbd::MockVmVolumes::standalone()),
     ));
     let sys = Arc::new(lumen_sys::SysService::new(
         Arc::new(lumen_sys::backend::mock::MockPower::appliance()),

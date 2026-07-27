@@ -449,6 +449,9 @@ pub struct VmCreate {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiskCreate {
+    /// The pool a local disk's zvol lives in. Unused — and allowed empty —
+    /// for a replicated disk, whose members each name their own pool.
+    #[serde(default)]
     pub pool: String,
     pub size_gib: u64,
     #[serde(default)]
@@ -460,6 +463,15 @@ pub struct DiskCreate {
     /// Volume block size in bytes. `None` leaves the pool default.
     #[serde(default)]
     pub blocksize: Option<u64>,
+    /// Back the disk with a replicated volume instead of a local zvol: the
+    /// machine's data lands on every replica before a write is acknowledged,
+    /// and the machine can run on any member holding one.
+    #[serde(default)]
+    pub replicated: bool,
+    /// The replica seats for a replicated disk. Empty means "place it for
+    /// me": this node plus the least-utilized other member.
+    #[serde(default)]
+    pub members: Vec<lumen_drbd::VolumeMemberCreate>,
 }
 
 /// An optical drive to define. The image is named by the pool it is in and
@@ -491,6 +503,16 @@ pub struct NicCreate {
     pub vlan_tag: Option<u16>,
 }
 
+/// POST /api/vms/{vmid}/migrate — the machine's one home moved. There is no
+/// `VmView` in the answer on purpose: after a migration this node has no
+/// view of the machine to give.
+#[derive(Debug, Clone, Serialize)]
+pub struct VmMigrateResponse {
+    pub vmid: u32,
+    pub name: String,
+    pub target: String,
+}
+
 /// PATCH /api/vms/{vmid}. Absent fields are left alone.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -516,6 +538,11 @@ pub struct VirtService {
     backend: Arc<dyn VirtBackend>,
     storage: Arc<StorageService>,
     network: Arc<NetworkService>,
+    /// Replicated disks, through the narrow trait `lumen-drbd` defines for
+    /// this one consumer. On a standalone appliance every call refuses with
+    /// a sentence, which is exactly the answer a replicated disk deserves
+    /// there.
+    volumes: Arc<dyn lumen_drbd::VmVolumes>,
     node: String,
     /// Serializes every mutation. Two machines being created at once must not
     /// race for the same identifier.
@@ -532,16 +559,28 @@ struct Machine {
     config: VmConfig,
 }
 
+/// What a machine's disk is backed by — the two kinds the unwind and the
+/// purge paths have to tell apart.
+enum Backing {
+    /// A local zvol, named by its dataset path.
+    Zvol(String),
+    /// A replicated volume, named by its device (stable on every member)
+    /// and its volume name (what the operator knows it as).
+    Replicated { device: String, name: String },
+}
+
 impl VirtService {
     pub fn new(
         backend: Arc<dyn VirtBackend>,
         storage: Arc<StorageService>,
         network: Arc<NetworkService>,
+        volumes: Arc<dyn lumen_drbd::VmVolumes>,
     ) -> Self {
         Self {
             backend,
             storage,
             network,
+            volumes,
             node: crate::state::hostname(),
             gate: Mutex::new(()),
             osinfo_root: osinfo::OSINFO_DB_ROOT.into(),
@@ -976,9 +1015,13 @@ impl VirtService {
             });
         }
 
+        // A replicated disk's pools are its members' business, validated by
+        // the storage domain when it is made — only the local disks are
+        // checked against this node's pools.
         let planned: Vec<PlannedDisk> = request
             .disks
             .iter()
+            .filter(|disk| !disk.replicated)
             .map(|disk| PlannedDisk {
                 pool: disk.pool.clone(),
                 size: disk.size_gib.saturating_mul(GIB),
@@ -993,38 +1036,66 @@ impl VirtService {
 
         // Everything below this point creates something on the node, so
         // everything below this point has to be able to undo itself.
-        let mut created: Vec<String> = Vec::new();
+        let mut created: Vec<Backing> = Vec::new();
         for (index, disk) in request.disks.iter().enumerate() {
             let name = format!("vm-{vmid}-disk-{index}");
             let size = disk.size_gib.saturating_mul(GIB);
-            let volume = match self
-                .storage
-                .create_volume(&disk.pool, &name, size, disk.blocksize)
-                .await
-            {
-                Ok(volume) => volume,
-                Err(err) => {
-                    self.remove_volumes(&created).await;
-                    return Err(err.into());
+            let (source, actual_size, backing) = if disk.replicated {
+                match self
+                    .volumes
+                    .create_disk(&lumen_drbd::VmDiskRequest {
+                        name: name.clone(),
+                        size_bytes: size,
+                        members: disk.members.clone(),
+                    })
+                    .await
+                {
+                    Ok(replicated) => {
+                        let backing = Backing::Replicated {
+                            device: replicated.device.clone(),
+                            name: replicated.name,
+                        };
+                        (replicated.device, replicated.size_bytes, backing)
+                    }
+                    Err(err) => {
+                        self.remove_backings(&created).await;
+                        return Err(err.into());
+                    }
+                }
+            } else {
+                match self
+                    .storage
+                    .create_volume(&disk.pool, &name, size, disk.blocksize)
+                    .await
+                {
+                    Ok(volume) => (
+                        self.storage.device_path(&volume.name),
+                        volume.volsize.unwrap_or(size),
+                        Backing::Zvol(volume.name),
+                    ),
+                    Err(err) => {
+                        self.remove_backings(&created).await;
+                        return Err(err.into());
+                    }
                 }
             };
             config.disks.push(VmDisk {
                 id: config.next_disk_target(disk.bus),
                 bus: disk.bus,
-                source: self.storage.device_path(&volume.name),
-                size: volume.volsize.unwrap_or(size),
+                source,
+                size: actual_size,
                 cache: disk.cache,
                 discard: disk.discard,
                 boot_index: None,
             });
-            created.push(volume.name);
+            created.push(backing);
         }
 
         if let Err(err) = self.backend.define(&domain_xml::render(&config)).await {
             // A machine that did not get defined must not leave its disks
             // behind: the next attempt with the same identifier would find the
             // volumes already there and fail for a reason nobody could guess.
-            self.remove_volumes(&created).await;
+            self.remove_backings(&created).await;
             return Err(err);
         }
 
@@ -1249,28 +1320,60 @@ impl VirtService {
         }
         self.backend.undefine(&name).await?;
 
-        let volumes: Vec<String> = machine
-            .config
-            .disks
-            .iter()
-            .filter_map(|disk| volume_of(&disk.source))
-            .collect();
+        // Both kinds of backing leave with the machine: local zvols by their
+        // dataset path, replicated volumes resolved from their device.
+        let mut backings: Vec<Backing> = Vec::new();
+        for disk in &machine.config.disks {
+            if let Some(volume) = volume_of(&disk.source) {
+                backings.push(Backing::Zvol(volume));
+            } else if let Ok(Some(replicated)) = self.volumes.disk_of(&disk.source).await {
+                backings.push(Backing::Replicated {
+                    device: disk.source.clone(),
+                    name: replicated.name,
+                });
+            }
+        }
 
         let mut removed = Vec::new();
         let mut kept = Vec::new();
-        for volume in volumes {
-            if !purge_disks {
-                kept.push(volume);
-                continue;
-            }
-            match self.storage.destroy_volume(&volume).await {
-                Ok(()) => removed.push(volume),
-                Err(err) => {
+        for backing in backings {
+            let (label, result) = match &backing {
+                Backing::Zvol(volume) => (
+                    volume.clone(),
+                    if purge_disks {
+                        Some(
+                            self.storage
+                                .destroy_volume(volume)
+                                .await
+                                .map_err(VirtError::from),
+                        )
+                    } else {
+                        None
+                    },
+                ),
+                Backing::Replicated { device, name } => (
+                    name.clone(),
+                    if purge_disks {
+                        Some(
+                            self.volumes
+                                .destroy_disk(device)
+                                .await
+                                .map_err(VirtError::from),
+                        )
+                    } else {
+                        None
+                    },
+                ),
+            };
+            match result {
+                None => kept.push(label),
+                Some(Ok(())) => removed.push(label),
+                Some(Err(err)) => {
                     // The machine is already gone; a volume that will not go
                     // with it is reported rather than making the whole
                     // operation look like a failure.
-                    tracing::error!(%volume, "could not remove the volume: {err}");
-                    kept.push(volume);
+                    tracing::error!(volume = %label, "could not remove the volume: {err}");
+                    kept.push(label);
                 }
             }
         }
@@ -1382,36 +1485,173 @@ impl VirtService {
 
     // --- hardware ---------------------------------------------------------
 
+    /// Live-migrate a running machine to another member of its disks'
+    /// replica set. The two-primaries window — DRBD's one deliberate
+    /// exception to "one writer" — opens on every replicated disk just
+    /// before the migration and closes on **every** path out: the guard is
+    /// two loops around one backend call, not a flag something remembers to
+    /// reset.
+    pub async fn migrate(
+        &self,
+        vmid: u32,
+        target: &str,
+        destination: &str,
+    ) -> Result<VmMigrateResponse> {
+        let _guard = self.gate.lock().await;
+        let machine = self.machine(vmid).await?;
+        let name = machine.config.name.clone();
+
+        if !machine.observed.state.is_running() {
+            return Err(VirtError::Conflict(format!(
+                "\"{name}\" is not running. Live migration moves a running machine; a stopped \
+                 one has nothing to keep alive in transit."
+            )));
+        }
+        if target == self.node {
+            return Err(VirtError::Conflict(format!(
+                "\"{name}\" is already on {target}."
+            )));
+        }
+        if !machine.config.cdroms.is_empty() {
+            return Err(VirtError::Conflict(format!(
+                "\"{name}\" has installation media attached — a file on this node's pool, which \
+                 cannot follow it. Eject the media first."
+            )));
+        }
+        if machine.config.disks.is_empty() {
+            return Err(VirtError::Conflict(format!(
+                "\"{name}\" has no disks, so it has no replica set naming where it can run."
+            )));
+        }
+        for disk in &machine.config.disks {
+            if volume_of(&disk.source).is_some() {
+                return Err(VirtError::Conflict(format!(
+                    "\"{}\" is a local volume on this node. Every disk must be replicated for \
+                     the machine to leave.",
+                    disk.id
+                )));
+            }
+        }
+
+        let devices: Vec<String> = machine
+            .config
+            .disks
+            .iter()
+            .map(|d| d.source.clone())
+            .collect();
+        let members = self.volumes.common_members(&devices).await?;
+        if !members.iter().any(|m| m == target) {
+            return Err(VirtError::Conflict(format!(
+                "\"{target}\" holds no replica of every disk — \"{name}\" can run on {}.",
+                members.join(", ")
+            )));
+        }
+
+        // Open the window on every disk; then, whatever happens, close it on
+        // everything that opened. DRBD refuses a second writer the moment
+        // the window shuts, so a closed window after a failed migration is a
+        // machine exactly where it started.
+        let mut opened: Vec<String> = Vec::new();
+        let mut failure: Option<VirtError> = None;
+        for device in &devices {
+            match self.volumes.set_two_primaries(device, true).await {
+                Ok(()) => opened.push(device.clone()),
+                Err(err) => {
+                    failure = Some(VirtError::Conflict(format!(
+                        "The two-primaries window on {device} did not open, so the migration \
+                         was not started: {err}"
+                    )));
+                    break;
+                }
+            }
+        }
+        if failure.is_none() {
+            if let Err(err) = self.backend.migrate(&name, destination).await {
+                failure = Some(err);
+            }
+        }
+        for device in opened.iter().rev() {
+            if let Err(err) = self.volumes.set_two_primaries(device, false).await {
+                tracing::error!(%device, "the two-primaries window did not close: {err}");
+                if failure.is_none() {
+                    failure = Some(VirtError::Conflict(format!(
+                        "\"{name}\" migrated to {target}, but the two-primaries window on \
+                         {device} did not close: {err}. Close it before anything else — the \
+                         open window is what makes a second writer possible."
+                    )));
+                }
+            }
+        }
+        if let Some(err) = failure {
+            return Err(err);
+        }
+
+        tracing::info!(vmid, %name, target, "machine migrated");
+        Ok(VmMigrateResponse {
+            vmid,
+            name,
+            target: target.to_string(),
+        })
+    }
+
+    /// The stored domain document, exactly as the hypervisor holds it — what
+    /// definition replication pushes to the cluster's other members.
+    pub async fn definition(&self, vmid: u32) -> Result<String> {
+        Ok(self.machine(vmid).await?.observed.xml)
+    }
+
     pub async fn attach_disk(&self, vmid: u32, request: DiskCreate) -> Result<VmUpdateResponse> {
         let _guard = self.gate.lock().await;
         let machine = self.machine(vmid).await?;
         let mut config = machine.config.clone();
 
         let size = request.size_gib.saturating_mul(GIB);
-        let facts = self.facts(Some(vmid)).await?;
-        let errors = validate(
-            &config,
-            &[PlannedDisk {
+        let planned: Vec<PlannedDisk> = if request.replicated {
+            Vec::new()
+        } else {
+            vec![PlannedDisk {
                 pool: request.pool.clone(),
                 size,
-            }],
-            &facts,
-        );
+            }]
+        };
+        let facts = self.facts(Some(vmid)).await?;
+        let errors = validate(&config, &planned, &facts);
         if !errors.is_empty() {
             return Err(VirtError::Invalid(errors));
         }
 
-        let name = format!("vm-{vmid}-disk-{}", config.next_disk_index());
-        let volume = self
-            .storage
-            .create_volume(&request.pool, &name, size, request.blocksize)
-            .await?;
+        let name = format!("vm-{vmid}-disk-{}", self.next_disk_index(&config).await?);
+        let (source, actual_size, backing) = if request.replicated {
+            let replicated = self
+                .volumes
+                .create_disk(&lumen_drbd::VmDiskRequest {
+                    name,
+                    size_bytes: size,
+                    members: request.members.clone(),
+                })
+                .await?;
+            let backing = Backing::Replicated {
+                device: replicated.device.clone(),
+                name: replicated.name,
+            };
+            (replicated.device, replicated.size_bytes, backing)
+        } else {
+            let volume = self
+                .storage
+                .create_volume(&request.pool, &name, size, request.blocksize)
+                .await?;
+            (
+                self.storage.device_path(&volume.name),
+                volume.volsize.unwrap_or(size),
+                Backing::Zvol(volume.name),
+            )
+        };
 
         let disk = VmDisk {
             id: config.next_disk_target(request.bus),
             bus: request.bus,
-            source: self.storage.device_path(&volume.name),
-            size: volume.volsize.unwrap_or(size),
+            source,
+            size: actual_size,
             cache: request.cache,
             discard: request.discard,
             boot_index: None,
@@ -1426,7 +1666,7 @@ impl VirtService {
             ))
             .await
         {
-            self.remove_volumes(&[volume.name]).await;
+            self.remove_backings(&[backing]).await;
             return Err(err);
         }
 
@@ -1434,7 +1674,7 @@ impl VirtService {
             .live_device(&machine, true, &domain_xml::disk_fragment(&disk), &disk.id)
             .await;
 
-        tracing::info!(vmid, disk = %disk.id, volume = %volume.name, "disk attached");
+        tracing::info!(vmid, disk = %disk.id, source = %disk.source, "disk attached");
         Ok(VmUpdateResponse {
             vm: self.get(vmid).await?,
             applied_live,
@@ -1482,15 +1722,18 @@ impl VirtService {
 
         if purge {
             let still_attached = machine.observed.state.is_running() && !pending_reboot.is_empty();
+            if still_attached {
+                return Err(VirtError::Conflict(format!(
+                    "\"{id}\" was removed from the configuration, but the running machine \
+                     still has it, so its volume was left in place. Restart the machine and \
+                     remove the volume again."
+                )));
+            }
             match volume_of(&disk.source) {
-                Some(volume) if still_attached => {
-                    return Err(VirtError::Conflict(format!(
-                        "\"{id}\" was removed from the configuration, but the running machine \
-                         still has it, so \"{volume}\" was left in place. Restart the machine and \
-                         remove the volume again."
-                    )));
-                }
                 Some(volume) => self.storage.destroy_volume(&volume).await?,
+                None if self.volumes.disk_of(&disk.source).await?.is_some() => {
+                    self.volumes.destroy_disk(&disk.source).await?
+                }
                 None => {
                     return Err(VirtError::Conflict(format!(
                         "\"{}\" is not a volume this appliance created, so it was left in place.",
@@ -1757,14 +2000,56 @@ impl VirtService {
         }
     }
 
-    /// Undo volumes created for a machine that did not survive being made.
-    async fn remove_volumes(&self, volumes: &[String]) {
-        for volume in volumes {
-            if let Err(err) = self.storage.destroy_volume(volume).await {
-                tracing::error!(%volume, "could not clean up after a failed create: {err}");
+    /// Undo backings created for a machine that did not survive being made —
+    /// local zvols and replicated volumes alike.
+    async fn remove_backings(&self, backings: &[Backing]) {
+        for backing in backings {
+            let result = match backing {
+                Backing::Zvol(volume) => self
+                    .storage
+                    .destroy_volume(volume)
+                    .await
+                    .map_err(VirtError::from),
+                Backing::Replicated { device, .. } => self
+                    .volumes
+                    .destroy_disk(device)
+                    .await
+                    .map_err(VirtError::from),
+            };
+            if let Err(err) = result {
+                tracing::error!("could not clean up after a failed create: {err}");
             }
         }
     }
+
+    /// The next free disk index across *both* kinds of backing. A zvol
+    /// carries its index in its device path; a replicated disk's device is
+    /// `/dev/drbd<minor>` and says nothing, so its volume name is looked up
+    /// in the record — which is why this lives here and not on the model.
+    async fn next_disk_index(&self, config: &VmConfig) -> Result<u32> {
+        let mut taken: Vec<u32> = Vec::new();
+        for disk in &config.disks {
+            let name = match volume_of(&disk.source) {
+                Some(volume) => Some(volume),
+                None => self
+                    .volumes
+                    .disk_of(&disk.source)
+                    .await?
+                    .map(|replicated| replicated.name),
+            };
+            if let Some(index) = name.as_deref().and_then(index_of) {
+                taken.push(index);
+            }
+        }
+        Ok((0u32..)
+            .find(|index| !taken.contains(index))
+            .expect("an unbounded search always finds a free index"))
+    }
+}
+
+/// The index out of a `…-disk-<n>` volume name.
+fn index_of(name: &str) -> Option<u32> {
+    name.rsplit_once("-disk-")?.1.parse().ok()
 }
 
 /// The dataset behind a disk's device path, if the appliance created it.
@@ -1810,6 +2095,7 @@ mod tests {
         service: VirtService,
         virt: Arc<MockBackend>,
         zfs: Arc<MockZfsBackend>,
+        volumes: Arc<lumen_drbd::MockVmVolumes>,
         state_dir: std::path::PathBuf,
     }
 
@@ -1821,11 +2107,26 @@ mod tests {
 
     /// A node with one bridge, one pool, and no machines.
     ///
-    /// The three domains are wired together exactly as `main` wires them, so
+    /// The domains are wired together exactly as `main` wires them, so
     /// these tests exercise the real dependency direction: compute asks
     /// storage for a volume and networking for a bridge, and neither of those
-    /// knows a machine exists.
+    /// knows a machine exists. Replicated storage is the standalone stub —
+    /// this node is not in a cluster unless a test says so.
     async fn harness(tag: &str) -> Harness {
+        harness_with(tag, lumen_drbd::MockVmVolumes::standalone()).await
+    }
+
+    /// The same node inside a two-node cluster, for the replicated-disk and
+    /// migration tests.
+    async fn clustered_harness(tag: &str) -> Harness {
+        harness_with(
+            tag,
+            lumen_drbd::MockVmVolumes::clustered("alpha", &["lumen", "lumen02"]),
+        )
+        .await
+    }
+
+    async fn harness_with(tag: &str, volumes: lumen_drbd::MockVmVolumes) -> Harness {
         let state_dir = std::env::temp_dir().join(format!(
             "lumen-virt-service-{tag}-{}-{:?}",
             std::process::id(),
@@ -1849,13 +2150,15 @@ mod tests {
         // running it actually has.
         let storage =
             Arc::new(StorageService::new(zfs.clone()).with_iso_root(state_dir.join("iso")));
-        let service = VirtService::new(virt.clone(), storage, network)
+        let volumes = Arc::new(volumes);
+        let service = VirtService::new(virt.clone(), storage, network, volumes.clone())
             .with_osinfo_root(state_dir.join("osinfo"));
 
         Harness {
             service,
             virt,
             zfs,
+            volumes,
             state_dir,
         }
     }
@@ -1895,6 +2198,8 @@ mod tests {
                 cache: CacheMode::None,
                 discard: true,
                 blocksize: None,
+                replicated: false,
+                members: Vec::new(),
             }],
             nics: vec![NicCreate {
                 bridge: "br0".into(),
@@ -2295,6 +2600,8 @@ mod tests {
                     cache: CacheMode::None,
                     discard: true,
                     blocksize: None,
+                    replicated: false,
+                    members: Vec::new(),
                 },
             )
             .await
@@ -2340,6 +2647,8 @@ mod tests {
                     cache: CacheMode::None,
                     discard: true,
                     blocksize: None,
+                    replicated: false,
+                    members: Vec::new(),
                 },
             )
             .await
@@ -2605,7 +2914,10 @@ mod tests {
         assert_eq!(node.node, h.service.node());
         assert_eq!(node.cpus, 16);
         assert_eq!(node.memory_mib, 32_768);
-        assert_eq!(node.reserved_memory_mib, crate::state::HOST_MEMORY_RESERVE_MIB);
+        assert_eq!(
+            node.reserved_memory_mib,
+            crate::state::HOST_MEMORY_RESERVE_MIB
+        );
         assert_eq!(node.hypervisor_version.as_deref(), Some("11.10.0"));
         assert_eq!(node.machines, 0);
         assert_eq!(node.running, 0);
@@ -2798,5 +3110,203 @@ mod tests {
         let guests = h.service.os_catalog().await.unwrap();
         assert!(guests.is_empty());
         assert!(guests.reason.is_some());
+    }
+
+    // --- replicated disks and migration -------------------------------------
+
+    fn replicated_disk(size_gib: u64) -> DiskCreate {
+        DiskCreate {
+            pool: String::new(),
+            size_gib,
+            bus: DiskBus::VirtioBlk,
+            cache: CacheMode::None,
+            discard: true,
+            blocksize: None,
+            replicated: true,
+            members: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_replicated_disk_rides_the_stable_device_and_leaves_with_the_machine() {
+        let h = clustered_harness("replicated-disk").await;
+        let mut request = create("web01");
+        request.disks = vec![replicated_disk(10)];
+        let vm = h.service.create(request).await.unwrap();
+
+        // The stable device, not a zvol path — the same document is valid on
+        // every member.
+        assert_eq!(vm.disks[0].source, "/dev/drbd1");
+        let made = h.volumes.disks();
+        assert_eq!(made.len(), 1);
+        assert_eq!(made[0].name, format!("vm-{}-disk-0", vm.vmid));
+
+        // A local disk attached next takes index 1: the replicated disk's
+        // index is invisible in its device path and is found in the record.
+        h.service
+            .attach_disk(
+                vm.vmid,
+                DiskCreate {
+                    pool: "boot".into(),
+                    size_gib: 8,
+                    bus: DiskBus::VirtioBlk,
+                    cache: CacheMode::None,
+                    discard: true,
+                    blocksize: None,
+                    replicated: false,
+                    members: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(h
+            .zfs
+            .has_dataset(&format!("boot/lumen/vm-{}-disk-1", vm.vmid)));
+
+        // Purge takes both kinds of backing with the machine.
+        let deleted = h
+            .service
+            .delete(
+                vm.vmid,
+                true,
+                Acknowledgements {
+                    may_lose_data: true,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(deleted
+            .removed_volumes
+            .contains(&format!("vm-{}-disk-0", vm.vmid)));
+        assert!(deleted
+            .removed_volumes
+            .contains(&format!("boot/lumen/vm-{}-disk-1", vm.vmid)));
+        assert_eq!(
+            h.volumes.destroyed(),
+            vec![format!("vm-{}-disk-0", vm.vmid)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replicated_disk_is_refused_outside_a_cluster_and_leaves_nothing() {
+        let h = harness("replicated-standalone").await;
+        let mut request = create("web01");
+        request.disks = vec![replicated_disk(10)];
+        let err = h.service.create(request).await.unwrap_err();
+        assert!(err.to_string().contains("environment"), "{err}");
+        assert!(h.virt.names().is_empty(), "no half-made machine");
+    }
+
+    #[tokio::test]
+    async fn a_migration_holds_the_window_for_exactly_as_long_as_it_takes() {
+        let h = clustered_harness("migrate").await;
+        let mut request = create("web01");
+        request.disks = vec![replicated_disk(10)];
+        request.start = true;
+        let vm = h.service.create(request).await.unwrap();
+
+        let answer = h
+            .service
+            .migrate(vm.vmid, "lumen02", "qemu+tcp://10.10.0.2/system")
+            .await
+            .unwrap();
+        assert_eq!(answer.target, "lumen02");
+        assert_eq!(
+            h.virt.migrated(),
+            vec![(
+                "web01".to_string(),
+                "qemu+tcp://10.10.0.2/system".to_string()
+            )]
+        );
+
+        // The window opened before the move and closed after it — and is
+        // verifiably closed now.
+        assert_eq!(
+            h.volumes.windows(),
+            vec![
+                ("/dev/drbd1".to_string(), true),
+                ("/dev/drbd1".to_string(), false)
+            ]
+        );
+        assert!(h.volumes.open_windows().is_empty());
+
+        // The machine has one home, and it is not this node.
+        assert!(h.service.get(vm.vmid).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_failed_migration_still_closes_the_window_and_keeps_the_machine() {
+        let h = clustered_harness("migrate-fails").await;
+        let mut request = create("web01");
+        request.disks = vec![replicated_disk(10)];
+        request.start = true;
+        let vm = h.service.create(request).await.unwrap();
+
+        h.virt.refuse_migration("the transport dropped mid-copy");
+        let err = h
+            .service
+            .migrate(vm.vmid, "lumen02", "qemu+tcp://10.10.0.2/system")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("dropped"), "{err}");
+        assert!(
+            h.volumes.open_windows().is_empty(),
+            "the window must close on failure too"
+        );
+        assert!(
+            h.service.get(vm.vmid).await.is_ok(),
+            "the machine never left"
+        );
+
+        // And when opening the window itself fails, nothing migrates at all.
+        h.volumes.fail_next_window();
+        let err = h
+            .service
+            .migrate(vm.vmid, "lumen02", "qemu+tcp://10.10.0.2/system")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("was not started"), "{err}");
+        assert_eq!(h.virt.migrated().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_migration_is_refused_where_it_cannot_work() {
+        let h = clustered_harness("migrate-refusals").await;
+        let uri = "qemu+tcp://10.10.0.2/system";
+
+        // A machine with a local disk cannot leave the node its zvol is on.
+        let mut request = create("web01");
+        request.start = true;
+        let local = h.service.create(request).await.unwrap();
+        let err = h
+            .service
+            .migrate(local.vmid, "lumen02", uri)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("local volume"), "{err}");
+
+        // A stopped machine has nothing to keep alive in transit.
+        let mut request = create("web02");
+        request.disks = vec![replicated_disk(4)];
+        let stopped = h.service.create(request).await.unwrap();
+        let err = h
+            .service
+            .migrate(stopped.vmid, "lumen02", uri)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not running"), "{err}");
+
+        // A node outside the replica set is refused by name.
+        h.service.start(stopped.vmid).await.unwrap();
+        let err = h
+            .service
+            .migrate(stopped.vmid, "ghost", uri)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("holds no replica"), "{err}");
+        assert!(
+            h.volumes.windows().is_empty(),
+            "no refusal touches a window"
+        );
     }
 }

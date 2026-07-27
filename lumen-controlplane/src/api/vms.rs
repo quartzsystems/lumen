@@ -15,8 +15,8 @@ use axum::extract::{Path, Query, State};
 use axum::Json;
 
 use lumen_virt::service::{
-    DiskCreate, NicCreate, VmCreate, VmDeleteResponse, VmPatch, VmUpdateResponse, VmView,
-    VmsResponse,
+    DiskCreate, NicCreate, VmCreate, VmDeleteResponse, VmMigrateResponse, VmPatch,
+    VmUpdateResponse, VmView, VmsResponse,
 };
 use lumen_virt::{Acknowledgements, CpuModels, OsCatalog, PushedFile, MAX_GUEST_FILE_BYTES};
 
@@ -181,6 +181,25 @@ pub async fn get(
     Ok(Json(state.virt.get(vmid).await?))
 }
 
+/// Keep the cluster's copy of the machine's definition current — the HA
+/// manager's restart inventory, replicated to co-members at define time
+/// because libvirt on a dead node cannot be asked for it. Best-effort by
+/// design: a peer that is down misses this push and is caught up by the
+/// next define, and failing the operator's action over HA prep would make
+/// the preparation more important than the machine.
+async fn sync_definition(state: &AppState, vmid: u32) {
+    match state.virt.definition(vmid).await {
+        Ok(xml) => {
+            if let Err(err) = state.cluster.replicate_definition(vmid, &xml).await {
+                tracing::warn!(vmid, "the definition did not replicate: {err}");
+            }
+        }
+        Err(err) => {
+            tracing::warn!(vmid, "could not read the definition to replicate: {err}")
+        }
+    }
+}
+
 /// POST /api/vms — define the machine and the volumes its disks live on.
 pub async fn create(
     session: Session,
@@ -199,6 +218,9 @@ pub async fn create(
     // so there is nothing to file it under.
     if let Some(vmid) = result.as_ref().map(|vm| vm.vmid).ok().or(requested) {
         record(&state, &session, vmid, "create", detail, &result);
+    }
+    if let Ok(vm) = &result {
+        sync_definition(&state, vm.vmid).await;
     }
     Ok(Json(result?))
 }
@@ -220,6 +242,9 @@ pub async fn update(
     };
     let result = state.virt.update(vmid, patch).await;
     record(&state, &session, vmid, "update", detail, &result);
+    if result.is_ok() {
+        sync_definition(&state, vmid).await;
+    }
     Ok(Json(result?))
 }
 
@@ -242,7 +267,74 @@ pub async fn delete(
         .delete(vmid, request.purge_disks, request.ack())
         .await;
     record(&state, &session, vmid, "delete", detail, &result);
+    if result.is_ok() {
+        // A stored definition for a machine that no longer exists is a
+        // machine waiting to be wrongly resurrected.
+        if let Err(err) = state.cluster.withdraw_definition(vmid).await {
+            tracing::warn!(vmid, "the definition was not withdrawn: {err}");
+        }
+    }
     Ok(Json(result?))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MigrateRequest {
+    /// The member to move to — one of the machine's disks' replica nodes.
+    pub target: String,
+}
+
+/// POST /api/vms/{vmid}/migrate — live-migrate the machine to another member
+/// of its disks' replica set. The transfer rides the cluster's Core network
+/// — the dedicated storage link, whose address the membership record already
+/// knows — and the two-primaries window around it is the service's guard.
+pub async fn migrate(
+    session: Session,
+    State(state): State<Arc<AppState>>,
+    Path(vmid): Path<u32>,
+    raw: Body,
+) -> Result<Json<VmMigrateResponse>, ApiError> {
+    let request: MigrateRequest = required_body(raw)?;
+    let destination = core_uri_of(&state, &request.target)?;
+    let detail = format!("Migrate to {}", request.target);
+    let result = state
+        .virt
+        .migrate(vmid, &request.target, &destination)
+        .await;
+    record(&state, &session, vmid, "migrate", detail, &result);
+    Ok(Json(result?))
+}
+
+/// The migration destination URI: the target's seat on its cluster's Core
+/// network. Management carries the console; the machine's memory rides the
+/// same dedicated link its disks already replicate over.
+fn core_uri_of(state: &AppState, target: &str) -> Result<String, ApiError> {
+    let membership = state
+        .cluster
+        .environment_record()
+        .map_err(ApiError::from)?
+        .ok_or_else(|| {
+            ApiError::Conflict("This node has not joined an environment.".to_string())
+        })?;
+    let address = membership
+        .clusters
+        .iter()
+        .find_map(|record| {
+            record
+                .networks
+                .core
+                .members
+                .iter()
+                .find(|m| m.node == target)
+                .map(|m| m.address)
+        })
+        .ok_or_else(|| {
+            ApiError::Conflict(format!(
+                "\"{target}\" has no seat on a cluster's Core network, so there is no path to \
+                 migrate over."
+            ))
+        })?;
+    Ok(format!("qemu+tcp://{address}/system"))
 }
 
 pub async fn start(
@@ -354,9 +446,16 @@ pub async fn attach_disk(
     raw: Body,
 ) -> Result<Json<VmUpdateResponse>, ApiError> {
     let request: DiskCreate = required_body(raw)?;
-    let detail = format!("Add a {} GiB disk from {}", request.size_gib, request.pool);
+    let detail = if request.replicated {
+        format!("Add a replicated {} GiB disk", request.size_gib)
+    } else {
+        format!("Add a {} GiB disk from {}", request.size_gib, request.pool)
+    };
     let result = state.virt.attach_disk(vmid, request).await;
     record(&state, &session, vmid, "attach-disk", detail, &result);
+    if result.is_ok() {
+        sync_definition(&state, vmid).await;
+    }
     Ok(Json(result?))
 }
 
@@ -382,6 +481,9 @@ pub async fn detach_disk(
         .detach_disk(vmid, &id, request.purge_disks, request.ack())
         .await;
     record(&state, &session, vmid, "detach-disk", detail, &result);
+    if result.is_ok() {
+        sync_definition(&state, vmid).await;
+    }
     Ok(Json(result?))
 }
 
@@ -395,6 +497,9 @@ pub async fn attach_nic(
     let detail = format!("Add a network adapter on {}", request.bridge);
     let result = state.virt.attach_nic(vmid, request).await;
     record(&state, &session, vmid, "attach-nic", detail, &result);
+    if result.is_ok() {
+        sync_definition(&state, vmid).await;
+    }
     Ok(Json(result?))
 }
 
@@ -408,6 +513,9 @@ pub async fn detach_nic(
     let detail = format!("Detach network adapter {id}");
     let result = state.virt.detach_nic(vmid, &id).await;
     record(&state, &session, vmid, "detach-nic", detail, &result);
+    if result.is_ok() {
+        sync_definition(&state, vmid).await;
+    }
     Ok(Json(result?))
 }
 

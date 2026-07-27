@@ -71,6 +71,11 @@ struct Inner {
     /// pushing a file in wants to look at.
     guest_files: BTreeMap<String, Vec<u8>>,
     next_agent_handle: i64,
+    /// Every completed migration, in order: (name, destination URI).
+    migrated: Vec<(String, String)>,
+    /// When set, the next migration fails with this reason, once — the
+    /// mid-flight failure the two-primaries guard exists to survive.
+    refuse_migration: Option<String>,
 }
 
 pub struct MockBackend {
@@ -103,6 +108,8 @@ impl MockBackend {
                 agent_open: BTreeMap::new(),
                 guest_files: BTreeMap::new(),
                 next_agent_handle: 1000,
+                migrated: Vec::new(),
+                refuse_migration: None,
             }),
         }
     }
@@ -132,6 +139,16 @@ impl MockBackend {
     /// Every live call made, in order, as `verb name`.
     pub fn live_calls(&self) -> Vec<String> {
         self.inner.lock().unwrap().live_calls.clone()
+    }
+
+    /// Every completed migration, in order: (name, destination URI).
+    pub fn migrated(&self) -> Vec<(String, String)> {
+        self.inner.lock().unwrap().migrated.clone()
+    }
+
+    /// Make the next migration fail, once.
+    pub fn refuse_migration(&self, reason: impl Into<String>) {
+        self.inner.lock().unwrap().refuse_migration = Some(reason.into());
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -465,6 +482,24 @@ impl VirtBackend for MockBackend {
             return Err(VirtError::Conflict(format!("\"{name}\" is not running.")));
         }
         entry.started_at = started;
+        Ok(())
+    }
+
+    async fn migrate(&self, name: &str, destination: &str) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(reason) = inner.refuse_migration.take() {
+            return Err(VirtError::Backend(anyhow::anyhow!("{reason}")));
+        }
+        let entry = inner.entry(name)?;
+        if !entry.state.is_running() {
+            return Err(VirtError::Conflict(format!("\"{name}\" is not running.")));
+        }
+        // Undefined here, persistent there: the machine leaves this node
+        // whole, exactly as the flags on the real call demand.
+        inner.domains.remove(name);
+        inner
+            .migrated
+            .push((name.to_string(), destination.to_string()));
         Ok(())
     }
 

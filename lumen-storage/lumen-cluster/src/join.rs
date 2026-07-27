@@ -213,6 +213,14 @@ pub trait PeerChannel: Send + Sync {
         node: &EnvironmentNode,
         membership: &EnvironmentMembership,
     ) -> Result<EnvironmentMembership>;
+
+    /// Hand a peer one machine's domain document to keep — the HA manager's
+    /// restart inventory, filled at define time because libvirt on a dead
+    /// node cannot be asked for it.
+    async fn store_definition(&self, node: &EnvironmentNode, vmid: u32, xml: &str) -> Result<()>;
+
+    /// Tell a peer to forget one.
+    async fn drop_definition(&self, node: &EnvironmentNode, vmid: u32) -> Result<()>;
 }
 
 // --- create progress --------------------------------------------------------
@@ -735,6 +743,8 @@ struct MockPeersInner {
     torn_down: Vec<(String, TeardownPayload)>,
     grant: Option<JoinGrant>,
     join_requests: Vec<(String, String, JoinRequest)>,
+    definitions: Vec<(String, u32, String)>,
+    dropped_definitions: Vec<(String, u32)>,
 }
 
 impl MockPeers {
@@ -801,6 +811,15 @@ impl MockPeers {
 
     pub fn join_requests(&self) -> Vec<(String, String, JoinRequest)> {
         self.inner.lock().unwrap().join_requests.clone()
+    }
+
+    /// Every definition pushed to a peer: (node, vmid, xml).
+    pub fn definitions(&self) -> Vec<(String, u32, String)> {
+        self.inner.lock().unwrap().definitions.clone()
+    }
+
+    pub fn dropped_definitions(&self) -> Vec<(String, u32)> {
+        self.inner.lock().unwrap().dropped_definitions.clone()
     }
 
     fn maybe_form(&self) {
@@ -921,5 +940,23 @@ impl PeerChannel for MockPeers {
         membership: &EnvironmentMembership,
     ) -> Result<EnvironmentMembership> {
         Ok(membership.clone())
+    }
+
+    async fn store_definition(&self, node: &EnvironmentNode, vmid: u32, xml: &str) -> Result<()> {
+        self.inner
+            .lock()
+            .unwrap()
+            .definitions
+            .push((node.name.clone(), vmid, xml.to_string()));
+        Ok(())
+    }
+
+    async fn drop_definition(&self, node: &EnvironmentNode, vmid: u32) -> Result<()> {
+        self.inner
+            .lock()
+            .unwrap()
+            .dropped_definitions
+            .push((node.name.clone(), vmid));
+        Ok(())
     }
 }

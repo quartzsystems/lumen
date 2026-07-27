@@ -136,6 +136,67 @@ resources it participates in, so a console on a member with no replica says
 that cannot be asked at all leaves the volumes listed from the record, each
 carrying the reason.
 
+### A machine's replicated disk is the same document everywhere
+
+The compute domain consumes replicated storage through one deliberately
+narrow trait (`lumen_drbd::VmVolumes`): make a disk, recognise one, destroy
+one, know where the machine can run, hold the two-primaries window. It never
+sees records, renderers, peers, or ports — and its tests run against an
+in-memory implementation of the same five verbs.
+
+Two rules the interface enforces rather than assumes. **The machine's own
+node always holds a replica**: `/dev/drbd<minor>` exists only where a
+replica does, so a placement that skips the machine's node is refused, not
+accommodated with a diskless client. And **the volume's identity is not
+written into the domain document**. The spec called for identity and
+membership in `<metadata>`, and that is deviated from deliberately: the
+membership record already carries both — gossiped, durable, and readable
+when a node is dead, which is exactly the property HA needs — and
+`/dev/drbd<minor>` is stable on every member, so the record is resolved from
+the device path and a second copy would be a second source of truth to keep
+honest. The same stability is what makes one domain document valid wherever
+the machine runs.
+
+### The two-primaries window opens for one migration and closes on every path out
+
+DRBD's one deliberate exception to "one writer" is a live migration: for the
+moment of the handover, source and destination both hold the device open. The
+window (`--allow-two-primaries`) is opened on every member just before the
+migration and closed on **every** path out — the guard is two loops around
+one backend call, not a flag something remembers to reset. If opening fails,
+the migration is never started. If the migration fails, the window closes
+and the machine is exactly where it was. If the migration succeeds but a
+close fails, the operation reports an error *demanding* the close — a
+successful move with an open window is more dangerous than a failed move —
+and `a_migration_holds_the_window_for_exactly_as_long_as_it_takes` and its
+failure-path siblings pin all of it.
+
+The transfer itself is libvirt's: peer-to-peer to
+`qemu+tcp://<core-address>/system`, persistent on the destination, undefined
+at the source — when the call answers, the machine has one home. The memory
+rides the cluster's Core network, the same dedicated link its disks already
+replicate over; Management keeps carrying the console. A migration is
+refused, by name, for a machine with a local zvol disk, attached
+installation media, no disks at all, or a target outside the replica set.
+(Making libvirt listen on the Core network is packaging's business and lands
+with the packaging stage.)
+
+### Definitions replicate at define time, because a dead node cannot be asked
+
+An HA restart needs the machine's domain document on the survivor, and
+libvirt on the dead node is exactly what stopped answering. So every define
+— create, update, attach, detach — pushes the stored document to the
+cluster's other members, kept under the environment state directory
+(`<state_dir>/environment/definitions/<vmid>.xml`; the spec named
+`/var/lib/lumen/`, deviated from because the state directory is writable
+without a transient unit and already holds the environment's other
+replicated state). The push is best-effort beyond the local copy: a peer
+that is down misses it and is caught up by the next define, and failing an
+operator's action over HA prep would make the preparation more important
+than the machine. A delete withdraws the definition everywhere — a stored
+definition for a machine that no longer exists is a machine waiting to be
+wrongly resurrected.
+
 ### A volume only grows
 
 `zfs set volsize` can shrink, and a shrunk block device under a running
@@ -160,10 +221,16 @@ matching `/api/environment`.
 | POST | `/api/storage/replicated` | Create — members chosen (or least-utilized default), record written last |
 | DELETE | `/api/storage/replicated/:cluster/:name` | Destroy every replica; `i_understand_this_may_lose_data` required |
 | POST | `/api/storage/replicated/:cluster/:name/resize` | Grow only |
+| POST | `/api/vms/:vmid/migrate` | Live-migrate to another member of the disks' replica set, under the two-primaries guard |
+
+Machine disks gain the replicated shape on the existing routes: a
+`DiskCreate` with `"replicated": true` and its member seats, on both
+`POST /api/vms` and `POST /api/vms/:vmid/disks`.
 
 The peer surface gains `/api/peer/volume/{prepare,prime,teardown,`
-`resize-backing,grow}` — peer-ticket authenticated like the rest of
-`/api/peer`, never for a browser.
+`resize-backing,grow,two-primaries}` and
+`/api/peer/definition/{store,drop}` — peer-ticket authenticated like the
+rest of `/api/peer`, never for a browser.
 
 ## Web UI
 
@@ -198,10 +265,13 @@ other, pull the Core cable and watch I/O suspend rather than diverge.
 
 ## Out of scope for this stage
 
-In the order it lands: machines on replicated disks and live migration with
-the scoped two-primaries window (`lumen-virt` integration); snapshots and
-the transactional rollback; the guided split-brain recovery; the HA manager
-and the events stream it needs; packaging and ISO pins for the DRBD kmod
-(ELRepo, kABI-gated exactly like kmod-zfs). No external storage export, no
-thin provisioning under replication, and no scale past 3 replicas — stated
-non-goals, not omissions.
+Machines on replicated disks and live migration have landed, and the
+definitions HA will restart from are already replicating. Still in the order
+it lands: the HA manager itself (fence-confirmed restarts, the HA flag, the
+events log — the console's HA toggle arrives with it); snapshots and the
+transactional rollback; the guided split-brain recovery; the 2→3 scale-out;
+and packaging and ISO pins for the DRBD kmod (ELRepo, kABI-gated exactly
+like kmod-zfs) plus the libvirt Core-network listener the migration URI
+assumes. No external storage export, no thin provisioning under
+replication, and no scale past 3 replicas — stated non-goals, not
+omissions.

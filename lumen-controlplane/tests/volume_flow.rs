@@ -109,6 +109,8 @@ struct Harness {
     router: axum::Router,
     drbd_backend: Arc<DrbdMockBackend>,
     peers: Arc<MockVolumePeers>,
+    cluster: Arc<ClusterService>,
+    cluster_peers: Arc<lumen_cluster::MockPeers>,
     _state_dir: TempDir,
 }
 
@@ -130,15 +132,17 @@ fn harness(tag: &str, membership: &EnvironmentMembership) -> Harness {
         Arc::new(lumen_virt::backend::mock::MockBackend::appliance()),
         storage.clone(),
         network.clone(),
+        Arc::new(lumen_drbd::MockVmVolumes::standalone()),
     ));
     let sys = Arc::new(lumen_sys::SysService::new(
         Arc::new(lumen_sys::backend::mock::MockPower::appliance()),
         Arc::new(lumen_sys::exec::MockExec::new()),
     ));
+    let cluster_peers = Arc::new(lumen_cluster::MockPeers::new());
     let cluster = Arc::new(
         ClusterService::new(
             Arc::new(lumen_cluster::backend::mock::MockBackend::environment()),
-            Arc::new(lumen_cluster::MockPeers::new()),
+            cluster_peers.clone(),
             network.clone(),
             &state_dir.0,
             "test",
@@ -163,7 +167,7 @@ fn harness(tag: &str, membership: &EnvironmentMembership) -> Harness {
         network,
         storage,
         virt,
-        cluster,
+        cluster: cluster.clone(),
         drbd,
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
     }));
@@ -171,6 +175,8 @@ fn harness(tag: &str, membership: &EnvironmentMembership) -> Harness {
         router,
         drbd_backend,
         peers,
+        cluster,
+        cluster_peers,
         _state_dir: state_dir,
     }
 }
@@ -377,6 +383,97 @@ async fn a_malformed_create_is_a_validation_answer_with_fields() {
     assert!(codes.contains(&"invalid_volume_name"), "{codes:?}");
     assert!(codes.contains(&"invalid_volume_size"), "{codes:?}");
     assert!(harness.peers.prepared().is_empty());
+}
+
+#[tokio::test]
+async fn a_machines_definition_replicates_to_co_members_and_is_withdrawn() {
+    let harness = harness("definitions", &alpha_membership());
+    let cookie = sign_in(&harness.router).await;
+
+    let (status, vm) = request(
+        &harness.router,
+        Method::POST,
+        "/api/vms",
+        Some(&cookie),
+        None,
+        Some(serde_json::json!({ "name": "web01", "vcpus": 1, "memory_mib": 1024 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{vm}");
+    let vmid = vm["vmid"].as_u64().unwrap() as u32;
+
+    // The definition went to the cluster's other member and stayed here too
+    // — the HA manager's restart inventory, filled at define time.
+    let pushed = harness.cluster_peers.definitions();
+    assert_eq!(pushed.len(), 1, "{pushed:?}");
+    assert_eq!(pushed[0].0, "alpha-2");
+    assert_eq!(pushed[0].1, vmid);
+    assert!(pushed[0].2.contains("web01"), "the document itself travels");
+    assert_eq!(harness.cluster.stored_definitions().unwrap().len(), 1);
+
+    // Deleting the machine withdraws it everywhere: a stored definition for
+    // a machine that no longer exists is a machine waiting to be wrongly
+    // resurrected.
+    let (status, _) = request(
+        &harness.router,
+        Method::DELETE,
+        &format!("/api/vms/{vmid}"),
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        harness.cluster_peers.dropped_definitions(),
+        vec![("alpha-2".to_string(), vmid)]
+    );
+    assert!(harness.cluster.stored_definitions().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn peer_definition_routes_take_peer_tickets_and_store() {
+    let harness = harness("peer-definitions", &alpha_membership());
+    let body = serde_json::json!({ "vmid": 42, "xml": "<domain/>" });
+
+    let (status, _) = request(
+        &harness.router,
+        Method::POST,
+        "/api/peer/definition/store",
+        None,
+        None,
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let ticket = security::issue_peer_ticket(TICKET_SECRET, "alpha-2").unwrap();
+    let (status, _) = request(
+        &harness.router,
+        Method::POST,
+        "/api/peer/definition/store",
+        None,
+        Some(&ticket),
+        Some(body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        harness.cluster.stored_definitions().unwrap(),
+        vec![(42, "<domain/>".to_string())]
+    );
+
+    let (status, _) = request(
+        &harness.router,
+        Method::POST,
+        "/api/peer/definition/drop",
+        None,
+        Some(&ticket),
+        Some(serde_json::json!({ "vmid": 42 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(harness.cluster.stored_definitions().unwrap().is_empty());
 }
 
 #[tokio::test]

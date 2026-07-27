@@ -147,6 +147,7 @@ async fn harness(tag: &str, signed_in_as: &str) -> Harness {
         Arc::new(lumen_virt::backend::mock::MockBackend::appliance()),
         storage.clone(),
         network.clone(),
+        Arc::new(lumen_drbd::MockVmVolumes::standalone()),
     ));
 
     let cluster = Arc::new(lumen_cluster::ClusterService::new(

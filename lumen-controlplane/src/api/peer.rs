@@ -139,3 +139,55 @@ pub async fn grow_volume(
     state.drbd.peer_grow(&payload.resource).await?;
     Ok(Json(serde_json::json!({ "grown": true })))
 }
+
+#[derive(Debug, serde::Deserialize)]
+pub struct TwoPrimariesRef {
+    pub resource: String,
+    pub allow: bool,
+}
+
+/// POST /api/peer/volume/two-primaries — the live-migration guard's reach
+/// into this replica: open or close the window here.
+pub async fn volume_two_primaries(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<TwoPrimariesRef>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state
+        .drbd
+        .peer_two_primaries(&payload.resource, payload.allow)
+        .await?;
+    Ok(Json(serde_json::json!({ "adjusted": true })))
+}
+
+// --- replicated machine definitions -----------------------------------------
+
+#[derive(Debug, serde::Deserialize)]
+pub struct DefinitionRef {
+    pub vmid: u32,
+    #[serde(default)]
+    pub xml: String,
+}
+
+/// POST /api/peer/definition/store — keep a machine's domain document, so an
+/// HA restart can define it here after its node dies.
+pub async fn store_definition(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<DefinitionRef>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state
+        .cluster
+        .peer_store_definition(payload.vmid, &payload.xml)?;
+    Ok(Json(serde_json::json!({ "stored": true })))
+}
+
+/// POST /api/peer/definition/drop — forget one.
+pub async fn drop_definition(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<DefinitionRef>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state.cluster.peer_drop_definition(payload.vmid)?;
+    Ok(Json(serde_json::json!({ "dropped": true })))
+}

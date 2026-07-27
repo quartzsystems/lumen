@@ -7,6 +7,7 @@ import { Switch } from "@/components/ui/Switch";
 import { Tabs, type TabItem } from "@/components/ui/Tabs";
 import { ErrorText, Field, SelectInput, TextInput } from "@/components/ui/formkit";
 import { Button } from "@/components/ui/Button";
+import { fetchEnvironment } from "@/lib/clusterClient";
 import { fetchInterfaces } from "@/lib/networkClient";
 import {
   createIsoStore,
@@ -100,6 +101,13 @@ interface Draft {
   sizeGib: string;
   bus: DiskBus;
   discard: boolean;
+  /// Back the disk with a replicated volume instead of a local zvol —
+  /// offered only when this node is a cluster member.
+  replicated: boolean;
+  /// The replica seats: every member of this node's cluster, this node
+  /// always included and always on, each chosen seat naming the pool its
+  /// copy lives in.
+  replicaSeats: { node: string; local: boolean; on: boolean; pool: string }[];
   sockets: string;
   cores: string;
   cpuType: string;
@@ -136,6 +144,8 @@ const emptyDraft = (): Draft => ({
   sizeGib: "32",
   bus: "virtio-blk",
   discard: true,
+  replicated: false,
+  replicaSeats: [],
   sockets: "1",
   cores: "2",
   cpuType: HOST_MODEL,
@@ -251,6 +261,30 @@ export function CreateVmDialog({
       } catch {
         setCpus({ host_passthrough: true, models: [], reason: "unreadable" });
       }
+      try {
+        // The replica seats, when this node is in a cluster: every member,
+        // this node first — its copy is not optional, because the disk's
+        // device exists only where a replica does.
+        const environment = await fetchEnvironment();
+        const home = environment.clusters.find((cluster) =>
+          cluster.nodes.some((node) => node.local),
+        );
+        if (home) {
+          const seats = [...home.nodes]
+            .sort((a, b) => Number(b.local) - Number(a.local))
+            .map((node, index) => ({
+              node: node.node,
+              local: node.local,
+              // This node's copy is not optional; the second seat defaults
+              // to the first other member.
+              on: node.local || index === 1,
+              pool: "",
+            }));
+          setDraft((d) => ({ ...d, replicaSeats: seats }));
+        }
+      } catch {
+        /* a standalone node simply has no replicated choice */
+      }
       await loadIsos();
     })();
   }, [loadIsos]);
@@ -318,8 +352,20 @@ export function CreateVmDialog({
   }, []);
 
   // Disk validation needs the pool's free space, so it is separate from the
-  // pure-draft rules above.
+  // pure-draft rules above. A replicated disk's pools are its members' —
+  // each is validated by the node that owns it when the volume is made.
   const diskError = useMemo(() => {
+    if (draft.replicated) {
+      const size = numberOf(draft.sizeGib);
+      if (size === undefined || size < 1) return "Use a size of at least 1 GiB.";
+      const chosen = draft.replicaSeats.filter((seat) => seat.on);
+      if (chosen.length < 2) return "A replicated disk needs at least two replicas.";
+      if (chosen.length > 3) return "A replicated disk has at most three replicas.";
+      if (chosen.some((seat) => seat.pool.trim() === "")) {
+        return "Name the pool each replica lives in.";
+      }
+      return undefined;
+    }
     if (!draft.pool) return undefined;
     const size = numberOf(draft.sizeGib);
     if (size === undefined || size < 1) return "Use a size of at least 1 GiB.";
@@ -327,7 +373,7 @@ export function CreateVmDialog({
       return `"${selectedPool.name}" has ${formatBytes(selectedPool.free)} free.`;
     }
     return undefined;
-  }, [draft.pool, draft.sizeGib, selectedPool]);
+  }, [draft.replicated, draft.replicaSeats, draft.pool, draft.sizeGib, selectedPool]);
 
   const live = useMemo(() => {
     const found = validate(draft);
@@ -402,16 +448,31 @@ export function CreateVmDialog({
         guest_agent: draft.guestAgent,
         start_on_boot: draft.startOnBoot,
         cdroms,
-        disks: draft.pool
+        disks: draft.replicated
           ? [
               {
-                pool: draft.pool,
                 size_gib: numberOf(draft.sizeGib) ?? 0,
                 bus: draft.bus,
                 discard: draft.discard,
+                replicated: true,
+                members: draft.replicaSeats
+                  .filter((seat) => seat.on)
+                  .map((seat) => ({
+                    node: seat.node,
+                    pool: seat.pool.trim(),
+                  })),
               },
             ]
-          : [],
+          : draft.pool
+            ? [
+                {
+                  pool: draft.pool,
+                  size_gib: numberOf(draft.sizeGib) ?? 0,
+                  bus: draft.bus,
+                  discard: draft.discard,
+                },
+              ]
+            : [],
         nics: draft.bridge
           ? [
               {
@@ -604,6 +665,71 @@ export function CreateVmDialog({
                 </Callout>
               ) : (
                 <>
+                  {draft.replicaSeats.length > 0 && (
+                    <label className="flex items-center gap-[10px] cursor-pointer select-none">
+                      <Switch
+                        on={draft.replicated}
+                        onChange={(v) => set("replicated", v)}
+                      />
+                      <span className="text-[13px] text-[var(--qz-fg-2)]">
+                        Replicated across the cluster — every write lands on every replica
+                        before it is acknowledged, and the machine can run on any of them
+                      </span>
+                    </label>
+                  )}
+                  {draft.replicated ? (
+                    <Field label="Replicas">
+                      <div className="flex flex-col gap-2">
+                        {draft.replicaSeats.map((seat, index) => (
+                          <div key={seat.node} className="flex items-center gap-3">
+                            <label className="flex items-center gap-2 w-[180px] cursor-pointer select-none">
+                              <input
+                                type="checkbox"
+                                checked={seat.on}
+                                disabled={seat.local}
+                                onChange={() =>
+                                  set(
+                                    "replicaSeats",
+                                    draft.replicaSeats.map((s, i) =>
+                                      i === index ? { ...s, on: !s.on } : s,
+                                    ),
+                                  )
+                                }
+                              />
+                              <span className="qz-mono text-[13px] text-[var(--qz-fg-1)]">
+                                {seat.node}
+                              </span>
+                              {seat.local && (
+                                <span className="badge badge-muted">this node</span>
+                              )}
+                            </label>
+                            {seat.on && (
+                              <span className="w-[180px]">
+                                <TextInput
+                                  mono
+                                  value={seat.pool}
+                                  placeholder="pool"
+                                  onChange={(v) =>
+                                    set(
+                                      "replicaSeats",
+                                      draft.replicaSeats.map((s, i) =>
+                                        i === index ? { ...s, pool: v } : s,
+                                      ),
+                                    )
+                                  }
+                                />
+                              </span>
+                            )}
+                          </div>
+                        ))}
+                        <p className="text-[12px] text-[var(--qz-fg-4)] m-0">
+                          This node&apos;s copy is not optional — the disk&apos;s device
+                          exists only where a replica does. Each seat names the pool its
+                          copy lives in on that node.
+                        </p>
+                      </div>
+                    </Field>
+                  ) : (
                   <Field label="Storage" htmlFor="vm-pool" error={errorOf("pool")}>
                     <SelectInput
                       id="vm-pool"
@@ -619,6 +745,7 @@ export function CreateVmDialog({
                       ))}
                     </SelectInput>
                   </Field>
+                  )}
                   <div className="grid gap-4" style={{ gridTemplateColumns: "1fr 1fr" }}>
                     <Field label="Disk size (GiB)" htmlFor="vm-size" required error={errorOf("size_gib")}>
                       <TextInput

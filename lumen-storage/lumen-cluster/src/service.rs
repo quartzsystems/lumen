@@ -1018,6 +1018,78 @@ impl ClusterService {
         Ok(())
     }
 
+    // --- replicated machine definitions -------------------------------------
+
+    /// Keep a machine's domain document on every member of this node's
+    /// cluster — the HA manager's restart inventory, filled at define time
+    /// because libvirt on a dead node cannot be asked for it. Best-effort
+    /// beyond the local copy: a peer that is down misses this push and is
+    /// caught up by the next define, and failing the operator's action over
+    /// it would make HA prep more important than the machine.
+    pub async fn replicate_definition(&self, vmid: u32, xml: &str) -> Result<()> {
+        self.store.save_definition(vmid, xml)?;
+        for member in self.co_members()? {
+            if let Err(err) = self.peers.store_definition(&member, vmid, xml).await {
+                tracing::warn!(
+                    vmid,
+                    peer = %member.name,
+                    "the definition did not replicate: {err}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Forget a machine's definition everywhere — it was deleted, and a
+    /// stored definition for a machine that no longer exists is a machine
+    /// waiting to be wrongly resurrected.
+    pub async fn withdraw_definition(&self, vmid: u32) -> Result<()> {
+        self.store.remove_definition(vmid)?;
+        for member in self.co_members()? {
+            if let Err(err) = self.peers.drop_definition(&member, vmid).await {
+                tracing::warn!(
+                    vmid,
+                    peer = %member.name,
+                    "the definition was not withdrawn: {err}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The other members of this node's cluster — empty for a standalone or
+    /// unassigned node, which makes definition replication a quiet local
+    /// copy there.
+    fn co_members(&self) -> Result<Vec<EnvironmentNode>> {
+        let Some(membership) = self.membership()? else {
+            return Ok(Vec::new());
+        };
+        let Some(cluster) = membership.node(&self.node).and_then(|n| n.cluster.clone()) else {
+            return Ok(Vec::new());
+        };
+        Ok(membership
+            .members_of(&cluster)
+            .into_iter()
+            .filter(|n| n.name != self.node)
+            .cloned()
+            .collect())
+    }
+
+    /// A peer handed this node a definition to keep.
+    pub fn peer_store_definition(&self, vmid: u32, xml: &str) -> Result<()> {
+        self.store.save_definition(vmid, xml)
+    }
+
+    /// A peer told this node to forget one.
+    pub fn peer_drop_definition(&self, vmid: u32) -> Result<()> {
+        self.store.remove_definition(vmid)
+    }
+
+    /// The stored definitions — the HA manager reads these when a node dies.
+    pub fn stored_definitions(&self) -> Result<Vec<(u32, String)>> {
+        self.store.definitions()
+    }
+
     // --- the storage domain's door ------------------------------------------
 
     /// The whole membership record, read-only, for the replicated-storage
@@ -1909,6 +1981,62 @@ mod tests {
             service.cluster("alpha").await.unwrap().health,
             ClusterHealth::Degraded
         );
+    }
+
+    #[tokio::test]
+    async fn definitions_replicate_to_co_members_and_withdraw_everywhere() {
+        let peers = Arc::new(MockPeers::new());
+        let membership = membership_of(&[
+            ("alpha-1", Some("alpha")),
+            ("alpha-2", Some("alpha")),
+            ("beta-1", Some("beta")),
+            ("spare-1", None),
+        ]);
+        let network = network();
+        let service = Arc::new(
+            ClusterService::new(
+                Arc::new(MockBackend::environment()) as Arc<dyn ClusterBackend>,
+                peers.clone(),
+                network,
+                &test_dir("definitions"),
+                "0.3.0",
+            )
+            .with_node("alpha-1")
+            .with_environment(&membership),
+        );
+
+        service
+            .replicate_definition(101, "<domain>web01</domain>")
+            .await
+            .unwrap();
+        // The local copy exists, and exactly the cluster's other members —
+        // not beta-1, not the spare — were pushed to.
+        assert_eq!(
+            service.stored_definitions().unwrap(),
+            vec![(101, "<domain>web01</domain>".to_string())]
+        );
+        let pushed = peers.definitions();
+        assert_eq!(pushed.len(), 1, "{pushed:?}");
+        assert_eq!(pushed[0].0, "alpha-2");
+        assert_eq!(pushed[0].1, 101);
+
+        // The peer side stores what it is handed.
+        service
+            .peer_store_definition(102, "<domain>db01</domain>")
+            .unwrap();
+        assert_eq!(service.stored_definitions().unwrap().len(), 2);
+
+        service.withdraw_definition(101).await.unwrap();
+        assert_eq!(
+            service.stored_definitions().unwrap(),
+            vec![(102, "<domain>db01</domain>".to_string())]
+        );
+        assert_eq!(
+            peers.dropped_definitions(),
+            vec![("alpha-2".to_string(), 101)]
+        );
+        // Withdrawing what is already gone is the goal state, not an error.
+        service.withdraw_definition(101).await.unwrap();
     }
 
     #[tokio::test]

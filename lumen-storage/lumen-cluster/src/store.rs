@@ -125,6 +125,80 @@ impl EnvironmentStore {
         self.write_json("tokens.json", &tokens.to_vec(), false)
     }
 
+    // --- replicated machine definitions -------------------------------------
+
+    fn definitions_dir(&self) -> PathBuf {
+        self.root.join("definitions")
+    }
+
+    /// Keep one machine's domain document, so an HA restart can define the
+    /// machine on a survivor — libvirt on a dead node cannot be asked for
+    /// it. Overwrites: the newest definition is the only one worth having.
+    pub fn save_definition(&self, vmid: u32, xml: &str) -> Result<()> {
+        let dir = self.definitions_dir();
+        std::fs::create_dir_all(&dir).map_err(|err| {
+            ClusterError::Backend(anyhow::anyhow!("could not create {}: {err}", dir.display()))
+        })?;
+        let path = dir.join(format!("{vmid}.xml"));
+        let tmp = dir.join(format!("{vmid}.xml.tmp"));
+        std::fs::write(&tmp, xml).map_err(|err| {
+            ClusterError::Backend(anyhow::anyhow!("could not write {}: {err}", tmp.display()))
+        })?;
+        std::fs::rename(&tmp, &path).map_err(|err| {
+            ClusterError::Backend(anyhow::anyhow!(
+                "could not move {} into place: {err}",
+                path.display()
+            ))
+        })
+    }
+
+    /// Forget one. A definition that is already gone is the goal state, not
+    /// an error.
+    pub fn remove_definition(&self, vmid: u32) -> Result<()> {
+        match std::fs::remove_file(self.definitions_dir().join(format!("{vmid}.xml"))) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(ClusterError::Backend(anyhow::anyhow!(
+                "could not remove the stored definition of {vmid}: {err}"
+            ))),
+        }
+    }
+
+    /// Every stored definition — the HA manager's restart inventory.
+    pub fn definitions(&self) -> Result<Vec<(u32, String)>> {
+        let dir = self.definitions_dir();
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => {
+                return Err(ClusterError::Backend(anyhow::anyhow!(
+                    "could not read {}: {err}",
+                    dir.display()
+                )))
+            }
+        };
+        let mut definitions = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(vmid) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if path.extension().and_then(|e| e.to_str()) != Some("xml") {
+                continue;
+            }
+            let xml = std::fs::read_to_string(&path).map_err(|err| {
+                ClusterError::Backend(anyhow::anyhow!("could not read {}: {err}", path.display()))
+            })?;
+            definitions.push((vmid, xml));
+        }
+        definitions.sort_by_key(|(vmid, _)| *vmid);
+        Ok(definitions)
+    }
+
     // --- plumbing ---------------------------------------------------------
 
     fn read_text(&self, name: &str) -> Result<Option<String>> {

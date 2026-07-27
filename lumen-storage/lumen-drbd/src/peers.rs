@@ -76,6 +76,15 @@ pub trait VolumePeers: Send + Sync {
     /// Let the resource take its grown backing — run once, after every
     /// member's backing has grown.
     async fn grow(&self, node: &EnvironmentNode, resource: &str) -> Result<()>;
+
+    /// Open or close the two-primaries window on one member — the
+    /// live-migration guard's reach into each replica.
+    async fn two_primaries(
+        &self,
+        node: &EnvironmentNode,
+        resource: &str,
+        allow: bool,
+    ) -> Result<()>;
 }
 
 // --- in-memory peers --------------------------------------------------------
@@ -99,6 +108,7 @@ struct MockInner {
     torn_down: Vec<(String, VolumeTeardown)>,
     resized: Vec<(String, VolumeResizeBacking)>,
     grown: Vec<(String, String)>,
+    two_primaries: Vec<(String, String, bool)>,
     fail_prepare: Option<String>,
     fail_teardown: Option<String>,
     fail_resize: Option<String>,
@@ -152,6 +162,11 @@ impl MockVolumePeers {
 
     pub fn grown(&self) -> Vec<(String, String)> {
         self.inner.lock().unwrap().grown.clone()
+    }
+
+    /// Every two-primaries adjustment, in order: (node, resource, allow).
+    pub fn two_primaries(&self) -> Vec<(String, String, bool)> {
+        self.inner.lock().unwrap().two_primaries.clone()
     }
 }
 
@@ -228,6 +243,20 @@ impl VolumePeers for MockVolumePeers {
             .unwrap()
             .grown
             .push((node.name.clone(), resource.to_string()));
+        Ok(())
+    }
+
+    async fn two_primaries(
+        &self,
+        node: &EnvironmentNode,
+        resource: &str,
+        allow: bool,
+    ) -> Result<()> {
+        self.inner.lock().unwrap().two_primaries.push((
+            node.name.clone(),
+            resource.to_string(),
+            allow,
+        ));
         Ok(())
     }
 }

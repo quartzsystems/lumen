@@ -112,8 +112,13 @@ async fn harness(tag: &str) -> Harness {
             .with_root_pool(Some("boot".into())),
     );
     let virt = Arc::new(
-        VirtService::new(virt_backend.clone(), storage.clone(), network.clone())
-            .with_osinfo_root(state_dir.0.join("osinfo")),
+        VirtService::new(
+            virt_backend.clone(),
+            storage.clone(),
+            network.clone(),
+            Arc::new(lumen_drbd::MockVmVolumes::standalone()),
+        )
+        .with_osinfo_root(state_dir.0.join("osinfo")),
     );
 
     let sys = Arc::new(lumen_sys::SysService::new(
@@ -844,6 +849,7 @@ async fn every_machine_and_storage_route_requires_a_session() {
         ("POST", "/api/vms/100/stop"),
         ("POST", "/api/vms/100/reboot"),
         ("POST", "/api/vms/100/reset"),
+        ("POST", "/api/vms/100/migrate"),
         ("GET", "/api/vms/100/tasks"),
         ("GET", "/api/vms/100/console"),
         ("GET", "/api/vms/100/console/ws"),

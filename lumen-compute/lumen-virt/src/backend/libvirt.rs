@@ -397,6 +397,23 @@ impl VirtBackend for LibvirtBackend {
         .await
     }
 
+    async fn migrate(&self, name: &str, destination: &str) -> Result<()> {
+        let destination = destination.to_string();
+        self.with_domain(name, move |domain| {
+            // Peer-to-peer: this hypervisor drives the whole transfer over
+            // its own connection to the destination, so the control plane
+            // holds no third socket open for the minutes this takes.
+            // Persistent there, undefined here: when this returns, the
+            // machine has exactly one home.
+            let flags = virt_sys::VIR_MIGRATE_LIVE
+                | virt_sys::VIR_MIGRATE_PEER2PEER
+                | virt_sys::VIR_MIGRATE_PERSIST_DEST
+                | virt_sys::VIR_MIGRATE_UNDEFINE_SOURCE;
+            domain.migrate_to_uri(&destination, flags, None, 0)
+        })
+        .await
+    }
+
     async fn live_xml(&self, name: &str) -> Result<String> {
         // No flags: for a running machine that is the live document, which is
         // the whole point of asking here rather than reading `observed.xml`.
