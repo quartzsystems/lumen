@@ -20,8 +20,8 @@ use crate::error::ApiError;
 use crate::security::Session;
 use crate::AppState;
 use lumen_cluster::{
-    Acknowledgements, ClusterCreate, ClusterView, CreateProgress, EnvironmentResponse, MintedToken,
-    PreflightView,
+    Acknowledgements, ClusterCreate, ClusterView, CreateProgress, EnvironmentResponse,
+    FenceTestView, MintedToken, PreflightView,
 };
 
 /// GET /api/environment — the whole environment: every cluster, every node,
@@ -197,6 +197,66 @@ pub async fn destroy_cluster(
     let request: DestroyRequest = body(raw)?;
     state.cluster.destroy_cluster(&name, request.ack()).await?;
     Ok(Json(serde_json::json!({ "destroyed": true })))
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FenceTestRequest {
+    #[serde(default)]
+    pub i_understand_this_power_cycles_the_node: bool,
+}
+
+/// POST /api/environment/clusters/{name}/fence/{node}/test — a guarded live
+/// fence test: the target really power-cycles through its BMC. The service
+/// refuses it without the acknowledgement, on an unhealthy cluster, and from
+/// the target's own console; the outcome is recorded on the membership
+/// record either way, because a failed test is an answer, not an error.
+pub async fn test_fence(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    Path((name, node)): Path<(String, String)>,
+    raw: Body,
+) -> Result<Json<FenceTestView>, ApiError> {
+    let request: FenceTestRequest = body(raw)?;
+    Ok(Json(
+        state
+            .cluster
+            .test_fence(
+                &name,
+                &node,
+                request.i_understand_this_power_cycles_the_node,
+            )
+            .await?,
+    ))
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmDeadRequest {
+    #[serde(default)]
+    pub i_have_verified_the_node_is_powered_off: bool,
+}
+
+/// POST /api/environment/clusters/{name}/nodes/{node}/confirm-dead — the
+/// break-glass: the operator vouches that an unfenced-unreachable node is
+/// powered off, and the cluster recovers as if fencing succeeded. Offered in
+/// exactly that one state and no other.
+pub async fn confirm_node_dead(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    Path((name, node)): Path<(String, String)>,
+    raw: Body,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let request: ConfirmDeadRequest = body(raw)?;
+    state
+        .cluster
+        .confirm_node_dead(
+            &name,
+            &node,
+            request.i_have_verified_the_node_is_powered_off,
+        )
+        .await?;
+    Ok(Json(serde_json::json!({ "confirmed": true })))
 }
 
 /// DELETE /api/environment/nodes/{name} — remove an unassigned node from

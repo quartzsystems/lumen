@@ -61,6 +61,7 @@ export function TextInput({
   disabled,
   autoFocus,
   inputMode,
+  type,
 }: {
   id?: string;
   value: string;
@@ -72,6 +73,8 @@ export function TextInput({
   disabled?: boolean;
   autoFocus?: boolean;
   inputMode?: "numeric" | "text";
+  /// "password" masks the value — for secrets that are typed, not read.
+  type?: "text" | "password";
 }) {
   const base = mono ? monoSt : inputSt;
   // A value that is shown but cannot be changed should not behave like
@@ -82,6 +85,7 @@ export function TextInput({
   return (
     <input
       id={id}
+      type={type}
       value={value}
       readOnly={readOnly}
       disabled={disabled}

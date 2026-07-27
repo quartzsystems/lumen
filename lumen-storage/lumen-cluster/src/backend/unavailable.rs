@@ -68,6 +68,22 @@ impl ClusterBackend for UnavailableBackend {
     ) -> Result<()> {
         self.error()
     }
+
+    async fn create_fence_device(
+        &self,
+        _device: &crate::topology::FenceDevice,
+        _password: &str,
+    ) -> Result<()> {
+        self.error()
+    }
+
+    async fn fence_node(&self, _target: &str) -> Result<()> {
+        self.error()
+    }
+
+    async fn confirm_node_dead(&self, _target: &str) -> Result<()> {
+        self.error()
+    }
 }
 
 #[cfg(test)]

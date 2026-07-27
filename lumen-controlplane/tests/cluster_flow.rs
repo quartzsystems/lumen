@@ -210,6 +210,14 @@ async fn every_environment_route_requires_a_session() {
         (Method::GET, "/api/environment/clusters/pending"),
         (Method::DELETE, "/api/environment/clusters/alpha"),
         (Method::DELETE, "/api/environment/nodes/spare-1"),
+        (
+            Method::POST,
+            "/api/environment/clusters/alpha/fence/alpha-2/test",
+        ),
+        (
+            Method::POST,
+            "/api/environment/clusters/alpha/nodes/alpha-2/confirm-dead",
+        ),
     ] {
         let (status, _) = request(&harness.router, method.clone(), path, None, None, None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {path}");
@@ -465,6 +473,7 @@ fn create_body(nodes: &[&str]) -> serde_json::Value {
             "management_address": format!("192.168.10.{}", i + 1),
             "bmc_address": format!("10.20.0.{}", i + 1),
             "bmc_username": "ADMIN",
+            "bmc_password": "fence-pw",
         })).collect::<Vec<_>>(),
     })
 }
@@ -619,10 +628,11 @@ async fn destroy_needs_the_acknowledgement_and_tears_every_member_down() {
     // Store the definition the way a create would have.
     let request_body: lumen_cluster::ClusterCreate =
         serde_json::from_value(create_body(&["alpha-1", "alpha-2"])).unwrap();
-    let (definition, networks) = request_body.build().unwrap();
+    let (definition, networks, _) = request_body.build().unwrap();
     membership.clusters.push(lumen_cluster::ClusterRecord {
         definition,
         networks,
+        fence_tests: Default::default(),
     });
 
     let harness = harness(
@@ -672,6 +682,158 @@ async fn destroy_needs_the_acknowledgement_and_tears_every_member_down() {
     .await;
     assert!(body["clusters"].as_array().unwrap().is_empty());
     assert_eq!(body["unassigned"].as_array().unwrap().len(), 2);
+}
+
+// --- fencing ----------------------------------------------------------------
+
+/// A membership record that knows cluster "alpha" whole — assignments and
+/// the stored definition, as a completed create leaves them.
+fn alpha_membership() -> EnvironmentMembership {
+    let mut membership = membership_of(&[("alpha-1", Some("alpha")), ("alpha-2", Some("alpha"))]);
+    let request_body: lumen_cluster::ClusterCreate =
+        serde_json::from_value(create_body(&["alpha-1", "alpha-2"])).unwrap();
+    let (definition, networks, _) = request_body.build().unwrap();
+    membership.clusters.push(lumen_cluster::ClusterRecord {
+        definition,
+        networks,
+        fence_tests: Default::default(),
+    });
+    membership
+}
+
+#[tokio::test]
+async fn a_fence_test_needs_the_acknowledgement_and_its_answer_reaches_the_view() {
+    let harness = harness(
+        "fence-test",
+        MockBackend::environment().with_untested_fencing("alpha"),
+        MockPeers::new(),
+        Some(&alpha_membership()),
+    );
+    let cookie = sign_in(&harness.router).await;
+
+    // Without the acknowledgement: a validation answer naming the field.
+    let (status, answer) = request(
+        &harness.router,
+        Method::POST,
+        "/api/environment/clusters/alpha/fence/alpha-2/test",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    assert!(answer["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["field"] == "i_understand_this_power_cycles_the_node"));
+
+    // Acknowledged: the node is fenced for real and the answer says so.
+    let (status, outcome) = request(
+        &harness.router,
+        Method::POST,
+        "/api/environment/clusters/alpha/fence/alpha-2/test",
+        Some(&cookie),
+        None,
+        Some(serde_json::json!({ "i_understand_this_power_cycles_the_node": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{outcome}");
+    assert_eq!(outcome["passed"], true);
+    assert_eq!(outcome["node"], "alpha-2");
+
+    // The environment view now shows this direction proven and the other
+    // still pinned by the untested warning.
+    let (_, body) = request(
+        &harness.router,
+        Method::GET,
+        "/api/environment",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    let alpha = &body["clusters"][0];
+    assert_eq!(alpha["fence"]["untested"], 1, "{alpha}");
+    let tested = alpha["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["node"] == "alpha-2")
+        .unwrap();
+    assert_eq!(tested["fence"]["last_test"]["passed"], true);
+
+    // A node's own direction is refused with the sentence that says where
+    // to run it instead.
+    let (status, refused) = request(
+        &harness.router,
+        Method::POST,
+        "/api/environment/clusters/alpha/fence/alpha-1/test",
+        Some(&cookie),
+        None,
+        Some(serde_json::json!({ "i_understand_this_power_cycles_the_node": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(refused["error"]
+        .as_str()
+        .unwrap()
+        .contains("another member"));
+}
+
+#[tokio::test]
+async fn break_glass_confirms_only_an_unfenced_unreachable_peer() {
+    let harness = harness(
+        "break-glass",
+        MockBackend::environment()
+            .with_partition("alpha", "alpha-2")
+            .with_fence_failure("alpha", "alpha-2"),
+        MockPeers::new(),
+        Some(&alpha_membership()),
+    );
+    let cookie = sign_in(&harness.router).await;
+
+    let (status, answer) = request(
+        &harness.router,
+        Method::POST,
+        "/api/environment/clusters/alpha/nodes/alpha-2/confirm-dead",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    assert!(answer["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["field"] == "i_have_verified_the_node_is_powered_off"));
+
+    let (status, confirmed) = request(
+        &harness.router,
+        Method::POST,
+        "/api/environment/clusters/alpha/nodes/alpha-2/confirm-dead",
+        Some(&cookie),
+        None,
+        Some(serde_json::json!({ "i_have_verified_the_node_is_powered_off": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{confirmed}");
+    assert_eq!(confirmed["confirmed"], true);
+
+    // Confirmed once, the node is no longer unclean — a second confirmation
+    // has nothing to vouch for and is refused.
+    let (status, refused) = request(
+        &harness.router,
+        Method::POST,
+        "/api/environment/clusters/alpha/nodes/alpha-2/confirm-dead",
+        Some(&cookie),
+        None,
+        Some(serde_json::json!({ "i_have_verified_the_node_is_powered_off": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(refused["error"].as_str().unwrap().contains("not waiting"));
 }
 
 #[tokio::test]

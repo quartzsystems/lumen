@@ -1,11 +1,15 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { AlertTriangle, Plus, Trash2 } from "lucide-react";
+import { AlertTriangle, Plus, Trash2, Zap } from "lucide-react";
 import { Page, PageBody, PageHeader } from "@/components/PageHeader";
 import { DataTable, Dash, type Column } from "@/components/console/DataTable";
 import { Button } from "@/components/ui/Button";
-import { AddNodeDialog } from "@/components/cluster/ClusterDialogs";
+import {
+  AddNodeDialog,
+  ConfirmDeadDialog,
+  FenceTestDialog,
+} from "@/components/cluster/ClusterDialogs";
 import { ApiError } from "@/lib/authClient";
 import { useConsole } from "@/lib/ConsoleContext";
 import {
@@ -27,6 +31,9 @@ export default function NodesPage() {
   const [environment, setEnvironment] = useState<EnvironmentResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
+  // The fencing dialogs: a guarded live test, and the break-glass confirm.
+  const [fencing, setFencing] = useState<{ cluster: string; node: ClusterNodeView } | null>(null);
+  const [confirming, setConfirming] = useState<{ cluster: string; node: string } | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -44,12 +51,12 @@ export default function NodesPage() {
   }, [load]);
 
   useEffect(() => {
-    // Paused while the Add Node dialog is open: a poll must not redraw the
-    // token out from under the operator copying it.
-    if (adding) return;
+    // Paused while a dialog is open: a poll must not redraw the token out
+    // from under the operator copying it, or the fencing dialogs mid-act.
+    if (adding || fencing || confirming) return;
     const timer = setInterval(() => void load(), POLL_MS);
     return () => clearInterval(timer);
-  }, [load, adding]);
+  }, [load, adding, fencing, confirming]);
 
   const remove = async (node: UnassignedNodeView) => {
     try {
@@ -107,7 +114,13 @@ export default function NodesPage() {
               >
                 {cluster.name}
               </h2>
-              <MemberTable rows={cluster.nodes} unreachable={Boolean(cluster.error)} onRefresh={load} />
+              <MemberTable
+                rows={cluster.nodes}
+                unreachable={Boolean(cluster.error)}
+                onRefresh={load}
+                onTestFence={(node) => setFencing({ cluster: cluster.name, node })}
+                onConfirmDead={(node) => setConfirming({ cluster: cluster.name, node: node.node })}
+              />
             </section>
           ))}
 
@@ -127,6 +140,34 @@ export default function NodesPage() {
           hasEnvironment={Boolean(environment?.environment)}
           onClose={() => {
             setAdding(false);
+            void load();
+          }}
+        />
+      )}
+
+      {fencing && (
+        <FenceTestDialog
+          cluster={fencing.cluster}
+          node={fencing.node.node}
+          isLocal={fencing.node.local}
+          onClose={() => {
+            setFencing(null);
+            void load();
+          }}
+          onTested={() => void load()}
+        />
+      )}
+
+      {confirming && (
+        <ConfirmDeadDialog
+          cluster={confirming.cluster}
+          node={confirming.node}
+          onClose={() => setConfirming(null)}
+          onConfirmed={() => {
+            setToast(
+              `${confirming.node} confirmed dead — the cluster recovers as if fencing succeeded.`,
+            );
+            setConfirming(null);
             void load();
           }}
         />
@@ -283,10 +324,14 @@ function MemberTable({
   rows,
   unreachable,
   onRefresh,
+  onTestFence,
+  onConfirmDead,
 }: {
   rows: ClusterNodeView[];
   unreachable: boolean;
   onRefresh: () => Promise<void>;
+  onTestFence: (node: ClusterNodeView) => void;
+  onConfirmDead: (node: ClusterNodeView) => void;
 }) {
   const columns = useMemo(() => memberColumns(unreachable), [unreachable]);
   return (
@@ -298,6 +343,27 @@ function MemberTable({
       searchPlaceholder="Search nodes…"
       emptyMessage="No members."
       onRefresh={onRefresh}
+      actionsWidth={130}
+      actions={(node) => (
+        <span className="inline-flex items-center gap-1">
+          {/* The break-glass, offered in exactly the one state it exists
+              for: lost and not successfully fenced. */}
+          {!unreachable && node.unclean && (
+            <button
+              type="button"
+              className="btn btn-danger btn-sm"
+              onClick={() => onConfirmDead(node)}
+            >
+              Confirm dead
+            </button>
+          )}
+          {!unreachable && !node.unclean && node.fence && (
+            <span title={`Live-test the fencing of ${node.node}`}>
+              <Button kind="ghost" size="sm" icon={Zap} onClick={() => onTestFence(node)} />
+            </span>
+          )}
+        </span>
+      )}
     />
   );
 }

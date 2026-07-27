@@ -143,6 +143,9 @@ export interface MemberCreate {
   management_address: string;
   bmc_address: string;
   bmc_username: string;
+  /// Written into the CIB by the fencing stage; never stored anywhere else,
+  /// which is why editing a cluster later never shows it back.
+  bmc_password: string;
 }
 
 export interface ClusterCreateRequest {
@@ -201,6 +204,29 @@ export const destroyCluster = (name: string, acknowledge: boolean): Promise<void
 
 export const removeNode = (name: string): Promise<void> =>
   apiFetch<void>(`/environment/nodes/${encodeURIComponent(name)}`, { method: "DELETE" });
+
+/// What a guarded live fence test answered. `passed: false` is a successful
+/// request that learned something bad about the fence path.
+export interface FenceTestView {
+  cluster: string;
+  node: string;
+  passed: boolean;
+  /// Unix seconds.
+  at: number;
+  error?: string;
+}
+
+export const testFence = (cluster: string, node: string): Promise<FenceTestView> =>
+  post(
+    `/environment/clusters/${encodeURIComponent(cluster)}/fence/${encodeURIComponent(node)}/test`,
+    { i_understand_this_power_cycles_the_node: true },
+  );
+
+export const confirmNodeDead = (cluster: string, node: string): Promise<{ confirmed: boolean }> =>
+  post(
+    `/environment/clusters/${encodeURIComponent(cluster)}/nodes/${encodeURIComponent(node)}/confirm-dead`,
+    { i_have_verified_the_node_is_powered_off: true },
+  );
 
 // --- display helpers ---------------------------------------------------------
 

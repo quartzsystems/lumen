@@ -33,10 +33,16 @@ const DEADLINE: Duration = Duration::from_secs(30);
 
 const COROSYNC_CONF: &str = "/etc/corosync/corosync.conf";
 const COROSYNC_AUTHKEY: &str = "/etc/corosync/authkey";
+/// Pacemaker's CIB store. Removed with the corosync configuration: a stale
+/// CIB would resurrect the old cluster's resources — fence devices with old
+/// BMC passwords among them — into the next cluster built on this node.
+/// Pacemaker recreates the directory on start.
+const PACEMAKER_CIB: &str = "/var/lib/pacemaker/cib";
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
 const INSTALL: &str = "/usr/bin/install";
 const RM: &str = "/usr/bin/rm";
 const PCS: &str = "/usr/sbin/pcs";
+const CIBADMIN: &str = "/usr/sbin/cibadmin";
 
 pub struct CliBackend {
     crm_mon: String,
@@ -231,9 +237,10 @@ impl ClusterBackend for CliBackend {
         self.run_privileged(
             "removing the cluster configuration failed".into(),
             ExecRequest::new("remove the cluster configuration", RM).args([
-                "-f",
+                "-rf",
                 COROSYNC_CONF,
                 COROSYNC_AUTHKEY,
+                PACEMAKER_CIB,
             ]),
         )
         .await
@@ -274,6 +281,116 @@ impl ClusterBackend for CliBackend {
         )
         .await
     }
+
+    async fn create_fence_device(
+        &self,
+        device: &crate::topology::FenceDevice,
+        password: &str,
+    ) -> Result<()> {
+        // `pcs stonith create` would put the password in an argument vector,
+        // which lands in the journal and /proc. cibadmin reads the resource
+        // as XML from the unit's standard input instead — the same
+        // content-over-the-pipe rule as the corosync key, and the password
+        // then exists only where Pacemaker keeps its CIB.
+        self.run_privileged(
+            format!("creating the fence device for {} failed", device.target),
+            ExecRequest::new("create a fence device", CIBADMIN)
+                .args(["--create", "--scope", "resources", "--xml-pipe"])
+                .stdin(fence_primitive_xml(device, password)),
+        )
+        .await?;
+        // A fence device must not run on the node it powers off: fencing a
+        // node that hosts its own executioner is a race the cluster loses.
+        self.run_privileged(
+            format!("placing the fence device for {} failed", device.target),
+            ExecRequest::new("keep a fence device off its target", CIBADMIN)
+                .args(["--create", "--scope", "constraints", "--xml-pipe"])
+                .stdin(fence_location_xml(device)),
+        )
+        .await
+    }
+
+    async fn fence_node(&self, target: &str) -> Result<()> {
+        self.run_privileged(
+            format!("fencing {target} failed"),
+            ExecRequest::new("fence a node", PCS).args(["stonith", "fence", target]),
+        )
+        .await
+    }
+
+    async fn confirm_node_dead(&self, target: &str) -> Result<()> {
+        // --force answers pcs's own are-you-sure prompt; the human
+        // confirmation this operation actually rests on happened in the
+        // console, against the typed name of the node.
+        self.run_privileged(
+            format!("confirming {target} dead failed"),
+            ExecRequest::new("confirm a node is dead", PCS)
+                .args(["stonith", "confirm", target, "--force"]),
+        )
+        .await
+    }
+}
+
+/// The CIB XML for one `fence_ipmilan` primitive. Rendered here, next to the
+/// parsers, as a free function over the device — the password is a parameter
+/// precisely so nothing above this line ever holds it together with anything
+/// that logs. The 60-second monitor is the continuous BMC connectivity check:
+/// its failure is what flips `FenceDeviceState::failed` in `crm_mon`.
+fn fence_primitive_xml(device: &crate::topology::FenceDevice, password: &str) -> String {
+    use quick_xml::escape::escape;
+    let id = &device.id;
+    let mut xml = format!(
+        r#"<primitive id="{}" class="stonith" type="fence_ipmilan">
+  <instance_attributes id="{}-attrs">
+    <nvpair id="{}-ip" name="ip" value="{}"/>
+    <nvpair id="{}-username" name="username" value="{}"/>
+    <nvpair id="{}-password" name="password" value="{}"/>
+    <nvpair id="{}-lanplus" name="lanplus" value="1"/>
+    <nvpair id="{}-host" name="pcmk_host_list" value="{}"/>
+"#,
+        escape(id.as_str()),
+        escape(id.as_str()),
+        escape(id.as_str()),
+        escape(device.bmc_address.as_str()),
+        escape(id.as_str()),
+        escape(device.bmc_username.as_str()),
+        escape(id.as_str()),
+        escape(password),
+        escape(id.as_str()),
+        escape(id.as_str()),
+        escape(device.target.as_str()),
+    );
+    if device.delay_base_secs > 0 {
+        // The fence-race bias: the peer waits this long before killing this
+        // device's target. Emitted only when the topology engine set it —
+        // a zero here would still be an attribute an operator has to read.
+        xml.push_str(&format!(
+            "    <nvpair id=\"{}-delay\" name=\"pcmk_delay_base\" value=\"{}s\"/>\n",
+            escape(id.as_str()),
+            device.delay_base_secs
+        ));
+    }
+    xml.push_str(&format!(
+        r#"  </instance_attributes>
+  <operations>
+    <op id="{}-monitor" name="monitor" interval="60s"/>
+  </operations>
+</primitive>
+"#,
+        escape(id.as_str()),
+    ));
+    xml
+}
+
+/// The location constraint keeping a fence device off its own target.
+fn fence_location_xml(device: &crate::topology::FenceDevice) -> String {
+    use quick_xml::escape::escape;
+    format!(
+        "<rsc_location id=\"{}-placement\" rsc=\"{}\" node=\"{}\" score=\"-INFINITY\"/>\n",
+        escape(device.id.as_str()),
+        escape(device.id.as_str()),
+        escape(device.target.as_str()),
+    )
 }
 
 /// The `cluster_name` out of a corosync.conf.
@@ -683,6 +800,92 @@ Not synchronised\n";
         assert!(ran[0].args.contains(&"stonith-enabled=true".to_string()));
         assert!(ran[1].args.contains(&"ip=192.168.10.100".to_string()));
         assert!(ran[1].args.contains(&"cidr_netmask=24".to_string()));
+    }
+
+    /// The other place a secret could leak into an argument vector: the BMC
+    /// password rides inside CIB XML over the unit's standard input, and the
+    /// argv both cibadmin calls get is fixed text.
+    #[tokio::test]
+    async fn the_bmc_password_rides_the_cib_xml_over_stdin_never_as_an_argument() {
+        let exec = lumen_sys::exec::MockExec::working();
+        let backend = CliBackend::new(exec.clone());
+        let device = crate::topology::FenceDevice {
+            id: "fence-alpha-1".into(),
+            target: "alpha-1".into(),
+            bmc_address: "10.20.0.1".into(),
+            bmc_username: "ADMIN".into(),
+            delay_base_secs: 10,
+        };
+        backend
+            .create_fence_device(&device, "s3cret&<pass>")
+            .await
+            .unwrap();
+
+        let ran = exec.ran().await;
+        assert_eq!(ran.len(), 2);
+        assert_eq!(ran[0].program, CIBADMIN);
+        assert_eq!(
+            ran[0].args,
+            vec!["--create", "--scope", "resources", "--xml-pipe"]
+        );
+        let xml = ran[0].stdin.as_deref().unwrap();
+        // The password is in the piped XML — escaped, so the CIB parses it
+        // back to exactly what the operator typed — and in no argument.
+        assert!(xml.contains("s3cret&amp;&lt;pass&gt;"), "{xml}");
+        assert!(!ran[0].args.iter().any(|a| a.contains("s3cret")));
+        assert!(xml.contains(r#"name="pcmk_host_list" value="alpha-1""#));
+        assert!(xml.contains(r#"name="pcmk_delay_base" value="10s""#));
+        // The continuous BMC connectivity check.
+        assert!(xml.contains(r#"name="monitor" interval="60s""#));
+
+        // The constraint keeps the device off the node it powers off.
+        let constraint = ran[1].stdin.as_deref().unwrap();
+        assert!(
+            constraint.contains(r#"rsc="fence-alpha-1" node="alpha-1" score="-INFINITY""#),
+            "{constraint}"
+        );
+    }
+
+    /// The unpreferred device carries no delay attribute at all: a zero
+    /// would still be a knob an operator has to read and reason about.
+    #[test]
+    fn an_undelayed_device_omits_the_delay_rather_than_writing_zero() {
+        let device = crate::topology::FenceDevice {
+            id: "fence-beta-2".into(),
+            target: "beta-2".into(),
+            bmc_address: "10.20.0.2".into(),
+            bmc_username: "ADMIN".into(),
+            delay_base_secs: 0,
+        };
+        assert!(!fence_primitive_xml(&device, "pw").contains("pcmk_delay_base"));
+    }
+
+    #[tokio::test]
+    async fn a_live_fence_and_a_confirmation_go_through_pcs() {
+        let exec = lumen_sys::exec::MockExec::working();
+        let backend = CliBackend::new(exec.clone());
+        backend.fence_node("alpha-2").await.unwrap();
+        backend.confirm_node_dead("alpha-2").await.unwrap();
+
+        assert!(exec.ran_with(PCS, &["stonith", "fence", "alpha-2"]).await);
+        assert!(
+            exec.ran_with(PCS, &["stonith", "confirm", "alpha-2", "--force"])
+                .await
+        );
+    }
+
+    /// A node that leaves a cluster leaves nothing behind for the next one:
+    /// the CIB goes with the corosync configuration, or stale fence devices
+    /// — old BMC passwords included — would resurrect into a new cluster.
+    #[tokio::test]
+    async fn removing_the_configuration_takes_the_cib_with_it() {
+        let exec = lumen_sys::exec::MockExec::working();
+        let backend = CliBackend::new(exec.clone());
+        backend.remove_cluster_config().await.unwrap();
+        assert!(
+            exec.ran_with(RM, &["-rf", COROSYNC_CONF, COROSYNC_AUTHKEY, PACEMAKER_CIB])
+                .await
+        );
     }
 
     #[tokio::test]

@@ -1,11 +1,15 @@
 # Lumen clustering
 
 The environment, its clusters, and the machinery that keeps a cluster honest:
-membership, quorum, and fencing. Two stages in: the model, the topology
-engine, and the read path came first; this release adds the workflows —
-joining an environment with a one-time token, and building (or destroying) a
-cluster transactionally, per node, per step, unwound completely on failure.
-What still lands after is listed at the end.
+membership, quorum, and fencing. Three stages in: the model, the topology
+engine, and the read path came first; the workflows second — joining an
+environment with a one-time token, and building (or destroying) a cluster
+transactionally, per node, per step, unwound completely on failure. This
+release completes fencing: the create writes one `fence_ipmilan` device per
+member into the CIB, every direction can be live-tested from the console —
+guarded, and recorded either way — and the break-glass confirm-peer-dead
+exists for the one state that has no automatic resolution. What still lands
+after is listed at the end.
 
 ```
 lumen-storage/
@@ -162,20 +166,74 @@ Nothing can prove the peer is dead, so nothing pretends to. DRBD's fencing
 policy suspends I/O on the affected volumes — integrity over availability,
 always — until either the BMC path recovers and fencing completes on its own,
 or an operator performs the break-glass **confirm peer is dead** operation:
-available only while a peer is unfenced-unreachable, and only after typing
-the peer node's name and acknowledging that confirming a live peer dead
-destroys data. The break-glass is an operator action, not a fencing
-mechanism — it is the one escape hatch, and the console keeps it prominent
-enough to find at 3 a.m. rather than buried in a menu.
+offered only while a peer is unfenced-unreachable, and only after typing the
+peer node's name and acknowledging — in the words of the dialog — that a
+wrongly-confirmed peer means both sides write the same volumes. Underneath
+it is `pcs stonith confirm --force`: Pacemaker recovers as if fencing
+succeeded, on the operator's word. The break-glass is an operator action,
+not a fencing mechanism — it is the one escape hatch, and the console keeps
+it prominent enough to find at 3 a.m.: a red **Confirm dead** button appears
+on the node's own row the moment the node is unfenced-unreachable, and
+nowhere else, because offering it anywhere else would be offering a way to
+corrupt data with one request.
 
-Two things follow from having exactly one fence path, and both are already in
-this stage's read model. There is **no supported configuration with fencing
-disabled** — no API field, no UI control, and the property renderer always
-emits `stonith-enabled=true`. And **fence-device health is cluster-level
-news**: the BMC connectivity monitor failing degrades the cluster's own
-health pill rather than hiding in a panel, and a device that has never been
-live-tested pins a warning that does not go away — an untested fence path is
-one that fails during the outage that needed it.
+Two things follow from having exactly one fence path. There is **no
+supported configuration with fencing disabled** — no API field, no UI
+control, and the property renderer always emits `stonith-enabled=true`. And
+**fence-device health is cluster-level news**: every device carries a
+60-second monitor — the continuous BMC connectivity check — whose failure
+degrades the cluster's own health pill rather than hiding in a panel, and a
+device that has never been live-tested pins a warning that does not go away —
+an untested fence path is one that fails during the outage that needed it.
+
+### The BMC password goes into the CIB over a pipe, and nowhere else
+
+`pcs stonith create` would take the password as an argument, and an argument
+lands in the journal and `/proc` — the rule since docs/system.md is that a
+password is never an argument. So the fence devices are not created with pcs
+at all: the device is rendered as CIB XML, password inside, and piped to
+`cibadmin --create --scope resources --xml-pipe` as the standard input of a
+transient unit — the same content-over-the-pipe shape as the corosync
+authkey. After that the password exists in exactly one place, Pacemaker's
+CIB, which is root-only and is where the fence agent has to read it from
+anyway. It is deliberately **not** in the membership record — the record is
+gossiped, and a gossiped secret is a distributed one — which is also why the
+wizard never shows a password back and why changing a BMC password means
+recreating the device, not editing a stored copy.
+
+The same reasoning removes the CIB on teardown: `remove_cluster_config`
+deletes `/var/lib/pacemaker/cib` along with the corosync configuration,
+because a stale CIB would resurrect the old cluster's fence devices — old
+passwords included — into the next cluster built on the node.
+
+A placement constraint rides along with each device: `fence-<node>` is
+banned from `<node>` itself, because a node hosting its own executioner is a
+race the cluster loses.
+
+### A fence test is a real power cycle, and both answers are recorded
+
+The per-direction fence test does the only thing that proves a fence path:
+`pcs stonith fence <node>`, for real — the target powers off through its BMC
+and boots back up. Anything less (a BMC ping, a status query) tests the
+monitor, which the cluster already runs every minute; the thing that fails
+during an outage is the power operation itself, so that is what the test
+exercises.
+
+Because it is real, it is guarded: an acknowledgement field
+(`i_understand_this_power_cycles_the_node`), refused on a cluster that is
+not fully healthy — fencing a struggling cluster is an outage, not a test —
+and refused from the target's own console, because a node running the test
+that powers itself off takes the answer down with it. The outcome is
+recorded **either way**: a failed test is not an error in the request, it is
+exactly the news the untested warning exists to force out before an outage
+finds it first, and it keeps the cluster degraded until the path is fixed
+and retested.
+
+The record of tests lives on the membership record (`ClusterRecord::
+fence_tests`), not in Pacemaker — `crm_mon` can say whether a device's
+monitor passes, never whether the device was ever proven — and it gossips
+with the record, so a test run from one console clears the warning on every
+console.
 
 ### The membership record is last-writer-wins, and that is enough
 
@@ -338,6 +396,8 @@ one level upward: grouped by cluster, then by node.
 | GET | `/api/environment/clusters/pending` | The create in flight (or last finished): per node, per step |
 | DELETE | `/api/environment/clusters/:name` | Destroy — every member torn down, `i_understand_this_may_lose_data` required |
 | DELETE | `/api/environment/nodes/:name` | Remove an unassigned node from the environment |
+| POST | `/api/environment/clusters/:name/fence/:node/test` | Guarded live fence test — the node really power-cycles; `i_understand_this_power_cycles_the_node` required |
+| POST | `/api/environment/clusters/:name/nodes/:node/confirm-dead` | Break-glass — only for an unfenced-unreachable node; `i_have_verified_the_node_is_powered_off` required |
 
 A node that never joined an environment answers `GET /api/environment` with
 no `environment` object and itself as the one entry in `unassigned` — the
@@ -362,11 +422,11 @@ console — every tab reachable, invalid ones marked: members with per-node
 preflight results and their reasons inline; networks, with per-member NIC
 pickers fed by what each node's preflight actually reported, proposed Core
 addresses, adopted Management addressing, and the optional VIP; the fencing
-seats; a review of everything about to be generated; and then the create
-itself, live — per node, per step, unwind steps included, because a wizard
-that closes on submit turns a five-minute workflow into a spinner. Destroy
-is the typed-name confirmation the console uses everywhere destruction is
-meant.
+seats with their BMC passwords (masked, never shown back); a review of
+everything about to be generated; and then the create itself, live — per
+node, per step, fence devices included, because a wizard that closes on
+submit turns a five-minute workflow into a spinner. Destroy is the
+typed-name confirmation the console uses everywhere destruction is meant.
 
 **Infrastructure → Nodes** is every node the console can see: the current
 node's card first, then each cluster's members grouped under the cluster's
@@ -375,7 +435,10 @@ their own group, labelled standalone hypervisors rather than leftovers.
 **Add Node** shows the token flow in both directions — mint here, or paste
 here — because the operator is standing at one console or the other, and the
 page cannot know which. Removing an unassigned node is an inline confirm,
-not a modal: the node can simply join again.
+not a modal: the node can simply join again. Each member row carries the
+fencing actions: the live fence test behind its own dialog — what will
+happen, the acknowledgement, then the answer, pass or fail — and, only while
+a node is unfenced-unreachable, the break-glass **Confirm dead**.
 
 Both pages poll at five seconds and render straight from `/api/environment`;
 the health pill is derived in the service, so the console and the API can
@@ -403,8 +466,9 @@ ships: corosync 3.1, pacemaker 2.1, chrony 4.6.
 acceptance scenario — a two-node cluster, a three-node cluster, and one
 unassigned node — and the control plane's `tests/cluster_flow.rs` drives the
 real router over it: the token bootstrap, the peer-join grant, both
-directions of ticket separation, a polled create, and a refused-then-acked
-destroy.
+directions of ticket separation, a polled create, a refused-then-acked
+destroy, the fence test with its recorded answer, and the break-glass in the
+one state it is offered.
 
 The one thing the in-memory tests cannot cover is two real control planes
 completing the handshake over real TLS — the fingerprint pin and the
@@ -413,15 +477,15 @@ the other, and `openssl s_client` against both afterwards shows the same CA.
 
 ## Out of scope for this stage
 
-In the order it lands: fence devices, per-direction fence tests, continuous
-BMC monitoring, and the break-glass confirm-peer-dead (the wizard already
-collects the BMC seats; nothing yet creates the devices — a fresh cluster's
-card says "Not configured yet" honestly); External-network realization
-(bridges on every member) and the typed-networks page; replicated volumes
-(`lumen-drbd`); the HA manager; adding a node to an existing cluster and the
-2→3 scale-out, and with them removing a member from a live cluster; the
-environment-wide console federation — aggregated reads with per-node
-freshness, proxied writes — for which the peer channel built here is the
-transport; and gossip beyond the once-a-minute record exchange. A removed
-node also keeps its stale environment state until it re-joins somewhere; a
-"leave and reset" for the node itself rides the federation stage.
+In the order it lands: External-network realization (bridges on every
+member) and the typed-networks page; replicated volumes (`lumen-drbd`); the
+HA manager; adding a node to an existing cluster and the 2→3 scale-out, and
+with them removing a member from a live cluster; the environment-wide
+console federation — aggregated reads with per-node freshness, proxied
+writes — for which the peer channel built here is the transport; and gossip
+beyond the once-a-minute record exchange. A removed node also keeps its
+stale environment state until it re-joins somewhere; a "leave and reset" for
+the node itself rides the federation stage. One fencing consequence of the
+missing federation is worth naming: a fence test runs from a member of the
+cluster it tests, so testing every direction of a two-node cluster means
+signing into each node once — the proxied-writes stage dissolves that.

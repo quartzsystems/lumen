@@ -1,16 +1,19 @@
 "use client";
 
 import { useState } from "react";
-import { AlertTriangle, Copy } from "lucide-react";
+import { AlertTriangle, Check, Copy, X, Zap } from "lucide-react";
 import { ModalHeader, ModalShell } from "@/components/ui/Modal";
 import { Tabs } from "@/components/ui/Tabs";
 import { Field, ModalFooter, TextInput } from "@/components/ui/formkit";
 import { ApiError } from "@/lib/authClient";
 import {
+  confirmNodeDead,
+  destroyCluster,
   joinEnvironment,
   mintToken,
+  testFence,
   type ClusterView,
-  destroyCluster,
+  type FenceTestView,
 } from "@/lib/clusterClient";
 
 /// Both directions of the join-token flow in one dialog: mint a token here
@@ -197,6 +200,217 @@ export function AddNodeDialog({
             />
           </div>
         ))}
+    </ModalShell>
+  );
+}
+
+/// A guarded live fence test: the target node really power-cycles through
+/// its BMC, because an untested fence path is one that fails during the
+/// outage that needed it. The dialog says exactly what will happen, takes a
+/// checkbox, and then shows the answer — pass or fail — rather than closing.
+export function FenceTestDialog({
+  cluster,
+  node,
+  isLocal,
+  onClose,
+  onTested,
+}: {
+  cluster: string;
+  node: string;
+  /// The target is the node this console is signed into — the one direction
+  /// this console cannot test, and the dialog says so instead of trying.
+  isLocal: boolean;
+  onClose: () => void;
+  onTested: () => void;
+}) {
+  const [acked, setAcked] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [outcome, setOutcome] = useState<FenceTestView | null>(null);
+
+  const run = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const answer = await testFence(cluster, node);
+      setOutcome(answer);
+      onTested();
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) return;
+      setError(err instanceof Error ? err.message : "The fence test could not run.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <ModalShell onClose={busy ? () => {} : onClose}>
+      <ModalHeader
+        title={`Test fencing of ${node}`}
+        subtitle={`Prove the cluster can actually kill ${node} when it must.`}
+        onClose={busy ? () => {} : onClose}
+      />
+      <div className="flex flex-col gap-4">
+        {error && (
+          <div className="callout callout-crit">
+            <AlertTriangle size={17} className="flex-shrink-0 text-[var(--qz-danger)] mt-[1px]" />
+            <div className="text-[13px] text-[var(--qz-fg-2)]">{error}</div>
+          </div>
+        )}
+
+        {outcome ? (
+          <>
+            <div className={`callout ${outcome.passed ? "" : "callout-crit"}`}>
+              {outcome.passed ? (
+                <Check size={17} className="flex-shrink-0 text-[var(--qz-success)] mt-[1px]" />
+              ) : (
+                <X size={17} className="flex-shrink-0 text-[var(--qz-danger)] mt-[1px]" />
+              )}
+              <div className="text-[13px] text-[var(--qz-fg-2)]">
+                {outcome.passed
+                  ? `${node} was fenced. It is power-cycling now and will rejoin the cluster on its own — the direction is proven and recorded.`
+                  : `The fence path to ${node} does not work: ${outcome.error ?? "the fence operation failed"}. Recorded — fix the BMC before an outage needs this path.`}
+              </div>
+            </div>
+            <div className="flex justify-end">
+              <button type="button" className="btn btn-primary" onClick={onClose}>
+                Close
+              </button>
+            </div>
+          </>
+        ) : isLocal ? (
+          <div className="callout">
+            <AlertTriangle size={17} className="flex-shrink-0 text-[var(--qz-warn)] mt-[1px]" />
+            <div className="text-[13px] text-[var(--qz-fg-2)]">
+              This console runs on {node}, and a node does not run the test that powers itself
+              off — the answer would go down with it. Open another member&apos;s console and
+              test this direction from there.
+            </div>
+          </div>
+        ) : (
+          <>
+            <div className="callout callout-warn">
+              <Zap size={17} className="flex-shrink-0 text-[var(--qz-warn)] mt-[1px]" />
+              <div className="text-[13px] text-[var(--qz-fg-2)]">
+                {node} will be powered off through its BMC and boot back up. Machines running
+                on it stop. The test takes a minute either way, and the result — pass or fail —
+                is recorded against this direction.
+              </div>
+            </div>
+            <label className="qz-check">
+              <input
+                type="checkbox"
+                checked={acked}
+                onChange={() => setAcked(!acked)}
+                style={{ accentColor: "var(--qz-warn)" }}
+              />
+              <span className="text-[13px] text-[var(--qz-fg-2)]">
+                I understand this power-cycles {node}.
+              </span>
+            </label>
+            <ModalFooter
+              onCancel={onClose}
+              saving={busy}
+              disabled={!acked}
+              submitLabel="Run fence test"
+              savingLabel="Fencing…"
+              onSubmit={() => void run()}
+            />
+          </>
+        )}
+      </div>
+    </ModalShell>
+  );
+}
+
+/// The break-glass: only offered for a node that is unreachable and could
+/// not be fenced. The operator types the node's name to vouch for a fact
+/// the cluster cannot verify — that the machine is really powered off — and
+/// the consequence of vouching wrongly is written out in full.
+export function ConfirmDeadDialog({
+  cluster,
+  node,
+  onClose,
+  onConfirmed,
+}: {
+  cluster: string;
+  node: string;
+  onClose: () => void;
+  onConfirmed: () => void;
+}) {
+  const [typed, setTyped] = useState("");
+  const [acked, setAcked] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const confirmed = typed.trim() === node && acked;
+
+  const confirm = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await confirmNodeDead(cluster, node);
+      onConfirmed();
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) return;
+      setError(err instanceof Error ? err.message : "The confirmation was refused.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <ModalShell onClose={onClose}>
+      <ModalHeader
+        title={`Confirm ${node} is dead`}
+        subtitle="The cluster could not fence this node, so it is waiting on you instead."
+        onClose={onClose}
+      />
+      <div className="flex flex-col gap-4">
+        {error && (
+          <div className="callout callout-crit">
+            <AlertTriangle size={17} className="flex-shrink-0 text-[var(--qz-danger)] mt-[1px]" />
+            <div className="text-[13px] text-[var(--qz-fg-2)]">{error}</div>
+          </div>
+        )}
+        <div className="callout callout-crit">
+          <AlertTriangle size={17} className="flex-shrink-0 text-[var(--qz-danger)] mt-[1px]" />
+          <div className="text-[13px] text-[var(--qz-fg-2)]">
+            Confirming makes the cluster recover as if fencing succeeded. If {node} is in fact
+            still running, both sides will write the same volumes and that data will not
+            survive. Verify the power is off at the machine — lights, power switch, the BMC of
+            a different node — not from this console.
+          </div>
+        </div>
+        <label className="qz-check">
+          <input
+            type="checkbox"
+            checked={acked}
+            onChange={() => setAcked(!acked)}
+            style={{ accentColor: "var(--qz-danger)" }}
+          />
+          <span className="text-[13px] text-[var(--qz-fg-2)]">
+            I have personally verified {node} is powered off.
+          </span>
+        </label>
+        <Field label={`Type ${node} to confirm`} htmlFor="confirm-dead-name">
+          <TextInput
+            id="confirm-dead-name"
+            value={typed}
+            onChange={setTyped}
+            mono
+            autoFocus
+            placeholder={node}
+          />
+        </Field>
+        <ModalFooter
+          onCancel={onClose}
+          saving={busy}
+          disabled={!confirmed}
+          submitLabel="Confirm dead"
+          savingLabel="Confirming…"
+          onSubmit={() => void confirm()}
+        />
+      </div>
     </ModalShell>
   );
 }

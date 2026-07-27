@@ -121,6 +121,17 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/environment/nodes/{name}",
             delete(cluster::remove_node),
         )
+        // Fencing: the guarded live test per direction, and the break-glass
+        // confirmation for a node that is unreachable and could not be
+        // fenced. Both are operator actions, never peer calls.
+        .route(
+            "/api/environment/clusters/{name}/fence/{node}/test",
+            post(cluster::test_fence),
+        )
+        .route(
+            "/api/environment/clusters/{name}/nodes/{node}/confirm-dead",
+            post(cluster::confirm_node_dead),
+        )
         // The peer surface: one control plane answering another, peer-ticket
         // authenticated — except join, whose one-time token is the
         // authentication; see src/api/peer.rs.

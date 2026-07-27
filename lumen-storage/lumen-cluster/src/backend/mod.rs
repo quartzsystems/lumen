@@ -81,4 +81,27 @@ pub trait ClusterBackend: Send + Sync {
         address: std::net::Ipv4Addr,
         prefix: u8,
     ) -> Result<()>;
+
+    /// Create one `fence_ipmilan` STONITH device. The password travels
+    /// separately from the rendered device because it must never enter the
+    /// membership record, a journal line, or an argument vector — the CLI
+    /// backend pipes it inside CIB XML over a transient unit's stdin, and
+    /// after that it lives only where Pacemaker keeps it.
+    async fn create_fence_device(
+        &self,
+        device: &crate::topology::FenceDevice,
+        password: &str,
+    ) -> Result<()>;
+
+    /// Fence a node for real — the guarded live test's teeth. Pacemaker
+    /// routes the action to a member that can run the device, the target
+    /// power-cycles, and the call answers only when the fence operation has
+    /// a result.
+    async fn fence_node(&self, target: &str) -> Result<()>;
+
+    /// Break-glass: tell Pacemaker an unfenced-unreachable node is verified
+    /// down, so recovery proceeds without a successful fence. The guards —
+    /// only an unclean node, never this node, an explicit acknowledgement —
+    /// are the service's; this is just the confirmation.
+    async fn confirm_node_dead(&self, target: &str) -> Result<()>;
 }

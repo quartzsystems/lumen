@@ -18,7 +18,7 @@ use tokio::sync::Mutex;
 
 use crate::backend::ClusterBackend;
 use crate::environment::{
-    hash_secret, issue_node_certificate, mint_ca, pem_fingerprint, random_hex,
+    hash_secret, issue_node_certificate, mint_ca, pem_fingerprint, random_hex, ClusterRecord,
     EnvironmentMembership, EnvironmentNode, JoinToken, TOKEN_TTL_SECS,
 };
 use crate::error::{ClusterError, Result};
@@ -27,7 +27,7 @@ use crate::join::{
     PreflightReport, PreflightView, PreparePayload, ProgressHandle, TeardownPayload,
 };
 use crate::model::Regime;
-use crate::state::{hostname, ClusterState, FenceDeviceState, QuorumState, RingLink};
+use crate::state::{hostname, ClusterState, FenceDeviceState, FenceTest, QuorumState, RingLink};
 use crate::store::{EnvironmentStore, Identity, JoinTokenRecord};
 use crate::validate::{
     validate_definition, Acknowledgements, ClusterCreate, ValidationCode, ValidationError,
@@ -151,6 +151,21 @@ pub struct MintedToken {
 #[derive(Debug)]
 pub struct JoinOutcome {
     pub session_secret: Vec<u8>,
+}
+
+/// POST /api/environment/clusters/{name}/fence/{node}/test — what a guarded
+/// live fence test answered. `passed: false` is a successful request that
+/// learned something bad; the transport error, when there was one, rides in
+/// `error`.
+#[derive(Debug, Clone, Serialize)]
+pub struct FenceTestView {
+    pub cluster: String,
+    pub node: String,
+    pub passed: bool,
+    /// Unix seconds.
+    pub at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 pub struct ClusterService {
@@ -734,7 +749,8 @@ impl ClusterService {
             ));
         }
         let membership = self.require_membership()?;
-        let (definition, networks) = request.build().map_err(ClusterError::Invalid)?;
+        let (definition, networks, bmc_passwords) =
+            request.build().map_err(ClusterError::Invalid)?;
         let errors = validate_definition(&definition, &membership);
         if !errors.is_empty() {
             return Err(ClusterError::Invalid(errors));
@@ -751,6 +767,7 @@ impl ClusterService {
             let result = run_create(
                 definition,
                 networks,
+                bmc_passwords,
                 membership,
                 &version,
                 service.peers.as_ref(),
@@ -847,6 +864,160 @@ impl ClusterService {
         Ok(())
     }
 
+    // --- fencing ------------------------------------------------------------
+
+    /// Live-test one fence direction: actually power-cycle `target` through
+    /// its BMC, and record what happened on the membership record either way
+    /// — a failed test is an answer about the fence path, not an error in
+    /// the request, and it is exactly the news the untested warning exists
+    /// to force out before an outage finds it first.
+    pub async fn test_fence(
+        &self,
+        cluster: &str,
+        target: &str,
+        acknowledged: bool,
+    ) -> Result<FenceTestView> {
+        let _guard = self.gate.lock().await;
+        if !acknowledged {
+            return Err(ClusterError::invalid(ValidationError::new(
+                ValidationCode::UnacknowledgedDestructiveOperation,
+                Some("i_understand_this_power_cycles_the_node"),
+                "A live fence test powers the target node off and on through its BMC — its \
+                 machines migrate or restart. Acknowledge that to proceed.",
+            )));
+        }
+        let mut membership = self.require_membership()?;
+        if membership.cluster_record(cluster).is_none() {
+            return Err(ClusterError::NotFound(format!(
+                "There is no cluster called \"{cluster}\" in this environment."
+            )));
+        }
+        if !membership
+            .members_of(cluster)
+            .iter()
+            .any(|n| n.name == target)
+        {
+            return Err(ClusterError::NotFound(format!(
+                "\"{target}\" is not a member of \"{cluster}\"."
+            )));
+        }
+        if target == self.node {
+            return Err(ClusterError::Conflict(format!(
+                "A node does not run the test that powers itself off — the answer would go \
+                 down with it. Run this from another member of \"{cluster}\"."
+            )));
+        }
+        if membership
+            .node(&self.node)
+            .and_then(|n| n.cluster.as_deref())
+            != Some(cluster)
+        {
+            return Err(ClusterError::Conflict(format!(
+                "Fence tests run from inside the cluster. Open the console of a member of \
+                 \"{cluster}\" — any of them except \"{target}\"."
+            )));
+        }
+        let state = self.backend.cluster_state(cluster).await?;
+        if state.fence_for(target).is_none() {
+            return Err(ClusterError::Conflict(format!(
+                "\"{target}\" has no fence device to test."
+            )));
+        }
+        if !state.quorum.quorate
+            || state
+                .nodes
+                .iter()
+                .any(|n| !n.online || n.unclean || n.standby)
+        {
+            return Err(ClusterError::Conflict(
+                "A fence test is for a healthy cluster: quorate, every member online, nobody \
+                 in standby. Fencing a cluster that is already struggling is an outage, not a \
+                 test."
+                    .to_string(),
+            ));
+        }
+
+        let result = self.backend.fence_node(target).await;
+        let at = now_unix();
+        let passed = result.is_ok();
+        membership.version += 1;
+        if let Some(record) = membership
+            .clusters
+            .iter_mut()
+            .find(|r| r.definition.name == cluster)
+        {
+            record
+                .fence_tests
+                .insert(target.to_string(), FenceTest { at, passed });
+        }
+        self.store.save_membership(&membership)?;
+        drop(_guard);
+        self.gossip_once().await;
+        tracing::info!(cluster, node = target, passed, "fence test recorded");
+        Ok(FenceTestView {
+            cluster: cluster.to_string(),
+            node: target.to_string(),
+            passed,
+            at,
+            error: result.err().map(|err| err.to_string()),
+        })
+    }
+
+    /// Break-glass: the operator vouches that an unfenced-unreachable node is
+    /// powered off, so the cluster recovers as if fencing had succeeded.
+    /// Offered in exactly one state — a member lost and not successfully
+    /// fenced — because everywhere else it is either meaningless or a way to
+    /// corrupt data with one request.
+    pub async fn confirm_node_dead(
+        &self,
+        cluster: &str,
+        target: &str,
+        acknowledged: bool,
+    ) -> Result<()> {
+        let _guard = self.gate.lock().await;
+        if !acknowledged {
+            return Err(ClusterError::invalid(ValidationError::new(
+                ValidationCode::UnacknowledgedDestructiveOperation,
+                Some("i_have_verified_the_node_is_powered_off"),
+                "Confirming a node dead makes the cluster recover as if fencing succeeded. If \
+                 the node is in fact still running, both sides will write the same volumes and \
+                 that data will not survive. Verify the power is off at the machine, then \
+                 acknowledge that here.",
+            )));
+        }
+        let membership = self.require_membership()?;
+        if !membership
+            .members_of(cluster)
+            .iter()
+            .any(|n| n.name == target)
+        {
+            return Err(ClusterError::NotFound(format!(
+                "\"{target}\" is not a member of \"{cluster}\"."
+            )));
+        }
+        if target == self.node {
+            return Err(ClusterError::Conflict(
+                "This node is answering the request, so it is not the dead one.".to_string(),
+            ));
+        }
+        let state = self.backend.cluster_state(cluster).await?;
+        let unclean = state.node(target).is_some_and(|n| n.unclean);
+        if !unclean {
+            return Err(ClusterError::Conflict(format!(
+                "\"{target}\" is not waiting on a fence confirmation. Break-glass exists for \
+                 exactly one state — a node that is unreachable and could not be fenced — and \
+                 \"{target}\" is not in it."
+            )));
+        }
+        self.backend.confirm_node_dead(target).await?;
+        tracing::warn!(
+            cluster,
+            node = target,
+            "operator confirmed the node dead; recovery proceeds without a successful fence"
+        );
+        Ok(())
+    }
+
     // --- assembly ---------------------------------------------------------
 
     async fn cluster_view(&self, name: &str, membership: &EnvironmentMembership) -> ClusterView {
@@ -854,7 +1025,14 @@ impl ClusterService {
             .cluster_record(name)
             .and_then(|r| r.definition.preferred_node.clone());
         match self.backend.cluster_state(name).await {
-            Ok(state) => self.view_of(name, &state, membership, preferred),
+            Ok(mut state) => {
+                // Pacemaker cannot say whether a device was ever proven —
+                // only whether its monitor passes. The proof lives on the
+                // membership record and is laid over the observed state here,
+                // before health is derived from it.
+                overlay_fence_tests(&mut state, membership.cluster_record(name));
+                self.view_of(name, &state, membership, preferred)
+            }
             Err(err) => {
                 // The cluster could not be asked. Say so, list its members
                 // from the record, and claim nothing about them — an
@@ -964,6 +1142,18 @@ fn now_unix() -> u64 {
         .as_secs()
 }
 
+/// Lay the recorded fence tests over the observed devices. The record wins
+/// where it has an answer; a device the record has never heard of keeps
+/// whatever the backend said — which for the real backend is "never tested".
+fn overlay_fence_tests(state: &mut ClusterState, record: Option<&ClusterRecord>) {
+    let Some(record) = record else { return };
+    for device in &mut state.fence_devices {
+        if let Some(test) = record.fence_tests.get(&device.target) {
+            device.last_test = Some(*test);
+        }
+    }
+}
+
 /// The one derivation of a cluster's health pill. Critical is reserved for
 /// "data is at stake now": lost quorum, or a member lost and not yet fenced.
 /// Everything an operator should fix but can schedule is Degraded — including
@@ -977,10 +1167,9 @@ fn health_of(state: &ClusterState) -> ClusterHealth {
         .nodes
         .iter()
         .any(|n| n.rings.iter().any(|r| !r.connected));
-    let fence_worry = state
-        .fence_devices
-        .iter()
-        .any(|d| d.failed || !d.active || d.last_test.is_none());
+    let fence_worry = state.fence_devices.iter().any(|d| {
+        d.failed || !d.active || d.last_test.is_none() || d.last_test.is_some_and(|t| !t.passed)
+    });
     if state.nodes.iter().any(|n| !n.online || n.standby) || ring_degraded || fence_worry {
         return ClusterHealth::Degraded;
     }
@@ -1055,6 +1244,7 @@ mod tests {
                     management_address: format!("192.168.10.{}", i + 1),
                     bmc_address: format!("10.20.0.{}", i + 1),
                     bmc_username: "ADMIN".into(),
+                    bmc_password: "fence-pw".into(),
                 })
                 .collect(),
             external: Vec::new(),
@@ -1306,6 +1496,31 @@ mod tests {
         assert!(backend
             .properties_set()
             .contains(&("stonith-enabled".into(), "true".into())));
+
+        // And so did one fence device per member, each with its password —
+        // the delay biasing the fence race sits on the preferred node's own
+        // device, exactly as the topology engine rendered it.
+        let devices = backend.fence_devices_created();
+        assert_eq!(devices.len(), 2);
+        assert!(devices.iter().all(|(_, password)| password == "fence-pw"));
+        let delay_of = |target: &str| {
+            devices
+                .iter()
+                .find(|(d, _)| d.target == target)
+                .map(|(d, _)| d.delay_base_secs)
+        };
+        assert_eq!(
+            delay_of("alpha-1"),
+            Some(crate::model::FENCE_RACE_DELAY_SECS)
+        );
+        assert_eq!(delay_of("alpha-2"), Some(0));
+
+        // The wizard's plan carried the fence steps, and they finished.
+        assert!(progress
+            .steps
+            .iter()
+            .filter(|s| s.step == "fence")
+            .all(|s| s.state == crate::join::StepState::Done));
     }
 
     /// The acceptance criterion: a create failed mid-way unwinds completely —
@@ -1406,10 +1621,11 @@ mod tests {
         let mut membership =
             membership_of(&[("alpha-1", Some("alpha")), ("alpha-2", Some("alpha"))]);
         let request = create_request(&["alpha-1", "alpha-2"]);
-        let (definition, networks) = request.build().unwrap();
+        let (definition, networks, _) = request.build().unwrap();
         membership.clusters.push(crate::environment::ClusterRecord {
             definition,
             networks,
+            fence_tests: Default::default(),
         });
 
         let peers = Arc::new(MockPeers::new());
@@ -1476,6 +1692,164 @@ mod tests {
                 .map(|n| n.node.as_str())
                 .collect::<Vec<_>>(),
             vec!["alpha-1"]
+        );
+    }
+
+    // --- fencing ------------------------------------------------------------
+
+    /// A membership record that knows cluster "alpha" whole — the shape a
+    /// completed create leaves behind.
+    fn clustered_membership() -> EnvironmentMembership {
+        let mut membership =
+            membership_of(&[("alpha-1", Some("alpha")), ("alpha-2", Some("alpha"))]);
+        let (definition, networks, _) = create_request(&["alpha-1", "alpha-2"]).build().unwrap();
+        membership.clusters.push(ClusterRecord {
+            definition,
+            networks,
+            fence_tests: Default::default(),
+        });
+        membership
+    }
+
+    fn fence_harness(backend: Arc<MockBackend>) -> Arc<ClusterService> {
+        Arc::new(
+            ClusterService::new(
+                backend as Arc<dyn ClusterBackend>,
+                Arc::new(MockPeers::new()),
+                network(),
+                &test_dir("fence"),
+                "0.3.0",
+            )
+            .with_node("alpha-1")
+            .with_environment(&clustered_membership()),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_fence_test_needs_the_acknowledgement_and_never_tests_its_own_direction() {
+        let backend = Arc::new(MockBackend::environment().with_untested_fencing("alpha"));
+        let service = fence_harness(backend.clone());
+
+        let refused = service
+            .test_fence("alpha", "alpha-2", false)
+            .await
+            .unwrap_err();
+        assert!(matches!(refused, ClusterError::Invalid(_)));
+
+        // The test powers its target off, and this node is the target.
+        let own = service
+            .test_fence("alpha", "alpha-1", true)
+            .await
+            .unwrap_err();
+        assert!(own.to_string().contains("another member"), "{own}");
+        assert!(backend.fenced().is_empty(), "nothing may have been fenced");
+    }
+
+    #[tokio::test]
+    async fn a_passed_fence_test_is_recorded_and_clears_that_directions_warning() {
+        let backend = Arc::new(MockBackend::environment().with_untested_fencing("alpha"));
+        let service = fence_harness(backend.clone());
+
+        let view = service.test_fence("alpha", "alpha-2", true).await.unwrap();
+        assert!(view.passed && view.error.is_none());
+        assert_eq!(backend.fenced(), vec!["alpha-2"]);
+
+        // The record carries the answer, so the view shows this direction
+        // proven and the other still waiting.
+        let cluster = service.cluster("alpha").await.unwrap();
+        assert_eq!(cluster.fence.untested, 1, "{:?}", cluster.fence);
+        let tested = cluster.nodes.iter().find(|n| n.node == "alpha-2").unwrap();
+        assert!(tested.fence.as_ref().unwrap().last_test.unwrap().passed);
+    }
+
+    /// A failed test is an answer, not an error: recorded, shown, and it
+    /// keeps the cluster degraded even though the device's monitor passes.
+    #[tokio::test]
+    async fn a_failed_fence_test_is_an_answer_that_degrades_the_cluster() {
+        let backend = Arc::new(MockBackend::environment().with_untested_fencing("alpha"));
+        let service = fence_harness(backend.clone());
+
+        backend.fail_fence("the BMC refused the power command");
+        let view = service.test_fence("alpha", "alpha-2", true).await.unwrap();
+        assert!(!view.passed);
+        assert!(
+            view.error.as_deref().unwrap_or("").contains("BMC"),
+            "{view:?}"
+        );
+
+        let cluster = service.cluster("alpha").await.unwrap();
+        let device = cluster
+            .nodes
+            .iter()
+            .find(|n| n.node == "alpha-2")
+            .and_then(|n| n.fence.clone())
+            .unwrap();
+        assert!(!device.last_test.unwrap().passed);
+        assert_eq!(cluster.health, ClusterHealth::Degraded);
+    }
+
+    #[tokio::test]
+    async fn a_fence_test_is_for_a_healthy_cluster_only() {
+        let backend = Arc::new(
+            MockBackend::environment()
+                .with_untested_fencing("alpha")
+                .with_partition("alpha", "alpha-2"),
+        );
+        let service = fence_harness(backend.clone());
+        let refused = service
+            .test_fence("alpha", "alpha-2", true)
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("healthy cluster"), "{refused}");
+        assert!(backend.fenced().is_empty());
+    }
+
+    #[tokio::test]
+    async fn break_glass_confirms_only_an_unclean_peer_and_recovery_follows() {
+        // A healthy peer is not confirmable — there is nothing to vouch for.
+        let healthy = fence_harness(Arc::new(MockBackend::environment()));
+        let refused = healthy
+            .confirm_node_dead("alpha", "alpha-2", true)
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("not waiting"), "{refused}");
+
+        // The state break-glass exists for: lost, and fencing could not
+        // prove it dead.
+        let backend = Arc::new(
+            MockBackend::environment()
+                .with_partition("alpha", "alpha-2")
+                .with_fence_failure("alpha", "alpha-2"),
+        );
+        let service = fence_harness(backend.clone());
+        assert_eq!(
+            service.cluster("alpha").await.unwrap().health,
+            ClusterHealth::Critical
+        );
+
+        let unacked = service
+            .confirm_node_dead("alpha", "alpha-2", false)
+            .await
+            .unwrap_err();
+        assert!(matches!(unacked, ClusterError::Invalid(_)));
+
+        // This node cannot be the dead one — it is answering.
+        let own = service
+            .confirm_node_dead("alpha", "alpha-1", true)
+            .await
+            .unwrap_err();
+        assert!(own.to_string().contains("not the dead one"), "{own}");
+
+        service
+            .confirm_node_dead("alpha", "alpha-2", true)
+            .await
+            .unwrap();
+        assert_eq!(backend.confirmed_dead(), vec!["alpha-2"]);
+        // Vouched for: no longer critical — degraded, because a member is
+        // still down.
+        assert_eq!(
+            service.cluster("alpha").await.unwrap().health,
+            ClusterHealth::Degraded
         );
     }
 

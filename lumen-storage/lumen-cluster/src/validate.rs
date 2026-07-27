@@ -40,6 +40,7 @@ pub enum ValidationCode {
     PreferredNodeNeedsTwoNodes,
     DuplicateRingAddress,
     MissingBmc,
+    MissingBmcPassword,
     UnacknowledgedDestructiveOperation,
     // Networks. Produced by `networks::validate_networks`.
     InvalidSubnet,
@@ -77,6 +78,7 @@ impl ValidationCode {
             ValidationCode::PreferredNodeNeedsTwoNodes => "preferred_node_needs_two_nodes",
             ValidationCode::DuplicateRingAddress => "duplicate_ring_address",
             ValidationCode::MissingBmc => "missing_bmc",
+            ValidationCode::MissingBmcPassword => "missing_bmc_password",
             ValidationCode::UnacknowledgedDestructiveOperation => {
                 "unacknowledged_destructive_operation"
             }
@@ -370,6 +372,10 @@ pub struct MemberCreate {
     pub management_address: String,
     pub bmc_address: String,
     pub bmc_username: String,
+    /// Consumed by the fencing stage and written into the CIB — deliberately
+    /// not part of [`crate::model::BmcConfig`], so it can never reach the
+    /// membership record, a gossip payload, or a log line.
+    pub bmc_password: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -382,13 +388,21 @@ pub struct ExternalCreate {
     pub uplinks: Vec<Uplink>,
 }
 
+/// What a parsed create request separates into: the model that is stored and
+/// gossiped, the networks, and the one thing that is neither — the BMC
+/// passwords, keyed by node, which the fencing stage consumes and nothing
+/// persists.
+pub type BuiltCluster = (
+    ClusterDefinition,
+    ClusterNetworks,
+    std::collections::BTreeMap<String, String>,
+);
+
 impl ClusterCreate {
     /// Parse the request into the model, collecting every malformed field
     /// rather than stopping at the first. Rule checking is the callers':
     /// `validate_definition` and `networks::validate_networks`.
-    pub fn build(
-        &self,
-    ) -> std::result::Result<(ClusterDefinition, ClusterNetworks), Vec<ValidationError>> {
+    pub fn build(&self) -> std::result::Result<BuiltCluster, Vec<ValidationError>> {
         let mut errors = Vec::new();
 
         let core_subnet = self.core.subnet.parse::<Subnet>().map_err(|reason| {
@@ -419,6 +433,26 @@ impl ClusterCreate {
                 }
             },
         };
+
+        // The passwords first, before the address closure borrows the error
+        // list: present passwords go to the fencing stage, absent ones are a
+        // field error like any other.
+        let mut bmc_passwords = std::collections::BTreeMap::new();
+        for member in &self.members {
+            if member.bmc_password.is_empty() {
+                errors.push(ValidationError::new(
+                    ValidationCode::MissingBmcPassword,
+                    Some("fencing"),
+                    format!(
+                        "\"{}\" has no BMC password. The fence device cannot sign in to the BMC \
+                         without it.",
+                        member.node
+                    ),
+                ));
+            } else {
+                bmc_passwords.insert(member.node.clone(), member.bmc_password.clone());
+            }
+        }
 
         let mut parse_member_address =
             |value: &str, field: &str| match value.parse::<std::net::Ipv4Addr>() {
@@ -499,7 +533,7 @@ impl ClusterCreate {
                 })
                 .collect(),
         };
-        Ok((definition, networks))
+        Ok((definition, networks, bmc_passwords))
     }
 }
 

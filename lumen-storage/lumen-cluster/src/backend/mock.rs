@@ -21,12 +21,16 @@ struct Inner {
     clusters: HashMap<String, ClusterState>,
     preflight: LocalPreflight,
     fail_next: Option<String>,
+    fail_fence: Option<String>,
     // What the node was asked to do, for assertions.
     written_configs: Vec<(String, String)>,
     stack_enabled: bool,
     config_removed: bool,
     properties: Vec<(String, String)>,
     vips: Vec<(String, String)>,
+    fence_devices_created: Vec<(crate::topology::FenceDevice, String)>,
+    fenced: Vec<String>,
+    confirmed_dead: Vec<String>,
 }
 
 pub struct MockBackend {
@@ -159,6 +163,13 @@ impl MockBackend {
         self.inner.lock().unwrap().fail_next = Some(reason.into());
     }
 
+    /// The next live fence fails with this reason, once — targeted, because
+    /// a fence test reads cluster state first and `fail_next` would be spent
+    /// on the read instead of the fence.
+    pub fn fail_fence(&self, reason: impl Into<String>) {
+        self.inner.lock().unwrap().fail_fence = Some(reason.into());
+    }
+
     // --- assertion accessors ------------------------------------------------
 
     pub fn written_configs(&self) -> Vec<(String, String)> {
@@ -179,6 +190,18 @@ impl MockBackend {
 
     pub fn vips_created(&self) -> Vec<(String, String)> {
         self.inner.lock().unwrap().vips.clone()
+    }
+
+    pub fn fence_devices_created(&self) -> Vec<(crate::topology::FenceDevice, String)> {
+        self.inner.lock().unwrap().fence_devices_created.clone()
+    }
+
+    pub fn fenced(&self) -> Vec<String> {
+        self.inner.lock().unwrap().fenced.clone()
+    }
+
+    pub fn confirmed_dead(&self) -> Vec<String> {
+        self.inner.lock().unwrap().confirmed_dead.clone()
     }
 
     fn take_failure(&self) -> Option<ClusterError> {
@@ -388,6 +411,63 @@ impl ClusterBackend for MockBackend {
             .push((cluster.to_string(), format!("{address}/{prefix}")));
         Ok(())
     }
+
+    async fn create_fence_device(
+        &self,
+        device: &crate::topology::FenceDevice,
+        password: &str,
+    ) -> Result<()> {
+        if let Some(err) = self.take_failure() {
+            return Err(err);
+        }
+        let mut inner = self.inner.lock().unwrap();
+        // The device becomes observable on whichever simulated cluster the
+        // target belongs to, the way a CIB write shows up in the next
+        // crm_mon — active, unfailed, and never live-tested.
+        for state in inner.clusters.values_mut() {
+            if state.nodes.iter().any(|n| n.name == device.target) {
+                state.fence_devices.push(FenceDeviceState {
+                    device: device.id.clone(),
+                    target: device.target.clone(),
+                    active: true,
+                    failed: false,
+                    last_test: None,
+                });
+            }
+        }
+        inner
+            .fence_devices_created
+            .push((device.clone(), password.to_string()));
+        Ok(())
+    }
+
+    async fn fence_node(&self, target: &str) -> Result<()> {
+        if let Some(err) = self.take_failure() {
+            return Err(err);
+        }
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(reason) = inner.fail_fence.take() {
+            return Err(ClusterError::Backend(anyhow::anyhow!(reason)));
+        }
+        inner.fenced.push(target.to_string());
+        Ok(())
+    }
+
+    async fn confirm_node_dead(&self, target: &str) -> Result<()> {
+        if let Some(err) = self.take_failure() {
+            return Err(err);
+        }
+        let mut inner = self.inner.lock().unwrap();
+        // Pacemaker stops calling the node unclean: the operator has vouched
+        // for what fencing could not prove. It stays offline.
+        for state in inner.clusters.values_mut() {
+            if let Some(node) = state.nodes.iter_mut().find(|n| n.name == target) {
+                node.unclean = false;
+            }
+        }
+        inner.confirmed_dead.push(target.to_string());
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -450,6 +530,37 @@ mod tests {
         assert!(backend.local_preflight().await.unwrap().already_clustered);
         backend.remove_cluster_config().await.unwrap();
         assert!(!backend.local_preflight().await.unwrap().already_clustered);
+    }
+
+    #[tokio::test]
+    async fn a_created_device_is_observable_and_a_confirmation_clears_unclean() {
+        let backend = MockBackend::environment().with_partition("alpha", "alpha-2");
+        backend
+            .create_fence_device(
+                &crate::topology::FenceDevice {
+                    id: "fence-extra".into(),
+                    target: "alpha-1".into(),
+                    bmc_address: "10.20.0.9".into(),
+                    bmc_username: "ADMIN".into(),
+                    delay_base_secs: 0,
+                },
+                "pw",
+            )
+            .await
+            .unwrap();
+        let alpha = backend.cluster_state("alpha").await.unwrap();
+        assert!(alpha
+            .fence_devices
+            .iter()
+            .any(|d| d.device == "fence-extra"));
+
+        assert_eq!(alpha.unfenced_unreachable().len(), 1);
+        backend.confirm_node_dead("alpha-2").await.unwrap();
+        let alpha = backend.cluster_state("alpha").await.unwrap();
+        // Vouched for: no longer unclean, still offline.
+        assert!(alpha.unfenced_unreachable().is_empty());
+        assert!(!alpha.node("alpha-2").unwrap().online);
+        assert_eq!(backend.confirmed_dead(), vec!["alpha-2"]);
     }
 
     #[tokio::test]

@@ -252,7 +252,7 @@ function ClusterCard({
           <div className="text-[13px] text-[var(--qz-fg-2)]">
             Fencing has not been live-tested for {cluster.fence.untested} node
             {cluster.fence.untested === 1 ? "" : "s"}. An untested fence path is one that fails
-            during the outage that needed it.
+            during the outage that needed it — test each direction from Infrastructure → Nodes.
           </div>
         </div>
       )}

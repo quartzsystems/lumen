@@ -31,8 +31,10 @@ import {
 /// included — because a wizard that closes on submit turns a five-minute
 /// workflow into a spinner.
 ///
-/// Fencing here collects the BMC seats; connectivity checks and live fence
-/// tests land with the fencing stage and will slot into this tab.
+/// Fencing collects the BMC seats and passwords; the create writes the fence
+/// devices into the CIB itself. The live per-direction fence tests are a
+/// separate, deliberate act afterwards — from the Nodes page, one direction
+/// at a time — because a test power-cycles a node.
 
 interface MemberDraft {
   core_interface: string;
@@ -41,6 +43,7 @@ interface MemberDraft {
   management_address: string;
   bmc_address: string;
   bmc_username: string;
+  bmc_password: string;
 }
 
 const emptyDraft = (): MemberDraft => ({
@@ -50,6 +53,7 @@ const emptyDraft = (): MemberDraft => ({
   management_address: "",
   bmc_address: "",
   bmc_username: "ADMIN",
+  bmc_password: "",
 });
 
 /// Propose the n-th host address inside a /24-ish subnet: base + n + 1.
@@ -150,6 +154,7 @@ export function CreateClusterDialog({
         management_address: draft.management_address,
         bmc_address: draft.bmc_address,
         bmc_username: draft.bmc_username,
+        bmc_password: draft.bmc_password,
       };
     });
     return {
@@ -186,7 +191,7 @@ export function CreateClusterDialog({
     });
   const fencingReady = selected.every((node) => {
     const draft = draftOf(node);
-    return draft.bmc_address.trim() && draft.bmc_username.trim();
+    return draft.bmc_address.trim() && draft.bmc_username.trim() && draft.bmc_password.length > 0;
   });
 
   const create = async () => {
@@ -458,8 +463,9 @@ export function CreateClusterDialog({
             <AlertTriangle size={17} className="flex-shrink-0 text-[var(--qz-fg-4)] mt-[1px]" />
             <div className="text-[13px] text-[var(--qz-fg-3)]">
               IPMI is the only fencing mechanism this appliance uses — one BMC per node, no
-              fallback levels. Fence devices are created and live-tested in the fencing stage;
-              the seats are collected now so the cluster is built knowing them.
+              fallback levels. The create writes one fence device per member into the cluster,
+              password and all; the password goes nowhere else and is never shown back. Live
+              fence tests run afterwards, from the Nodes page.
             </div>
           </div>
           {selected.map((node) => {
@@ -483,6 +489,18 @@ export function CreateClusterDialog({
                       mono
                       value={draft.bmc_username}
                       onChange={(v) => patchDraft(node, { bmc_username: v })}
+                    />
+                  </Field>
+                  <Field
+                    label="BMC password"
+                    required
+                    hint="Written into the cluster's fence device and kept nowhere else."
+                  >
+                    <TextInput
+                      mono
+                      type="password"
+                      value={draft.bmc_password}
+                      onChange={(v) => patchDraft(node, { bmc_password: v })}
                     />
                   </Field>
                 </div>
@@ -599,6 +617,7 @@ const STEP_LABEL: Record<string, string> = {
   start: "Start cluster stack",
   form: "Wait for the cluster to form",
   properties: "Set cluster properties",
+  fence: "Create fence device",
   record: "Record the cluster",
   unwind: "Unwind",
 };

@@ -13,11 +13,11 @@
 //!
 //! Preflight every member → validate → generate (corosync.conf from the
 //! topology engine, a fresh authkey) → prepare every member → start every
-//! member → wait for the cluster to form → set Pacemaker properties → write
-//! the membership record. **The record is written last**, which is what makes
-//! "a half-created cluster is not a representable state" true: any failure
-//! before the record unwinds the members to exactly where they started, and
-//! the record never knew the cluster existed.
+//! member → wait for the cluster to form → set Pacemaker properties → create
+//! the fence devices → write the membership record. **The record is written
+//! last**, which is what makes "a half-created cluster is not a representable
+//! state" true: any failure before the record unwinds the members to exactly
+//! where they started, and the record never knew the cluster existed.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -338,6 +338,7 @@ pub fn generate_authkey() -> String {
 pub async fn run_create(
     definition: ClusterDefinition,
     networks: ClusterNetworks,
+    bmc_passwords: std::collections::BTreeMap<String, String>,
     membership: EnvironmentMembership,
     coordinator_version: &str,
     peers: &dyn PeerChannel,
@@ -357,6 +358,7 @@ pub async fn run_create(
     match drive(
         &definition,
         &networks,
+        &bmc_passwords,
         &membership,
         &members,
         coordinator_version,
@@ -453,6 +455,9 @@ pub fn plan_progress(definition: &ClusterDefinition) -> CreateProgress {
     }
     steps.push(step("form", None));
     steps.push(step("properties", None));
+    for node in &member_names {
+        steps.push(step("fence", Some(node)));
+    }
     steps.push(step("record", None));
     CreateProgress {
         cluster: definition.name.clone(),
@@ -468,6 +473,7 @@ pub fn plan_progress(definition: &ClusterDefinition) -> CreateProgress {
 async fn drive(
     definition: &ClusterDefinition,
     networks: &ClusterNetworks,
+    bmc_passwords: &std::collections::BTreeMap<String, String>,
     membership: &EnvironmentMembership,
     members: &[EnvironmentNode],
     coordinator_version: &str,
@@ -661,6 +667,34 @@ async fn drive(
     }
     progress.set_step("properties", None, StepState::Done, None);
 
+    // Fencing: one fence_ipmilan device per member, written into the CIB
+    // with its BMC password — the only place the password goes. STONITH was
+    // enabled a step ago, so the cluster is not left enabled-but-deviceless
+    // for longer than this loop takes.
+    for device in topology.fence_devices() {
+        progress.set_step("fence", Some(&device.target), StepState::Running, None);
+        let password = bmc_passwords
+            .get(&device.target)
+            .map(String::as_str)
+            .unwrap_or_default();
+        if let Err(err) = backend.create_fence_device(&device, password).await {
+            progress.set_step(
+                "fence",
+                Some(&device.target),
+                StepState::Failed,
+                Some(err.to_string()),
+            );
+            return Err((
+                members.len(),
+                ClusterError::Conflict(format!(
+                    "Creating the fence device for {} failed: {err}",
+                    device.target
+                )),
+            ));
+        }
+        progress.set_step("fence", Some(&device.target), StepState::Done, None);
+    }
+
     // Record, last. Failure before this line leaves the record untouched.
     progress.set_step("record", None, StepState::Running, None);
     let mut updated = membership.clone();
@@ -673,6 +707,7 @@ async fn drive(
     updated.clusters.push(ClusterRecord {
         definition: definition.clone(),
         networks: networks.clone(),
+        fence_tests: Default::default(),
     });
     progress.set_step("record", None, StepState::Done, None);
     Ok(updated)

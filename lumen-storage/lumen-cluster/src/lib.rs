@@ -63,7 +63,7 @@ pub use networks::{
 };
 pub use service::{
     ClusterHealth, ClusterNodeView, ClusterService, ClusterView, EnvironmentResponse,
-    EnvironmentView, FenceSummaryView, JoinOutcome, MintedToken, UnassignedNodeView,
+    EnvironmentView, FenceSummaryView, FenceTestView, JoinOutcome, MintedToken, UnassignedNodeView,
 };
 pub use state::{ClusterState, FenceDeviceState, FenceTest, NodeState, QuorumState, RingLink};
 pub use store::{EnvironmentStore, Identity};

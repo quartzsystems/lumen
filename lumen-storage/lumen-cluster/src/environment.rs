@@ -58,6 +58,13 @@ pub struct EnvironmentNode {
 pub struct ClusterRecord {
     pub definition: ClusterDefinition,
     pub networks: ClusterNetworks,
+    /// The last guarded live fence test per direction, keyed by target node.
+    /// Lumen state, not Pacemaker's — crm_mon cannot say whether a device was
+    /// ever proven, only whether its monitor passes — and it rides the
+    /// membership record so a test run from one console clears the untested
+    /// warning on every console.
+    #[serde(default)]
+    pub fence_tests: std::collections::BTreeMap<String, crate::state::FenceTest>,
 }
 
 /// The replicated membership record. See the module documentation for how two
