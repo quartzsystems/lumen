@@ -45,17 +45,21 @@ install anything this key did not sign.
 install -D -p -m 0644 %{SOURCE0} %{buildroot}%{_sysconfdir}/yum.repos.d/lumen.repo
 install -D -p -m 0644 %{SOURCE1} %{buildroot}%{_sysconfdir}/pki/rpm-gpg/RPM-GPG-KEY-lumen
 
-%post
-# Import the key into the package database on install and on upgrade. The
-# repository definition names the file, which is enough for dnf to offer the
-# import interactively — but nothing on an appliance is interactive, and an
-# unattended transaction that stops to ask a question nobody is there to answer
-# is an update that silently never happens.
+# No %post key import. The obvious thing — rpmkeys --import here — cannot work
+# and never did: a scriptlet runs inside the transaction that installs this
+# package, that transaction holds the rpm database lock for its whole duration
+# including %posttrans, and rpmkeys needs the same lock to write a key. It fails
+# with "can't create transaction lock", the "|| :" that made it look tolerable
+# swallowed the exit status, and every node ended up without the key while the
+# install reported success.
 #
-# Suffixed with "|| :" unlike the control plane's semodule call: a key that is
-# already present is the ordinary case on every upgrade, and rpmkeys is not
-# uniformly quiet about it.
-%{_bindir}/rpmkeys --import %{_sysconfdir}/pki/rpm-gpg/RPM-GPG-KEY-lumen || :
+# The key is shipped to the path the repository definition names as its gpgkey,
+# which is where dnf imports it from, on its own terms and outside any lock we
+# hold. That import is a prompt, and an appliance has nobody to answer it, so
+# both of the update service's dnf invocations pass --assumeyes: the check as
+# well as the upgrade. The check is the one that matters — it runs first, and a
+# check that cannot import the key reads a repository it then silently skips.
+# See lumen-system/lumen-update/src/backend/dnf.rs.
 
 %files
 # noreplace: an operator who pointed this node at their own mirror, or turned

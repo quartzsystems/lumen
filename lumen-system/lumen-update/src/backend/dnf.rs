@@ -83,10 +83,25 @@ impl UpdateBackend for DnfBackend {
     async fn check(&self) -> Result<Vec<Update>> {
         // --refresh is the point of an explicit check: an operator pressing
         // "Check now" wants the repositories asked, not the cache re-read.
+        //
+        // --assumeyes answers exactly one question, and check-update installs
+        // nothing, so it cannot answer anything more dangerous: the first time a
+        // node reads a repository with repo_gpgcheck, dnf asks whether to import
+        // that repository's key. Nothing here is a terminal, so unanswered means
+        // the repository fails to load, and skip_if_unavailable then drops it
+        // without a word — a node with updates waiting reports none, which is
+        // the worst possible way for this to fail. The key being imported is the
+        // one already installed at the path lumen.repo names, by a package the
+        // operator chose to install; consenting to it again is not a decision.
         let outcome = self
             .run(
                 "Lumen: check for updates",
-                vec!["--quiet".into(), "--refresh".into(), "check-update".into()],
+                vec![
+                    "--quiet".into(),
+                    "--assumeyes".into(),
+                    "--refresh".into(),
+                    "check-update".into(),
+                ],
             )
             .await?;
 

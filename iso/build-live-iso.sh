@@ -157,6 +157,23 @@ mkdir -p "$TREE/lumen"
 cp "$REPO_ROOT"/dist/rpms/*.noarch.rpm "$REPO_ROOT"/dist/rpms/*.x86_64.rpm \
    "$TREE/lumen/"
 
+# lumen-repo carries the repository configuration and the signing key, so it is
+# what tells an installed node where its updates come from. Without it a node
+# resolves against the distribution's repositories alone and never sees a Lumen
+# update — the packages are on the media, but the address they came from is not.
+#
+# Appended here rather than listed in TARGET_PACKAGES above because
+# build-rpms.sh only builds it when the signing key is in the tree. A
+# contributor without key material still gets a working ISO; its nodes just have
+# no Lumen repository configured, which is said out loud rather than discovered.
+if compgen -G "$REPO_ROOT/dist/rpms/lumen-repo-*.noarch.rpm" > /dev/null; then
+    TARGET_PACKAGES+=(lumen-repo)
+else
+    echo "==> NOTE: lumen-repo was not built, so nodes installed from this ISO"
+    echo "    will have no Lumen repository configured and will not be offered"
+    echo "    Lumen updates. See packages/keys/README.md."
+fi
+
 echo "==> Mirroring OpenZFS $ZFS_SERIES kABI subset from $ZFS_REPO_URL"
 zfs_dl="$WORK/zfs-download"
 mkdir -p "$zfs_dl"
