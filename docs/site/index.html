@@ -53,7 +53,7 @@
   <p>This host serves the package repository that installed Lumen appliances
      update from. There is nothing to download here by hand — an appliance is
      installed from the ISO on the
-     <a href="https://github.com/zagdrath/lumen/releases">releases page</a> and
+     <a href="https://github.com/quartzsystems/lumen/releases">releases page</a> and
      configures this repository itself.</p>
 
   <h2>Updating an appliance</h2>
@@ -70,14 +70,14 @@
   <h2>Adding the repository by hand</h2>
   <p>Only needed on a node that was not installed from a Lumen ISO.</p>
 <pre>rpm --import https://lumen.quartz.systems/RPM-GPG-KEY-lumen
-dnf install https://lumen.quartz.systems/repo/stable/10/x86_64/lumen-repo-0.3.0-1.el10.noarch.rpm</pre>
+dnf install https://lumen.quartz.systems/repo/stable/10/x86_64/@LUMEN_REPO_RPM@</pre>
 
   <p>Every package here is signed, and so is the repository index. An appliance
      verifies both before it installs anything.</p>
 
   <h2>Source</h2>
   <p>Lumen is developed in the open at
-     <a href="https://github.com/zagdrath/lumen">github.com/zagdrath/lumen</a>,
+     <a href="https://github.com/quartzsystems/lumen">github.com/quartzsystems/lumen</a>,
      where the design notes for each subsystem live under <code>docs/</code>.</p>
 
   <hr>

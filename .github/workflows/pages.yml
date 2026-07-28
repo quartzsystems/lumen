@@ -142,6 +142,39 @@ jobs:
           find "$stable" -name '*.src.rpm' -delete
           ls -l "$stable" || true
 
+      - name: Point the install instructions at a package that exists
+        # The landing page carries the one copy-pasteable command for setting up
+        # a node by hand, and it has to name a specific file. Hardcoding the
+        # version there means every release silently invalidates it — the page
+        # keeps advertising a package that is no longer published.
+        #
+        # The name is taken from the package actually mirrored above rather than
+        # from VERSION. On main, VERSION is frequently a version that has been
+        # bumped but not yet tagged, so templating from it would swap one wrong
+        # answer for another; the mirrored file is by construction one a reader
+        # can download.
+        run: |
+          set -euo pipefail
+          stable="build/pages/repo/stable/$RELEASEVER/x86_64"
+          # A missing placeholder means someone edited the page back to a
+          # literal version, which fails silently and stays wrong until a user
+          # reports a 404. Catch it here instead.
+          if ! grep -q '@LUMEN_REPO_RPM@' build/pages/index.html; then
+            echo "::error::docs/site/index.html has no @LUMEN_REPO_RPM@ placeholder; the install command would publish whatever version is hardcoded in it"
+            exit 1
+          fi
+          rpm="$(find "$stable" -maxdepth 1 -name 'lumen-repo-*.rpm' -printf '%f\n' \
+                   | sort -V | tail -n1)"
+          if [ -z "$rpm" ]; then
+            # Before the first release there is nothing to point at. The command
+            # is published unresolvable either way; say so in the log rather
+            # than failing the deployment of an otherwise correct site.
+            rpm="lumen-repo-$(cat VERSION)-1.el10.noarch.rpm"
+            echo "::warning::no lumen-repo package was mirrored; the manual install command will name $rpm, which is not published"
+          fi
+          echo "==> manual install points at $rpm"
+          sed -i "s|@LUMEN_REPO_RPM@|$rpm|g" build/pages/index.html
+
       - name: Import the signing key
         env:
           LUMEN_GPG_PRIVATE_KEY: ${{ secrets.LUMEN_GPG_PRIVATE_KEY }}
