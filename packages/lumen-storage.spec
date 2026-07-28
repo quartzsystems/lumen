@@ -37,6 +37,14 @@ Requires:       pcs
 Requires:       fence-agents-ipmilan
 Requires:       drbd9x-utils
 Requires:       kmod-drbd9x
+# The shell helper every OCF agent sources resolves its own tool paths by
+# shelling out to a command EL10 no longer installs by default, and the
+# package that ships those agents does not ask for it. Without it the lookup
+# fails for every tool, so each agent reports itself as not installed and the
+# resource never starts — the address one is simply the first an operator
+# meets. Asked for here because this is the package that puts those agents on
+# a node.
+Requires:       which
 %{?systemd_requires}
 BuildRequires:  systemd-rpm-macros
 

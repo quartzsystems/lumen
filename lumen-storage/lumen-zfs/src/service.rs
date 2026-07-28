@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::backend::ZfsBackend;
@@ -45,7 +45,7 @@ pub struct DevicesResponse {
 /// One row of the console's pool table. Everything a row needs is here, so
 /// rendering never needs a second round trip — the shape
 /// `lumen_net::service::LinkView` established.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoolView {
     pub name: String,
     pub health: PoolHealth,

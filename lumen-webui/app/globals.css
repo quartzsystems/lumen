@@ -270,7 +270,17 @@ body {
   background: var(--qz-accent);
 }
 
-/* --- Dark checkbox --- */
+/* --- Dark checkbox ---
+   `.qz-check` is the box itself and belongs on the `input`. A label that
+   pairs the box with its text takes `.qz-check-row`, which is the only part
+   that lays anything out — putting the box class on the label collapses the
+   label to the box's 15px and wraps its text one word per line. */
+.qz-check-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  cursor: pointer;
+}
 .qz-check {
   appearance: none;
   -webkit-appearance: none;
@@ -288,8 +298,10 @@ body {
 .qz-check:hover { border-color: var(--qz-fg-4); }
 .qz-check:checked,
 .qz-check:indeterminate {
-  background: var(--qz-accent);
-  border-color: var(--qz-accent);
+  /* A dialog whose acknowledgement is destructive sets `--qz-check-accent`
+     to say so in the box's own colour. */
+  background: var(--qz-check-accent, var(--qz-accent));
+  border-color: var(--qz-check-accent, var(--qz-accent));
 }
 .qz-check:checked::after {
   content: "";

@@ -28,8 +28,10 @@ use crate::join::{
     TeardownPayload,
 };
 use crate::model::Regime;
-use crate::networks::ClusterNetworks;
-use crate::state::{hostname, ClusterState, FenceDeviceState, FenceTest, QuorumState, RingLink};
+use crate::networks::{valid_bridge_name, ClusterNetworks, ExternalNetwork, VlanMode};
+use crate::state::{
+    hostname, ClusterState, FenceDeviceState, FenceTest, QuorumState, RingLink, VipState,
+};
 use crate::store::{EnvironmentStore, Identity, JoinTokenRecord};
 use crate::validate::{
     validate_definition, Acknowledgements, ClusterCreate, ValidationCode, ValidationError,
@@ -86,11 +88,33 @@ pub struct ClusterView {
     pub preferred_node: Option<String>,
     pub nodes: Vec<ClusterNodeView>,
     pub fence: FenceSummaryView,
+    /// The cluster address: what the definition asked for, and what Pacemaker
+    /// has actually done about it.
+    ///
+    /// Absent when the definition names no VIP. Present with `state: None`
+    /// when it names one and Pacemaker has no such resource — which is a
+    /// fault, not an absence, and the console says so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vip: Option<VipView>,
     /// Why the cluster's state could not be read, when it could not. The
     /// nodes are then listed from the membership record with nothing claimed
     /// about them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// The cluster address, definition and reality side by side.
+///
+/// Both halves, because either one alone misleads. The definition alone says
+/// a VIP exists when Pacemaker may have stopped it; Pacemaker alone cannot
+/// say which address was meant when the resource is missing entirely.
+#[derive(Debug, Clone, Serialize)]
+pub struct VipView {
+    /// The address the cluster's Management network defines.
+    pub address: std::net::Ipv4Addr,
+    /// What Pacemaker reports about the resource, when it has one at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<VipState>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -286,6 +310,19 @@ impl ClusterService {
         self.store.load_membership()
     }
 
+    /// Every node in this environment, local one included, for a caller that
+    /// wants to ask each of them the same question.
+    ///
+    /// A node that has not joined anything answers with itself and no
+    /// address: it is an environment of one, and a reader that has to
+    /// special-case "no membership yet" is a reader that will forget to.
+    pub fn environment_nodes(&self) -> Result<Vec<EnvironmentNode>> {
+        Ok(self
+            .membership()?
+            .map(|membership| membership.nodes)
+            .unwrap_or_default())
+    }
+
     fn require_membership(&self) -> Result<EnvironmentMembership> {
         self.membership()?.ok_or_else(|| {
             ClusterError::Conflict(
@@ -370,6 +407,180 @@ impl ClusterService {
             ))
         })?;
         Ok(record.networks.clone())
+    }
+
+    /// What one member has to build for an External network, given the port
+    /// that member carries it on.
+    ///
+    /// A trunk bridges the uplink directly and turns on VLAN filtering, which
+    /// is what "VLAN aware" means: tagged frames reach the machines. An
+    /// access network bridges `nic.N` instead — the bridge itself carries
+    /// untagged frames, and the tag is put on and taken off by the VLAN
+    /// interface underneath. Bridging the raw uplink for an access network
+    /// would put the machines on whatever the switch sends untagged, which is
+    /// not the VLAN that was asked for.
+    fn external_seat(network: &ExternalNetwork, interface: &str) -> crate::join::ExternalSeat {
+        let comment = Some(format!("External network \"{}\"", network.name));
+        match network.vlan {
+            VlanMode::Trunk { .. } => crate::join::ExternalSeat {
+                vlan: None,
+                bridge: lumen_net::Bridge {
+                    name: network.bridge.clone(),
+                    ports: vec![interface.to_string()],
+                    vlan_filtering: true,
+                    comment,
+                    ..lumen_net::Bridge::default()
+                },
+            },
+            VlanMode::Access { vlan } => {
+                let name = format!("{interface}.{vlan}");
+                crate::join::ExternalSeat {
+                    vlan: Some(lumen_net::Vlan {
+                        name: name.clone(),
+                        parent: interface.to_string(),
+                        vlan_id: vlan,
+                        comment: comment.clone(),
+                        ..lumen_net::Vlan::default()
+                    }),
+                    bridge: lumen_net::Bridge {
+                        name: network.bridge.clone(),
+                        ports: vec![name],
+                        vlan_filtering: false,
+                        comment,
+                        ..lumen_net::Bridge::default()
+                    },
+                }
+            }
+        }
+    }
+
+    /// Define an External network on a cluster and build its bridge on every
+    /// member.
+    ///
+    /// Realized before it is recorded, in that order and deliberately. The
+    /// consistency rule the whole type rests on is that an External network
+    /// is on every member or on none — a machine restarted onto a node where
+    /// its network does not resolve is the failure HA exists to prevent — so
+    /// a record written before the boxes agreed with it would be a promise
+    /// the cluster had not kept.
+    ///
+    /// A member that cannot build its bridge fails the call and nothing is
+    /// recorded. Bridges already built on other members stay: they are
+    /// ordinary links, harmless on their own, and `peer_create_bridge` is
+    /// idempotent, so fixing the failing node and asking again finishes the
+    /// job rather than tripping over the work already done.
+    pub async fn create_external_network(
+        &self,
+        cluster: &str,
+        network: ExternalNetwork,
+    ) -> Result<ExternalNetwork> {
+        let _guard = self.gate.lock().await;
+        let mut membership = self.require_membership()?;
+        let Some(record) = membership.cluster_record(cluster).cloned() else {
+            return Err(ClusterError::NotFound(format!(
+                "There is no cluster called \"{cluster}\" in this environment."
+            )));
+        };
+
+        if network.name.trim().is_empty() {
+            return Err(ClusterError::Conflict(
+                "An External network needs a name — it is what a machine's network refers to."
+                    .to_string(),
+            ));
+        }
+        if !valid_bridge_name(&network.bridge) {
+            return Err(ClusterError::Conflict(format!(
+                "\"{}\" is not a usable bridge name.",
+                network.bridge
+            )));
+        }
+        if record
+            .networks
+            .external
+            .iter()
+            .any(|existing| existing.name == network.name)
+        {
+            return Err(ClusterError::Conflict(format!(
+                "\"{cluster}\" already defines an External network called \"{}\".",
+                network.name
+            )));
+        }
+        if record
+            .networks
+            .external
+            .iter()
+            .any(|existing| existing.bridge == network.bridge)
+        {
+            return Err(ClusterError::Conflict(format!(
+                "\"{cluster}\" already has an External network on bridge \"{}\" — two networks \
+                 sharing a bridge are one network with two names.",
+                network.bridge
+            )));
+        }
+
+        // Every member or none, checked before anything is built rather than
+        // discovered halfway through.
+        let members: Vec<EnvironmentNode> =
+            membership.members_of(cluster).into_iter().cloned().collect();
+        for member in &members {
+            if !network.uplinks.iter().any(|up| up.node == member.name) {
+                return Err(ClusterError::Conflict(format!(
+                    "\"{}\" has no uplink for this network. An External network is defined on \
+                     every member or on none — a machine that fails over onto a member without \
+                     it comes up with no network.",
+                    member.name
+                )));
+            }
+        }
+        for uplink in &network.uplinks {
+            if !members.iter().any(|member| member.name == uplink.node) {
+                return Err(ClusterError::Conflict(format!(
+                    "\"{}\" is not a member of \"{cluster}\".",
+                    uplink.node
+                )));
+            }
+        }
+
+        // Build it everywhere. The bridge carries no host addressing — that
+        // is what makes it an External network rather than a second
+        // Management one — and takes its uplink as its only port.
+        for member in &members {
+            let uplink = network
+                .uplinks
+                .iter()
+                .find(|up| up.node == member.name)
+                .expect("every member was checked to have one above");
+            let seat = Self::external_seat(&network, &uplink.interface);
+            if let Err(err) = self.peers.create_bridge(member, &seat).await {
+                return Err(ClusterError::Conflict(format!(
+                    "\"{}\" could not build the bridge, so the network was not defined: {err}. \
+                     Fix that member and try again — the members that did build it will not \
+                     object the second time.",
+                    member.name
+                )));
+            }
+        }
+
+        // Recorded only now that every member has it.
+        let Some(stored) = membership
+            .clusters
+            .iter_mut()
+            .find(|candidate| candidate.definition.name == cluster)
+        else {
+            return Err(ClusterError::NotFound(format!(
+                "There is no cluster called \"{cluster}\" in this environment."
+            )));
+        };
+        stored.networks.external.push(network.clone());
+        membership.version += 1;
+        self.store.save_membership(&membership)?;
+        tracing::info!(
+            cluster = cluster,
+            network = %network.name,
+            bridge = %network.bridge,
+            "external network defined on every member"
+        );
+        Ok(network)
     }
 
     // --- environment membership -------------------------------------------
@@ -708,6 +919,90 @@ impl ClusterService {
         }
         self.network
             .create_bond(bond.clone())
+            .await
+            .map_err(ClusterError::from)?;
+        self.network
+            .apply(lumen_net::Acknowledgements::default())
+            .await
+            .map_err(ClusterError::from)?;
+        self.network.confirm().await.map_err(ClusterError::from)?;
+        Ok(())
+    }
+
+    /// Build an External network's bridge here, through this node's own
+    /// networking domain.
+    ///
+    /// Same rule as the bond above: what comes out is an ordinary link. The
+    /// cluster's record says the network exists and on which port; the bridge
+    /// realizing it belongs to networking, is edited there, and survives a
+    /// cluster teardown — because the machines attached to it do.
+    ///
+    /// Idempotent on the bridge already being right. A create that half
+    /// succeeded across members is retried by the coordinator, and a member
+    /// that already did its part must not fail the second attempt.
+    pub async fn peer_create_bridge(&self, seat: &crate::join::ExternalSeat) -> Result<()> {
+        let bridge = &seat.bridge;
+        let observed = self.network.observe().await.map_err(ClusterError::from)?;
+        if let Some(existing) = observed.link(&bridge.name) {
+            if existing.kind != lumen_net::LinkKind::Bridge {
+                return Err(ClusterError::Conflict(format!(
+                    "This node already has a link called \"{}\", and it is not a bridge.",
+                    bridge.name
+                )));
+            }
+            // Already built, by an earlier attempt or by hand. The uplink is
+            // what makes it the right bridge; a bridge of the same name with
+            // a different port is a different network wearing the name.
+            for port in &bridge.ports {
+                if !existing.ports.contains(port) {
+                    return Err(ClusterError::Conflict(format!(
+                        "This node already has a bridge called \"{}\" and \"{port}\" is not one \
+                         of its ports.",
+                        bridge.name
+                    )));
+                }
+            }
+            return Ok(());
+        }
+        // An access network's port is the VLAN interface, which does not
+        // exist yet — so the port check applies to whatever the seat is
+        // actually built on: the VLAN's parent when there is one, the
+        // bridge's port when there is not.
+        let physical: Vec<&String> = match &seat.vlan {
+            Some(vlan) => vec![&vlan.parent],
+            None => bridge.ports.iter().collect(),
+        };
+        for port in physical {
+            let Some(link) = observed.link(port) else {
+                return Err(ClusterError::Conflict(format!(
+                    "This node has no link called \"{port}\"."
+                )));
+            };
+            // The same cut-yourself-off rule the bond enforces: a bridge takes
+            // its port over, so the link the console answers on may not be
+            // swallowed without moving the addressing first. A VLAN interface
+            // is the exception — it shares its parent rather than consuming
+            // it, which is exactly why an access network is built that way.
+            if seat.vlan.is_none() && !link.addresses.is_empty() {
+                return Err(ClusterError::Conflict(format!(
+                    "\"{port}\" already carries {} — a bridge takes its port over, so move the \
+                     addressing off it first.",
+                    link.addresses.join(", ")
+                )));
+            }
+        }
+        // The VLAN interface first: the bridge names it as its port, so it
+        // has to exist before the bridge that claims it.
+        if let Some(vlan) = &seat.vlan {
+            if observed.link(&vlan.name).is_none() {
+                self.network
+                    .create_vlan(vlan.clone())
+                    .await
+                    .map_err(ClusterError::from)?;
+            }
+        }
+        self.network
+            .create_bridge(bridge.clone())
             .await
             .map_err(ClusterError::from)?;
         self.network
@@ -2000,6 +2295,14 @@ impl ClusterService {
                     preferred_node: preferred,
                     nodes,
                     fence: FenceSummaryView::default(),
+                    // The definition's address is known from the record even
+                    // here; what Pacemaker has done about it is not.
+                    vip: membership.cluster_record(name).and_then(|record| {
+                        record.networks.management.vip.map(|address| VipView {
+                            address,
+                            state: None,
+                        })
+                    }),
                     error: Some(err.to_string()),
                 }
             }
@@ -2060,6 +2363,15 @@ impl ClusterService {
             preferred_node,
             nodes,
             fence,
+            // Only when the definition asked for one. A cluster with no VIP
+            // has nothing to report, and reporting Pacemaker's silence about
+            // a resource nobody asked for would read as a fault.
+            vip: membership.cluster_record(name).and_then(|record| {
+                record.networks.management.vip.map(|address| VipView {
+                    address,
+                    state: state.vip.clone(),
+                })
+            }),
             error: None,
         }
     }
@@ -2125,7 +2437,19 @@ fn health_of(state: &ClusterState) -> ClusterHealth {
     let fence_worry = state.fence_devices.iter().any(|d| {
         d.failed || !d.active || d.last_test.is_none() || d.last_test.is_some_and(|t| !t.passed)
     });
-    if state.nodes.iter().any(|n| !n.online || n.standby) || ring_degraded || fence_worry {
+    // A cluster address that exists in Pacemaker and is not running is an
+    // address nobody answers on. Degraded rather than Critical: no data is at
+    // stake, but every console bookmark pointing at the VIP is dead, which an
+    // operator finds out at the worst possible moment otherwise.
+    let vip_worry = state
+        .vip
+        .as_ref()
+        .is_some_and(|vip| !vip.active || vip.failed || vip.blocked);
+    if state.nodes.iter().any(|n| !n.online || n.standby)
+        || ring_degraded
+        || fence_worry
+        || vip_worry
+    {
         return ClusterHealth::Degraded;
     }
     ClusterHealth::Ok

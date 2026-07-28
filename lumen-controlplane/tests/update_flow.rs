@@ -140,6 +140,7 @@ async fn harness(tag: &str, mock: MockUpdates) -> Harness {
         storage,
         virt,
         cluster,
+        peers: Arc::new(lumen_controlplane::inventory::NoPeers),
         drbd,
         updates: Arc::new(UpdateService::new(updates.clone(), "lumen")),
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),

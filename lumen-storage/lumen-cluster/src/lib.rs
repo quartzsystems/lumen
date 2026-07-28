@@ -67,9 +67,11 @@ pub use networks::{
 pub use service::{
     quorum_survives_loss, AddNodePlan, ClusterHealth, ClusterNodeView, ClusterService, ClusterView,
     EnvironmentResponse, EnvironmentView, FenceSummaryView, FenceTestView, JoinOutcome,
-    MaintenanceView, MintedToken, UnassignedNodeView,
+    MaintenanceView, MintedToken, UnassignedNodeView, VipView,
 };
-pub use state::{ClusterState, FenceDeviceState, FenceTest, NodeState, QuorumState, RingLink};
+pub use state::{
+    ClusterState, FenceDeviceState, FenceTest, NodeState, QuorumState, RingLink, VipState,
+};
 pub use store::{EnvironmentStore, Identity, StoredDefinition};
 pub use topology::{ClusterTopology, FenceDevice, ReplicationPolicy};
 pub use validate::{

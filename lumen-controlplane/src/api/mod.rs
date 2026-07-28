@@ -109,6 +109,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         // that never joined an environment still answers, with itself as the
         // one unassigned node; see src/api/cluster.rs and docs/cluster.md.
         .route("/api/environment", get(cluster::environment))
+        .route("/api/environment/inventory", get(cluster::inventory))
+        // One pool name, built on several members at once — what the drive
+        // picker across nodes submits. Each pool is still that node's own.
+        .route(
+            "/api/environment/storage/pools",
+            post(cluster::create_cluster_pool),
+        )
         .route("/api/environment/tokens", post(cluster::mint_token))
         .route("/api/environment/join", post(cluster::join))
         .route("/api/environment/preflight", post(cluster::preflight))
@@ -131,6 +138,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/environment/clusters/{name}/networks",
             get(cluster::cluster_networks),
+        )
+        // Defining an External network builds its bridge on every member
+        // before the record admits it exists — see the handler for why the
+        // two halves are one call.
+        .route(
+            "/api/environment/clusters/{name}/networks/external",
+            post(cluster::create_external_network),
         )
         .route(
             "/api/environment/nodes/{name}",
@@ -171,6 +185,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/peer/cluster/prepare", post(peer::prepare))
         .route("/api/peer/cluster/start", post(peer::start))
         .route("/api/peer/network/bond", post(peer::create_bond))
+        .route("/api/peer/network/bridge", post(peer::create_bridge))
+        .route("/api/peer/node/inventory", post(peer::inventory))
+        .route("/api/peer/storage/pool", post(peer::create_pool))
         .route("/api/peer/cluster/teardown", post(peer::teardown))
         .route("/api/peer/cluster/reconfigure", post(peer::reconfigure))
         .route("/api/peer/volume/prepare", post(peer::prepare_volume))

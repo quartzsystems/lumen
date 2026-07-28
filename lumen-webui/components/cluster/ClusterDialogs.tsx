@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type CSSProperties } from "react";
 import { AlertTriangle, Check, Copy, X, Zap } from "lucide-react";
 import { ModalHeader, ModalShell } from "@/components/ui/Modal";
 import { Tabs } from "@/components/ui/Tabs";
@@ -301,12 +301,13 @@ export function FenceTestDialog({
                 is recorded against this direction.
               </div>
             </div>
-            <label className="qz-check">
+            <label className="qz-check-row">
               <input
                 type="checkbox"
+                className="qz-check"
                 checked={acked}
                 onChange={() => setAcked(!acked)}
-                style={{ accentColor: "var(--qz-warn)" }}
+                style={{ "--qz-check-accent": "var(--qz-warn)" } as CSSProperties}
               />
               <span className="text-[13px] text-[var(--qz-fg-2)]">
                 I understand this power-cycles {node}.
@@ -466,12 +467,12 @@ export function MaintenanceDialog({
                 is no automatic move back.
               </div>
             </div>
-            <label className="qz-check">
+            <label className="qz-check-row">
               <input
                 type="checkbox"
+                className="qz-check"
                 checked={evacuate}
                 onChange={() => setEvacuate(!evacuate)}
-                style={{ accentColor: "var(--qz-accent)" }}
               />
               <span className="text-[13px] text-[var(--qz-fg-2)]">
                 Move the running machines to other members first.
@@ -584,12 +585,13 @@ export function ConfirmDeadDialog({
             a different node — not from this console.
           </div>
         </div>
-        <label className="qz-check">
+        <label className="qz-check-row">
           <input
             type="checkbox"
+            className="qz-check"
             checked={acked}
             onChange={() => setAcked(!acked)}
-            style={{ accentColor: "var(--qz-danger)" }}
+            style={{ "--qz-check-accent": "var(--qz-danger)" } as CSSProperties}
           />
           <span className="text-[13px] text-[var(--qz-fg-2)]">
             I have personally verified {node} is powered off.
@@ -664,12 +666,13 @@ export function DestroyClusterDialog({
             <div className="text-[13px] text-[var(--qz-fg-2)]">{error}</div>
           </div>
         )}
-        <label className="qz-check">
+        <label className="qz-check-row">
           <input
             type="checkbox"
+            className="qz-check"
             checked={acked}
             onChange={() => setAcked(!acked)}
-            style={{ accentColor: "var(--qz-danger)" }}
+            style={{ "--qz-check-accent": "var(--qz-danger)" } as CSSProperties}
           />
           <span className="text-[13px] text-[var(--qz-fg-2)]">
             I understand this stops the cluster on {cluster.nodes.length} node

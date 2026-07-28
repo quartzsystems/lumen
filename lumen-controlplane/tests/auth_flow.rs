@@ -93,6 +93,7 @@ fn test_app() -> axum::Router {
         storage,
         virt,
         cluster,
+        peers: Arc::new(lumen_controlplane::inventory::NoPeers),
         drbd,
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
         updates: Arc::new(lumen_update::UpdateService::new(

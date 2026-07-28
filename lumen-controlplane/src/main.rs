@@ -285,6 +285,7 @@ async fn main() -> Result<()> {
         storage,
         virt,
         cluster,
+        peers,
         drbd,
         updates,
         tasks: lumen_controlplane::tasks::TaskLog::open(state_dir.join("vm-tasks.jsonl")),

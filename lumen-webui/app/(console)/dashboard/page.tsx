@@ -36,7 +36,14 @@ import {
 import { assignableMemoryMib, fetchNodes, type NodeView } from "@/lib/nodeClient";
 import { fetchPools, type PoolView } from "@/lib/storageClient";
 import { useVms } from "@/lib/VmContext";
-import { fetchRecentTasks, formatMib, type TaskView } from "@/lib/vmClient";
+import { fetchRecentTasks, formatBytes, formatMib, type TaskView } from "@/lib/vmClient";
+import {
+  fetchInventory,
+  pooledCapacity,
+  type InventoryResponse,
+  type PooledCapacity,
+} from "@/lib/inventoryClient";
+import { ringState, vipState } from "@/lib/networkStatus";
 
 /// Matches lib/VmContext.tsx: often enough that the page feels live, slow
 /// enough to cost nothing.
@@ -98,18 +105,23 @@ export default function DashboardPage() {
   /// Which subsystems could not be read this poll. Named rather than counted:
   /// "storage could not be read" is actionable and "0 pools" is a lie.
   const [unread, setUnread] = useState<string[]>([]);
+  /// What every member has, which is the only way a cluster row can add up
+  /// its members' processors, memory, and disks.
+  const [inventory, setInventory] = useState<InventoryResponse | null>(null);
 
   // Settled rather than all: a dashboard is six independent readings, and one
   // subsystem being down must not blank the five that are up.
   const load = useCallback(async () => {
-    const [nodes, interfaces, staged, storage, log, environment] = await Promise.allSettled([
-      fetchNodes(),
-      fetchInterfaces(),
-      fetchPending(),
-      fetchPools(),
-      fetchRecentTasks(LOG_ROWS),
-      fetchEnvironment(),
-    ]);
+    const [nodes, interfaces, staged, storage, log, environment, everyone] =
+      await Promise.allSettled([
+        fetchNodes(),
+        fetchInterfaces(),
+        fetchPending(),
+        fetchPools(),
+        fetchRecentTasks(LOG_ROWS),
+        fetchEnvironment(),
+        fetchInventory(),
+      ]);
 
     const failed: string[] = [];
     const take = <T,>(
@@ -135,6 +147,7 @@ export default function DashboardPage() {
     take(storage, "storage", (value) => setPools(value.nodes.flatMap((node) => node.pools)));
     take(log, "the log", (value) => setTasks(value.tasks));
     take(environment, "the environment", (value) => setClusters(value.clusters));
+    take(everyone, "the other members", setInventory);
     setUnread(failed);
 
     // The shared network definitions live one request per cluster behind the
@@ -181,6 +194,25 @@ export default function DashboardPage() {
   );
   const worst = worstSeverity(alarms);
 
+  /// Every member of the environment, not just the one serving this page.
+  ///
+  /// Falls back to the node-local reading when the environment read failed,
+  /// so a standalone appliance — and a console whose peers are all away —
+  /// still shows the node the operator is actually looking at.
+  const members = useMemo(() => {
+    if (inventory !== null) {
+      return inventory.members.map((member) => ({
+        node: member.node,
+        reachable: member.reachable,
+        capacity: member.inventory?.capacity ?? null,
+      }));
+    }
+    if (capacity === null) return null;
+    return capacity.map((node) => ({ node: node.node, reachable: true, capacity: node }));
+  }, [inventory, capacity]);
+
+  const membersOnline = members?.filter((member) => member.reachable).length ?? 0;
+
   // Every cluster's networks, in the order the three types are defined, with
   // the live ring state each addressed network's members are sitting on.
   const clusterNetworks = useMemo(() => {
@@ -205,9 +237,25 @@ export default function DashboardPage() {
         kind: "Management",
         qualifier: null,
         address: shared.management.subnet,
-        alsoAt: shared.management.vip ? `VIP ${shared.management.vip}` : null,
+        alsoAt: null,
         ...ringState(cluster, 1, shared.management.members),
       });
+      // The floating address, with what Pacemaker has actually done about it.
+      // Its own row and its own state: the ring being up says nothing about
+      // whether anything answers on the VIP, and this panel used to print the
+      // address beside the Management subnet as though naming it made it so.
+      if (cluster.vip) {
+        rows.push({
+          key: `${cluster.name}/vip`,
+          cluster: cluster.name,
+          name: "Cluster address",
+          kind: "Management",
+          qualifier: null,
+          address: cluster.vip.address,
+          alsoAt: cluster.vip.state?.node ? `on ${cluster.vip.state.node}` : null,
+          ...vipState(cluster, cluster.vip),
+        });
+      }
       for (const external of shared.external) {
         rows.push({
           key: `${cluster.name}/external/${external.name}`,
@@ -314,12 +362,20 @@ export default function DashboardPage() {
                   : undefined
               }
             />
+            {/* Reachable over total, so a member that is down is visible here
+                rather than only in the panel below. The old tile divided the
+                node count by itself and could only ever read n / n. */}
             <StatTile
               label="Nodes"
               href="/infrastructure/nodes"
-              value={capacity === null ? "—" : String(capacity.length)}
-              of={capacity === null ? undefined : String(capacity.length)}
-              bar={<Bar percent={capacity === null ? 0 : 100} tone="ok" />}
+              value={members === null ? "—" : String(membersOnline)}
+              of={members === null ? undefined : String(members.length)}
+              bar={
+                <Bar
+                  percent={members === null ? 0 : share(membersOnline, members.length)}
+                  tone={members !== null && membersOnline < members.length ? "crit" : "ok"}
+                />
+              }
             />
             <StatTile
               label="Alarms"
@@ -370,15 +426,29 @@ export default function DashboardPage() {
                   <table className="qz-table">
                     <thead>
                       <tr>
-                        <th style={{ width: 120 }}>Status</th>
+                        <th style={{ width: 110 }}>Status</th>
                         <th>Name</th>
-                        <th style={{ width: 100 }}>Nodes</th>
-                        <th style={{ width: 170 }}>Quorum</th>
+                        <th style={{ width: 80 }}>Nodes</th>
+                        <th style={{ width: 130 }}>Quorum</th>
+                        <th style={{ width: 100 }}>Cores</th>
+                        <th style={{ width: 130 }}>RAM</th>
+                        {/* Raw, and labelled raw. A replicated volume costs its
+                            full size on every member holding a replica, so the
+                            sum of the pools is what the hardware is — not what
+                            a machine may be given. */}
+                        <th style={{ width: 130 }}>Storage (raw)</th>
                       </tr>
                     </thead>
                     <tbody>
                       {clusters.map((cluster) => (
-                        <ClusterRow key={cluster.name} cluster={cluster} />
+                        <ClusterRow
+                          key={cluster.name}
+                          cluster={cluster}
+                          pooled={pooledCapacity(
+                            inventory,
+                            cluster.nodes.map((node) => node.node),
+                          )}
+                        />
                       ))}
                     </tbody>
                   </table>
@@ -390,8 +460,8 @@ export default function DashboardPage() {
                 title="Compute Nodes"
                 action={<MoreLink href="/infrastructure/nodes">Nodes</MoreLink>}
               >
-                {capacity === null ? (
-                  <PanelEmpty>Reading the node…</PanelEmpty>
+                {members === null ? (
+                  <PanelEmpty>Reading the nodes…</PanelEmpty>
                 ) : (
                   <table className="qz-table">
                     <thead>
@@ -404,8 +474,13 @@ export default function DashboardPage() {
                       </tr>
                     </thead>
                     <tbody>
-                      {capacity.map((node) => (
-                        <NodeRow key={node.node} node={node} />
+                      {members.map((member) => (
+                        <NodeRow
+                          key={member.node}
+                          node={member.node}
+                          capacity={member.capacity}
+                          reachable={member.reachable}
+                        />
                       ))}
                     </tbody>
                   </table>
@@ -542,42 +617,73 @@ function AlarmRow({ alarm }: { alarm: Alarm }) {
   );
 }
 
-function NodeRow({ node }: { node: NodeView }) {
+/// One member of the environment.
+///
+/// The name comes from the membership record and the figures from the node
+/// itself, which is why they arrive separately: a member that is switched off
+/// is still a member, and the row that says so is more use than no row at
+/// all.
+function NodeRow({
+  node,
+  capacity,
+  reachable,
+}: {
+  node: string;
+  capacity: NodeView | null;
+  reachable: boolean;
+}) {
   // Against what a machine may actually be given, not against every byte the
   // node has: the reserve is never available, and a meter that counts it reads
   // as healthier than the node is.
-  const assignable = assignableMemoryMib(node);
+  const assignable = capacity ? assignableMemoryMib(capacity) : 0;
   return (
     <tr style={staticRow}>
       <td>
-        <Status tone="ok" label="Online" />
+        {reachable ? (
+          <Status tone="ok" label="Online" />
+        ) : (
+          <Status tone="crit" label="Unreachable" />
+        )}
       </td>
-      <td className="mono truncate" title={node.hypervisor_version ?? undefined}>
-        {node.node}
+      <td className="mono truncate" title={capacity?.hypervisor_version ?? undefined}>
+        {node}
       </td>
-      <td className="mono">
-        {node.running} / {node.machines}
-      </td>
-      <td>
-        <Usage
-          used={String(node.used_vcpus)}
-          of={String(node.cpus)}
-          percent={share(node.used_vcpus, node.cpus)}
-        />
-      </td>
-      <td>
-        <Usage
-          used={formatMib(node.used_memory_mib)}
-          of={formatMib(assignable)}
-          percent={share(node.used_memory_mib, assignable)}
-        />
-      </td>
+      {capacity === null ? (
+        <td colSpan={3}>
+          <span className="qz-dim">Could not be asked what it is running</span>
+        </td>
+      ) : (
+        <>
+          <td className="mono">
+            {capacity.running} / {capacity.machines}
+          </td>
+          <td>
+            <Usage
+              used={String(capacity.used_vcpus)}
+              of={String(capacity.cpus)}
+              percent={share(capacity.used_vcpus, capacity.cpus)}
+            />
+          </td>
+          <td>
+            <Usage
+              used={formatMib(capacity.used_memory_mib)}
+              of={formatMib(assignable)}
+              percent={share(capacity.used_memory_mib, assignable)}
+            />
+          </td>
+        </>
+      )}
     </tr>
   );
 }
 
-function ClusterRow({ cluster }: { cluster: ClusterView }) {
+function ClusterRow({ cluster, pooled }: { cluster: ClusterView; pooled: PooledCapacity }) {
   const online = cluster.nodes.filter((node) => node.online).length;
+  // A total is only a total if every member was counted. When one could not
+  // be asked, the figure is marked partial rather than quietly reported as
+  // though the cluster were smaller than it is.
+  const partial = pooled.counted > 0 && pooled.counted < pooled.of;
+  const none = pooled.counted === 0;
   return (
     <tr style={staticRow}>
       <td>
@@ -601,7 +707,59 @@ function ClusterRow({ cluster }: { cluster: ClusterView }) {
           </span>
         )}
       </td>
+      <Pooled partial={partial} none={none} of={pooled.of} counted={pooled.counted}>
+        {pooled.usedCores} / {pooled.cores}
+      </Pooled>
+      <Pooled partial={partial} none={none} of={pooled.of} counted={pooled.counted}>
+        {formatMib(pooled.memoryMib)}
+      </Pooled>
+      <Pooled partial={partial} none={none} of={pooled.of} counted={pooled.counted}>
+        {formatBytes(pooled.rawStorage)}
+      </Pooled>
     </tr>
+  );
+}
+
+/// A pooled figure, with the honesty about how many members it counted.
+///
+/// Three states, because they mean different things: a total over every
+/// member, a total over some of them, and no answer at all. The middle one is
+/// the one worth marking — a number that looks whole and is not is worse than
+/// no number.
+function Pooled({
+  children,
+  partial,
+  none,
+  counted,
+  of,
+}: {
+  children: React.ReactNode;
+  partial: boolean;
+  none: boolean;
+  counted: number;
+  of: number;
+}) {
+  if (none) {
+    return (
+      <td>
+        <span className="qz-dim" title="No member could be asked">
+          —
+        </span>
+      </td>
+    );
+  }
+  return (
+    <td className="mono whitespace-nowrap">
+      {children}
+      {partial && (
+        <span
+          className="qz-dim ml-1"
+          title={`${counted} of ${of} members answered; the rest are not counted`}
+        >
+          *
+        </span>
+      )}
+    </td>
   );
 }
 
@@ -653,33 +811,6 @@ function Usage({ used, of, percent }: { used: string; of: string; percent: numbe
 /// by — a node with no processors reported is a node with an empty meter, not
 /// a broken one.
 const share = (part: number, whole: number): number => (whole > 0 ? (part / whole) * 100 : 0);
-
-/// What corosync sees of one addressed network: every member's seat on the ring
-/// that network carries. A cluster that could not be asked, or a member the
-/// cluster has nothing to say about, is "Unknown" — the dashboard may not
-/// report a link as up or down on the strength of a definition alone.
-function ringState(
-  cluster: ClusterView,
-  ring: number,
-  members: AddressedMember[],
-): { tone: Tone; status: string } {
-  if (cluster.error || members.length === 0) return { tone: "muted", status: "Unknown" };
-
-  let observed = 0;
-  let connected = 0;
-  for (const member of members) {
-    const node = cluster.nodes.find((candidate) => candidate.node === member.node);
-    const link = node?.rings.find((candidate) => candidate.link === ring);
-    if (!node || !link) continue;
-    observed += 1;
-    if (link.connected) connected += 1;
-  }
-
-  if (observed === 0) return { tone: "muted", status: "Unknown" };
-  if (connected === members.length) return { tone: "ok", status: "Connected" };
-  if (connected === 0) return { tone: "crit", status: "Down" };
-  return { tone: "warn", status: `${connected} / ${members.length} up` };
-}
 
 /// When, as an operator reads it: absolute and in their own locale, because
 /// "3 minutes ago" is useless in an incident review. Matches

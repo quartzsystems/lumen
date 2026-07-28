@@ -47,7 +47,7 @@ pub enum ChangeState {
 
 /// One row of the console's interface table. Everything a row needs is here,
 /// so rendering never needs a second round trip.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LinkView {
     pub name: String,
     /// The kernel's name for this NIC before it was pinned to `nicN`.

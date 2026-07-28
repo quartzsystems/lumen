@@ -1,19 +1,25 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { AlertTriangle, ArrowRight } from "lucide-react";
+import { AlertTriangle, Plus } from "lucide-react";
 import { Page, PageBody, PageHeader } from "@/components/PageHeader";
+import { DataTable, Dash, type Column, type FilterDef } from "@/components/console/DataTable";
+import { Status } from "@/components/dashboard/DashboardBits";
+import { Button } from "@/components/ui/Button";
 import { ApiError } from "@/lib/authClient";
 import {
   fetchClusterNetworks,
   fetchEnvironment,
-  type AddressedMember,
   type ClusterNetworks,
   type ClusterView,
   type EnvironmentResponse,
   type ExternalNetwork,
 } from "@/lib/clusterClient";
+import { externalState, ringState, vipState, type StatusTone } from "@/lib/networkStatus";
+import { fetchInventory, type InventoryResponse } from "@/lib/inventoryClient";
+import { useConsole } from "@/lib/ConsoleContext";
+import { CreateExternalNetworkDialog } from "@/components/network/CreateExternalNetworkDialog";
 
 const POLL_MS = 5000;
 
@@ -21,6 +27,234 @@ const POLL_MS = 5000;
 /// there is none. Kept per cluster so one unreachable record does not blank
 /// the others.
 type NetworksAnswer = { networks: ClusterNetworks } | { error: string };
+
+/// One row of the table: a cluster-wide network of one of the three types.
+///
+/// Flat rather than three shapes, because the table wants one set of columns.
+/// The fields a given type does not have are null and render as a dash, which
+/// is more honest than a column that means something different per row.
+interface NetworkRow {
+  key: string;
+  cluster: string;
+  name: string;
+  kind: "Core" | "Management" | "External";
+  /// Host addressing, or null for External — a network with no address on the
+  /// host is the whole point of that type.
+  subnet: string | null;
+  /// The cluster VIP, the only second address any of these has.
+  vip: string | null;
+  /// MTU for Core, VLAN semantics for External, nothing for Management.
+  detail: string | null;
+  tone: StatusTone;
+  status: string;
+  /// Which members carry it, for the column that answers "is this everywhere?"
+  members: string[];
+  of: number;
+}
+
+/// The rows one cluster contributes: Core, Management, and each External
+/// network it defines.
+function networkRows(cluster: ClusterView, networks: ClusterNetworks): NetworkRow[] {
+  const core = ringState(cluster, 0, networks.core.members);
+  const management = ringState(cluster, 1, networks.management.members);
+
+  return [
+    {
+      key: `${cluster.name}/core`,
+      cluster: cluster.name,
+      name: "Core",
+      kind: "Core",
+      subnet: networks.core.subnet,
+      vip: null,
+      detail: `MTU ${networks.core.mtu}`,
+      tone: core.tone,
+      status: core.status,
+      members: networks.core.members.map((member) => member.node),
+      of: cluster.nodes.length,
+    },
+    {
+      key: `${cluster.name}/management`,
+      cluster: cluster.name,
+      name: "Management",
+      kind: "Management",
+      subnet: networks.management.subnet,
+      // The floating address is its own row below, with its own state. Naming
+      // it here too would say it twice and, worse, say it without a state.
+      vip: null,
+      detail: null,
+      tone: management.tone,
+      status: management.status,
+      members: networks.management.members.map((member) => member.node),
+      of: cluster.nodes.length,
+    },
+    // The cluster address gets a row of its own rather than a footnote on the
+    // Management one. It is the address every console bookmark points at, it
+    // has a state of its own that the ring's says nothing about, and burying
+    // it in another row's cell is how an address nobody answers on goes
+    // unnoticed.
+    ...(cluster.vip
+      ? [
+          (() => {
+            const state = vipState(cluster, cluster.vip);
+            const holder = cluster.vip.state?.node;
+            return {
+              key: `${cluster.name}/vip`,
+              cluster: cluster.name,
+              name: "Cluster address",
+              kind: "Management" as const,
+              subnet: cluster.vip.address,
+              vip: null,
+              detail: holder ? `on ${holder}` : null,
+              tone: state.tone,
+              status: state.status,
+              members: holder ? [holder] : [],
+              of: cluster.nodes.length,
+            };
+          })(),
+        ]
+      : []),
+    ...networks.external.map((network): NetworkRow => {
+      const nodes = network.uplinks.map((uplink) => uplink.node);
+      const state = externalState(cluster, nodes);
+      return {
+        key: `${cluster.name}/external/${network.name}`,
+        cluster: cluster.name,
+        name: network.name,
+        kind: "External",
+        subnet: null,
+        vip: null,
+        detail: `${network.bridge} · ${vlanText(network)}`,
+        tone: state.tone,
+        status: state.status,
+        members: nodes,
+        of: cluster.nodes.length,
+      };
+    }),
+  ];
+}
+
+const columns: Column<NetworkRow>[] = [
+  {
+    key: "status",
+    header: "Status",
+    value: (row) => row.status,
+    render: (row) => <Status tone={row.tone} label={row.status} />,
+    sortable: true,
+    width: 170,
+  },
+  {
+    key: "cluster",
+    header: "Cluster",
+    value: (row) => row.cluster,
+    render: (row) => (
+      <span className="qz-mono text-[12px] truncate" title={row.cluster}>
+        {row.cluster}
+      </span>
+    ),
+    sortable: true,
+    width: 160,
+  },
+  {
+    key: "name",
+    header: "Name",
+    value: (row) => row.name,
+    render: (row) => (
+      <span className="text-[var(--qz-fg-1)] font-semibold qz-mono truncate">{row.name}</span>
+    ),
+    sortable: true,
+    width: 160,
+  },
+  {
+    key: "kind",
+    header: "Type",
+    value: (row) => row.kind,
+    render: (row) => <span className="text-[var(--qz-fg-4)]">{row.kind}</span>,
+    sortable: true,
+    width: 120,
+  },
+  {
+    key: "subnet",
+    header: "Subnet",
+    value: (row) => row.subnet ?? "",
+    render: (row) =>
+      row.subnet ? (
+        <span className="whitespace-nowrap">
+          {row.subnet}
+          {row.vip && <span className="qz-dim"> · VIP {row.vip}</span>}
+        </span>
+      ) : (
+        <Dash />
+      ),
+    mono: true,
+    width: 220,
+  },
+  {
+    key: "detail",
+    header: "Detail",
+    value: (row) => row.detail ?? "",
+    render: (row) => row.detail || <Dash />,
+    mono: true,
+    width: 240,
+  },
+  {
+    key: "members",
+    header: "Members",
+    value: (row) => String(row.members.length),
+    render: (row) => (
+      <span className="qz-mono whitespace-nowrap" title={row.members.join(", ")}>
+        {row.members.length} / {row.of}
+      </span>
+    ),
+    sortable: true,
+    width: 110,
+  },
+];
+
+function NetworksTable({
+  rows,
+  onRefresh,
+  toolbar,
+}: {
+  rows: NetworkRow[];
+  onRefresh: () => Promise<void>;
+  toolbar?: React.ReactNode;
+}) {
+  const filters: FilterDef<NetworkRow>[] = useMemo(
+    () => [
+      {
+        key: "cluster",
+        label: "Cluster",
+        options: Array.from(new Set(rows.map((row) => row.cluster)))
+          .sort()
+          .map((name) => ({ value: name, label: name })),
+        predicate: (row, value) => row.cluster === value,
+      },
+      {
+        key: "kind",
+        label: "Type",
+        options: Array.from(new Set(rows.map((row) => row.kind)))
+          .sort()
+          .map((kind) => ({ value: kind, label: kind })),
+        predicate: (row, value) => row.kind === value,
+      },
+    ],
+    [rows],
+  );
+
+  return (
+    <DataTable
+      rows={rows}
+      columns={columns}
+      filters={filters}
+      toolbar={toolbar}
+      rowId={(row) => row.key}
+      storageKey="networking-networks"
+      searchPlaceholder="Search networks…"
+      emptyMessage="No cluster networks defined."
+      onRefresh={onRefresh}
+    />
+  );
+}
 
 /// The three typed networks every cluster's members share — Core, Management,
 /// External — read off the replicated record and joined with what corosync
@@ -30,9 +264,17 @@ export default function NetworksPage() {
   const [environment, setEnvironment] = useState<EnvironmentResponse | null>(null);
   const [answers, setAnswers] = useState<Record<string, NetworksAnswer>>({});
   const [error, setError] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [inventory, setInventory] = useState<InventoryResponse | null>(null);
+  const { setToast } = useConsole();
 
   const load = useCallback(async () => {
     try {
+      // The uplink pickers need every member's links; a failure here costs
+      // the pickers their options, not the page its table.
+      void fetchInventory()
+        .then(setInventory)
+        .catch(() => setInventory(null));
       const env = await fetchEnvironment();
       const entries = await Promise.all(
         env.clusters.map(async (cluster): Promise<[string, NetworksAnswer]> => {
@@ -65,6 +307,29 @@ export default function NetworksPage() {
   const noEnvironment = environment !== null && !environment.environment;
   const clusters = environment?.clusters ?? [];
 
+  // One flat list across every cluster: the Cluster column is what tells them
+  // apart, so a reader comparing two clusters' Core subnets no longer has to
+  // scroll between two sections to do it.
+  const rows = clusters.flatMap((cluster) => {
+    const answer = answers[cluster.name];
+    if (!answer || "error" in answer) return [];
+    return networkRows(cluster, answer.networks);
+  });
+
+  const unreadable = clusters.flatMap((cluster): [string, string][] => {
+    const answer = answers[cluster.name];
+    return answer && "error" in answer ? [[cluster.name, answer.error]] : [];
+  });
+
+  // Creating an External network needs a cluster to define it in. With none,
+  // the control has nothing to act on and says so rather than opening a
+  // dialog whose first field would be empty.
+  const createControl = (
+    <Button kind="primary" disabled={clusters.length === 0} onClick={() => setCreating(true)}>
+      <Plus size={15} /> Create Network
+    </Button>
+  );
+
   return (
     <Page>
       <PageHeader
@@ -91,13 +356,20 @@ export default function NetworksPage() {
             <NoNetworksYet reason="no-cluster" />
           )}
 
-          {clusters.map((cluster) => (
-            <ClusterNetworksSection
-              key={cluster.name}
-              cluster={cluster}
-              named={clusters.length > 1}
-              answer={answers[cluster.name] ?? null}
-            />
+          {clusters.length > 0 && (
+            <NetworksTable rows={rows} onRefresh={load} toolbar={createControl} />
+          )}
+
+          {/* A cluster whose record could not be read contributes no rows, so
+              the reason is said here rather than leaving a table that is
+              quietly short. */}
+          {unreadable.map(([name, reason]) => (
+            <div key={name} className="callout callout-crit">
+              <AlertTriangle size={17} className="flex-shrink-0 text-[var(--qz-danger)] mt-[1px]" />
+              <div className="text-[13px] text-[var(--qz-fg-2)]">
+                <span className="qz-mono">{name}</span>: {reason}
+              </div>
+            </div>
           ))}
 
           {environment !== null &&
@@ -120,6 +392,19 @@ export default function NetworksPage() {
             )}
         </div>
       </PageBody>
+
+      {creating && (
+        <CreateExternalNetworkDialog
+          clusters={clusters}
+          inventory={inventory}
+          onClose={() => setCreating(false)}
+          onCreated={(message) => {
+            setCreating(false);
+            setToast(message);
+            void load();
+          }}
+        />
+      )}
     </Page>
   );
 }
@@ -146,158 +431,6 @@ function NoNetworksYet({ reason }: { reason: "standalone" | "no-cluster" }) {
   );
 }
 
-function ClusterNetworksSection({
-  cluster,
-  named,
-  answer,
-}: {
-  cluster: ClusterView;
-  /// Whether the environment has more than one cluster — only then does the
-  /// section need saying whose networks these are.
-  named: boolean;
-  answer: NetworksAnswer | null;
-}) {
-  return (
-    <section className="flex flex-col gap-4">
-      {named && (
-        <h2
-          className="text-[13px] font-semibold text-[var(--qz-fg-2)] m-0"
-          style={{ fontFamily: "var(--qz-font-mono)" }}
-        >
-          {cluster.name}
-        </h2>
-      )}
-
-      {answer === null && (
-        <div className="text-[13px] text-[var(--qz-fg-4)]">Reading the networks…</div>
-      )}
-
-      {answer !== null && "error" in answer && (
-        <div className="callout callout-crit">
-          <AlertTriangle size={17} className="flex-shrink-0 text-[var(--qz-danger)] mt-[1px]" />
-          <div className="text-[13px] text-[var(--qz-fg-2)]">{answer.error}</div>
-        </div>
-      )}
-
-      {answer !== null && "networks" in answer && (
-        <>
-          <div
-            className="grid gap-4"
-            style={{ gridTemplateColumns: "repeat(auto-fit, minmax(340px, 1fr))" }}
-          >
-            <NetworkCard
-              title="Core"
-              subtitle="Storage replication and the cluster heartbeat, ring 0."
-              facts={[
-                { label: "Subnet", value: answer.networks.core.subnet },
-                { label: "MTU", value: String(answer.networks.core.mtu) },
-              ]}
-              members={answer.networks.core.members}
-              ring={0}
-              cluster={cluster}
-            />
-            <NetworkCard
-              title="Management"
-              subtitle="The console and the heartbeat's second ring."
-              facts={[
-                { label: "Subnet", value: answer.networks.management.subnet },
-                { label: "VIP", value: answer.networks.management.vip ?? "—" },
-              ]}
-              members={answer.networks.management.members}
-              ring={1}
-              cluster={cluster}
-            />
-          </div>
-          <ExternalCard external={answer.networks.external} />
-        </>
-      )}
-    </section>
-  );
-}
-
-/// One addressed network — Core or Management — as a card: the shared facts,
-/// then each member's seat with what corosync says about that member's ring.
-function NetworkCard({
-  title,
-  subtitle,
-  facts,
-  members,
-  ring,
-  cluster,
-}: {
-  title: string;
-  subtitle: string;
-  facts: { label: string; value: string }[];
-  members: AddressedMember[];
-  ring: number;
-  cluster: ClusterView;
-}) {
-  return (
-    <section className="surface p-5 flex flex-col gap-4">
-      <header>
-        <h3 className="text-[14px] font-semibold text-[var(--qz-fg-1)] m-0">{title}</h3>
-        <p className="text-[12px] text-[var(--qz-fg-4)] mt-1 mb-0">{subtitle}</p>
-      </header>
-
-      <dl className="qz-facts m-0">
-        {facts.map((fact) => (
-          <FactRow key={fact.label} label={fact.label} value={fact.value} />
-        ))}
-      </dl>
-
-      <ul className="m-0 p-0 flex flex-col gap-[6px]" style={{ listStyle: "none" }}>
-        {members.map((member) => (
-          <MemberRow key={member.node} member={member} ring={ring} cluster={cluster} />
-        ))}
-      </ul>
-    </section>
-  );
-}
-
-function FactRow({ label, value }: { label: string; value: string }) {
-  return (
-    <>
-      <dt>{label}</dt>
-      <dd className="qz-mono">{value}</dd>
-    </>
-  );
-}
-
-/// One member's seat: which link carries the network there, on what address,
-/// and whether corosync sees that member's ring — live state against the
-/// definition, from the one place that already watches it.
-function MemberRow({
-  member,
-  ring,
-  cluster,
-}: {
-  member: AddressedMember;
-  ring: number;
-  cluster: ClusterView;
-}) {
-  const node = cluster.nodes.find((candidate) => candidate.node === member.node) ?? null;
-  const link = node?.rings.find((candidate) => candidate.link === ring) ?? null;
-
-  // The cluster not answering is "unknown", not "down": nothing here may
-  // claim a state nobody observed.
-  const state =
-    cluster.error || node === null || link === null
-      ? ({ tone: "muted", label: "Unknown" } as const)
-      : link.connected
-        ? ({ tone: "ok", label: "Connected" } as const)
-        : ({ tone: "crit", label: "Down" } as const);
-
-  return (
-    <li className="flex items-center gap-2 text-[13px]">
-      <span className={`state-dot-${state.tone}`} title={`ring ${ring}: ${state.label}`} />
-      <span className="qz-mono text-[var(--qz-fg-2)]">{member.node}</span>
-      {node?.local && <span className="badge badge-muted">this node</span>}
-      <span className="qz-mono text-[12px] text-[var(--qz-fg-4)] ml-auto">
-        {member.interface} · {member.address}
-      </span>
-    </li>
-  );
-}
 
 /// The VLAN semantics, spelled the way the definition means them.
 const vlanText = (network: ExternalNetwork): string =>
@@ -307,49 +440,3 @@ const vlanText = (network: ExternalNetwork): string =>
       : "Trunk"
     : `Access — VLAN ${network.vlan}`;
 
-/// External networks: zero or more, and zero is the common state until
-/// realization lands — so the empty case is a sentence, not an empty table.
-function ExternalCard({ external }: { external: ExternalNetwork[] }) {
-  return (
-    <section className="surface p-5 flex flex-col gap-4">
-      <header>
-        <h3 className="text-[14px] font-semibold text-[var(--qz-fg-1)] m-0">External</h3>
-        <p className="text-[12px] text-[var(--qz-fg-4)] mt-1 mb-0">
-          Virtual machine traffic: an identically named bridge on every member, no host
-          addressing.
-        </p>
-      </header>
-
-      {external.length === 0 ? (
-        <p className="text-[13px] text-[var(--qz-fg-4)] m-0">
-          This cluster defines no External networks yet. Virtual machines attach to node-local
-          bridges meanwhile —{" "}
-          <Link
-            href="/networking/interfaces"
-            className="text-[var(--qz-accent)] no-underline inline-flex items-center gap-1"
-          >
-            Interfaces
-            <ArrowRight size={13} />
-          </Link>
-        </p>
-      ) : (
-        <ul className="m-0 p-0 flex flex-col gap-3" style={{ listStyle: "none" }}>
-          {external.map((network) => (
-            <li key={network.name} className="flex flex-wrap items-center gap-x-6 gap-y-2">
-              <span className="qz-mono text-[13px] font-semibold text-[var(--qz-fg-1)]">
-                {network.name}
-              </span>
-              <span className="qz-mono text-[13px] text-[var(--qz-fg-3)]">{network.bridge}</span>
-              <span className="text-[13px] text-[var(--qz-fg-3)]">{vlanText(network)}</span>
-              <span className="qz-mono text-[12px] text-[var(--qz-fg-4)] ml-auto">
-                {network.uplinks
-                  .map((uplink) => `${uplink.node}: ${uplink.interface}`)
-                  .join(" · ")}
-              </span>
-            </li>
-          ))}
-        </ul>
-      )}
-    </section>
-  );
-}

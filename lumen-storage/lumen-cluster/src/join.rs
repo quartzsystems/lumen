@@ -197,6 +197,23 @@ pub struct JoinGrant {
     pub session_secret: String,
 }
 
+/// One member's realization of an External network: the bridge machines
+/// attach to, and — for an access network — the VLAN interface it sits on.
+///
+/// The VLAN is part of the same payload rather than a second call because
+/// the two are one thing on the wire. An access network's bridge carries
+/// untagged frames *from a tagged uplink*, which on Linux means the bridge's
+/// port is `nic.N`, not `nic`. Building the bridge alone would put the
+/// machines on whatever the switch sends untagged — usually the native VLAN,
+/// and never the one that was asked for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalSeat {
+    /// Built first when present; the bridge's port is then its name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vlan: Option<lumen_net::Vlan>,
+    pub bridge: lumen_net::Bridge,
+}
+
 /// The seam between the workflows and the other nodes. The control plane
 /// implements it over TLS; tests implement it in memory. The local node is
 /// addressed like any other member.
@@ -221,6 +238,12 @@ pub trait PeerChannel: Send + Sync {
     /// which is why this is its own call and not part of prepare — it
     /// outlives the cluster, and a teardown must not take it away.
     async fn create_bond(&self, node: &EnvironmentNode, bond: &lumen_net::Bond) -> Result<()>;
+
+    /// Build an External network's seat on a member, through that node's own
+    /// networking domain. The same shape as `create_bond` and for the same
+    /// reason: what it builds outlives the cluster, because the machines
+    /// attached to it do.
+    async fn create_bridge(&self, node: &EnvironmentNode, seat: &ExternalSeat) -> Result<()>;
 
     async fn start(&self, node: &EnvironmentNode) -> Result<()>;
     async fn teardown(&self, node: &EnvironmentNode, payload: &TeardownPayload) -> Result<()>;
@@ -780,8 +803,10 @@ struct MockPeersInner {
     fail_start: Option<String>,
     fail_teardown: Option<String>,
     fail_bond: Option<String>,
+    fail_bridge: Option<String>,
     prepared: Vec<(String, PreparePayload)>,
     bonds: Vec<(String, lumen_net::Bond)>,
+    bridges: Vec<(String, ExternalSeat)>,
     started: Vec<String>,
     torn_down: Vec<(String, TeardownPayload)>,
     reconfigured: Vec<(String, ReconfigurePayload)>,
@@ -843,6 +868,15 @@ impl MockPeers {
 
     pub fn bonds(&self) -> Vec<(String, lumen_net::Bond)> {
         self.inner.lock().unwrap().bonds.clone()
+    }
+
+    pub fn fail_bridge_on(self, node: &str) -> Self {
+        self.inner.lock().unwrap().fail_bridge = Some(node.to_string());
+        self
+    }
+
+    pub fn bridges(&self) -> Vec<(String, ExternalSeat)> {
+        self.inner.lock().unwrap().bridges.clone()
     }
 
     pub fn with_grant(self, grant: JoinGrant) -> Self {
@@ -986,6 +1020,30 @@ impl PeerChannel for MockPeers {
             });
         }
         inner.bonds.push((node.name.clone(), bond.clone()));
+        Ok(())
+    }
+
+    async fn create_bridge(&self, node: &EnvironmentNode, seat: &ExternalSeat) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.fail_bridge.as_deref() == Some(node.name.as_str()) {
+            return Err(ClusterError::Conflict(format!(
+                "the bridge could not be built on \"{}\"",
+                node.name
+            )));
+        }
+        // A node that grew a bridge reports it afterwards, as the real one
+        // would.
+        if let Some(report) = inner.reports.get_mut(&node.name) {
+            report.links.retain(|link| link.name != seat.bridge.name);
+            report.links.push(lumen_net::ObservedLink {
+                name: seat.bridge.name.clone(),
+                kind: lumen_net::LinkKind::Bridge,
+                state: lumen_net::LinkState::Activated,
+                carrier: true,
+                ..lumen_net::ObservedLink::default()
+            });
+        }
+        inner.bridges.push((node.name.clone(), seat.clone()));
         Ok(())
     }
 

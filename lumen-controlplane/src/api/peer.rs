@@ -15,6 +15,7 @@ use axum::extract::State;
 use axum::Json;
 
 use crate::error::ApiError;
+use crate::inventory::NodeInventory;
 use crate::security::PeerSession;
 use crate::AppState;
 use lumen_cluster::{
@@ -50,6 +51,45 @@ pub async fn preflight(
     Ok(Json(state.cluster.peer_preflight().await?))
 }
 
+/// POST /api/peer/node/inventory — what this node has: its processors and
+/// memory, its links, and its pools.
+///
+/// A read, on a surface that is otherwise all writes, because the console's
+/// environment-wide tables need every member's answer and only each member
+/// can give its own. One call rather than three: the three reads happen on
+/// the same node at the same moment, and splitting them would only let the
+/// three halves of one row disagree.
+pub async fn inventory(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<NodeInventory>, ApiError> {
+    Ok(Json(crate::inventory::local(&state).await))
+}
+
+/// POST /api/peer/storage/pool — build a pool here, on this node's own
+/// disks.
+///
+/// The acknowledgement is not taken from the wire: the operator's consent was
+/// given to the coordinator, which is where it belongs, and a peer route that
+/// accepted "yes, erase them" from a body would be a second, quieter way to
+/// reformat a node's disks.
+pub async fn create_pool(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<lumen_zfs::PoolCreate>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state
+        .storage
+        .create_pool(
+            request,
+            lumen_zfs::Acknowledgements {
+                may_lose_data: true,
+            },
+        )
+        .await?;
+    Ok(Json(serde_json::json!({ "built": true })))
+}
+
 /// POST /api/peer/cluster/prepare — realize this node's Core seat and write
 /// the cluster configuration.
 pub async fn prepare(
@@ -71,6 +111,18 @@ pub async fn create_bond(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     state.cluster.peer_create_bond(&bond).await?;
     Ok(Json(serde_json::json!({ "bonded": true })))
+}
+
+/// POST /api/peer/network/bridge — build an External network's bridge here,
+/// through this node's own networking domain. Like the bond above, what comes
+/// out is an ordinary link that outlives the cluster.
+pub async fn create_bridge(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+    Json(seat): Json<lumen_cluster::join::ExternalSeat>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state.cluster.peer_create_bridge(&seat).await?;
+    Ok(Json(serde_json::json!({ "built": true })))
 }
 
 /// POST /api/peer/cluster/start — enable and start the cluster stack.

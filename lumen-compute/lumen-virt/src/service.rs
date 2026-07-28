@@ -330,7 +330,7 @@ pub struct VmsResponse {
 /// spoken for" needs the node's own size, and nothing above this line knew
 /// it. The hypervisor has always reported it — see [`HostInfo`] — it simply
 /// had no way out.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeView {
     pub node: String,
     /// Logical processors the node has online.

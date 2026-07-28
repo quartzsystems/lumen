@@ -32,6 +32,13 @@ import {
   type LinkView,
   type PendingResponse,
 } from "@/lib/networkClient";
+import {
+  fetchInventory,
+  linksByMember,
+  unreachable,
+  type InventoryResponse,
+  type OwnedLink,
+} from "@/lib/inventoryClient";
 
 const POLL_MS = 5000;
 
@@ -43,6 +50,9 @@ export default function InterfacesPage() {
   const { checkpoint, begin, refresh: refreshCheckpoint } = useNetworkCheckpoint();
 
   const [interfaces, setInterfaces] = useState<InterfacesResponse | null>(null);
+  /// Every member's links. The node-local read above is still what the edit
+  /// dialogs work against; this is what the table renders.
+  const [inventory, setInventory] = useState<InventoryResponse | null>(null);
   const [pending, setPending] = useState<PendingResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [dialog, setDialog] = useState<{ kind: DialogKind; editing: LinkView | null } | null>(null);
@@ -58,9 +68,17 @@ export default function InterfacesPage() {
 
   const load = useCallback(async () => {
     try {
-      const [links, staged] = await Promise.all([fetchInterfaces(), fetchPending()]);
+      const [links, staged, everyone] = await Promise.all([
+        fetchInterfaces(),
+        fetchPending(),
+        // Settled rather than awaited with the rest: the environment read
+        // reaches other nodes, and one member being away must not cost this
+        // page the two reads that answered locally.
+        fetchInventory().catch(() => null),
+      ]);
       setInterfaces(links);
       setPending(staged);
+      setInventory(everyone);
       setError(null);
     } catch (err) {
       // A 401 has already redirected to /login. A status 0 during a confirm
@@ -88,7 +106,16 @@ export default function InterfacesPage() {
     if (!checkpoint) void load();
   }, [checkpoint, load]);
 
+  // This node's own links: what the dialogs validate against (a bond may not
+  // swallow a name that is taken *here*) and what the management banner reads.
   const allLinks = interfaces?.nodes.flatMap((node) => node.interfaces) ?? [];
+  // Every member's, for the table. Falls back to this node alone when the
+  // environment read failed, so the page still works standalone.
+  const rows: OwnedLink[] =
+    inventory !== null
+      ? linksByMember(inventory)
+      : allLinks.map((link) => ({ node: interfaces?.nodes[0]?.node ?? "", local: true, link }));
+  const missing = unreachable(inventory);
   const staged = pending?.changes ?? [];
   const management = allLinks.find((link) => link.management) ?? null;
   // Assume bridged until proven otherwise, so the banner never flashes up
@@ -184,7 +211,7 @@ export default function InterfacesPage() {
     <Page>
       <PageHeader
         title="Interfaces"
-        description="Physical adapters, bridges, bonds, and VLAN interfaces on this node."
+        description="Physical adapters, bridges, bonds, and VLAN interfaces across the environment."
       />
 
       <PageBody>
@@ -278,30 +305,35 @@ export default function InterfacesPage() {
             </div>
           )}
 
-          {interfaces?.nodes.map((node) => (
-            <section key={node.node} className="flex flex-col gap-2">
-              {/* One appliance is the usual case, and naming it then is noise.
-                  A cluster is not, and then every table needs saying whose. */}
-              {(interfaces?.nodes.length ?? 0) > 1 && (
-                <h2
-                  className="text-[13px] font-semibold text-[var(--qz-fg-2)] m-0"
-                  style={{ fontFamily: "var(--qz-font-mono)" }}
-                >
-                  {node.node}
-                </h2>
-              )}
-              <InterfaceTable
-                rows={node.interfaces}
-                busy={busy || outstanding}
-                toolbar={createControl}
-                onRefresh={load}
-                onEdit={(link) => setDialog({ kind: dialogKindFor(link.kind), editing: link })}
-                onDelete={(link) =>
-                  run(() => deleteLink(link.kind, link.name), `${link.name} staged for removal.`)
-                }
-              />
-            </section>
-          ))}
+          {/* A member the environment knows about and could not be asked. Named
+              rather than silently absent: a table quietly missing a node's rows
+              reads as a node with no interfaces. */}
+          {missing.length > 0 && (
+            <div className="callout callout-warn">
+              <AlertTriangle size={17} className="flex-shrink-0 text-[var(--qz-warn)] mt-[1px]" />
+              <div className="text-[13px] text-[var(--qz-fg-2)]">
+                {missing.map((member) => member.node).join(", ")}{" "}
+                {missing.length === 1 ? "could not be asked" : "could not be asked"} for its
+                interfaces, so none are listed below.
+                {missing[0]?.error && (
+                  <span className="text-[var(--qz-fg-4)]"> {missing[0].error}</span>
+                )}
+              </div>
+            </div>
+          )}
+
+          {interfaces !== null && (
+            <InterfaceTable
+              rows={rows}
+              busy={busy || outstanding}
+              toolbar={createControl}
+              onRefresh={load}
+              onEdit={(link) => setDialog({ kind: dialogKindFor(link.kind), editing: link })}
+              onDelete={(link) =>
+                run(() => deleteLink(link.kind, link.name), `${link.name} staged for removal.`)
+              }
+            />
+          )}
         </div>
       </PageBody>
 
@@ -362,23 +394,41 @@ const addressText = (link: LinkView): string => {
 const gatewayText = (link: LinkView): string =>
   link.ip.mode === "static" ? link.ip.gateway : (link.gateway ?? "");
 
-const columns: Column<LinkView>[] = [
+const columns: Column<OwnedLink>[] = [
+  {
+    key: "node",
+    header: "Node",
+    value: (row) => row.node,
+    sortable: true,
+    width: 190,
+    render: (row) => (
+      <span className="inline-flex items-center gap-2 min-w-0">
+        <span className="qz-mono text-[12px] truncate" title={row.node}>
+          {row.node}
+        </span>
+        {/* Only this appliance's own links can be edited from here, and a row
+            that cannot be acted on should say why before the operator finds
+            out by clicking a greyed-out pencil. */}
+        {!row.local && <span className="badge badge-muted">remote</span>}
+      </span>
+    ),
+  },
   {
     key: "name",
     header: "Name",
-    value: (link) => link.name,
+    value: (row) => row.link.name,
     sortable: true,
     width: 170,
-    render: (link) => (
+    render: (row) => (
       <span className="inline-flex items-center gap-2 min-w-0">
         <span
           className="text-[var(--qz-fg-1)] font-semibold truncate"
           style={{ fontFamily: "var(--qz-font-mono)" }}
         >
-          {link.name}
+          {row.link.name}
         </span>
-        {link.change !== "unchanged" && (
-          <span className={CHANGE_BADGE[link.change]}>{link.change}</span>
+        {row.link.change !== "unchanged" && (
+          <span className={CHANGE_BADGE[row.link.change]}>{row.link.change}</span>
         )}
       </span>
     ),
@@ -386,8 +436,8 @@ const columns: Column<LinkView>[] = [
   {
     key: "altname",
     header: "Alternative Name",
-    value: (link) => link.altname ?? "",
-    render: (link) => link.altname || <Dash />,
+    value: (row) => row.link.altname ?? "",
+    render: (row) => row.link.altname || <Dash />,
     mono: true,
     sortable: true,
     width: 150,
@@ -395,26 +445,27 @@ const columns: Column<LinkView>[] = [
   {
     key: "kind",
     header: "Type",
-    value: (link) => link.kind,
-    render: (link) => <span className="text-[var(--qz-fg-4)]">{titleCase(link.kind)}</span>,
+    value: (row) => row.link.kind,
+    render: (row) => <span className="text-[var(--qz-fg-4)]">{titleCase(row.link.kind)}</span>,
     sortable: true,
     width: 100,
   },
   {
     key: "active",
     header: "Active",
-    value: activeText,
-    render: (link) => <ActiveCell link={link} />,
+    value: (row) => activeText(row.link),
+    render: (row) => <ActiveCell link={row.link} />,
     sortable: true,
     width: 110,
   },
   {
     key: "vlan_aware",
     header: "VLAN Aware",
-    value: (link) => (link.kind === "bridge" ? (link.vlan_aware ? "yes" : "no") : ""),
-    render: (link) =>
-      link.kind === "bridge" ? (
-        <span className="text-[var(--qz-fg-4)]">{link.vlan_aware ? "Yes" : "No"}</span>
+    value: (row) =>
+      row.link.kind === "bridge" ? (row.link.vlan_aware ? "yes" : "no") : "",
+    render: (row) =>
+      row.link.kind === "bridge" ? (
+        <span className="text-[var(--qz-fg-4)]">{row.link.vlan_aware ? "Yes" : "No"}</span>
       ) : (
         <Dash />
       ),
@@ -424,10 +475,10 @@ const columns: Column<LinkView>[] = [
   {
     key: "ports",
     header: "Ports/Slaves",
-    value: (link) => link.ports.join(", "),
-    render: (link) =>
-      link.ports.length > 0 ? (
-        <span title={link.ports.join(", ")}>{link.ports.join(", ")}</span>
+    value: (row) => row.link.ports.join(", "),
+    render: (row) =>
+      row.link.ports.length > 0 ? (
+        <span title={row.link.ports.join(", ")}>{row.link.ports.join(", ")}</span>
       ) : (
         <Dash />
       ),
@@ -437,16 +488,16 @@ const columns: Column<LinkView>[] = [
   {
     key: "bond_mode",
     header: "Bond Mode",
-    value: (link) => link.bond_mode ?? "",
-    render: (link) => link.bond_mode || <Dash />,
+    value: (row) => row.link.bond_mode ?? "",
+    render: (row) => row.link.bond_mode || <Dash />,
     mono: true,
     width: 130,
   },
   {
     key: "address",
     header: "Address",
-    value: addressText,
-    render: (link) => addressText(link) || <Dash />,
+    value: (row) => addressText(row.link),
+    render: (row) => addressText(row.link) || <Dash />,
     mono: true,
     sortable: true,
     width: 170,
@@ -454,19 +505,19 @@ const columns: Column<LinkView>[] = [
   {
     key: "gateway",
     header: "Gateway",
-    value: gatewayText,
-    render: (link) => gatewayText(link) || <Dash />,
+    value: (row) => gatewayText(row.link),
+    render: (row) => gatewayText(row.link) || <Dash />,
     mono: true,
     width: 150,
   },
   {
     key: "comment",
     header: "Description",
-    value: (link) => link.comment ?? "",
-    render: (link) =>
-      link.comment ? (
-        <span className="text-[var(--qz-fg-3)]" title={link.comment}>
-          {link.comment}
+    value: (row) => row.link.comment ?? "",
+    render: (row) =>
+      row.link.comment ? (
+        <span className="text-[var(--qz-fg-3)]" title={row.link.comment}>
+          {row.link.comment}
         </span>
       ) : (
         <Dash />
@@ -475,9 +526,19 @@ const columns: Column<LinkView>[] = [
   },
 ];
 
-/// One row per link on the node. Ports are listed against their controller
-/// rather than nested under it: an operator scanning the Name column wants a
-/// flat list of everything the box has.
+/// One row per link across every member. Ports are listed against their
+/// controller rather than nested under it: an operator scanning the Name
+/// column wants a flat list of everything the environment has.
+///
+/// One table rather than one per node, because the question an operator asks
+/// here — "where does this address live?", "which node still has a free
+/// port?" — is asked across the environment, and answering it by scrolling
+/// between tables is the console making them do the join by hand.
+///
+/// Editing stays node-local. The links of another member are shown and not
+/// touched: the writes behind that pencil land on whichever node serves the
+/// request, so offering them on a remote row would quietly change the wrong
+/// box.
 function InterfaceTable({
   rows,
   busy,
@@ -486,32 +547,42 @@ function InterfaceTable({
   onEdit,
   onDelete,
 }: {
-  rows: LinkView[];
+  rows: OwnedLink[];
   busy: boolean;
   toolbar?: React.ReactNode;
   onRefresh: () => Promise<void>;
   onEdit: (link: LinkView) => void;
   onDelete: (link: LinkView) => Promise<void>;
 }) {
-  // The drop-downs offer what is actually on this node, not every value the
-  // API can produce — a filter for a type the box does not have is dead space.
-  // The option value stays the wire one the predicate matches on; only the
-  // label an operator reads is capitalised.
-  const filters: FilterDef<LinkView>[] = useMemo(() => {
-    const optionsOf = (of: (link: LinkView) => string) =>
+  // The drop-downs offer what is actually out there, not every value the API
+  // can produce — a filter for a type nothing has is dead space. The option
+  // value stays the wire one the predicate matches on; only the label an
+  // operator reads is capitalised.
+  const filters: FilterDef<OwnedLink>[] = useMemo(() => {
+    const optionsOf = (of: (row: OwnedLink) => string) =>
       titleCaseOptions(Array.from(new Set(rows.map(of).filter(Boolean))).sort());
     return [
       {
+        key: "node",
+        label: "Node",
+        // Node names are not titles and must not be capitalised — they are
+        // what corosync matches on.
+        options: Array.from(new Set(rows.map((row) => row.node)))
+          .sort()
+          .map((node) => ({ value: node, label: node })),
+        predicate: (row, value) => row.node === value,
+      },
+      {
         key: "kind",
         label: "Type",
-        options: optionsOf((link) => link.kind),
-        predicate: (link, value) => link.kind === value,
+        options: optionsOf((row) => row.link.kind),
+        predicate: (row, value) => row.link.kind === value,
       },
       {
         key: "active",
         label: "Active",
-        options: optionsOf(activeText),
-        predicate: (link, value) => activeText(link) === value,
+        options: optionsOf((row) => activeText(row.link)),
+        predicate: (row, value) => activeText(row.link) === value,
       },
     ];
   }, [rows]);
@@ -522,22 +593,34 @@ function InterfaceTable({
       columns={columns}
       filters={filters}
       toolbar={toolbar}
-      rowId={(link) => link.name}
+      // Two members may each have a nic0; the node is what makes a row
+      // identity unique across the environment.
+      rowId={(row) => `${row.node}/${row.link.name}`}
       storageKey="networking-interfaces"
       searchPlaceholder="Search interfaces…"
-      emptyMessage="No interfaces on this node."
+      emptyMessage="No interfaces found."
       onRefresh={onRefresh}
-      actions={(link) => (
+      actions={(row) => (
         <RowActions
-          label={link.name}
-          onEdit={() => onEdit(link)}
-          onDelete={() => onDelete(link)}
-          editDisabled={busy || link.kind === "other"}
-          editTitle={link.kind === "other" ? "Not managed by Lumen" : undefined}
-          deleteDisabled={busy || !link.deletable}
+          label={row.link.name}
+          onEdit={() => onEdit(row.link)}
+          onDelete={() => onDelete(row.link)}
+          editDisabled={busy || !row.local || row.link.kind === "other"}
+          editTitle={
+            !row.local
+              ? `Owned by ${row.node} — edit it from that node's console`
+              : row.link.kind === "other"
+                ? "Not managed by Lumen"
+                : undefined
+          }
+          deleteDisabled={busy || !row.local || !row.link.deletable}
           // The control explains itself instead of being silently greyed out:
-          // the backend supplies the reason.
-          deleteTitle={link.delete_blocked_reason ?? undefined}
+          // the backend supplies the reason for a local row.
+          deleteTitle={
+            !row.local
+              ? `Owned by ${row.node} — delete it from that node's console`
+              : (row.link.delete_blocked_reason ?? undefined)
+          }
         />
       )}
     />

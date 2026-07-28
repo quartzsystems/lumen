@@ -7,7 +7,14 @@ import { DataTable, Dash, type Column, type FilterDef } from "@/components/conso
 import { Button } from "@/components/ui/Button";
 import { Meter } from "@/components/vm/VmBits";
 import { CreatePoolDialog, DestroyPoolDialog } from "@/components/storage/CreatePoolDialog";
+import { PoolAcrossNodesDialog } from "@/components/storage/PoolAcrossNodesDialog";
 import { ReplicatedVolumesSection } from "@/components/storage/ReplicatedVolumes";
+import {
+  fetchInventory,
+  pooledStorage,
+  unreachable,
+  type InventoryResponse,
+} from "@/lib/inventoryClient";
 import { ApiError } from "@/lib/authClient";
 import { useConsole } from "@/lib/ConsoleContext";
 import { titleCase, titleCaseOptions } from "@/lib/labels";
@@ -32,13 +39,23 @@ const POLL_MS = 10000;
 export default function StoragePage() {
   const { setToast } = useConsole();
   const [pools, setPools] = useState<PoolsResponse | null>(null);
+  /// What every member has, for the cluster capacity figures and the
+  /// cross-node drive picker. Null on a node whose peers cannot be asked,
+  /// which is also the standalone case.
+  const [inventory, setInventory] = useState<InventoryResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  const [poolingAcrossNodes, setPoolingAcrossNodes] = useState(false);
   const [destroying, setDestroying] = useState<PoolView | null>(null);
   const [busy, setBusy] = useState(false);
 
   const load = useCallback(async () => {
     try {
+      // The environment read reaches other nodes; a member being away must
+      // not cost this page the local pool table it exists to show.
+      void fetchInventory()
+        .then(setInventory)
+        .catch(() => setInventory(null));
       setPools(await fetchPools());
       setError(null);
     } catch (err) {
@@ -108,6 +125,16 @@ export default function StoragePage() {
             <div className="text-[13px] text-[var(--qz-fg-4)]">Reading the storage…</div>
           )}
 
+          {/* Only once there is more than one member. On a standalone
+              appliance the pool table below is the whole truth, and a
+              "cluster total" of one node's pools is noise. */}
+          {(inventory?.members.length ?? 0) > 1 && (
+            <ClusterCapacity
+              inventory={inventory}
+              onPoolAcrossNodes={() => setPoolingAcrossNodes(true)}
+            />
+          )}
+
           {pools?.nodes.map((node) => (
             <section key={node.node} className="flex flex-col gap-2">
               {/* One appliance is the usual case, and naming it then is noise. */}
@@ -142,6 +169,18 @@ export default function StoragePage() {
           onCreated={async (pool) => {
             setCreating(false);
             setToast(`${pool.name} created — ${formatBytes(pool.size)}.`);
+            await load();
+          }}
+        />
+      )}
+
+      {poolingAcrossNodes && (
+        <PoolAcrossNodesDialog
+          inventory={inventory}
+          onClose={() => setPoolingAcrossNodes(false)}
+          onCreated={async (message) => {
+            setPoolingAcrossNodes(false);
+            setToast(message);
             await load();
           }}
         />
@@ -253,6 +292,71 @@ const columns: Column<PoolView>[] = [
     width: 110,
   },
 ];
+
+/// What the members' pools add up to, and the way in to building more.
+///
+/// Every figure here is raw capacity, said so in the panel rather than only
+/// in a tooltip. A replicated volume consumes its full size on every member
+/// holding a replica, so the sum of the pools is what the hardware is — not
+/// what a machine may be given. An operator who reads it as usable will size
+/// their volumes wrong by exactly the replica count.
+function ClusterCapacity({
+  inventory,
+  onPoolAcrossNodes,
+}: {
+  inventory: InventoryResponse | null;
+  onPoolAcrossNodes: () => void;
+}) {
+  const total = pooledStorage(inventory);
+  const missing = unreachable(inventory);
+  const used = total.size > 0 ? (total.allocated / total.size) * 100 : 0;
+
+  return (
+    <section className="surface p-5 flex flex-col gap-4">
+      <header className="flex items-start gap-4">
+        <div className="flex-1 min-w-0">
+          <h2 className="text-[14px] font-semibold text-[var(--qz-fg-1)] m-0">
+            Across the environment
+          </h2>
+          <p className="text-[12px] text-[var(--qz-fg-4)] mt-1 mb-0">
+            {total.pools} {total.pools === 1 ? "pool" : "pools"} on {total.counted} of {total.of}{" "}
+            members. Raw capacity — a replicated volume costs its full size on every member
+            holding a replica.
+          </p>
+        </div>
+        <Button kind="primary" size="sm" icon={Plus} onClick={onPoolAcrossNodes}>
+          Pool drives across nodes
+        </Button>
+      </header>
+
+      {missing.length > 0 && (
+        <div className="callout callout-warn">
+          <AlertTriangle size={17} className="flex-shrink-0 text-[var(--qz-warn)] mt-[1px]" />
+          <div className="text-[13px] text-[var(--qz-fg-2)]">
+            {missing.map((member) => member.node).join(", ")} could not be asked, so nothing they
+            hold is counted here.
+          </div>
+        </div>
+      )}
+
+      <div className="grid gap-4" style={{ gridTemplateColumns: "repeat(3, 1fr)" }}>
+        <Figure label="Raw capacity" value={formatBytes(total.size)} />
+        <Figure label="Allocated" value={formatBytes(total.allocated)} />
+        <Figure label="Free" value={formatBytes(total.free)} />
+      </div>
+      <Meter percent={used} />
+    </section>
+  );
+}
+
+function Figure({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex flex-col gap-1 min-w-0">
+      <span className="text-[11px] uppercase tracking-wide text-[var(--qz-fg-4)]">{label}</span>
+      <span className="qz-mono text-[15px] text-[var(--qz-fg-1)]">{value}</span>
+    </div>
+  );
+}
 
 function PoolTable({
   rows,

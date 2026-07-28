@@ -89,7 +89,7 @@ pub struct Acknowledgements {
 /// A pool the console is asking for. Deserialized straight off the request, so
 /// `deny_unknown_fields` turns a typo into a 400 rather than a silently ignored
 /// setting.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PoolCreate {
     pub name: String,

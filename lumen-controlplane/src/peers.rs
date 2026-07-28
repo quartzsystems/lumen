@@ -321,6 +321,52 @@ impl rustls::client::danger::ServerCertVerifier for FingerprintVerifier {
     }
 }
 
+/// The environment-wide read's half of the channel: one ticketed,
+/// CA-verified GET-shaped call, kept off the `PeerChannel` trait because the
+/// answer is made of the compute, networking, and pool domains' own types and
+/// the crate that defines that trait has no business depending on all three.
+///
+/// The local node is not short-circuited here: only the caller holds the
+/// state those three answers are assembled from, so it answers for itself and
+/// calls this for everyone else.
+#[async_trait]
+impl crate::inventory::InventoryPeers for HttpPeerChannel {
+    async fn fetch(
+        &self,
+        node: &EnvironmentNode,
+    ) -> Result<crate::inventory::NodeInventory, ClusterError> {
+        self.call(
+            &node.address,
+            "/api/peer/node/inventory",
+            &serde_json::json!({}),
+            self.ca_client_config()?,
+            Some(self.peer_ticket()?),
+            CALL_DEADLINE,
+        )
+        .await
+    }
+
+    async fn create_pool(
+        &self,
+        node: &EnvironmentNode,
+        request: &lumen_zfs::PoolCreate,
+    ) -> Result<(), ClusterError> {
+        let _: serde_json::Value = self
+            .call(
+                &node.address,
+                "/api/peer/storage/pool",
+                request,
+                self.ca_client_config()?,
+                Some(self.peer_ticket()?),
+                // `zpool create` labels every disk it is given; a shelf of
+                // spinning disks takes its time.
+                SLOW_CALL_DEADLINE,
+            )
+            .await?;
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl PeerChannel for HttpPeerChannel {
     async fn request_join(
@@ -391,6 +437,29 @@ impl PeerChannel for HttpPeerChannel {
                 bond,
                 self.ca_client_config()?,
                 Some(self.peer_ticket()?),
+                SLOW_CALL_DEADLINE,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn create_bridge(
+        &self,
+        node: &EnvironmentNode,
+        seat: &lumen_cluster::join::ExternalSeat,
+    ) -> Result<(), ClusterError> {
+        if self.is_local(node) {
+            return self.service()?.peer_create_bridge(seat).await;
+        }
+        let _: serde_json::Value = self
+            .call(
+                &node.address,
+                "/api/peer/network/bridge",
+                seat,
+                self.ca_client_config()?,
+                Some(self.peer_ticket()?),
+                // Building it applies a network change and waits for its
+                // confirm, the same as the bond.
                 SLOW_CALL_DEADLINE,
             )
             .await?;

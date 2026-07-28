@@ -73,6 +73,33 @@ export interface FenceSummary {
 export type Regime = "two_node" | "quorum";
 export type ClusterHealth = "ok" | "degraded" | "critical" | "unknown";
 
+/// What Pacemaker reports about the cluster address resource.
+///
+/// `role` and `reason` are Pacemaker's own words, passed through rather than
+/// mapped — the operator will search for the string Pacemaker used. `reason`
+/// is the actionable half: the role says "Stopped" whatever went wrong, and
+/// the reason says whether the agent is missing, timed out, or was never
+/// started.
+export interface VipState {
+  resource: string;
+  active: boolean;
+  node?: string;
+  failed: boolean;
+  blocked: boolean;
+  role?: string;
+  reason?: string;
+}
+
+/// The cluster address: what the definition asked for, and what Pacemaker has
+/// actually done about it.
+///
+/// `state` absent means the definition names a VIP and Pacemaker has no such
+/// resource — a fault, not an absence.
+export interface VipView {
+  address: string;
+  state?: VipState;
+}
+
 export interface ClusterView {
   name: string;
   regime: Regime;
@@ -81,6 +108,8 @@ export interface ClusterView {
   preferred_node?: string;
   nodes: ClusterNodeView[];
   fence: FenceSummary;
+  /// Absent when the cluster's definition asks for no floating address.
+  vip?: VipView;
   /// Why the cluster could not be asked, when it could not — its nodes are
   /// then listed from the membership record with nothing claimed about them.
   error?: string;
@@ -159,6 +188,32 @@ export interface ClusterNetworks {
 
 export const fetchClusterNetworks = (name: string): Promise<ClusterNetworks> =>
   apiFetch<ClusterNetworks>(`/environment/clusters/${encodeURIComponent(name)}/networks`);
+
+/// An External network to define, with one uplink per member.
+///
+/// Every member or none: an External network that exists on some members is
+/// one a machine can be restarted onto a node where its network does not
+/// resolve, which is the failure HA exists to prevent. The dialog collects an
+/// uplink for every member for that reason, and the backend refuses anything
+/// short.
+export type ExternalNetworkCreate = {
+  name: string;
+  bridge: string;
+  uplinks: Uplink[];
+} & ({ mode: "trunk"; allowed: number[] } | { mode: "access"; vlan: number });
+
+/// Define an External network and realize its bridge on every member.
+///
+/// Not a definition-only write: the record and the boxes are made to agree
+/// before this answers, because a definition every member has not realized is
+/// exactly the inconsistency the consistency rule forbids. A member that
+/// cannot build its bridge fails the whole call and the definition is not
+/// recorded.
+export const createExternalNetwork = (
+  cluster: string,
+  network: ExternalNetworkCreate,
+): Promise<ExternalNetwork> =>
+  post(`/environment/clusters/${encodeURIComponent(cluster)}/networks/external`, network);
 
 // --- workflows ---------------------------------------------------------------
 

@@ -2,6 +2,7 @@ pub mod api;
 pub mod config;
 pub mod error;
 pub mod ha;
+pub mod inventory;
 pub mod maintenance;
 pub mod peers;
 pub mod realm;
@@ -55,6 +56,10 @@ pub struct AppState {
     pub virt: Arc<VirtService>,
     /// The environment and its clusters: membership, quorum, fencing.
     pub cluster: Arc<ClusterService>,
+    /// How the environment-wide reads reach the other members. The real
+    /// channel in the daemon, [`inventory::NoPeers`] anywhere there is none;
+    /// the workflows reach the full channel through the services that own it.
+    pub peers: Arc<dyn inventory::InventoryPeers>,
     /// Replicated volumes: DRBD resources over each member's zvols. Built on
     /// the cluster and storage domains, which is why it is constructed after
     /// both.

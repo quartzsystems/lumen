@@ -24,7 +24,7 @@ use tokio::time::timeout;
 
 use super::{ClusterBackend, LocalPreflight};
 use crate::error::{ClusterError, Result};
-use crate::state::{ClusterState, FenceDeviceState, NodeState, QuorumState, RingLink};
+use crate::state::{ClusterState, FenceDeviceState, NodeState, QuorumState, RingLink, VipState};
 
 /// Reads answer in milliseconds on a healthy node and not at all on one whose
 /// cluster stack has hung — and an unbounded read here would hang the whole
@@ -41,6 +41,11 @@ const PACEMAKER_CIB: &str = "/var/lib/pacemaker/cib";
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
 const INSTALL: &str = "/usr/bin/install";
 const RM: &str = "/usr/bin/rm";
+/// The resource agent `create_vip` builds the cluster address with, and the
+/// only one of its kind this appliance creates — which is what makes it a
+/// safe way to find the address resource without knowing the cluster's name.
+const IPADDR2_AGENT: &str = "ocf:heartbeat:IPaddr2";
+
 const PCS: &str = "/usr/sbin/pcs";
 const CIBADMIN: &str = "/usr/sbin/cibadmin";
 
@@ -155,7 +160,7 @@ impl ClusterBackend for CliBackend {
 
         let quorum = parse_quorumtool(&quorum_out);
         let local_rings = parse_cfgtool(&cfg_out);
-        let (mut nodes, fence_devices) = parse_crm_mon(&crm_out)?;
+        let (mut nodes, fence_devices, vip) = parse_crm_mon(&crm_out)?;
 
         // cfgtool answers for this node only; peers' rings arrive with the
         // environment federation, and until then an empty list is honest.
@@ -169,6 +174,7 @@ impl ClusterBackend for CliBackend {
             quorum,
             nodes,
             fence_devices,
+            vip,
         })
     }
 
@@ -526,18 +532,29 @@ fn parse_chronyc_tracking(output: &str) -> (bool, Option<i64>) {
 /// `crm_mon --output-as=xml`: node membership and the STONITH devices.
 /// Pacemaker's one machine-readable status format — the text form is for
 /// eyes and changes between releases; this one carries an api-version.
-fn parse_crm_mon(xml: &str) -> Result<(Vec<NodeState>, Vec<FenceDeviceState>)> {
+fn parse_crm_mon(xml: &str) -> Result<(Vec<NodeState>, Vec<FenceDeviceState>, Option<VipState>)> {
     use quick_xml::events::Event;
 
     let mut reader = quick_xml::Reader::from_str(xml);
     let mut nodes = Vec::new();
     let mut devices = Vec::new();
+    let mut vip: Option<VipState> = None;
     // The <node> elements under <nodes> are members; the ones nested inside
     // a <resource> only say where it runs. Depth-free flag on the section.
     let mut in_nodes = false;
+    // Set while inside the address resource's element, so the <node> nested
+    // in it is read as "where it runs" rather than as a member.
+    let mut in_vip_resource = false;
+    // The resource whose operation history is being read, so a failure can be
+    // attributed to the resource it belongs to.
+    let mut history_of: Option<String> = None;
 
     loop {
-        match reader.read_event() {
+        let event = reader.read_event();
+        // A `<resource …/>` carries no nested node; a `<resource …>` may.
+        // Only the latter opens a scope the node inside belongs to.
+        let opens_scope = matches!(event, Ok(Event::Start(_)));
+        match event {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
                 let name = e.name();
                 let tag = name.as_ref();
@@ -558,6 +575,12 @@ fn parse_crm_mon(xml: &str) -> Result<(Vec<NodeState>, Vec<FenceDeviceState>)> {
                         unclean: flag("unclean"),
                         rings: Vec::new(),
                     }),
+                    b"node" if in_vip_resource => {
+                        // Where the address actually is right now.
+                        if let Some(state) = vip.as_mut() {
+                            state.node = attr("name");
+                        }
+                    }
                     b"resource" => {
                         let agent = attr("resource_agent").unwrap_or_default();
                         if agent.starts_with("stonith:") {
@@ -570,12 +593,43 @@ fn parse_crm_mon(xml: &str) -> Result<(Vec<NodeState>, Vec<FenceDeviceState>)> {
                                 failed: flag("failed"),
                                 last_test: None,
                             });
+                        } else if agent == IPADDR2_AGENT {
+                            // The one address resource this appliance creates.
+                            // Matched on its agent rather than on its name:
+                            // the parser does not know the cluster's name, and
+                            // the agent is what `create_vip` chose.
+                            vip = Some(VipState {
+                                resource: attr("id").unwrap_or_default(),
+                                active: flag("active"),
+                                node: None,
+                                failed: flag("failed"),
+                                blocked: flag("blocked") || !flag("managed"),
+                                role: attr("role"),
+                                reason: None,
+                            });
+                            in_vip_resource = opens_scope;
+                        }
+                    }
+                    b"resource_history" => history_of = attr("id"),
+                    b"operation_history" => {
+                        // A non-zero return is a failure, and its text is the
+                        // only place the actionable cause appears — the role
+                        // says "Stopped" whatever went wrong.
+                        let failed_op = attr("rc").as_deref().is_some_and(|rc| rc != "0");
+                        let mine = history_of.as_deref()
+                            == vip.as_ref().map(|state| state.resource.as_str());
+                        if failed_op && mine {
+                            if let Some(state) = vip.as_mut() {
+                                state.reason = attr("rc_text");
+                            }
                         }
                     }
                     _ => {}
                 }
             }
             Ok(Event::End(e)) if e.name().as_ref() == b"nodes" => in_nodes = false,
+            Ok(Event::End(e)) if e.name().as_ref() == b"resource" => in_vip_resource = false,
+            Ok(Event::End(e)) if e.name().as_ref() == b"resource_history" => history_of = None,
             Ok(Event::Eof) => break,
             Ok(_) => {}
             Err(err) => {
@@ -585,7 +639,7 @@ fn parse_crm_mon(xml: &str) -> Result<(Vec<NodeState>, Vec<FenceDeviceState>)> {
             }
         }
     }
-    Ok((nodes, devices))
+    Ok((nodes, devices, vip))
 }
 
 #[cfg(test)]
@@ -694,6 +748,63 @@ Not synchronised\n";
 </pacemaker-result>
 "#;
 
+    /// A real answer from a two-node cluster whose address resource cannot
+    /// start because the agent's own dependency is missing from the image.
+    /// Trimmed from `crm_mon --output-as=xml --inactive` on EL10, keeping the
+    /// element that carries the reason.
+    const CRM_MON_VIP_NOT_INSTALLED: &str = r#"<pacemaker-result api-version="2.32">
+  <nodes>
+    <node name="lumen1" id="1" online="true" standby="false" unclean="false" type="member"/>
+    <node name="lumen2" id="2" online="true" standby="false" unclean="false" type="member"/>
+  </nodes>
+  <resources>
+    <resource id="lumen-cluster1-vip" resource_agent="ocf:heartbeat:IPaddr2" role="Stopped" active="false" orphaned="false" blocked="false" maintenance="false" managed="true" failed="false" failure_ignored="false" nodes_running_on="0"/>
+    <resource id="fence-lumen1" resource_agent="stonith:fence_ipmilan" role="Started" active="true" blocked="false" managed="true" failed="false" nodes_running_on="1">
+      <node name="lumen2" id="2" cached="true"/>
+    </resource>
+  </resources>
+  <node_history>
+    <node name="lumen2">
+      <resource_history id="lumen-cluster1-vip" orphan="false" migration-threshold="1000000">
+        <operation_history call="11" task="probe" rc="5" rc_text="Not installed" last-rc-change="Mon Jul 27 23:58:11 2026" exec-time="62ms" queue-time="0ms"/>
+      </resource_history>
+    </node>
+  </node_history>
+</pacemaker-result>
+"#;
+
+    /// The address resource whose agent will not run. "Stopped" is all the
+    /// role says; the actionable half is the operation's own `rc_text`, and
+    /// without it the console can only report that an address does not answer.
+    #[test]
+    fn a_stopped_address_carries_pacemakers_reason() {
+        let (_, _, vip) = parse_crm_mon(CRM_MON_VIP_NOT_INSTALLED).unwrap();
+        let vip = vip.expect("the address resource is in the answer");
+        assert_eq!(vip.resource, "lumen-cluster1-vip");
+        assert!(!vip.active);
+        assert_eq!(vip.node, None);
+        assert_eq!(vip.role.as_deref(), Some("Stopped"));
+        assert_eq!(vip.reason.as_deref(), Some("Not installed"));
+    }
+
+    /// A running address says where it is. The `<node>` inside the resource
+    /// is where it runs, not a third member — the same trap the fence
+    /// devices' parser has.
+    #[test]
+    fn a_running_address_names_the_member_holding_it() {
+        let xml = CRM_MON_VIP_NOT_INSTALLED
+            .replace(
+                r#"role="Stopped" active="false" orphaned="false" blocked="false" maintenance="false" managed="true" failed="false" failure_ignored="false" nodes_running_on="0"/>"#,
+                r#"role="Started" active="true" blocked="false" managed="true" failed="false" nodes_running_on="1"><node name="lumen1" id="1" cached="true"/></resource>"#,
+            );
+        let (nodes, _, vip) = parse_crm_mon(&xml).unwrap();
+        assert_eq!(nodes.len(), 2, "the resource's node is not a member");
+        let vip = vip.expect("the address resource is in the answer");
+        assert!(vip.active);
+        assert_eq!(vip.node.as_deref(), Some("lumen1"));
+        assert!(!vip.failed && !vip.blocked);
+    }
+
     #[test]
     fn a_two_node_quorum_reads_back_with_both_mechanisms() {
         let quorum = parse_quorumtool(QUORUMTOOL_TWO_NODE);
@@ -748,7 +859,7 @@ Not synchronised\n";
 
     #[test]
     fn crm_mon_yields_members_and_fence_devices_but_never_confuses_the_two() {
-        let (nodes, devices) = parse_crm_mon(CRM_MON_XML).unwrap();
+        let (nodes, devices, _) = parse_crm_mon(CRM_MON_XML).unwrap();
         // The <node> inside a <resource> says where it runs; it is not a
         // third member.
         assert_eq!(nodes.len(), 2);

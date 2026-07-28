@@ -136,6 +136,7 @@ fn harness(
         storage,
         virt,
         cluster,
+        peers: Arc::new(lumen_controlplane::inventory::NoPeers),
         drbd,
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
         updates: Arc::new(lumen_update::UpdateService::new(
@@ -274,6 +275,86 @@ async fn a_standalone_node_answers_with_itself_as_the_one_unassigned_node() {
     assert_eq!(unassigned.len(), 1);
     assert_eq!(unassigned[0]["node"], "alpha-1");
     assert_eq!(unassigned[0]["local"], true);
+}
+
+/// The environment-wide read answers for a node that has joined nothing:
+/// one member, itself, reachable. A console that has to special-case
+/// "standalone" before it can draw a table is a console that will get it
+/// wrong the day a second node arrives.
+#[tokio::test]
+async fn the_inventory_of_a_standalone_node_is_itself_alone() {
+    let harness = harness(
+        "inventory-standalone",
+        MockBackend::appliance(),
+        MockPeers::new(),
+        None,
+    );
+    let cookie = sign_in(&harness.router).await;
+    let (status, body) = request(
+        &harness.router,
+        Method::GET,
+        "/api/environment/inventory",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let members = body["members"].as_array().unwrap();
+    assert_eq!(members.len(), 1, "{body}");
+    assert_eq!(members[0]["node"], "alpha-1");
+    assert_eq!(members[0]["local"], true);
+    assert_eq!(members[0]["reachable"], true);
+    assert!(members[0]["inventory"].is_object(), "{body}");
+}
+
+/// A member this control plane cannot reach is a row with a reason on it,
+/// not a failed request. The whole point of the endpoint is that one node
+/// being away does not cost the operator the nodes that answered — so the
+/// call is still 200, the local node still carries its inventory, and the
+/// unreachable one says why it has none.
+#[tokio::test]
+async fn a_member_that_cannot_be_asked_is_a_row_carrying_its_reason() {
+    let harness = harness(
+        "inventory-unreachable",
+        MockBackend::environment(),
+        MockPeers::new(),
+        Some(&environment_membership()),
+    );
+    let cookie = sign_in(&harness.router).await;
+    let (status, body) = request(
+        &harness.router,
+        Method::GET,
+        "/api/environment/inventory",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let members = body["members"].as_array().unwrap();
+    assert!(members.len() > 1, "the fixture has more than one member");
+
+    let local = members
+        .iter()
+        .find(|m| m["local"] == true)
+        .expect("the local node");
+    assert_eq!(local["node"], "alpha-1");
+    assert_eq!(local["reachable"], true);
+    assert!(local["inventory"].is_object(), "{body}");
+
+    // The harness holds no peer channel, so every peer is honestly
+    // unreachable — and says so rather than being dropped from the list.
+    let peer = members
+        .iter()
+        .find(|m| m["local"] == false)
+        .expect("a peer row");
+    assert_eq!(peer["reachable"], false);
+    assert!(peer["inventory"].is_null() || peer.get("inventory").is_none());
+    assert!(
+        peer["error"].as_str().unwrap().contains("could not be asked"),
+        "{peer}"
+    );
 }
 
 #[tokio::test]
@@ -854,6 +935,7 @@ async fn a_cluster_create_reports_per_node_per_step_progress_and_completes() {
         storage,
         virt,
         cluster,
+        peers: Arc::new(lumen_controlplane::inventory::NoPeers),
         drbd,
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
         updates: Arc::new(lumen_update::UpdateService::new(
@@ -924,6 +1006,305 @@ async fn a_malformed_create_is_a_validation_answer_with_fields() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let errors = answer["errors"].as_array().unwrap();
     assert!(errors.iter().any(|e| e["code"] == "invalid_subnet"));
+}
+
+// --- pooling drives across members ------------------------------------------
+
+/// Reformatting disks is not something to do because a field defaulted. The
+/// acknowledgement is required before any member is touched.
+#[tokio::test]
+async fn pooling_across_members_needs_the_acknowledgement() {
+    let harness = harness(
+        "pool-unacked",
+        MockBackend::environment(),
+        MockPeers::new(),
+        Some(&alpha_with_record()),
+    );
+    let cookie = sign_in(&harness.router).await;
+
+    let (status, answer) = request(
+        &harness.router,
+        Method::POST,
+        "/api/environment/storage/pools",
+        Some(&cookie),
+        None,
+        Some(serde_json::json!({
+            "name": "tank",
+            "vdev": "mirror",
+            "compression": "lz4",
+            "seats": [{ "node": "alpha-1", "disks": ["/dev/disk/by-id/one"] }],
+        })),
+    )
+    .await;
+    assert_ne!(status, StatusCode::CREATED, "{answer}");
+}
+
+/// A member given no disks is a mistake, not an empty pool. Caught before
+/// anything is built rather than leaving one member with a pool the others
+/// do not have — which is exactly the drift this endpoint exists to prevent.
+#[tokio::test]
+async fn a_member_with_no_disks_is_refused() {
+    let harness = harness(
+        "pool-empty-seat",
+        MockBackend::environment(),
+        MockPeers::new(),
+        Some(&alpha_with_record()),
+    );
+    let cookie = sign_in(&harness.router).await;
+
+    let (status, answer) = request(
+        &harness.router,
+        Method::POST,
+        "/api/environment/storage/pools",
+        Some(&cookie),
+        None,
+        Some(serde_json::json!({
+            "name": "tank",
+            "vdev": "mirror",
+            "compression": "lz4",
+            "seats": [
+                { "node": "alpha-1", "disks": ["/dev/disk/by-id/one"] },
+                { "node": "alpha-2", "disks": [] },
+            ],
+            "i_understand_this_erases_the_disks": true,
+        })),
+    )
+    .await;
+    assert_ne!(status, StatusCode::CREATED, "{answer}");
+}
+
+/// A node that is not in the environment cannot be given disks to format.
+#[tokio::test]
+async fn a_stranger_cannot_be_given_disks_to_format() {
+    let harness = harness(
+        "pool-stranger",
+        MockBackend::environment(),
+        MockPeers::new(),
+        Some(&alpha_with_record()),
+    );
+    let cookie = sign_in(&harness.router).await;
+
+    let (status, answer) = request(
+        &harness.router,
+        Method::POST,
+        "/api/environment/storage/pools",
+        Some(&cookie),
+        None,
+        Some(serde_json::json!({
+            "name": "tank",
+            "vdev": "mirror",
+            "compression": "lz4",
+            "seats": [{ "node": "outsider", "disks": ["/dev/disk/by-id/one"] }],
+            "i_understand_this_erases_the_disks": true,
+        })),
+    )
+    .await;
+    assert_ne!(status, StatusCode::CREATED, "{answer}");
+}
+
+// --- external networks -------------------------------------------------------
+
+/// A membership whose cluster "alpha" is recorded whole, so the External
+/// network verbs have a definition to add to.
+fn alpha_with_record() -> EnvironmentMembership {
+    let mut membership = membership_of(&[("alpha-1", Some("alpha")), ("alpha-2", Some("alpha"))]);
+    let request_body: lumen_cluster::ClusterCreate =
+        serde_json::from_value(create_body(&["alpha-1", "alpha-2"])).unwrap();
+    let (definition, networks, _) = request_body.build().unwrap();
+    membership
+        .clusters
+        .push(lumen_cluster::ClusterRecord::new(definition, networks));
+    membership
+}
+
+/// The whole point of the type: every member builds the bridge, and only then
+/// does the record admit the network exists.
+#[tokio::test]
+async fn an_external_network_is_built_on_every_member_before_it_is_recorded() {
+    let peers = MockPeers::new();
+    let harness = harness(
+        "external-create",
+        MockBackend::environment(),
+        peers,
+        Some(&alpha_with_record()),
+    );
+    let cookie = sign_in(&harness.router).await;
+
+    let (status, answer) = request(
+        &harness.router,
+        Method::POST,
+        "/api/environment/clusters/alpha/networks/external",
+        Some(&cookie),
+        None,
+        Some(serde_json::json!({
+            "name": "vm-net",
+            "bridge": "vmbr1",
+            "mode": "trunk",
+            "allowed": [10, 20],
+            "uplinks": [
+                { "node": "alpha-1", "interface": "nic3" },
+                { "node": "alpha-2", "interface": "nic3" },
+            ],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+    assert_eq!(answer["name"], "vm-net");
+
+    // Built on both members, as a trunk — VLAN aware, no VLAN interface
+    // underneath, because the tags are meant to reach the machines.
+    let built = harness.peers.bridges();
+    assert_eq!(built.len(), 2, "one bridge per member");
+    assert!(built.iter().any(|(node, _)| node == "alpha-1"));
+    assert!(built.iter().any(|(node, _)| node == "alpha-2"));
+    for (_, seat) in &built {
+        assert_eq!(seat.bridge.name, "vmbr1");
+        assert!(seat.bridge.vlan_filtering, "a trunk is VLAN aware");
+        assert!(seat.vlan.is_none(), "a trunk needs no VLAN interface");
+        assert_eq!(seat.bridge.ports, vec!["nic3".to_string()]);
+    }
+
+    // And now it is in the record every member reads.
+    let (status, networks) = request(
+        &harness.router,
+        Method::GET,
+        "/api/environment/clusters/alpha/networks",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let external = networks["external"].as_array().unwrap();
+    assert_eq!(external.len(), 1, "{networks}");
+    assert_eq!(external[0]["name"], "vm-net");
+}
+
+/// An access network's bridge sits on a VLAN interface, not on the raw
+/// uplink. Bridging the uplink directly would put the machines on whatever
+/// the switch sends untagged, which is not the VLAN that was asked for.
+#[tokio::test]
+async fn an_access_network_bridges_a_vlan_interface_rather_than_the_uplink() {
+    let harness = harness(
+        "external-access",
+        MockBackend::environment(),
+        MockPeers::new(),
+        Some(&alpha_with_record()),
+    );
+    let cookie = sign_in(&harness.router).await;
+
+    let (status, answer) = request(
+        &harness.router,
+        Method::POST,
+        "/api/environment/clusters/alpha/networks/external",
+        Some(&cookie),
+        None,
+        Some(serde_json::json!({
+            "name": "office",
+            "bridge": "vmbr2",
+            "mode": "access",
+            "vlan": 30,
+            "uplinks": [
+                { "node": "alpha-1", "interface": "nic3" },
+                { "node": "alpha-2", "interface": "nic3" },
+            ],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+
+    for (_, seat) in harness.peers.bridges() {
+        let vlan = seat.vlan.as_ref().expect("an access network needs one");
+        assert_eq!(vlan.name, "nic3.30");
+        assert_eq!(vlan.parent, "nic3");
+        assert_eq!(vlan.vlan_id, 30);
+        // The bridge takes the VLAN interface as its port, and does no
+        // filtering of its own — the tag is the VLAN interface's job.
+        assert_eq!(seat.bridge.ports, vec!["nic3.30".to_string()]);
+        assert!(!seat.bridge.vlan_filtering);
+    }
+}
+
+/// Every member or none. A definition missing a member is refused before
+/// anything is built, rather than leaving a network a failover can land on
+/// and find absent.
+#[tokio::test]
+async fn an_external_network_missing_a_member_is_refused_and_builds_nothing() {
+    let harness = harness(
+        "external-partial",
+        MockBackend::environment(),
+        MockPeers::new(),
+        Some(&alpha_with_record()),
+    );
+    let cookie = sign_in(&harness.router).await;
+
+    let (status, answer) = request(
+        &harness.router,
+        Method::POST,
+        "/api/environment/clusters/alpha/networks/external",
+        Some(&cookie),
+        None,
+        Some(serde_json::json!({
+            "name": "half",
+            "bridge": "vmbr3",
+            "mode": "trunk",
+            "allowed": [],
+            "uplinks": [{ "node": "alpha-1", "interface": "nic3" }],
+        })),
+    )
+    .await;
+    assert_ne!(status, StatusCode::CREATED, "{answer}");
+    assert!(
+        harness.peers.bridges().is_empty(),
+        "nothing may have been built"
+    );
+}
+
+/// A member that cannot build its bridge fails the whole call, and the record
+/// does not gain a network the cluster has not got.
+#[tokio::test]
+async fn a_member_that_cannot_build_the_bridge_fails_the_definition() {
+    let harness = harness(
+        "external-fails",
+        MockBackend::environment(),
+        MockPeers::new().fail_bridge_on("alpha-2"),
+        Some(&alpha_with_record()),
+    );
+    let cookie = sign_in(&harness.router).await;
+
+    let (status, answer) = request(
+        &harness.router,
+        Method::POST,
+        "/api/environment/clusters/alpha/networks/external",
+        Some(&cookie),
+        None,
+        Some(serde_json::json!({
+            "name": "doomed",
+            "bridge": "vmbr4",
+            "mode": "trunk",
+            "allowed": [],
+            "uplinks": [
+                { "node": "alpha-1", "interface": "nic3" },
+                { "node": "alpha-2", "interface": "nic3" },
+            ],
+        })),
+    )
+    .await;
+    assert_ne!(status, StatusCode::CREATED, "{answer}");
+
+    let (_, networks) = request(
+        &harness.router,
+        Method::GET,
+        "/api/environment/clusters/alpha/networks",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert!(
+        networks["external"].as_array().unwrap().is_empty(),
+        "an unrealized network may not be recorded: {networks}"
+    );
 }
 
 // --- destroy and node removal -----------------------------------------------

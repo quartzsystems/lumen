@@ -21,7 +21,7 @@ use crate::security::Session;
 use crate::AppState;
 use lumen_cluster::{
     Acknowledgements, ClusterCreate, ClusterNetworks, ClusterView, CreateProgress,
-    EnvironmentResponse, FenceTestView, MintedToken, PreflightView,
+    EnvironmentResponse, ExternalNetwork, FenceTestView, MintedToken, PreflightView,
 };
 
 /// GET /api/environment — the whole environment: every cluster, every node,
@@ -44,6 +44,42 @@ pub async fn cluster(
     Ok(Json(state.cluster.cluster(&name).await?))
 }
 
+/// GET /api/environment/inventory — every member's processors, memory,
+/// links, and pools, side by side.
+///
+/// The environment-wide read behind the console's cross-node tables. The
+/// node-local routes it draws from — `/api/nodes`,
+/// `/api/network/interfaces`, `/api/storage/pools` — keep meaning "this
+/// appliance", because the edits the console offers on a link or a pool land
+/// on the node that owns it.
+///
+/// Always 200. A member that could not be asked is a row carrying its reason,
+/// not an error that costs the operator the members that did answer.
+pub async fn inventory(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+) -> Json<crate::inventory::InventoryResponse> {
+    Json(crate::inventory::environment(&state).await)
+}
+
+/// POST /api/environment/storage/pools — build one identically named pool
+/// across several members at once.
+///
+/// Not a cluster-wide pool: each member ends up with its own, on its own
+/// disks, listed and destroyed on its own Storage page. What this saves is
+/// the trip to every console, and what it prevents is the names drifting
+/// apart — a replicated volume names one pool and means it on every member
+/// holding a replica.
+pub async fn create_cluster_pool(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    raw: Body,
+) -> Result<(StatusCode, Json<crate::inventory::ClusterPoolOutcome>), ApiError> {
+    let request: crate::inventory::ClusterPoolCreate = required_body(raw)?;
+    let outcome = crate::inventory::create_cluster_pool(&state, &request).await?;
+    Ok((StatusCode::CREATED, Json(outcome)))
+}
+
 /// GET /api/environment/clusters/{name}/networks — the cluster's typed
 /// networks: Core, Management, and the External list, as the replicated
 /// record carries them. The console's Networks page reads this.
@@ -53,6 +89,25 @@ pub async fn cluster_networks(
     Path(name): Path<String>,
 ) -> Result<Json<ClusterNetworks>, ApiError> {
     Ok(Json(state.cluster.cluster_networks(&name)?))
+}
+
+/// POST /api/environment/clusters/{name}/networks/external — define an
+/// External network and build its bridge on every member.
+///
+/// One call rather than a definition write and a realization pass, because
+/// the two must not be separable: an External network the record claims and
+/// a member has not built is exactly the state the consistency rule forbids.
+/// Answers with the network as recorded, so the console renders what the
+/// cluster actually agreed to rather than what was typed.
+pub async fn create_external_network(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    raw: Body,
+) -> Result<(StatusCode, Json<ExternalNetwork>), ApiError> {
+    let network: ExternalNetwork = required_body(raw)?;
+    let created = state.cluster.create_external_network(&name, network).await?;
+    Ok((StatusCode::CREATED, Json(created)))
 }
 
 #[derive(Debug, Default, Deserialize)]

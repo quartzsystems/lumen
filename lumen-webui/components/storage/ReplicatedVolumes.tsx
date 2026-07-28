@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type CSSProperties } from "react";
 import { AlertTriangle, Camera, Expand, Plus, Trash2, Unplug } from "lucide-react";
 import { DataTable, Dash, type Column } from "@/components/console/DataTable";
 import { Button } from "@/components/ui/Button";
@@ -539,12 +539,13 @@ function DestroyVolumeDialog({
             <div className="text-[13px] text-[var(--qz-fg-2)]">{error}</div>
           </div>
         )}
-        <label className="qz-check">
+        <label className="qz-check-row">
           <input
             type="checkbox"
+            className="qz-check"
             checked={acked}
             onChange={() => setAcked(!acked)}
-            style={{ accentColor: "var(--qz-danger)" }}
+            style={{ "--qz-check-accent": "var(--qz-danger)" } as CSSProperties}
           />
           <span className="text-[13px] text-[var(--qz-fg-2)]">
             I understand this destroys the data on all {volume.replicas.length} replicas.
@@ -808,12 +809,13 @@ function SnapshotsDialog({
                         ))}
                       </SelectInput>
                     </Field>
-                    <label className="qz-check">
+                    <label className="qz-check-row">
                       <input
                         type="checkbox"
+                        className="qz-check"
                         checked={acked}
                         onChange={() => setAcked(!acked)}
-                        style={{ accentColor: "var(--qz-danger)" }}
+                        style={{ "--qz-check-accent": "var(--qz-danger)" } as CSSProperties}
                       />
                       <span className="text-[13px] text-[var(--qz-fg-2)]">
                         I understand everything written since this snapshot is lost, on every
@@ -907,12 +909,13 @@ function ResolveSplitBrainDialog({
             ))}
           </SelectInput>
         </Field>
-        <label className="qz-check">
+        <label className="qz-check-row">
           <input
             type="checkbox"
+            className="qz-check"
             checked={acked}
             onChange={() => setAcked(!acked)}
-            style={{ accentColor: "var(--qz-danger)" }}
+            style={{ "--qz-check-accent": "var(--qz-danger)" } as CSSProperties}
           />
           <span className="text-[13px] text-[var(--qz-fg-2)]">
             I understand the victim's unreplicated writes are discarded.

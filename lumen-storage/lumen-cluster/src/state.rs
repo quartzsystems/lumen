@@ -19,6 +19,15 @@ pub struct ClusterState {
     pub quorum: QuorumState,
     pub nodes: Vec<NodeState>,
     pub fence_devices: Vec<FenceDeviceState>,
+    /// The cluster's floating address, when its definition asked for one.
+    ///
+    /// Read from Pacemaker rather than inferred from the record, because the
+    /// two can disagree and the disagreement is the whole point: a VIP the
+    /// definition names and Pacemaker has stopped is an address nobody
+    /// answers on, and a console that reported it from the definition alone
+    /// would show a healthy cluster with an unreachable console.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vip: Option<VipState>,
 }
 
 impl ClusterState {
@@ -97,6 +106,43 @@ pub struct FenceDeviceState {
     pub last_test: Option<FenceTest>,
 }
 
+/// The cluster address resource, as Pacemaker reports it.
+///
+/// Its own type rather than a bool because "not running" has causes an
+/// operator has to act on differently. A resource Pacemaker never started is
+/// a different problem from one that started and failed, and one it calls
+/// "not installed" is a third — the agent, or something the agent needs, is
+/// missing from the image. The reason travels with the state so the console
+/// can say which.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VipState {
+    /// Resource id, `<cluster>-vip`.
+    pub resource: String,
+    /// Running somewhere.
+    pub active: bool,
+    /// The member holding the address, when one does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    /// Its last operation failed.
+    pub failed: bool,
+    /// Pacemaker will not act on it — unmanaged, or blocked behind a failed
+    /// operation it cannot recover from without help.
+    pub blocked: bool,
+    /// What Pacemaker calls the state, verbatim: "Started", "Stopped".
+    /// Passed through rather than mapped, because the operator will search
+    /// for the string Pacemaker used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Why it is not running, in Pacemaker's own words — the `rc_text` of the
+    /// last operation that failed, such as "Not installed" or "Timed Out".
+    ///
+    /// This is the field that turns "the address does not answer" into
+    /// something an operator can act on. The role alone says "Stopped" for
+    /// every cause there is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// The outcome of a guarded live fence test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FenceTest {
@@ -149,6 +195,7 @@ mod tests {
                 active: true,
                 ..FenceDeviceState::default()
             }],
+            vip: None,
         }
     }
 

@@ -370,3 +370,9 @@ is its own security decision, and turning it on silently for every
 appliance would make it nobody's. No external storage export, no thin
 provisioning under replication, and no scale past 3 replicas — stated
 non-goals, not omissions.
+
+The last of those is where the model ends rather than where it fails.
+Pooled capacity across a cluster, placement without naming members, and
+volumes larger than any one member are a different architecture, not an
+extension of this one; docs/storage-scaleout.md sets out what each of those
+three actually costs and why the answer differs either side of two nodes.

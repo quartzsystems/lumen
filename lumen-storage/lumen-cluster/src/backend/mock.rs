@@ -14,7 +14,9 @@ use async_trait::async_trait;
 use super::{ClusterBackend, LocalPreflight};
 use crate::environment::{ClusterRecord, EnvironmentMembership, EnvironmentNode};
 use crate::error::{ClusterError, Result};
-use crate::state::{ClusterState, FenceDeviceState, FenceTest, NodeState, QuorumState, RingLink};
+use crate::state::{
+    ClusterState, FenceDeviceState, FenceTest, NodeState, QuorumState, RingLink, VipState,
+};
 
 #[derive(Debug, Default)]
 struct Inner {
@@ -349,6 +351,17 @@ fn healthy_cluster(name: &str, nodes: &[&str], two_node: bool) -> ClusterState {
                 }),
             })
             .collect(),
+        // A healthy fixture's address is up on the first member. Tests that
+        // care about a stopped one set it themselves.
+        vip: Some(VipState {
+            resource: format!("{name}-vip"),
+            active: true,
+            node: nodes.first().map(|node| (*node).to_string()),
+            failed: false,
+            blocked: false,
+            role: Some("Started".into()),
+            reason: None,
+        }),
     }
 }
 
