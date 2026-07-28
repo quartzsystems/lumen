@@ -45,6 +45,11 @@ on:
     branches: [main]
     paths:
       - "docs/site/**"
+      # The published key is copied out of the tree by the job below, so a
+      # rotation has to republish the site. Without this line, committing a new
+      # key changes what future packages are signed with while the address a
+      # hand-configured node fetches from keeps serving the old one.
+      - "packages/keys/**"
       - ".github/workflows/pages.yml"
   # Called by release.yml once the release assets exist, so a new version
   # appears in the repository without anybody pressing anything.
