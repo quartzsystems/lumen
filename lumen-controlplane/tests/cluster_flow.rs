@@ -138,7 +138,12 @@ fn harness(
         cluster,
         drbd,
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
+        updates: Arc::new(lumen_update::UpdateService::new(
+            Arc::new(lumen_update::MockUpdates::new()),
+            "test-node",
+        )),
         drain: Default::default(),
+        update_job: Default::default(),
     };
     Harness {
         router: app(Arc::new(state)),
@@ -754,7 +759,12 @@ async fn a_cluster_create_reports_per_node_per_step_progress_and_completes() {
         cluster,
         drbd,
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
+        updates: Arc::new(lumen_update::UpdateService::new(
+            Arc::new(lumen_update::MockUpdates::new()),
+            "test-node",
+        )),
         drain: Default::default(),
+        update_job: Default::default(),
     }));
 
     let cookie = sign_in(&router).await;

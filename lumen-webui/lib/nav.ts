@@ -1,5 +1,6 @@
 import {
   Activity,
+  ArrowUpCircle,
   Boxes,
   Cable,
   Gauge,
@@ -81,6 +82,7 @@ export const NAV: NavItem[] = [
     children: [
       { id: "general", label: "General", href: "/system/general", icon: SlidersHorizontal },
       { id: "authentication", label: "Authentication", href: "/system/authentication", icon: KeyRound },
+      { id: "updates", label: "Updates", href: "/system/updates", icon: ArrowUpCircle },
       { id: "maintenance", label: "Maintenance", href: "/system/maintenance", icon: Wrench },
     ],
   },

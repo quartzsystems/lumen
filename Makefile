@@ -1,7 +1,8 @@
 # Lumen build entry points — see README.md and docs/build.md.
 #
 # make rpms                          build lumen-release/-logos/-networking/
-#                                    -storage/-compute
+#                                    -storage/-compute, plus lumen-repo when
+#                                    packages/keys/RPM-GPG-KEY-lumen is present
 # make installer                     cargo build the Rust installer (release)
 # make controlplane                  cargo build lumen-controlplane (release)
 # make webui                         Next.js static export -> lumen-webui/out
@@ -20,7 +21,7 @@ SCRIPTS := packages/build-rpms.sh iso/build-live-iso.sh \
            branding/console/50-lumen-banner
 SPECS   := packages/lumen-release.spec packages/lumen-logos.spec \
            packages/lumen-networking.spec packages/lumen-storage.spec \
-           packages/lumen-compute.spec
+           packages/lumen-compute.spec packages/lumen-repo.spec
 CARGO_MANIFEST := lumen-installer/app/Cargo.toml
 CP_MANIFEST    := lumen-controlplane/Cargo.toml
 # The domain crates are path dependencies of the control plane, not
@@ -31,6 +32,9 @@ CP_MANIFEST    := lumen-controlplane/Cargo.toml
 # after net because it depends on sys and net; lumen-drbd after cluster and
 # zfs because it is built on both.
 SYS_MANIFEST     := lumen-system/lumen-sys/Cargo.toml
+# lumen-update sits directly on lumen-sys (it borrows the privileged-command
+# runner) and on nothing else, so it comes straight after it.
+UPDATE_MANIFEST  := lumen-system/lumen-update/Cargo.toml
 NET_MANIFEST     := lumen-networking/lumen-net/Cargo.toml
 ZFS_MANIFEST     := lumen-storage/lumen-zfs/Cargo.toml
 CLUSTER_MANIFEST := lumen-storage/lumen-cluster/Cargo.toml
@@ -73,6 +77,8 @@ test:
 		--target-dir build/cargo-target
 	cargo test --manifest-path $(SYS_MANIFEST) \
 		--target-dir build/cargo-target-sys
+	cargo test --manifest-path $(UPDATE_MANIFEST) \
+		--target-dir build/cargo-target-update
 	cargo test --manifest-path $(NET_MANIFEST) \
 		--target-dir build/cargo-target-net
 	cargo test --manifest-path $(ZFS_MANIFEST) \
@@ -95,6 +101,9 @@ lint:
 	cargo fmt --manifest-path $(SYS_MANIFEST) --check
 	cargo clippy --manifest-path $(SYS_MANIFEST) --all-targets \
 		--target-dir build/cargo-target-sys -- -D warnings
+	cargo fmt --manifest-path $(UPDATE_MANIFEST) --check
+	cargo clippy --manifest-path $(UPDATE_MANIFEST) --all-targets \
+		--target-dir build/cargo-target-update -- -D warnings
 	cargo fmt --manifest-path $(NET_MANIFEST) --check
 	cargo clippy --manifest-path $(NET_MANIFEST) --all-targets \
 		--target-dir build/cargo-target-net -- -D warnings

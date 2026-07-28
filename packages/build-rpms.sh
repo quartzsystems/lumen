@@ -140,7 +140,34 @@ cp "$REPO_ROOT/lumen-compute/system/systemd/50-lumen-compute.preset" \
    "$REPO_ROOT/lumen-storage/system/firewalld/lumen-replication.xml" \
    "$TOPDIR/SOURCES/"
 
+# --- repository configuration (only when the signing key is in the tree) ------
+# lumen-repo ships the public key an appliance verifies Lumen's packages and
+# repository index against, so it cannot be built without one. That is a
+# requirement on this package alone and deliberately not on the build: a
+# checkout without the key still produces every other package, which is what
+# lets a contributor build and test the appliance without being handed key
+# material. The key is generated once and committed; docs/updates.md has the
+# procedure.
+REPO_KEY="$REPO_ROOT/packages/keys/RPM-GPG-KEY-lumen"
+REPO_BASEURL="${LUMEN_REPO_BASEURL:-https://lumen.quartz.systems/repo}"
+BUILD_REPO_PACKAGE=0
+if [ -s "$REPO_KEY" ]; then
+    BUILD_REPO_PACKAGE=1
+    echo "==> Staging lumen-repo (base $REPO_BASEURL)"
+    sed "s|@BASEURL@|$REPO_BASEURL|g" \
+        "$REPO_ROOT/packages/lumen.repo.in" > "$TOPDIR/SOURCES/lumen.repo"
+    cp "$REPO_KEY" "$TOPDIR/SOURCES/RPM-GPG-KEY-lumen"
+else
+    echo "==> NOTE: $REPO_KEY is absent, so lumen-repo will not be built."
+    echo "    Installed appliances get their updates from that package; without"
+    echo "    it they have no Lumen repository configured. See docs/updates.md"
+    echo "    for how to generate the key and where the private half belongs."
+fi
+
 for spec in "$REPO_ROOT"/packages/*.spec; do
+    if [ "$(basename "$spec")" = "lumen-repo.spec" ] && [ "$BUILD_REPO_PACKAGE" -eq 0 ]; then
+        continue
+    fi
     echo "==> rpmbuild $(basename "$spec") (version $VERSION)"
     rpmbuild -ba \
         --define "_topdir $TOPDIR" \

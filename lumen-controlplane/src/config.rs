@@ -29,6 +29,17 @@ pub struct Config {
     /// NetworkManager rolls it back on its own. Short enough that a mistake
     /// heals before anyone drives to the rack, long enough to click Confirm.
     pub net_confirm_secs: u32,
+    /// How often this node asks its repositories what is waiting, in seconds.
+    ///
+    /// Six hours: often enough that a security advisory published in the
+    /// morning is on the console by the afternoon, rare enough that a fleet of
+    /// appliances is not a load problem for whoever serves the repository —
+    /// and it is only metadata, a few hundred kilobytes at most. Nothing is
+    /// ever installed by this; see docs/updates.md.
+    ///
+    /// `0` turns the periodic check off entirely, for an appliance that must
+    /// make no outbound requests it was not asked to make.
+    pub update_check_secs: u64,
 }
 
 impl Config {
@@ -54,6 +65,10 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60),
+            update_check_secs: env::var("LUMEN_CP_UPDATE_CHECK_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(6 * 60 * 60),
         }
     }
 }

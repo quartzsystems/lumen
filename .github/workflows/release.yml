@@ -44,7 +44,52 @@ jobs:
         run: make rpms
       - name: rpmlint (specs + built RPMs)
         run: rpmlint packages/*.spec dist/rpms/*.rpm
+      - name: Sign the packages
+        # Signed here, at the moment they are built, rather than later when
+        # they are published: this is the only step that has both the packages
+        # and a reason to be trusted with the key, and a package that leaves
+        # this job unsigned can never be signed retroactively without changing
+        # the bytes an appliance already downloaded.
+        #
+        # An appliance verifies every package against the public half
+        # (lumen-repo), so a release that reached the repository unsigned would
+        # be a release no node can install. The gate below is what makes that
+        # impossible rather than merely unlikely.
+        env:
+          LUMEN_GPG_PRIVATE_KEY: ${{ secrets.LUMEN_GPG_PRIVATE_KEY }}
+          LUMEN_GPG_PASSPHRASE: ${{ secrets.LUMEN_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          if [ -z "${LUMEN_GPG_PRIVATE_KEY:-}" ]; then
+            echo "::error::LUMEN_GPG_PRIVATE_KEY is not set — refusing to publish unsigned packages"
+            exit 1
+          fi
+          dnf -y install rpm-sign gnupg2
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          mkdir -p "$GNUPGHOME"
+          chmod 700 "$GNUPGHOME"
+          printf '%s' "$LUMEN_GPG_PRIVATE_KEY" | gpg --batch --import
+          printf '%s' "$LUMEN_GPG_PASSPHRASE" > "$GNUPGHOME/passphrase"
+          chmod 600 "$GNUPGHOME/passphrase"
+          key="$(gpg --list-secret-keys --with-colons | awk -F: '/^sec:/ {print $5; exit}')"
+          [ -n "$key" ] || { echo "::error::no secret key was imported"; exit 1; }
+          rpm --define "_gpg_name $key" \
+              --define "_gpg_sign_cmd_extra_args --pinentry-mode loopback --passphrase-file $GNUPGHOME/passphrase" \
+              --addsign dist/rpms/*.rpm
+          # Prove it, against the public half exactly as an appliance would.
+          gpg --batch --yes --export --armor "$key" > "$RUNNER_TEMP/pub.asc"
+          rpmkeys --import "$RUNNER_TEMP/pub.asc"
+          for rpm in dist/rpms/*.rpm; do
+            out="$(rpmkeys --checksig "$rpm")"
+            case "$out" in
+              *"signatures OK"*) ;;
+              *) echo "::error::$rpm did not verify: $out"; exit 1 ;;
+            esac
+          done
+          echo "Signed and verified $(ls dist/rpms/*.rpm | wc -l) packages as $key."
       - name: Generate checksums
+        # After signing: the signature is part of the package file, so a
+        # checksum taken before it would describe bytes nobody ever downloads.
         run: |
           cd dist/rpms
           sha256sum ./*.rpm > SHA256SUMS
@@ -65,3 +110,17 @@ jobs:
     uses: ./.github/workflows/iso.yml
     with:
       attach-to-release: true
+
+  # Republish lumen.quartz.systems so installed appliances can see the release
+  # that was just cut. Runs off the release assets, so it has to come after
+  # they exist — and not after the ISO, which takes far longer and has nothing
+  # to do with what a running node updates from.
+  publish-repo:
+    name: Publish the package repository
+    needs: release-rpms
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/pages.yml
+    secrets: inherit

@@ -107,6 +107,36 @@ jobs:
           cargo test --manifest-path lumen-system/lumen-sys/Cargo.toml \
             --target-dir build/cargo-target-sys
 
+  updates:
+    name: Updates (Rust, AlmaLinux 10)
+    runs-on: ubuntu-latest
+    container: almalinux:10
+    steps:
+      - name: Install Rust toolchain
+        # No system libraries and no package manager involved: lumen-update
+        # reaches dnf through its command line and hands every invocation to
+        # systemd, and its tests run against the in-memory backend — CI never
+        # refreshes metadata, resolves a transaction, or installs a byte.
+        run: dnf -y install rust cargo rustfmt clippy make git-core
+      - uses: actions/checkout@v4
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            build/cargo-target-update
+          key: cargo-update-${{ hashFiles('lumen-system/lumen-update/Cargo.toml') }}
+      - name: Format
+        run: cargo fmt --manifest-path lumen-system/lumen-update/Cargo.toml --check
+      - name: Clippy
+        run: |
+          cargo clippy --manifest-path lumen-system/lumen-update/Cargo.toml \
+            --all-targets --target-dir build/cargo-target-update -- -D warnings
+      - name: Tests
+        run: |
+          cargo test --manifest-path lumen-system/lumen-update/Cargo.toml \
+            --target-dir build/cargo-target-update
+
   networking:
     name: Networking (Rust, AlmaLinux 10)
     runs-on: ubuntu-latest

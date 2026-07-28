@@ -19,6 +19,10 @@ license = "MIT"
 # privileged-command runner every other domain borrows. The most basic of the
 # four — it depends on none of them, and lumen-zfs depends on it.
 lumen-sys = { path = "../lumen-system/lumen-sys" }
+# The update domain: what this node could install, and installing it. Depends
+# on lumen-sys for the privileged-command runner and on nothing else — the
+# packages waiting for a node are a fact about the node.
+lumen-update = { path = "../lumen-system/lumen-update" }
 # The networking domain: model, validation, planning, and the NetworkManager
 # backend. A path dependency, deliberately not a workspace member — see the
 # note at the top of lumen-networking/lumen-net/Cargo.toml.

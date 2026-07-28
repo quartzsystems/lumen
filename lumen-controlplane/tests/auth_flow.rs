@@ -95,7 +95,12 @@ fn test_app() -> axum::Router {
         cluster,
         drbd,
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
+        updates: Arc::new(lumen_update::UpdateService::new(
+            Arc::new(lumen_update::MockUpdates::new()),
+            "test-node",
+        )),
         drain: Default::default(),
+        update_job: Default::default(),
     };
     app(Arc::new(state))
 }

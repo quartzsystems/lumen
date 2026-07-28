@@ -159,6 +159,19 @@ impl From<lumen_sys::SysError> for ApiError {
     }
 }
 
+/// The update domain's errors. No validation arm: an update request names
+/// nothing an operator typed — it is a button — so there is no document to
+/// reject and nothing to render against a field.
+impl From<lumen_update::UpdateError> for ApiError {
+    fn from(err: lumen_update::UpdateError) -> Self {
+        match err {
+            lumen_update::UpdateError::NotFound(message) => ApiError::NotFound(message),
+            lumen_update::UpdateError::Conflict(message) => ApiError::Conflict(message),
+            lumen_update::UpdateError::Backend(err) => ApiError::Internal(err),
+        }
+    }
+}
+
 /// The clustering domain's errors, mapped the same way.
 impl From<lumen_cluster::ClusterError> for ApiError {
     fn from(err: lumen_cluster::ClusterError) -> Self {

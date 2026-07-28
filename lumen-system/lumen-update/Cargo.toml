@@ -1,0 +1,37 @@
+# lumen-update — the Lumen update domain: what this node could install, and
+# installing it.
+#
+# A library crate, not a daemon: it compiles into lumen-controlplane the same
+# way lumen-sys and lumen-net do, and like them it is deliberately NOT a
+# workspace member — the Lumen manifests are independent by design and the
+# Makefile drives each with its own --manifest-path/--target-dir pair. See the
+# note at the top of lumen-networking/lumen-net/Cargo.toml.
+#
+# It depends on lumen-sys and on nothing else in the tree, because the one
+# thing it needs from the rest of Lumen is a way to run a command outside the
+# daemon's sandbox — which is lumen-sys::exec, already a trait with a mock of
+# its own. Nothing here links a system library: the package manager is reached
+# through its command line with typed argument arrays, the same discipline
+# lumen-zfs settled on, which keeps bindgen and libclang out of the toolchain.
+
+[package]
+name = "lumen-update"
+version = "0.1.0"
+edition = "2021"
+description = "Lumen updates: what this node could install, and installing it"
+license = "MIT"
+
+[dependencies]
+# The privileged-command runner. Every package-manager invocation goes through
+# it — reads as well as writes, because refreshing metadata writes a cache the
+# daemon's ProtectSystem=strict cannot reach either. See src/backend/dnf.rs.
+lumen-sys = { path = "../lumen-sys" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+async-trait = "0.1"
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

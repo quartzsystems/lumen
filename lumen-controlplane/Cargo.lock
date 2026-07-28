@@ -783,6 +783,7 @@ dependencies = [
  "lumen-drbd",
  "lumen-net",
  "lumen-sys",
+ "lumen-update",
  "lumen-virt",
  "lumen-zfs",
  "rand 0.8.7",
@@ -841,6 +842,19 @@ dependencies = [
  "tokio",
  "tracing",
  "zbus",
+]
+
+[[package]]
+name = "lumen-update"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "lumen-sys",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

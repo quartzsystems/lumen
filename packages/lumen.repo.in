@@ -1,0 +1,50 @@
+# Lumen's own package repository.
+#
+# @BASEURL@ is substituted at build time (packages/build-rpms.sh, from
+# LUMEN_REPO_BASEURL) so a private rebuild can point somewhere else without
+# editing this file.
+#
+# The address is a name Quartz Systems owns rather than whatever happens to
+# serve it today. That is the whole reason it is not a github.io address: this
+# line is baked into every appliance ever installed, dnf will not follow a
+# redirect to a new one, and the only way to move the repository later is to
+# repoint the name. See docs/updates.md.
+
+[lumen]
+name=Lumen $releasever - $basearch
+baseurl=@BASEURL@/stable/$releasever/$basearch/
+enabled=1
+
+# Both checks, and neither is optional on an appliance that installs software
+# unattended. gpgcheck verifies each package's own signature; repo_gpgcheck
+# verifies the repository index, which is what stops an attacker who has taken
+# the hostname from serving a valid old package in place of a fixed new one.
+# Transport security is not a substitute for either.
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-lumen
+
+# An appliance whose update repository is unreachable must still be able to
+# install from the distribution's. Without this, one unreachable host turns
+# every dnf invocation on the node into a failure.
+skip_if_unavailable=1
+
+# Six hours, matching the control plane's own check interval — there is no
+# point in the daemon asking more often than the metadata is allowed to age.
+metadata_expire=6h
+
+# Lumen counts its appliances through support, not through a repository ping.
+countme=0
+
+# The channel for builds that are not ready to be installed by everyone.
+# Off unless an operator turns it on, and never enabled by an update.
+[lumen-testing]
+name=Lumen $releasever - $basearch - Testing
+baseurl=@BASEURL@/testing/$releasever/$basearch/
+enabled=0
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-lumen
+skip_if_unavailable=1
+metadata_expire=6h
+countme=0

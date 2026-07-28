@@ -16,10 +16,24 @@ use lumen_sys::backend::logind::LogindBackend;
 use lumen_sys::backend::unavailable::UnavailablePower;
 use lumen_sys::exec::{Exec, SystemdRun};
 use lumen_sys::SysService;
+use lumen_update::backend::dnf::DnfBackend;
+use lumen_update::backend::unavailable::UnavailableUpdates;
+use lumen_update::UpdateService;
 use lumen_virt::backend::libvirt::LibvirtBackend;
 use lumen_virt::VirtService;
 use lumen_zfs::backend::cli::CliBackend;
 use lumen_zfs::StorageService;
+
+/// How long an update transaction may run before the privileged runner gives
+/// up on it.
+///
+/// An hour. A kernel, its modules, and the userland behind them are a few
+/// hundred megabytes, and an appliance in a rack somewhere may be fetching
+/// them over a link that is nothing like a build machine's. The bound exists
+/// so a transaction that has genuinely wedged — a mirror that accepted the
+/// connection and then stopped answering — is reported rather than leaving the
+/// console on "Installing…" until the daemon is restarted.
+const UPDATE_TRANSACTION_DEADLINE_SECS: u64 = 60 * 60;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -36,7 +50,8 @@ async fn main() -> Result<()> {
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
                 "lumen_controlplane=info,lumen_sys=info,lumen_zfs=info,lumen_virt=info,\
-                 lumen_net=info,lumen_cluster=info,lumen_drbd=info,tower_http=info"
+                 lumen_net=info,lumen_cluster=info,lumen_drbd=info,lumen_update=info,\
+                 tower_http=info"
                     .into()
             }),
         )
@@ -178,6 +193,30 @@ async fn main() -> Result<()> {
         drbd.clone(),
     ));
 
+    // Updates. Constructed after clustering only because it wants the node's
+    // canonical name; it depends on no other domain.
+    //
+    // Its privileged runner is its OWN, with a much longer deadline than the
+    // shared one: `useradd` returns in milliseconds and two minutes is a
+    // generous bound for it, while a transaction that downloads a kernel over
+    // a slow link legitimately takes far longer. Sharing the runner would mean
+    // choosing between a pointless wait on a failed `useradd` and an update
+    // killed halfway through — see lumen_update::backend::dnf.
+    let update_backend: Arc<dyn lumen_update::UpdateBackend> =
+        if std::path::Path::new("/usr/bin/dnf").exists() {
+            let runner: Arc<dyn Exec> = Arc::new(SystemdRun::new().with_deadline(
+                std::time::Duration::from_secs(UPDATE_TRANSACTION_DEADLINE_SECS),
+            ));
+            Arc::new(DnfBackend::new(runner))
+        } else {
+            // Same policy as every other domain: come up and say so. A
+            // development checkout on a machine with no package manager is the
+            // ordinary case here, not a broken appliance.
+            tracing::warn!("no package manager at /usr/bin/dnf — updates are unavailable");
+            Arc::new(UnavailableUpdates::new("/usr/bin/dnf is not present"))
+        };
+    let updates = Arc::new(UpdateService::new(update_backend, cluster.node()));
+
     // Membership gossip: push our record to every peer once a minute and
     // adopt anything newer that comes back. Quiet by design — the
     // environment view is what reports an unreachable peer.
@@ -247,9 +286,46 @@ async fn main() -> Result<()> {
         virt,
         cluster,
         drbd,
+        updates,
         tasks: lumen_controlplane::tasks::TaskLog::open(state_dir.join("vm-tasks.jsonl")),
         drain: Default::default(),
+        update_job: Default::default(),
     });
+
+    // Ask the repositories what is waiting, on a slow loop. Nothing is ever
+    // installed by this — it is what puts a number on the console's Updates
+    // entry without every page load blocking on a network request, and what
+    // makes a security advisory visible to an operator who was not looking for
+    // one. Set LUMEN_CP_UPDATE_CHECK_SECS=0 to make this appliance ask nobody
+    // anything unless told to.
+    if state.config.update_check_secs > 0 {
+        let state = state.clone();
+        let period = std::time::Duration::from_secs(state.config.update_check_secs);
+        tokio::spawn(async move {
+            // Not on the first tick: an appliance coming up has a console to
+            // serve and, quite possibly, networking still settling. tokio's
+            // interval fires immediately, so the first one is skipped
+            // deliberately rather than by choosing a start instant.
+            let mut interval = tokio::time::interval(period);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                match state.updates.check().await {
+                    Ok(view) => tracing::info!(
+                        updates = view.updates.len(),
+                        platform = view.counts.platform,
+                        "checked for updates"
+                    ),
+                    // Quiet by design at warning level: a node that cannot
+                    // reach its repository for a day should say so once per
+                    // attempt, not fail anything. The console carries the
+                    // reason on the page.
+                    Err(err) => tracing::warn!("periodic update check failed: {err}"),
+                }
+            }
+        });
+    }
 
     // The HA manager: one sweep every fifteen seconds. Quiet when there is
     // nothing lost; when a member is lost *and clean* — fenced, confirmed

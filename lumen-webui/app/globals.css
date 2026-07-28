@@ -455,6 +455,17 @@ body {
   border-color: color-mix(in oklab, var(--qz-danger) 45%, transparent);
   background: var(--qz-danger-soft);
 }
+/* Something is happening, and something finished. The Updates page needs both:
+   a transaction runs for minutes, and "it worked" is as much of an answer as
+   "it did not". */
+.callout-info {
+  border-color: color-mix(in oklab, var(--qz-info) 40%, transparent);
+  background: var(--qz-info-soft);
+}
+.callout-ok {
+  border-color: color-mix(in oklab, var(--qz-success) 40%, transparent);
+  background: var(--qz-success-soft);
+}
 
 /* --- Pending bar: staged-but-unapplied changes --- */
 .pending-bar {

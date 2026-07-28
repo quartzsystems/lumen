@@ -150,7 +150,12 @@ async fn harness(tag: &str) -> Harness {
         cluster,
         drbd,
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
+        updates: Arc::new(lumen_update::UpdateService::new(
+            Arc::new(lumen_update::MockUpdates::new()),
+            "test-node",
+        )),
         drain: Default::default(),
+        update_job: Default::default(),
     }));
 
     // Sign in once; every machine and storage route requires the session.

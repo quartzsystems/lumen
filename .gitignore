@@ -19,6 +19,16 @@
 # to be remembered.
 target/
 
+# Private key material. The PUBLIC signing key is committed on purpose —
+# packages/keys/RPM-GPG-KEY-lumen ships to every appliance — so this names the
+# shapes a private half arrives in rather than ignoring the directory. The
+# private key belongs in the repository secrets and nowhere in a checkout; see
+# docs/updates.md.
+*.private.asc
+*secret-key*.asc
+*.gpg
+*.pgp
+
 # Editor / OS noise
 *.swp
 *~

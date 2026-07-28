@@ -86,6 +86,18 @@ both are handed to **systemd**, which runs them as a transient unit outside it,
 the same way networking asks NetworkManager and machines ask the hypervisor.
 See [docs/system.md](docs/system.md).
 
+## Updates
+
+An installed appliance updates itself from `lumen.quartz.systems`, through
+**System → Updates** in the console. Two decisions are kept apart there and
+never joined into one button: ordinary updates, which can never move the
+kernel, and the kernel with the storage modules built against its ABI, which
+move as one set and only after the package manager has confirmed it can move
+all of them together. Nothing is ever restarted by the update itself.
+
+Packages and the repository index are both signed, and both are verified before
+anything is installed. See [docs/updates.md](docs/updates.md).
+
 ## Prerequisites
 
 Building is supported on **AlmaLinux 10 x86_64**; a container works — root

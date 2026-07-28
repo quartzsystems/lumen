@@ -8,6 +8,7 @@ pub mod realm;
 pub mod security;
 pub mod tasks;
 pub mod tls;
+pub mod updates;
 pub mod web;
 
 use std::sync::Arc;
@@ -20,6 +21,7 @@ use lumen_cluster::ClusterService;
 use lumen_drbd::DrbdService;
 use lumen_net::NetworkService;
 use lumen_sys::SysService;
+use lumen_update::UpdateService;
 use lumen_virt::VirtService;
 use lumen_zfs::StorageService;
 use realm::RealmRegistry;
@@ -57,11 +59,19 @@ pub struct AppState {
     /// the cluster and storage domains, which is why it is constructed after
     /// both.
     pub drbd: Arc<DrbdService>,
+    /// What this node could install, and installing it. Depends on nothing
+    /// else here: the packages waiting for a node are a fact about the node,
+    /// not about its machines or its cluster.
+    pub updates: Arc<UpdateService>,
     /// What has been done to each machine — the console's Tasks table.
     pub tasks: tasks::TaskLog,
     /// The drain of this node, while one is running. Node-local by nature:
     /// only the node running the machines can move them.
     pub drain: maintenance::DrainHandle,
+    /// The update transaction, while one is running. Node-local for the same
+    /// reason the drain is, and one at a time because the package manager
+    /// takes a lock of its own.
+    pub update_job: updates::UpdateHandle,
 }
 
 /// The full application router: /api plus the static web UI fallback.

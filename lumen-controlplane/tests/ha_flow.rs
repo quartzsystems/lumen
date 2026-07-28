@@ -188,7 +188,12 @@ fn harness(tag: &str, cluster_backend: ClusterMockBackend) -> Harness {
         cluster,
         drbd,
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
+        updates: Arc::new(lumen_update::UpdateService::new(
+            Arc::new(lumen_update::MockUpdates::new()),
+            "test-node",
+        )),
         drain: Default::default(),
+        update_job: Default::default(),
     });
     Harness {
         state,

@@ -7,6 +7,7 @@ pub mod peer;
 pub mod request;
 pub mod storage;
 pub mod system;
+pub mod updates;
 pub mod vms;
 
 use std::sync::Arc;
@@ -216,6 +217,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/system/power", get(system::power))
         .route("/api/system/power", post(system::set_power))
         .route("/api/system/power", delete(system::cancel_power))
+        // Updates. The read never touches the network and the refresh always
+        // does — the two are separate routes so a console that opens on a node
+        // with an unreachable repository still renders. Applying answers 202
+        // and is watched through the progress route; see src/api/updates.rs
+        // and docs/updates.md.
+        .route("/api/system/updates", get(updates::updates))
+        .route("/api/system/updates/check", post(updates::check))
+        .route("/api/system/updates/apply", post(updates::apply))
+        .route("/api/system/updates/progress", get(updates::progress))
         // Storage. The one volume write is reached through a machine's disks,
         // because a volume is created for a machine; a pool is not created for
         // anything, so it lives here. The media library is here too: an

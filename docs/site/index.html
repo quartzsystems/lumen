@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lumen — Quartz Systems</title>
+<meta name="description" content="Lumen is a KVM hypervisor platform by Quartz Systems. This site serves the package repository installed appliances update from.">
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff; --fg: #16181d; --fg-dim: #5a6070;
+    --border: #e3e6ec; --surface: #f7f8fa; --accent: #00a06c;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e1013; --fg: #e8eaee; --fg-dim: #9aa2b1;
+      --border: #23262d; --surface: #16191e; --accent: #00d992;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  main { max-width: 760px; margin: 0 auto; padding: 64px 24px 96px; }
+  h1 { font-size: 30px; letter-spacing: -0.02em; margin: 0 0 6px; }
+  h2 { font-size: 17px; letter-spacing: -0.01em; margin: 44px 0 12px; }
+  p { margin: 0 0 14px; color: var(--fg-dim); }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .lede { font-size: 17px; color: var(--fg-dim); margin-bottom: 8px; }
+  .mark { color: var(--accent); font-weight: 700; }
+  pre {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    padding: 14px 16px; overflow-x: auto; font-family: var(--mono);
+    font-size: 13px; line-height: 1.55; margin: 0 0 14px;
+  }
+  code { font-family: var(--mono); font-size: 0.92em; }
+  ul { color: var(--fg-dim); padding-left: 20px; margin: 0 0 14px; }
+  li { margin-bottom: 6px; }
+  hr { border: 0; border-top: 1px solid var(--border); margin: 48px 0 24px; }
+  footer { color: var(--fg-dim); font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+  <h1><span class="mark">Lumen</span></h1>
+  <p class="lede">A KVM hypervisor platform by
+    <a href="https://quartz.systems/">Quartz Systems</a>.</p>
+
+  <p>This host serves the package repository that installed Lumen appliances
+     update from. There is nothing to download here by hand — an appliance is
+     installed from the ISO on the
+     <a href="https://github.com/zagdrath/lumen/releases">releases page</a> and
+     configures this repository itself.</p>
+
+  <h2>Updating an appliance</h2>
+  <p>Open the management console and go to <strong>System → Updates</strong>.
+     Lumen keeps two decisions apart on that page, on purpose:</p>
+  <ul>
+    <li><strong>Updates</strong> — Lumen's own packages and the rest of the
+        system. These never move the kernel.</li>
+    <li><strong>Kernel and storage modules</strong> — the kernel and the
+        modules built against its ABI, which move as one set and only after the
+        package manager has confirmed it can move all of them together.</li>
+  </ul>
+
+  <h2>Adding the repository by hand</h2>
+  <p>Only needed on a node that was not installed from a Lumen ISO.</p>
+<pre>rpm --import https://lumen.quartz.systems/RPM-GPG-KEY-lumen
+dnf install https://lumen.quartz.systems/repo/stable/10/x86_64/lumen-repo-0.3.0-1.el10.noarch.rpm</pre>
+
+  <p>Every package here is signed, and so is the repository index. An appliance
+     verifies both before it installs anything.</p>
+
+  <h2>Source</h2>
+  <p>Lumen is developed in the open at
+     <a href="https://github.com/zagdrath/lumen">github.com/zagdrath/lumen</a>,
+     where the design notes for each subsystem live under <code>docs/</code>.</p>
+
+  <hr>
+  <footer>© Quartz Systems. Lumen is built on AlmaLinux.</footer>
+</main>
+</body>
+</html>

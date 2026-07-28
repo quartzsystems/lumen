@@ -1,0 +1,212 @@
+# Publish lumen.quartz.systems: the landing page, and the package repository
+# every installed appliance updates from.
+#
+# ## Why the repository is built here rather than committed
+#
+# Nothing in this workflow is checked into the repository. The packages come
+# from the GitHub releases that already published them, the metadata is
+# generated, and the whole tree is handed to Pages as an artifact. Committing
+# built RPMs would grow the git pack by tens of megabytes per release,
+# permanently and unremovably, to store bytes that already exist as release
+# assets.
+#
+# That is also why this uses the Actions deployment rather than the
+# "deploy from a branch" mode: branch mode can only publish the repository root
+# or /docs, and only content that has been committed. Actions mode publishes
+# any directory, assembled at build time.
+#
+# ## What is signed, and where
+#
+# The packages are signed in release.yml, at the moment they are built, and
+# arrive here already signed. This workflow signs one further thing: the
+# repository index (repodata/repomd.xml). Both matter and they are different
+# claims — a package signature says "Quartz Systems built this", and an index
+# signature says "and this is the current set of them". Without the second, an
+# attacker who took the hostname could serve a genuine but superseded package
+# in place of a fixed one.
+#
+# ## Size
+#
+# Pages publishes at most about a gigabyte. A Lumen release is roughly 35 MB of
+# packages, so REPO_RELEASES is bounded rather than unbounded: the newest few
+# releases are mirrored and older ones stay on the releases page, which is
+# where they came from. dnf needs the current build and, for a downgrade, the
+# one before it — not every build ever made.
+#
+# If that ever stops being enough, the escape hatch is createrepo_c's
+# --location-prefix, which writes absolute package addresses into the metadata
+# so the index can live here while the packages stream from the releases page.
+# It needs one createrepo_c run per release tag and a mergerepo_c pass, which
+# is why it is not the starting point.
+name: Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/site/**"
+      - ".github/workflows/pages.yml"
+  # Called by release.yml once the release assets exist, so a new version
+  # appears in the repository without anybody pressing anything.
+  workflow_call:
+    secrets:
+      LUMEN_GPG_PRIVATE_KEY:
+        required: true
+      LUMEN_GPG_PASSPHRASE:
+        required: true
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time, and never cancel one half-way: an interrupted
+# publish would leave appliances reading an index that does not match the
+# packages beside it.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  # How many past releases are mirrored into the published repository.
+  REPO_RELEASES: "3"
+  # The distribution major version the repository is laid out for. It is the
+  # $releasever an appliance substitutes into the baseurl.
+  RELEASEVER: "10"
+
+jobs:
+  publish:
+    name: Build and deploy the site
+    runs-on: ubuntu-latest
+    container: almalinux:10
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Install repository tooling
+        # createrepo_c writes the index; gnupg2 signs it; the GitHub CLI is how
+        # the release assets are fetched.
+        run: |
+          dnf -y install createrepo_c gnupg2 tar findutils
+          dnf -y install 'dnf-command(config-manager)'
+          dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
+          dnf -y install gh
+
+      - uses: actions/checkout@v4
+
+      - name: Lay out the site
+        run: |
+          set -euo pipefail
+          mkdir -p build/pages/repo/stable/"$RELEASEVER"/x86_64
+          mkdir -p build/pages/repo/testing/"$RELEASEVER"/x86_64
+          cp docs/site/index.html build/pages/index.html
+          # The public key, served at a stable address so a node being set up
+          # by hand — or a rebuild pointing at this repository — has somewhere
+          # to fetch it from. It is public material; the private half never
+          # leaves the secret store.
+          if [ -s packages/keys/RPM-GPG-KEY-lumen ]; then
+            cp packages/keys/RPM-GPG-KEY-lumen build/pages/RPM-GPG-KEY-lumen
+          else
+            echo "::warning::packages/keys/RPM-GPG-KEY-lumen is absent; the site will not serve a key"
+          fi
+
+      - name: Collect packages from the most recent releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          stable="build/pages/repo/stable/$RELEASEVER/x86_64"
+          # Newest first. A repository with no releases yet is not an error —
+          # it produces a valid, empty index, which is exactly what a node
+          # should read before the first release exists.
+          tags="$(gh release list --limit "$REPO_RELEASES" --json tagName \
+                    --jq '.[].tagName' || true)"
+          if [ -z "$tags" ]; then
+            echo "No releases yet; publishing an empty repository."
+          fi
+          for tag in $tags; do
+            echo "==> $tag"
+            gh release download "$tag" --dir "$stable" --pattern '*.rpm' --clobber || {
+              echo "::warning::$tag has no packages attached"
+            }
+          done
+          # Source packages are published on the releases page for anyone who
+          # wants them; they have no business in a repository an appliance
+          # resolves against, where they only inflate the index.
+          find "$stable" -name '*.src.rpm' -delete
+          ls -l "$stable" || true
+
+      - name: Import the signing key
+        env:
+          LUMEN_GPG_PRIVATE_KEY: ${{ secrets.LUMEN_GPG_PRIVATE_KEY }}
+          LUMEN_GPG_PASSPHRASE: ${{ secrets.LUMEN_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          if [ -z "${LUMEN_GPG_PRIVATE_KEY:-}" ]; then
+            echo "::error::LUMEN_GPG_PRIVATE_KEY is not set — the index cannot be signed"
+            exit 1
+          fi
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          mkdir -p "$GNUPGHOME"
+          chmod 700 "$GNUPGHOME"
+          printf '%s' "$LUMEN_GPG_PRIVATE_KEY" | gpg --batch --import
+          printf '%s' "$LUMEN_GPG_PASSPHRASE" > "$GNUPGHOME/passphrase"
+          chmod 600 "$GNUPGHOME/passphrase"
+          key="$(gpg --list-secret-keys --with-colons | awk -F: '/^sec:/ {print $5; exit}')"
+          [ -n "$key" ] || { echo "::error::no secret key was imported"; exit 1; }
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+          echo "LUMEN_KEY_ID=$key" >> "$GITHUB_ENV"
+          echo "Signing as $key"
+
+      - name: Build and sign the repository index
+        run: |
+          set -euo pipefail
+          sign_tree() {
+            local dir="$1"
+            createrepo_c --quiet "$dir"
+            # Detached, armoured, next to the file it covers: the name and the
+            # location are both what dnf's repo_gpgcheck looks for.
+            gpg --batch --yes --pinentry-mode loopback \
+                --passphrase-file "$GNUPGHOME/passphrase" \
+                --local-user "$LUMEN_KEY_ID" \
+                --detach-sign --armor "$dir/repodata/repomd.xml"
+            gpg --verify "$dir/repodata/repomd.xml.asc" "$dir/repodata/repomd.xml"
+          }
+          sign_tree "build/pages/repo/stable/$RELEASEVER/x86_64"
+          # The testing channel is published empty rather than absent: a node
+          # that has it turned on must read "nothing here" rather than a 404,
+          # which dnf reports as a broken repository.
+          sign_tree "build/pages/repo/testing/$RELEASEVER/x86_64"
+
+      - name: Verify a package signature actually verifies
+        # The gate that would have caught an unsigned release: if the packages
+        # about to be served are not signed by the key the appliance will be
+        # given, every node that installs one fails — and it fails at the
+        # customer, not here.
+        run: |
+          set -euo pipefail
+          stable="build/pages/repo/stable/$RELEASEVER/x86_64"
+          shopt -s nullglob
+          rpms=("$stable"/*.rpm)
+          if [ ${#rpms[@]} -eq 0 ]; then
+            echo "No packages to verify yet."
+            exit 0
+          fi
+          gpg --batch --yes --export --armor "$LUMEN_KEY_ID" > "$RUNNER_TEMP/pub.asc"
+          rpmkeys --import "$RUNNER_TEMP/pub.asc"
+          for rpm in "${rpms[@]}"; do
+            out="$(rpmkeys --checksig "$rpm")"
+            case "$out" in
+              *"signatures OK"*) ;;
+              *) echo "::error::$out"; exit 1 ;;
+            esac
+          done
+          echo "All ${#rpms[@]} packages verify against $LUMEN_KEY_ID."
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: build/pages
+      - id: deploy
+        uses: actions/deploy-pages@v4
