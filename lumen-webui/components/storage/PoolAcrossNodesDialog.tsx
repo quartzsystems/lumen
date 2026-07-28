@@ -56,7 +56,13 @@ export function PoolAcrossNodesDialog({
   /// Disks the picker has to refuse but an operator could reclaim: a
   /// partition table and nothing using it. Counted so the dialog can point at
   /// the page that clears them instead of just greying the row.
-  const reclaimable = candidates.filter((row) => row.device.wipeable).length;
+  ///
+  /// `in_use` as well as `wipeable`, because clearing is now offered on disks
+  /// that read as empty too — and those are already selectable here, so
+  /// counting them would send an operator to another page for nothing.
+  const reclaimable = candidates.filter(
+    (row) => row.device.in_use && row.device.wipeable,
+  ).length;
 
   const key = (node: string, path: string) => `${node}/${path}`;
   const toggle = (node: string, path: string) => {

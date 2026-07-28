@@ -194,7 +194,7 @@ pub async fn forget_external_network(
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SetVipRequest {
-    /// The new address, or `null` to take the cluster address away.
+    /// The new address, or `null` to take the cluster VIP away.
     #[serde(default)]
     pub address: Option<std::net::Ipv4Addr>,
     /// The operator has been told this drops the address the console may
@@ -203,7 +203,7 @@ pub struct SetVipRequest {
     pub i_understand_this_may_disconnect_me: bool,
 }
 
-/// PUT /api/environment/clusters/{name}/vip — move the cluster address, or
+/// PUT /api/environment/clusters/{name}/vip — move the cluster VIP, or
 /// take it away with a `null` address.
 ///
 /// Guarded by an acknowledgement rather than by a refusal, because there is no
@@ -221,7 +221,7 @@ pub async fn set_vip(
     let request: SetVipRequest = required_body(raw)?;
     if !request.i_understand_this_may_disconnect_me {
         return Err(ApiError::Conflict(
-            "Changing the cluster address takes the old one down before the new one comes up. \
+            "Changing the cluster VIP takes the old one down before the new one comes up. \
              If this console is reached on it, the connection drops mid-operation — the change \
              still completes, and each member's own address still works. Acknowledge that first."
                 .to_string(),

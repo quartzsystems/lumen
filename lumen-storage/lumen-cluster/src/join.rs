@@ -733,7 +733,7 @@ async fn drive(
             progress.set_step("properties", None, StepState::Failed, Some(err.to_string()));
             return Err((
                 members.len(),
-                ClusterError::Conflict(format!("Creating the cluster address failed: {err}")),
+                ClusterError::Conflict(format!("Creating the cluster VIP failed: {err}")),
             ));
         }
     }

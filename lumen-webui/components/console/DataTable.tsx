@@ -53,6 +53,7 @@ export function DataTable<T>({
   emptyMessage = "No rows.",
   toolbar,
   actions,
+  bulkActions,
   actionsWidth = 90,
   onRefresh,
   storageKey,
@@ -67,6 +68,16 @@ export function DataTable<T>({
   toolbar?: React.ReactNode;
   /** Trailing per-row actions cell (e.g. edit/delete). Does not trigger row selection. */
   actions?: (row: T) => React.ReactNode;
+  /**
+   * Controls for the selection bar, given the selected rows themselves rather
+   * than their ids — the caller is about to act on them, and looking them up
+   * again is the caller repeating work this component already did.
+   *
+   * `clear` drops the selection, and belongs after the work finishes: rows an
+   * operator has just acted on should stop being ticked, and only the caller
+   * knows when that is.
+   */
+  bulkActions?: (rows: T[], clear: () => void) => React.ReactNode;
   /**
    * Width (px) of the actions column. The fixed layout will not grow it to fit,
    * so a cell holding more than one control has to say how much room it needs —
@@ -402,7 +413,17 @@ export function DataTable<T>({
     setRange(anchorRef.current, index, dragAdditiveRef.current ? dragBaseRef.current : new Set());
   };
 
-  const selectedCount = selected.size;
+  // Taken from the rows rather than from the set of ids: a row that has gone
+  // away since it was ticked — a disk pulled, a machine deleted — must not be
+  // counted, and must certainly not be handed to a bulk action. A selection
+  // made before a filter narrowed the table still counts, which is why this
+  // reads `rows` and not `displayed`.
+  const selectedRows = useMemo(
+    () => rows.filter((row) => selected.has(rowId(row))),
+    [rows, selected, rowId],
+  );
+  const selectedCount = selectedRows.length;
+  const clearSelection = () => setSelected(new Set());
   const colSpan = visibleCols.length + 1 + (actions ? 1 : 0);
 
   return (
@@ -515,9 +536,12 @@ export function DataTable<T>({
           <span className="text-[13px] font-medium text-[var(--qz-fg-1)]">
             {selectedCount} selected
           </span>
+          {bulkActions && (
+            <div className="flex items-center gap-2">{bulkActions(selectedRows, clearSelection)}</div>
+          )}
           <button
             type="button"
-            onClick={() => setSelected(new Set())}
+            onClick={clearSelection}
             className="flex items-center gap-[5px] text-[12px] text-[var(--qz-fg-3)] hover:text-[var(--qz-fg-1)] transition-colors cursor-pointer bg-transparent border-0 p-0 ml-auto"
           >
             <X size={13} /> Clear

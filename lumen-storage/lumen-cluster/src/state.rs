@@ -106,7 +106,7 @@ pub struct FenceDeviceState {
     pub last_test: Option<FenceTest>,
 }
 
-/// The cluster address resource, as Pacemaker reports it.
+/// The cluster VIP resource, as Pacemaker reports it.
 ///
 /// Its own type rather than a bool because "not running" has causes an
 /// operator has to act on differently. A resource Pacemaker never started is

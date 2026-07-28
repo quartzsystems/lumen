@@ -56,7 +56,7 @@ interface NetworkRow {
   /// address is a single address and belongs in `addresses`, where the thing
   /// above the column heading is true of what is under it.
   subnet: string | null;
-  /// What answers on this network, per member — and for the cluster address
+  /// What answers on this network, per member — and for the cluster VIP
   /// row, the floating address itself.
   ///
   /// Its own column because the subnet alone does not answer the question an
@@ -72,13 +72,13 @@ interface NetworkRow {
   members: string[];
   of: number;
   /// What this row can be acted on as. Core and Management carry no actions
-  /// yet; the cluster address and the External networks do, and they are
+  /// yet; the cluster VIP and the External networks do, and they are
   /// different actions — so the row says which it is rather than the actions
   /// column guessing from the name.
   acts: "vip" | "external" | null;
   /// The External network behind the row, for the edit dialog.
   external?: ExternalNetwork;
-  /// The cluster address's state, for the recovery.
+  /// The cluster VIP's state, for the recovery.
   vipState?: VipView;
 }
 
@@ -127,7 +127,7 @@ function networkRows(
       of: cluster.nodes.length,
       acts: null,
     },
-    // The cluster address gets a row of its own rather than a footnote on the
+    // The cluster VIP gets a row of its own rather than a footnote on the
     // Management one. It is the address every console bookmark points at, it
     // has a state of its own that the ring's says nothing about, and burying
     // it in another row's cell is how an address nobody answers on goes
@@ -141,7 +141,7 @@ function networkRows(
             return {
               key: `${cluster.name}/vip`,
               cluster: cluster.name,
-              name: "Cluster address",
+              name: "Cluster VIP",
               kind: "Management" as const,
               // It has no subnet of its own — it lives in Management's, whose
               // own row says so. Putting the address here was the column
@@ -268,7 +268,7 @@ const columns: Column<NetworkRow>[] = [
 ///
 /// One address per member, each labelled with the member holding it — because
 /// "which of these is the node I want" is the question, and a bare list of
-/// four addresses does not answer it. The cluster address has no node to
+/// four addresses does not answer it. The cluster VIP has no node to
 /// label it with while it is stopped, and shows alone rather than beside an
 /// empty name.
 function AddressesCell({ row }: { row: NetworkRow }) {
@@ -365,8 +365,8 @@ function NetworksTable({
                 ? "Core and Management are defined when the cluster is created"
                 : undefined
             }
-            // The cluster address is removed by editing it — clearing the
-            // field is what "no cluster address" means, and a delete control
+            // The cluster VIP is removed by editing it — clearing the
+            // field is what "no cluster VIP" means, and a delete control
             // beside it would be a second way to say the same thing.
             deleteDisabled={busy || row.acts !== "external"}
             deleteTitle={
@@ -505,7 +505,7 @@ export default function NetworksPage() {
       const state = vip.state;
       setToast(
         state?.active
-          ? `The cluster address is up on ${shortNodeName(state.node ?? "a member")}.`
+          ? `The cluster VIP is up on ${shortNodeName(state.node ?? "a member")}.`
           : `The failure was cleared and the address probed again — Pacemaker still reports ${
               state?.reason ?? state?.role ?? "it stopped"
             }. Whatever stopped it is still there.`,

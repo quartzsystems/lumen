@@ -85,7 +85,7 @@ pub trait ClusterBackend: Send + Sync {
     /// `pcs resource delete <resource>` — stop a resource and take it out of
     /// the CIB.
     ///
-    /// The half of moving the cluster address that has to come first.
+    /// The half of moving the cluster VIP that has to come first.
     /// `IPaddr2` has no notion of its address changing underneath it, so a
     /// move is a removal and a create; without the removal the old address
     /// stays up on whichever member is holding it and the cluster answers on

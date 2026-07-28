@@ -73,7 +73,7 @@ export interface FenceSummary {
 export type Regime = "two_node" | "quorum";
 export type ClusterHealth = "ok" | "degraded" | "critical" | "unknown";
 
-/// What Pacemaker reports about the cluster address resource.
+/// What Pacemaker reports about the cluster VIP resource.
 ///
 /// `role` and `reason` are Pacemaker's own words, passed through rather than
 /// mapped — the operator will search for the string Pacemaker used. `reason`
@@ -90,7 +90,7 @@ export interface VipState {
   reason?: string;
 }
 
-/// The cluster address: what the definition asked for, and what Pacemaker has
+/// The cluster VIP: what the definition asked for, and what Pacemaker has
 /// actually done about it.
 ///
 /// `state` absent means the definition names a VIP and Pacemaker has no such
@@ -242,7 +242,7 @@ export const forgetExternalNetwork = (
 ): Promise<{ removed: boolean; note: string }> =>
   apiFetch(externalPath(cluster, name), { method: "DELETE" });
 
-/// Move the cluster address, or take it away with `null`.
+/// Move the cluster VIP, or take it away with `null`.
 ///
 /// The old address comes down before the new one goes up, so a console reached
 /// on the VIP loses its connection mid-operation. The change still completes
@@ -260,7 +260,7 @@ export const setClusterVip = (
     }),
   });
 
-/// Clear the cluster address's recorded failures and probe it again.
+/// Clear the cluster VIP's recorded failures and probe it again.
 ///
 /// Pacemaker latches a failed operation: an address stopped with "Not
 /// installed" stays stopped after the missing piece is installed, because

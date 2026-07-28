@@ -248,7 +248,7 @@ export default function DashboardPage() {
         rows.push({
           key: `${cluster.name}/vip`,
           cluster: cluster.name,
-          name: "Cluster address",
+          name: "Cluster VIP",
           kind: "Management",
           qualifier: null,
           address: cluster.vip.address,

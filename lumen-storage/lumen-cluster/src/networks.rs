@@ -297,7 +297,7 @@ pub fn validate_networks(
                 ValidationCode::InvalidVip,
                 Some("management.vip"),
                 format!(
-                    "The cluster address {vip} is outside the Management subnet {}.",
+                    "The cluster VIP {vip} is outside the Management subnet {}.",
                     networks.management.subnet
                 ),
             ));
@@ -306,7 +306,7 @@ pub fn validate_networks(
             errors.push(ValidationError::new(
                 ValidationCode::InvalidVip,
                 Some("management.vip"),
-                format!("The cluster address {vip} is already a node's own address."),
+                format!("The cluster VIP {vip} is already a node's own address."),
             ));
         }
     }

@@ -76,7 +76,7 @@ export function ringState(
     : { tone: "ok", status: `Connected · ${silent} unknown` };
 }
 
-/// The cluster address, as Pacemaker has it — not as the definition claims it.
+/// The cluster VIP, as Pacemaker has it — not as the definition claims it.
 ///
 /// This is the distinction that matters: a definition names an address, and
 /// only Pacemaker knows whether anything answers on it. Reporting the

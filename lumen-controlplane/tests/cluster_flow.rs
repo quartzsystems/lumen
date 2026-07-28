@@ -1832,7 +1832,7 @@ async fn forgetting_an_external_network_leaves_its_bridges_alone() {
     assert_eq!(status, StatusCode::NOT_FOUND, "{answer}");
 }
 
-// --- the cluster address ------------------------------------------------------
+// --- the cluster VIP ------------------------------------------------------
 
 /// The operation the console offers against a latched failure.
 ///
@@ -1987,7 +1987,7 @@ async fn changing_the_cluster_address_needs_the_acknowledgement() {
 }
 
 /// An address outside the Management subnet, or one a member already holds, is
-/// refused before the old one comes down — the two ways a cluster address
+/// refused before the old one comes down — the two ways a cluster VIP
 /// becomes a resource that never starts.
 #[tokio::test]
 async fn an_unusable_cluster_address_is_refused_before_anything_moves() {
@@ -2085,7 +2085,7 @@ async fn clearing_the_cluster_address_removes_it() {
         answer["error"]
             .as_str()
             .unwrap()
-            .contains("no cluster address"),
+            .contains("no cluster VIP"),
         "{answer}"
     );
 }

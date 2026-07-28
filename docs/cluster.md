@@ -609,7 +609,7 @@ can say what is still on one. Neither verb can undo a rebuild that succeeded
 on one member and failed on the next; the error names the member, the record
 stays on the old definition, and a retry finishes the job.
 
-**The cluster address** moves through `PUT
+**The cluster VIP** moves through `PUT
 /api/environment/clusters/{name}/vip`, with `null` to take it away. A move is
 a remove and a create: `IPaddr2` has no notion of its address changing under
 it, and without the removal the old address stays up on whichever member

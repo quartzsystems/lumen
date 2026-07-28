@@ -309,13 +309,22 @@ pub struct BlockDevice {
 }
 
 impl BlockDevice {
-    /// What the node's own `/sys` view says about clearing this disk: there
-    /// is something to clear, and nothing live is using it.
+    /// What the node's own `/sys` view says about clearing this disk: nothing
+    /// live is using it.
+    ///
+    /// Not conditioned on a partition table, deliberately. `/sys` can count
+    /// partitions and cannot see a signature, so a genuinely blank disk and
+    /// one carrying a damaged GPT or a bare filesystem are the same disk to
+    /// it — and `zpool create` tells them apart by refusing the second with
+    /// "contains a corrupt primary EFI label". Offering the clear on a disk
+    /// that is already empty costs an operator a confirmation and does
+    /// nothing; withholding it on a disk that only looks empty leaves them at
+    /// a shell, which is the state this whole operation exists to avoid.
     ///
     /// Deliberately not the final answer — see [`BlockDevice::wipeable`],
     /// which is what the console reads.
     pub fn looks_wipeable(&self) -> bool {
-        !self.claimed && self.partitions > 0
+        !self.claimed
     }
 }
 

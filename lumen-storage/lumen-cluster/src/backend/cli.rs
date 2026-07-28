@@ -41,7 +41,7 @@ const PACEMAKER_CIB: &str = "/var/lib/pacemaker/cib";
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
 const INSTALL: &str = "/usr/bin/install";
 const RM: &str = "/usr/bin/rm";
-/// The resource agent `create_vip` builds the cluster address with, and the
+/// The resource agent `create_vip` builds the cluster VIP with, and the
 /// only one of its kind this appliance creates — which is what makes it a
 /// safe way to find the address resource without knowing the cluster's name.
 const IPADDR2_AGENT: &str = "ocf:heartbeat:IPaddr2";
@@ -272,8 +272,8 @@ impl ClusterBackend for CliBackend {
         prefix: u8,
     ) -> Result<()> {
         self.run_privileged(
-            "creating the cluster address failed".into(),
-            ExecRequest::new("create the cluster address", PCS).args([
+            "creating the cluster VIP failed".into(),
+            ExecRequest::new("create the cluster VIP", PCS).args([
                 "resource",
                 "create",
                 &format!("{cluster}-vip"),

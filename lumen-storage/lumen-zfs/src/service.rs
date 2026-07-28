@@ -229,7 +229,15 @@ impl StorageService {
     /// The gap this closes: a disk that carries a partition table and nothing
     /// else is refused by the pool picker with "2 partitions" and no way to
     /// act on it, so an operator reusing hardware has to leave the console to
-    /// get anywhere. It is offered in that one state and no other.
+    /// get anywhere.
+    ///
+    /// A disk the scan calls empty is cleared too, rather than refused as
+    /// having nothing to clear. `/sys` counts partitions; it cannot see a
+    /// signature, and a disk whose GPT was damaged rather than removed reads
+    /// as empty here and is still refused by `zpool create` with "contains a
+    /// corrupt primary EFI label". Clearing one that really was empty does
+    /// nothing at all, which is a much better outcome than the only remedy
+    /// being unavailable in the one case it is needed.
     ///
     /// Every guard is here rather than in the backend, and they are the
     /// point. A disk something has mounted, a disk holding an imported pool,
@@ -280,13 +288,8 @@ impl StorageService {
                 device.used_by.as_deref().unwrap_or("something has it open")
             )));
         }
-        if device.partitions == 0 {
-            return Err(ZfsError::Conflict(format!(
-                "\"{}\" has nothing on it to clear — it is already free for a pool.",
-                device.name
-            )));
-        }
-
+        // No check on the partition count. See the note above: the disk that
+        // needs this most is the one that already reads as empty.
         self.backend.wipe_disk(device).await?;
         tracing::info!(disk = %device.name, path = %device.path, "disk cleared");
 
@@ -361,7 +364,8 @@ impl StorageService {
                 autotrim: request.autotrim,
                 force,
             })
-            .await?;
+            .await
+            .map_err(with_remedy)?;
 
         tracing::info!(pool = %pool.name, vdev = ?request.vdev, "pool created");
         Ok(view_of(pool, self.root_pool.as_deref()))
@@ -635,6 +639,30 @@ fn claims_device(pool_path: &str, device: &BlockDevice) -> bool {
     [&device.path, &device.kernel_path]
         .iter()
         .any(|base| !base.is_empty() && claims(base))
+}
+
+/// `zpool create` refusing a disk over something on it, with where to go next.
+///
+/// The tool's own words are kept — "contains a corrupt primary EFI label" says
+/// precisely what is wrong and no paraphrase improves on it. What they cannot
+/// say is that this console has a button for exactly that, because the disk in
+/// question is one the picker offered: `/sys` counts partitions and cannot see
+/// a signature, so a damaged label reads as an empty disk right up until
+/// `zpool` is asked. Without the sentence, an operator is left with a true
+/// statement about a disk they were just told was free.
+fn with_remedy(err: ZfsError) -> ZfsError {
+    let ZfsError::Conflict(message) = &err else {
+        return err;
+    };
+    let complaint = message.to_lowercase();
+    if !complaint.contains("label") && !complaint.contains("contains a") {
+        return err;
+    }
+    ZfsError::Conflict(format!(
+        "{message} Clearing the disk removes what it is objecting to — a disk that reads as \
+         empty here can still carry an old label. Clear it on the Disks page and build the pool \
+         again."
+    ))
 }
 
 fn reject_bad_pool(pool: &str) -> Result<()> {
@@ -1164,7 +1192,7 @@ mod tests {
 
     /// The three states, as the console reads them off one call.
     #[tokio::test]
-    async fn a_disk_is_offered_for_clearing_only_when_something_is_on_it_and_nothing_uses_it() {
+    async fn a_disk_is_offered_for_clearing_whenever_nothing_live_is_using_it() {
         let (service, _backend) = node_with_reclaimable_disks();
         let devices = service.block_devices().await.unwrap().devices;
         let find = |name: &str| devices.iter().find(|d| d.name == name).unwrap();
@@ -1175,9 +1203,10 @@ mod tests {
         // A partition table and nothing using it: a decision away from free.
         assert!(find("sdb").in_use);
         assert!(find("sdb").wipeable);
-        // Already empty: nothing to clear.
+        // Reads as empty, and is still offered: the scan cannot see a
+        // signature, and a damaged label looks exactly like this.
         assert!(!find("sdc").in_use);
-        assert!(!find("sdc").wipeable);
+        assert!(find("sdc").wipeable);
     }
 
     /// Clearing leaves the disk reading as empty, so the picker that refused
@@ -1248,14 +1277,40 @@ mod tests {
         assert!(backend.wiped().is_empty(), "the pool was not touched");
     }
 
-    /// An empty disk has nothing to clear, and saying so beats a no-op that
-    /// looks like it worked.
+    /// The disk this exists for is the one that already reads as empty.
+    ///
+    /// `/sys` counts partitions and cannot see a signature, so a disk whose
+    /// GPT was damaged rather than removed is indistinguishable from a blank
+    /// one here — and `zpool create` refuses it. Refusing to clear it because
+    /// there is "nothing to clear" would leave the operator with a disk the
+    /// console calls free and the pool build will not accept.
     #[tokio::test]
-    async fn an_already_empty_disk_has_nothing_to_clear() {
+    async fn a_disk_that_reads_as_empty_is_still_cleared() {
         let (service, backend) = node_with_reclaimable_disks();
-        let err = service.wipe_disk("sdc", acknowledged()).await.unwrap_err();
-        assert!(err.to_string().contains("already free"), "{err}");
-        assert!(backend.wiped().is_empty());
+        let cleared = service.wipe_disk("sdc", acknowledged()).await.unwrap();
+        assert!(!cleared.in_use, "{cleared:?}");
+        assert_eq!(backend.wiped(), vec!["sdc"]);
+    }
+
+    /// A refusal from `zpool` over something on the disk carries the way out
+    /// of it, because the disk it is refusing is one the picker just offered.
+    #[test]
+    fn a_pool_refused_over_a_label_says_where_to_clear_it() {
+        let refusal = ZfsError::Conflict(
+            "/dev/disk/by-id/nvme-INTEL_SSDPE2KX010T8_PHLJ contains a corrupt primary EFI label."
+                .into(),
+        );
+        let explained = with_remedy(refusal).to_string();
+        // zpool's own words survive; the sentence after them is ours.
+        assert!(explained.contains("corrupt primary EFI label"), "{explained}");
+        assert!(explained.contains("Disks page"), "{explained}");
+
+        // Everything else is left exactly as the tool said it.
+        let unrelated = ZfsError::Conflict("A pool needs at least one disk.".into());
+        assert_eq!(
+            with_remedy(unrelated).to_string(),
+            ZfsError::Conflict("A pool needs at least one disk.".into()).to_string()
+        );
     }
 
     /// The shapes a pool can be built on, reconciled against the shapes a disk

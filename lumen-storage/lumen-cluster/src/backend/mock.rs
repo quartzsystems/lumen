@@ -151,7 +151,7 @@ impl MockBackend {
         self
     }
 
-    /// The cluster address never came up, with Pacemaker's own words for why.
+    /// The cluster VIP never came up, with Pacemaker's own words for why.
     ///
     /// The state the recovery exists for: `rc_text` is what the agent's
     /// return code meant, and "Not installed" is the one an operator meets

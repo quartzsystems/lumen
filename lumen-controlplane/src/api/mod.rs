@@ -160,14 +160,14 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/environment/clusters/{name}/networks/external/{network}",
             put(cluster::update_external_network).delete(cluster::forget_external_network),
         )
-        // Moving the cluster address, or taking it away. Acknowledged rather
+        // Moving the cluster VIP, or taking it away. Acknowledged rather
         // than refused: there is no version of this that does not drop the
         // address for a moment.
         .route(
             "/api/environment/clusters/{name}/vip",
             put(cluster::set_vip),
         )
-        // Clearing the cluster address's latched failure and probing it
+        // Clearing the cluster VIP's latched failure and probing it
         // again — the step that turns "I fixed the cause" into an address
         // that actually comes back up.
         .route(

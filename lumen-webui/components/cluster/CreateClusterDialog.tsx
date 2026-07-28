@@ -382,7 +382,7 @@ export function CreateClusterDialog({
               />
             </Field>
             <Field
-              label="Cluster address (VIP)"
+              label="Cluster VIP (VIP)"
               hint="Optional: one stable console address that follows the survivors."
             >
               <TextInput value={vip} onChange={setVip} mono placeholder="192.168.10.100" />

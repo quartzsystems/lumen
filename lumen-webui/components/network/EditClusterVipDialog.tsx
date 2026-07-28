@@ -8,7 +8,7 @@ import { ApiError } from "@/lib/authClient";
 import { setClusterVip, type ClusterNetworks, type ClusterView } from "@/lib/clusterClient";
 import { shortNodeName } from "@/lib/nodeNames";
 
-/// Move the cluster address, or take it away.
+/// Move the cluster VIP, or take it away.
 ///
 /// The dialog exists to make one thing unmissable before it happens: the old
 /// address comes down before the new one goes up, so a console reached on the
@@ -18,7 +18,7 @@ import { shortNodeName } from "@/lib/nodeNames";
 /// it something to warn about rather than refuse.
 ///
 /// Clearing the field is how the address is removed. There is no separate
-/// delete control, because "no cluster address" is a value this field can
+/// delete control, because "no cluster VIP" is a value this field can
 /// hold, and two ways to say the same thing is one more than an operator
 /// should have to choose between.
 export function EditClusterVipDialog({
@@ -61,8 +61,8 @@ export function EditClusterVipDialog({
       await setClusterVip(cluster?.name ?? "", removing ? null : wanted);
       onSaved(
         removing
-          ? `${cluster?.name} no longer has a cluster address. Each member is still reachable on its own.`
-          : `The cluster address is now ${wanted}. If this console was reached on the old one, open the new one — or any member's own address.`,
+          ? `${cluster?.name} no longer has a cluster VIP. Each member is still reachable on its own.`
+          : `The cluster VIP is now ${wanted}. If this console was reached on the old one, open the new one — or any member's own address.`,
       );
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) return;
@@ -75,7 +75,7 @@ export function EditClusterVipDialog({
         );
         return;
       }
-      setError(err instanceof Error ? err.message : "The cluster address could not be changed.");
+      setError(err instanceof Error ? err.message : "The cluster VIP could not be changed.");
     } finally {
       setBusy(false);
     }
@@ -86,7 +86,7 @@ export function EditClusterVipDialog({
   return (
     <ModalShell onClose={busy ? () => {} : onClose}>
       <ModalHeader
-        title="Cluster address"
+        title="Cluster VIP"
         subtitle={`One address for ${cluster?.name ?? "the cluster"}'s console that follows the surviving members.`}
         onClose={busy ? () => {} : onClose}
       />
@@ -103,14 +103,14 @@ export function EditClusterVipDialog({
           htmlFor="vip-address"
           hint={
             networks
-              ? `Inside the Management subnet ${networks.management.subnet}, and an address no member already holds. Leave it empty to remove the cluster address.`
-              : "Leave it empty to remove the cluster address."
+              ? `Inside the Management subnet ${networks.management.subnet}, and an address no member already holds. Leave it empty to remove the cluster VIP.`
+              : "Leave it empty to remove the cluster VIP."
           }
           error={
             malformed
               ? "That is not an IPv4 address."
               : taken
-                ? `${wanted} is already ${shortNodeName(taken.node)}'s own address. The cluster address moves between members, so it has to be one nothing else holds.`
+                ? `${wanted} is already ${shortNodeName(taken.node)}'s own address. The cluster VIP moves between members, so it has to be one nothing else holds.`
                 : outside
                   ? `${wanted} is outside the Management subnet ${networks?.management.subnet} — nothing would route to it.`
                   : undefined

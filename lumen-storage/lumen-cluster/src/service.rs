@@ -88,7 +88,7 @@ pub struct ClusterView {
     pub preferred_node: Option<String>,
     pub nodes: Vec<ClusterNodeView>,
     pub fence: FenceSummaryView,
-    /// The cluster address: what the definition asked for, and what Pacemaker
+    /// The cluster VIP: what the definition asked for, and what Pacemaker
     /// has actually done about it.
     ///
     /// Absent when the definition names no VIP. Present with `state: None`
@@ -103,7 +103,7 @@ pub struct ClusterView {
     pub error: Option<String>,
 }
 
-/// The cluster address, definition and reality side by side.
+/// The cluster VIP, definition and reality side by side.
 ///
 /// Both halves, because either one alone misleads. The definition alone says
 /// a VIP exists when Pacemaker may have stopped it; Pacemaker alone cannot
@@ -441,7 +441,7 @@ impl ClusterService {
         Ok(record.networks.clone())
     }
 
-    /// Clear the cluster address's recorded failures and let Pacemaker probe
+    /// Clear the cluster VIP's recorded failures and let Pacemaker probe
     /// it again.
     ///
     /// The operation an operator needs after fixing whatever stopped the
@@ -467,7 +467,7 @@ impl ClusterService {
         };
         let Some(address) = record.networks.management.vip else {
             return Err(ClusterError::Conflict(format!(
-                "\"{cluster}\" defines no cluster address, so there is nothing to recover."
+                "\"{cluster}\" defines no cluster VIP, so there is nothing to recover."
             )));
         };
 
@@ -497,7 +497,7 @@ impl ClusterService {
         tracing::info!(
             cluster = cluster,
             resource = %vip.resource,
-            "cleared the cluster address's recorded failures"
+            "cleared the cluster VIP's recorded failures"
         );
 
         // Read back rather than reporting success: the probe is what decides
@@ -812,7 +812,7 @@ impl ClusterService {
         Ok(())
     }
 
-    /// Move the cluster address, or take it away.
+    /// Move the cluster VIP, or take it away.
     ///
     /// `None` removes it: the resource goes and the members keep their own
     /// addresses, which is what a cluster defined without a VIP looks like.
@@ -848,7 +848,7 @@ impl ClusterService {
             != Some(cluster)
         {
             return Err(ClusterError::Conflict(format!(
-                "The cluster address is changed from inside the cluster. Open the console of a \
+                "The cluster VIP is changed from inside the cluster. Open the console of a \
                  member of \"{cluster}\"."
             )));
         }
@@ -860,7 +860,7 @@ impl ClusterService {
                     ValidationCode::InvalidVip,
                     Some("management.vip"),
                     format!(
-                        "The cluster address {wanted} is outside the Management subnet {} — \
+                        "The cluster VIP {wanted} is outside the Management subnet {} — \
                          nothing would route to it.",
                         management.subnet
                     ),
@@ -871,7 +871,7 @@ impl ClusterService {
                     ValidationCode::InvalidVip,
                     Some("management.vip"),
                     format!(
-                        "{wanted} is already \"{}\"'s own address. The cluster address has to be \
+                        "{wanted} is already \"{}\"'s own address. The cluster VIP has to be \
                          one nothing else holds — it moves between members, and two things \
                          answering on it is a broken console for whoever gets the wrong one.",
                         member.node
@@ -881,8 +881,8 @@ impl ClusterService {
         }
         if management.vip == address {
             return Err(ClusterError::Conflict(match address {
-                Some(current) => format!("The cluster address is already {current}."),
-                None => format!("\"{cluster}\" has no cluster address to remove."),
+                Some(current) => format!("The cluster VIP is already {current}."),
+                None => format!("\"{cluster}\" has no cluster VIP to remove."),
             }));
         }
 
@@ -914,7 +914,7 @@ impl ClusterService {
         tracing::info!(
             cluster = cluster,
             address = ?address,
-            "cluster address changed"
+            "cluster VIP changed"
         );
 
         let Some(address) = address else {
@@ -2823,7 +2823,7 @@ fn health_of(state: &ClusterState) -> ClusterHealth {
     let fence_worry = state.fence_devices.iter().any(|d| {
         d.failed || !d.active || d.last_test.is_none() || d.last_test.is_some_and(|t| !t.passed)
     });
-    // A cluster address that exists in Pacemaker and is not running is an
+    // A cluster VIP that exists in Pacemaker and is not running is an
     // address nobody answers on. Degraded rather than Critical: no data is at
     // stake, but every console bookmark pointing at the VIP is dead, which an
     // operator finds out at the worst possible moment otherwise.

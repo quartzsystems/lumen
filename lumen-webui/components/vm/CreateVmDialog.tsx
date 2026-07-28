@@ -8,7 +8,9 @@ import { Tabs, type TabItem } from "@/components/ui/Tabs";
 import { ErrorText, Field, SelectInput, TextInput } from "@/components/ui/formkit";
 import { Button } from "@/components/ui/Button";
 import { fetchEnvironment } from "@/lib/clusterClient";
+import { fetchInventory } from "@/lib/inventoryClient";
 import { fetchInterfaces } from "@/lib/networkClient";
+import { shortNodeName } from "@/lib/nodeNames";
 import {
   createIsoStore,
   fetchIsos,
@@ -188,6 +190,13 @@ export function CreateVmDialog({
   const [saving, setSaving] = useState(false);
 
   const [pools, setPools] = useState<PoolView[] | null>(null);
+  /// Node name → the pools that node has, for the replica seats.
+  ///
+  /// `pools` above is this node's, which is all a local disk can use. A
+  /// replica lives in a pool on the member holding it, and a name typed from
+  /// memory is a volume that fails to create on a node the operator is not
+  /// looking at — so each seat picks from what its own member reported.
+  const [memberPools, setMemberPools] = useState<Record<string, PoolView[]>>({});
   const [bridges, setBridges] = useState<string[] | null>(null);
   const [isos, setIsos] = useState<IsoView[] | null>(null);
   const [isoStores, setIsoStores] = useState<IsoStoreView[]>([]);
@@ -285,9 +294,41 @@ export function CreateVmDialog({
       } catch {
         /* a standalone node simply has no replicated choice */
       }
+      try {
+        // What each member can actually hold a replica in. One read for the
+        // whole environment — a request per member would be the same answer
+        // taken apart, and a member that cannot be asked would then be
+        // indistinguishable from one with no pools.
+        const inventory = await fetchInventory();
+        setMemberPools(
+          Object.fromEntries(
+            inventory.members.map((member) => [member.node, member.inventory?.pools ?? []]),
+          ),
+        );
+      } catch {
+        /* the seats fall back to naming a pool that is not offered */
+      }
       await loadIsos();
     })();
   }, [loadIsos]);
+
+  // Each seat starts on its own member's first pool, once that member has
+  // said what it has. Only ever fills a seat that has no pool yet — a choice
+  // the operator has made is not something a late answer may overwrite.
+  useEffect(() => {
+    if (Object.keys(memberPools).length === 0) return;
+    setDraft((d) => {
+      let changed = false;
+      const seats = d.replicaSeats.map((seat) => {
+        if (seat.pool !== "") return seat;
+        const first = memberPools[seat.node]?.[0]?.name;
+        if (!first) return seat;
+        changed = true;
+        return { ...seat, pool: first };
+      });
+      return changed ? { ...d, replicaSeats: seats } : d;
+    });
+  }, [memberPools]);
 
   const selectedPool = useMemo(
     () => pools?.find((pool) => pool.name === draft.pool) ?? null,
@@ -680,35 +721,53 @@ export function CreateVmDialog({
                   {draft.replicated ? (
                     <Field label="Replicas">
                       <div className="flex flex-col gap-2">
-                        {draft.replicaSeats.map((seat, index) => (
-                          <div key={seat.node} className="flex items-center gap-3">
-                            <label className="flex items-center gap-2 w-[180px] cursor-pointer select-none">
-                              <input
-                                type="checkbox"
-                                checked={seat.on}
-                                disabled={seat.local}
-                                onChange={() =>
-                                  set(
-                                    "replicaSeats",
-                                    draft.replicaSeats.map((s, i) =>
-                                      i === index ? { ...s, on: !s.on } : s,
-                                    ),
-                                  )
-                                }
-                              />
-                              <span className="qz-mono text-[13px] text-[var(--qz-fg-1)]">
-                                {seat.node}
-                              </span>
-                              {seat.local && (
-                                <span className="badge badge-muted">this node</span>
-                              )}
-                            </label>
-                            {seat.on && (
-                              <span className="w-[180px]">
-                                <TextInput
+                        {draft.replicaSeats.map((seat, index) => {
+                          // What this member said it has. An empty list is
+                          // either a member with no pools or one that could
+                          // not be asked, and both leave the seat unusable —
+                          // said in the control rather than discovered when
+                          // the volume fails to create over there.
+                          const choices = memberPools[seat.node] ?? [];
+                          return (
+                            // A grid, not a row of fixed widths: a node named
+                            // `lumen1.ad.quartz.systems` is wider than any
+                            // guess, and the picker beside it must not be
+                            // what gives way.
+                            <div
+                              key={seat.node}
+                              className="grid items-center gap-3"
+                              style={{ gridTemplateColumns: "minmax(0, 1fr) 240px" }}
+                            >
+                              <label className="flex items-center gap-2 min-w-0 cursor-pointer select-none">
+                                <input
+                                  type="checkbox"
+                                  className="qz-check flex-shrink-0"
+                                  checked={seat.on}
+                                  disabled={seat.local}
+                                  onChange={() =>
+                                    set(
+                                      "replicaSeats",
+                                      draft.replicaSeats.map((s, i) =>
+                                        i === index ? { ...s, on: !s.on } : s,
+                                      ),
+                                    )
+                                  }
+                                />
+                                <span
+                                  className="qz-mono text-[13px] text-[var(--qz-fg-1)] truncate"
+                                  title={seat.node}
+                                >
+                                  {shortNodeName(seat.node)}
+                                </span>
+                                {seat.local && (
+                                  <span className="badge badge-muted flex-shrink-0">this node</span>
+                                )}
+                              </label>
+                              {seat.on && (
+                                <SelectInput
                                   mono
                                   value={seat.pool}
-                                  placeholder="pool"
+                                  invalid={seat.pool === ""}
                                   onChange={(v) =>
                                     set(
                                       "replicaSeats",
@@ -717,15 +776,33 @@ export function CreateVmDialog({
                                       ),
                                     )
                                   }
-                                />
-                              </span>
-                            )}
-                          </div>
-                        ))}
+                                >
+                                  {choices.length === 0 && (
+                                    <option value="">no pool on this member</option>
+                                  )}
+                                  {/* A pool the member no longer reports —
+                                      or one chosen before it answered —
+                                      still has to be shown, or the select
+                                      would silently read as something the
+                                      operator did not choose. */}
+                                  {seat.pool !== "" &&
+                                    !choices.some((pool) => pool.name === seat.pool) && (
+                                      <option value={seat.pool}>{seat.pool}</option>
+                                    )}
+                                  {choices.map((pool) => (
+                                    <option key={pool.name} value={pool.name}>
+                                      {pool.name} — {formatBytes(pool.free)} free
+                                    </option>
+                                  ))}
+                                </SelectInput>
+                              )}
+                            </div>
+                          );
+                        })}
                         <p className="text-[12px] text-[var(--qz-fg-4)] m-0">
                           This node&apos;s copy is not optional — the disk&apos;s device
                           exists only where a replica does. Each seat names the pool its
-                          copy lives in on that node.
+                          copy lives in on that node, chosen from what that member has.
                         </p>
                       </div>
                     </Field>
