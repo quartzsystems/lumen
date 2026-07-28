@@ -214,6 +214,14 @@ pub trait PeerChannel: Send + Sync {
 
     async fn preflight(&self, node: &EnvironmentNode) -> Result<PreflightReport>;
     async fn prepare(&self, node: &EnvironmentNode, payload: &PreparePayload) -> Result<()>;
+
+    /// Build a bond on a member, through that node's own networking domain.
+    /// The create wizard's shortcut for a Core seat that survives a cable:
+    /// the bond is an ordinary link owned by networking, not by the cluster,
+    /// which is why this is its own call and not part of prepare — it
+    /// outlives the cluster, and a teardown must not take it away.
+    async fn create_bond(&self, node: &EnvironmentNode, bond: &lumen_net::Bond) -> Result<()>;
+
     async fn start(&self, node: &EnvironmentNode) -> Result<()>;
     async fn teardown(&self, node: &EnvironmentNode, payload: &TeardownPayload) -> Result<()>;
 
@@ -771,7 +779,9 @@ struct MockPeersInner {
     fail_prepare: Option<String>,
     fail_start: Option<String>,
     fail_teardown: Option<String>,
+    fail_bond: Option<String>,
     prepared: Vec<(String, PreparePayload)>,
+    bonds: Vec<(String, lumen_net::Bond)>,
     started: Vec<String>,
     torn_down: Vec<(String, TeardownPayload)>,
     reconfigured: Vec<(String, ReconfigurePayload)>,
@@ -824,6 +834,15 @@ impl MockPeers {
     pub fn fail_teardown_on(self, node: &str) -> Self {
         self.inner.lock().unwrap().fail_teardown = Some(node.to_string());
         self
+    }
+
+    pub fn fail_bond_on(self, node: &str) -> Self {
+        self.inner.lock().unwrap().fail_bond = Some(node.to_string());
+        self
+    }
+
+    pub fn bonds(&self) -> Vec<(String, lumen_net::Bond)> {
+        self.inner.lock().unwrap().bonds.clone()
     }
 
     pub fn with_grant(self, grant: JoinGrant) -> Self {
@@ -942,6 +961,31 @@ impl PeerChannel for MockPeers {
             )));
         }
         inner.prepared.push((node.name.clone(), payload.clone()));
+        Ok(())
+    }
+
+    async fn create_bond(&self, node: &EnvironmentNode, bond: &lumen_net::Bond) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.fail_bond.as_deref() == Some(node.name.as_str()) {
+            return Err(ClusterError::Conflict(format!(
+                "the bond could not be built on \"{}\"",
+                node.name
+            )));
+        }
+        // A node that grew a bond reports it on the next preflight, exactly
+        // as the real one would — otherwise the seat cannot be picked.
+        if let Some(report) = inner.reports.get_mut(&node.name) {
+            report.links.retain(|link| link.name != bond.name);
+            report.links.push(lumen_net::ObservedLink {
+                name: bond.name.clone(),
+                kind: lumen_net::LinkKind::Bond,
+                state: lumen_net::LinkState::Activated,
+                carrier: true,
+                bond_mode: Some(bond.mode),
+                ..lumen_net::ObservedLink::default()
+            });
+        }
+        inner.bonds.push((node.name.clone(), bond.clone()));
         Ok(())
     }
 

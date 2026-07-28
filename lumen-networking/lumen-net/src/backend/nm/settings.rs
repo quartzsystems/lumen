@@ -248,8 +248,14 @@ fn apply_ip(builder: &mut SettingsBuilder, ip: &IpConfig) -> Result<()> {
             entry.insert("prefix".into(), Value::from(prefix));
             builder
                 .set(IPV4, "method", "manual")
-                .set(IPV4, "address-data", vec![entry])
-                .set(IPV4, "gateway", gateway.as_str());
+                .set(IPV4, "address-data", vec![entry]);
+            // An empty gateway means "this network routes nowhere" — a Core
+            // interconnect, a storage-only link. NetworkManager rejects "" as
+            // an invalid address rather than reading it as "no default route",
+            // so the property is left off entirely instead.
+            if !gateway.is_empty() {
+                builder.set(IPV4, "gateway", gateway.as_str());
+            }
             if !dns.is_empty() {
                 let words: Result<Vec<u32>> = dns.iter().map(|d| dns_word(d)).collect();
                 builder.set(IPV4, "dns", words?);
@@ -436,6 +442,28 @@ mod tests {
             Vec::<u32>::try_from(dns).unwrap(),
             vec![u32::from_ne_bytes([9, 9, 9, 9])]
         );
+    }
+
+    /// A Core interconnect is addressed but routes nowhere. Writing `""` for
+    /// the gateway is how NetworkManager gets told "invalid address" and the
+    /// whole profile is rejected, which took a cluster create down with it.
+    #[test]
+    fn a_static_address_with_no_gateway_omits_the_property() {
+        let mut link = spec("nic2", LinkKind::Ethernet);
+        link.ip = IpConfig::Static {
+            cidr: "10.10.0.1/24".into(),
+            gateway: String::new(),
+            dns: vec![],
+        };
+        let settings = to_settings(&link, None).unwrap();
+
+        assert_eq!(string_of(&settings, IPV4, "method"), "manual");
+        assert!(
+            !settings[IPV4].contains_key("gateway"),
+            "an empty gateway must not be written at all"
+        );
+        // …and it still reads back as the same desired state.
+        assert_eq!(get_ip(&settings), link.ip);
     }
 
     #[test]

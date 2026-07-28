@@ -376,6 +376,27 @@ impl PeerChannel for HttpPeerChannel {
         Ok(())
     }
 
+    async fn create_bond(
+        &self,
+        node: &EnvironmentNode,
+        bond: &lumen_net::Bond,
+    ) -> Result<(), ClusterError> {
+        if self.is_local(node) {
+            return self.service()?.peer_create_bond(bond).await;
+        }
+        let _: serde_json::Value = self
+            .call(
+                &node.address,
+                "/api/peer/network/bond",
+                bond,
+                self.ca_client_config()?,
+                Some(self.peer_ticket()?),
+                SLOW_CALL_DEADLINE,
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn start(&self, node: &EnvironmentNode) -> Result<(), ClusterError> {
         if self.is_local(node) {
             return self.service()?.peer_start().await;

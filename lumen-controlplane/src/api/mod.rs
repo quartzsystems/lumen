@@ -112,6 +112,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/environment/tokens", post(cluster::mint_token))
         .route("/api/environment/join", post(cluster::join))
         .route("/api/environment/preflight", post(cluster::preflight))
+        .route(
+            "/api/environment/nodes/{node}/bond",
+            post(cluster::bond_node_nics),
+        )
         .route("/api/environment/clusters", post(cluster::create_cluster))
         .route(
             "/api/environment/clusters/pending",
@@ -166,6 +170,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/peer/preflight", post(peer::preflight))
         .route("/api/peer/cluster/prepare", post(peer::prepare))
         .route("/api/peer/cluster/start", post(peer::start))
+        .route("/api/peer/network/bond", post(peer::create_bond))
         .route("/api/peer/cluster/teardown", post(peer::teardown))
         .route("/api/peer/cluster/reconfigure", post(peer::reconfigure))
         .route("/api/peer/volume/prepare", post(peer::prepare_volume))

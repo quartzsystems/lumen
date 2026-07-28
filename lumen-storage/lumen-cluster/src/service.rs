@@ -674,11 +674,144 @@ impl ClusterService {
         })
     }
 
+    /// Build a bond here, through this node's own networking domain.
+    ///
+    /// The bond is an ordinary link the moment it exists: it appears in the
+    /// Networking page, it is edited and deleted there, and a cluster
+    /// teardown leaves it alone. The wizard's shortcut only saves the
+    /// operator a trip to each node's console — it does not give the cluster
+    /// a second, private way to own a link.
+    pub async fn peer_create_bond(&self, bond: &lumen_net::Bond) -> Result<()> {
+        let observed = self.network.observe().await.map_err(ClusterError::from)?;
+        if observed.link(&bond.name).is_some() {
+            return Err(ClusterError::Conflict(format!(
+                "This node already has a link called \"{}\".",
+                bond.name
+            )));
+        }
+        for port in &bond.ports {
+            let Some(link) = observed.link(port) else {
+                return Err(ClusterError::Conflict(format!(
+                    "This node has no link called \"{port}\"."
+                )));
+            };
+            // Enslaving the link the console answers on cuts the operator off
+            // mid-wizard, and the confirm window cannot save a session that
+            // was severed by the change it was meant to protect.
+            if !link.addresses.is_empty() {
+                return Err(ClusterError::Conflict(format!(
+                    "\"{port}\" already carries {} — a bond takes its ports over entirely, so \
+                     move the addressing off it first.",
+                    link.addresses.join(", ")
+                )));
+            }
+        }
+        self.network
+            .create_bond(bond.clone())
+            .await
+            .map_err(ClusterError::from)?;
+        self.network
+            .apply(lumen_net::Acknowledgements::default())
+            .await
+            .map_err(ClusterError::from)?;
+        self.network.confirm().await.map_err(ClusterError::from)?;
+        Ok(())
+    }
+
+    /// Put addressing on this node's Core seat, whatever kind of link it is.
+    ///
+    /// A Core seat is a NIC most of the time and a bond when the operator
+    /// wants the ring to survive a cable — and `lumen-net` patches each kind
+    /// through its own call, so the kind has to be looked up rather than
+    /// assumed. Applied and confirmed in one motion: a Core address on a link
+    /// that is not the console cannot sever the operator, which is what the
+    /// confirm window exists to protect against.
+    async fn address_core_seat(
+        &self,
+        interface: &str,
+        ip: lumen_net::IpConfig,
+        mtu: Option<u32>,
+    ) -> Result<()> {
+        use lumen_net::service::{BondPatch, BridgePatch, NicPatch, VlanPatch};
+        use lumen_net::LinkKind;
+
+        let observed = self.network.observe().await.map_err(ClusterError::from)?;
+        let kind = observed
+            .link(interface)
+            .map(|link| link.kind)
+            .ok_or_else(|| {
+                ClusterError::Conflict(format!("This node has no link called \"{interface}\"."))
+            })?;
+        let ip = Some(ip);
+        match kind {
+            LinkKind::Ethernet => {
+                self.network
+                    .update_nic(
+                        interface,
+                        NicPatch {
+                            ip,
+                            mtu,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            }
+            LinkKind::Bond => {
+                self.network
+                    .update_bond(
+                        interface,
+                        BondPatch {
+                            ip,
+                            mtu,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            }
+            LinkKind::Bridge => {
+                self.network
+                    .update_bridge(
+                        interface,
+                        BridgePatch {
+                            ip,
+                            mtu,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            }
+            LinkKind::Vlan => {
+                self.network
+                    .update_vlan(
+                        interface,
+                        VlanPatch {
+                            ip,
+                            mtu,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            }
+            // Loopback, a guest tap, a tunnel: real links this appliance has
+            // no profile for, so there is nothing to patch.
+            LinkKind::Other => {
+                return Err(ClusterError::Conflict(format!(
+                    "\"{interface}\" is not a link this appliance manages, so it cannot carry a \
+                     Core seat."
+                )))
+            }
+        }
+        .map_err(ClusterError::from)?;
+        self.network
+            .apply(lumen_net::Acknowledgements::default())
+            .await
+            .map_err(ClusterError::from)?;
+        self.network.confirm().await.map_err(ClusterError::from)?;
+        Ok(())
+    }
+
     /// Become part of a cluster: realize the Core seat through the
-    /// networking domain, then write the cluster configuration. The address
-    /// change is applied and confirmed in one motion — a Core address on a
-    /// spare NIC cannot sever the operator, which is what the confirm window
-    /// exists to protect against.
+    /// networking domain, then write the cluster configuration.
     pub async fn peer_prepare(&self, payload: &PreparePayload) -> Result<()> {
         let core = &payload.core;
         let observed = self.network.observe().await.map_err(ClusterError::from)?;
@@ -693,28 +826,18 @@ impl ClusterService {
             Some(link) => !link.addresses.contains(&cidr),
         };
         if needs_address {
-            self.network
-                .update_nic(
-                    &core.interface,
-                    lumen_net::service::NicPatch {
-                        ip: Some(lumen_net::IpConfig::Static {
-                            cidr,
-                            // A Core network routes nowhere: replication and
-                            // heartbeat between members, and nothing else.
-                            gateway: String::new(),
-                            dns: Vec::new(),
-                        }),
-                        mtu: Some(core.mtu),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .map_err(ClusterError::from)?;
-            self.network
-                .apply(lumen_net::Acknowledgements::default())
-                .await
-                .map_err(ClusterError::from)?;
-            self.network.confirm().await.map_err(ClusterError::from)?;
+            self.address_core_seat(
+                &core.interface,
+                lumen_net::IpConfig::Static {
+                    cidr,
+                    // A Core network routes nowhere: replication and
+                    // heartbeat between members, and nothing else.
+                    gateway: String::new(),
+                    dns: Vec::new(),
+                },
+                Some(core.mtu),
+            )
+            .await?;
         }
         self.backend
             .write_cluster_config(&payload.corosync_conf, &payload.authkey)
@@ -741,26 +864,12 @@ impl ClusterService {
         note(self.backend.disable_stack().await);
         note(self.backend.remove_cluster_config().await);
         if let Some(interface) = &payload.core_interface {
-            let released: Result<()> = async {
-                self.network
-                    .update_nic(
-                        interface,
-                        lumen_net::service::NicPatch {
-                            ip: Some(lumen_net::IpConfig::Disabled),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .map_err(ClusterError::from)?;
-                self.network
-                    .apply(lumen_net::Acknowledgements::default())
-                    .await
-                    .map_err(ClusterError::from)?;
-                self.network.confirm().await.map_err(ClusterError::from)?;
-                Ok(())
-            }
-            .await;
-            note(released);
+            // The seat is released, not the link: a bond the operator built
+            // before the create outlives the cluster that borrowed it.
+            note(
+                self.address_core_seat(interface, lumen_net::IpConfig::Disabled, None)
+                    .await,
+            );
         }
         match first_error {
             None => Ok(()),
@@ -800,6 +909,31 @@ impl ClusterService {
             }
         }
         Ok(views)
+    }
+
+    /// Build a bond on one environment node, from the coordinator.
+    ///
+    /// The create wizard's Core-redundancy shortcut. It reaches the node
+    /// through the same peer channel every other cross-node call uses, and
+    /// lands in that node's networking domain — so the bond that comes out is
+    /// indistinguishable from one built on the node's own Networking page,
+    /// and is edited and deleted there afterwards.
+    pub async fn bond_node_nics(&self, node: &str, bond: &lumen_net::Bond) -> Result<()> {
+        let membership = self.require_membership()?;
+        let member = membership.node(node).ok_or_else(|| {
+            ClusterError::Conflict(format!(
+                "\"{node}\" has not joined this environment, so its links cannot be configured \
+                 from here."
+            ))
+        })?;
+        if bond.ports.len() < 2 {
+            return Err(ClusterError::Conflict(
+                "A bond built for redundancy needs at least two ports — one port is the cable \
+                 it was meant to survive."
+                    .to_string(),
+            ));
+        }
+        self.peers.create_bond(member, bond).await
     }
 
     /// Start a cluster create. Validation happens now; the workflow itself
@@ -2435,6 +2569,124 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("chrony"));
+    }
+
+    /// The wizard's Core-redundancy shortcut: the coordinator reaches the
+    /// member through the peer channel, and the bond lands in that node's
+    /// networking domain rather than in anything the cluster owns.
+    #[tokio::test]
+    async fn a_core_bond_is_built_on_the_member_through_its_own_networking() {
+        let membership = membership_of(&[("alpha-1", None), ("alpha-2", None)]);
+        let peers = Arc::new(
+            MockPeers::new()
+                .with_healthy_node("alpha-1", "0.3.0", &["nic0", "nic1", "nic2"])
+                .with_healthy_node("alpha-2", "0.3.0", &["nic0", "nic1", "nic2"]),
+        );
+        let service = Arc::new(
+            ClusterService::new(
+                Arc::new(MockBackend::appliance()) as Arc<dyn ClusterBackend>,
+                peers.clone(),
+                network(),
+                &test_dir("core-bond"),
+                "0.3.0",
+            )
+            .with_node("alpha-1")
+            .with_environment(&membership),
+        );
+
+        let bond = lumen_net::Bond {
+            name: "bond0".into(),
+            mode: lumen_net::BondMode::ActiveBackup,
+            ports: vec!["nic1".into(), "nic2".into()],
+            miimon: Some(100),
+            ..lumen_net::Bond::default()
+        };
+        service.bond_node_nics("alpha-2", &bond).await.unwrap();
+
+        let built = peers.bonds();
+        assert_eq!(built.len(), 1);
+        assert_eq!(built[0].0, "alpha-2");
+        assert_eq!(
+            built[0].1.ports,
+            vec!["nic1".to_string(), "nic2".to_string()]
+        );
+
+        // …and the node reports it on the next preflight, so the wizard's
+        // Core picker can actually offer the seat it just created.
+        let views = service.preflight(&["alpha-2".to_string()]).await.unwrap();
+        let links = &views[0].report.as_ref().unwrap().links;
+        let made = links.iter().find(|l| l.name == "bond0").expect("the bond");
+        assert_eq!(made.kind, lumen_net::LinkKind::Bond);
+    }
+
+    #[tokio::test]
+    async fn a_bond_of_one_port_is_refused_and_a_stranger_cannot_be_configured() {
+        let membership = membership_of(&[("alpha-1", None), ("alpha-2", None)]);
+        let peers =
+            Arc::new(MockPeers::new().with_healthy_node("alpha-2", "0.3.0", &["nic0", "nic1"]));
+        let service = Arc::new(
+            ClusterService::new(
+                Arc::new(MockBackend::appliance()) as Arc<dyn ClusterBackend>,
+                peers.clone(),
+                network(),
+                &test_dir("core-bond-refused"),
+                "0.3.0",
+            )
+            .with_node("alpha-1")
+            .with_environment(&membership),
+        );
+
+        // One port is the cable the bond was meant to survive.
+        let single = lumen_net::Bond {
+            name: "bond0".into(),
+            ports: vec!["nic1".into()],
+            ..lumen_net::Bond::default()
+        };
+        assert!(service.bond_node_nics("alpha-2", &single).await.is_err());
+
+        let good = lumen_net::Bond {
+            name: "bond0".into(),
+            ports: vec!["nic1".into(), "nic2".into()],
+            ..lumen_net::Bond::default()
+        };
+        assert!(service.bond_node_nics("outsider", &good).await.is_err());
+        assert!(peers.bonds().is_empty(), "nothing may have been built");
+    }
+
+    /// A bond takes its ports over entirely, so enslaving the link the
+    /// console answers on would cut the operator off mid-wizard — and the
+    /// confirm window cannot rescue a session severed by the change itself.
+    #[tokio::test]
+    async fn a_bond_refuses_to_swallow_an_addressed_link() {
+        let network = network();
+        let service = ClusterService::new(
+            Arc::new(MockBackend::appliance()),
+            Arc::new(MockPeers::new()),
+            network.clone(),
+            &test_dir("core-bond-addressed"),
+            "0.3.0",
+        )
+        .with_node("alpha-1");
+
+        let addressed = network
+            .observe()
+            .await
+            .unwrap()
+            .links
+            .into_iter()
+            .find(|link| !link.addresses.is_empty())
+            .expect("the appliance fixture has an addressed link");
+
+        let bond = lumen_net::Bond {
+            name: "bond0".into(),
+            ports: vec![addressed.name.clone(), "nic1".into()],
+            ..lumen_net::Bond::default()
+        };
+        let err = service.peer_create_bond(&bond).await.unwrap_err();
+        assert!(
+            err.to_string().contains(&addressed.name),
+            "the refusal names the link: {err}"
+        );
     }
 
     #[tokio::test]

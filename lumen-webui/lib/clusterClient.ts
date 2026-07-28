@@ -177,7 +177,28 @@ export interface PreflightLink {
   carrier: boolean;
   addresses: string[];
   mtu?: number | null;
+  /// The bridge or bond that has already claimed this link, when one has. A
+  /// link answers to one controller, so a claimed one cannot be bonded again.
+  controller?: string | null;
 }
+
+/// The links that can hold a ring seat. `other` is everything the appliance
+/// did not create and has no profile for — loopback, guest taps, tunnels —
+/// and a seat placed there fails at prepare time, so it is not offered.
+/// A bond belongs here: bonding two NICs is how a ring survives a cable.
+export const seatableLinks = (links: PreflightLink[]): PreflightLink[] =>
+  links.filter((link) => link.kind !== "other");
+
+/// How a link reads in a ring picker: its name, what it is when that is not
+/// a plain NIC, and the fact that will bite — no carrier, or the address it
+/// already answers on.
+export const linkLabel = (link: PreflightLink, show: "carrier" | "address"): string => {
+  const parts = [link.name];
+  if (link.kind !== "ethernet") parts.push(link.kind);
+  if (show === "carrier" && !link.carrier) parts.push("no carrier");
+  if (show === "address" && link.addresses.length > 0) parts.push(link.addresses[0]);
+  return parts.join(" — ");
+};
 
 export interface PreflightReport {
   node: string;
@@ -250,6 +271,24 @@ export const joinEnvironment = (token: string): Promise<{ joined: boolean; note:
 
 export const preflightNodes = (nodes: string[]): Promise<PreflightView[]> =>
   post("/environment/preflight", { nodes });
+
+/// Bond two or more of a node's NICs, before it is a cluster member — the
+/// wizard's shortcut to a Core seat that survives a cable. It lands in the
+/// target node's own networking domain, so the bond that results is an
+/// ordinary link, edited and deleted from its Networking page like any other.
+export const bondNodeNics = (
+  node: string,
+  bond: BondNodeRequest,
+): Promise<{ bonded: boolean }> =>
+  post(`/environment/nodes/${encodeURIComponent(node)}/bond`, bond);
+
+export interface BondNodeRequest {
+  name: string;
+  mode: "active-backup" | "802.3ad" | "balance-xor";
+  ports: string[];
+  miimon?: number;
+  mtu?: number;
+}
 
 export const createCluster = (request: ClusterCreateRequest): Promise<CreateProgress> =>
   post("/environment/clusters", request);

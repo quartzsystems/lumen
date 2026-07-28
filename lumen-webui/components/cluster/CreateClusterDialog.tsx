@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { AlertTriangle, Check, X } from "lucide-react";
 import { ModalHeader, ModalShell } from "@/components/ui/Modal";
+import { CoreBondPanel } from "@/components/cluster/CoreBondPanel";
 import { Tabs } from "@/components/ui/Tabs";
 import {
   CheckList,
@@ -16,8 +17,10 @@ import { ApiError } from "@/lib/authClient";
 import {
   createCluster,
   fetchCreateProgress,
+  linkLabel,
   preflightNodes,
   REGIME_LABEL,
+  seatableLinks,
   type CreateProgress,
   type MemberCreate,
   type PreflightView,
@@ -388,7 +391,9 @@ export function CreateClusterDialog({
 
           {selected.map((node) => {
             const draft = draftOf(node);
-            const links = preflights?.find((v) => v.node === node)?.report?.links ?? [];
+            const links = seatableLinks(
+              preflights?.find((v) => v.node === node)?.report?.links ?? [],
+            );
             const sameLink =
               draft.core_interface !== "" && draft.core_interface === draft.management_interface;
             return (
@@ -401,6 +406,16 @@ export function CreateClusterDialog({
                     Core and Management must not share a link — one cable would be both rings.
                   </div>
                 )}
+                <CoreBondPanel
+                  node={node}
+                  links={preflights?.find((v) => v.node === node)?.report?.links ?? []}
+                  onBuilt={(bond) => {
+                    // Seat Core on what was just built, then re-preflight so
+                    // every picker sees the node's links as they now are.
+                    patchDraft(node, { core_interface: bond });
+                    void runPreflight();
+                  }}
+                />
                 <div className="grid grid-cols-2 gap-3">
                   <Field label="Core NIC" required>
                     <SelectInput
@@ -411,8 +426,7 @@ export function CreateClusterDialog({
                       <option value="">Choose…</option>
                       {links.map((link) => (
                         <option key={link.name} value={link.name}>
-                          {link.name}
-                          {link.carrier ? "" : " — no carrier"}
+                          {linkLabel(link, "carrier")}
                         </option>
                       ))}
                     </SelectInput>
@@ -433,8 +447,7 @@ export function CreateClusterDialog({
                       <option value="">Choose…</option>
                       {links.map((link) => (
                         <option key={link.name} value={link.name}>
-                          {link.name}
-                          {link.addresses.length > 0 ? ` — ${link.addresses[0]}` : ""}
+                          {linkLabel(link, "address")}
                         </option>
                       ))}
                     </SelectInput>
@@ -453,6 +466,8 @@ export function CreateClusterDialog({
           <p className="text-[12px] text-[var(--qz-fg-4)] m-0">
             Ring 0 rides the Core network, ring 1 rides Management. Unaddressed Core NICs are
             given their address during the create; Management adopts what the node already has.
+            To make Core survive a cable, build a bond on the node&rsquo;s Networking page first
+            and pick it here — a bond is a Core seat like any other link.
           </p>
         </div>
       )}

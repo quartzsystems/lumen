@@ -154,6 +154,26 @@ pub async fn preflight(
     Ok(Json(state.cluster.preflight(&request.nodes).await?))
 }
 
+/// POST /api/environment/nodes/{node}/bond — build a bond on one environment
+/// node, before it is a cluster member. The wizard's shortcut to a Core seat
+/// that survives a cable: it lands in the target node's networking domain, so
+/// what comes out is an ordinary link, edited and deleted on its Networking
+/// page.
+///
+/// The target rides the path, not the body: a `node` field in a body means
+/// "this appliance" everywhere else in this API (see `check_node`), and this
+/// route means the opposite — a member that is deliberately not us.
+pub async fn bond_node_nics(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    Path(node): Path<String>,
+    raw: Body,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let bond: lumen_net::Bond = required_body(raw)?;
+    state.cluster.bond_node_nics(&node, &bond).await?;
+    Ok(Json(serde_json::json!({ "bonded": true })))
+}
+
 /// POST /api/environment/clusters — start a create. Validation answers now;
 /// the workflow runs in the background and `GET
 /// /api/environment/clusters/pending` is the wizard's progress feed.

@@ -514,8 +514,21 @@ addresses, adopted Management addressing, and the optional VIP; the fencing
 seats with their BMC passwords (masked, never shown back); a review of
 everything about to be generated; and then the create itself, live — per
 node, per step, fence devices included, because a wizard that closes on
-submit turns a five-minute workflow into a spinner. Destroy is the
-typed-name confirmation the console uses everywhere destruction is meant.
+submit turns a five-minute workflow into a spinner.
+
+A ring seat is any link the appliance manages, not only a bare NIC: the
+pickers offer bonds, bridges, and VLAN interfaces alike, and prepare patches
+whichever kind the seat turns out to be. For a Core network that survives a
+cable, the Networks tab carries **Bond NICs for Core** per member — two or
+more of that node's unaddressed, unclaimed NICs, a mode, and a name. It is a
+shortcut, not a second owner: the request lands in the target node's own
+networking domain through the peer channel, so what comes out is an ordinary
+bond, listed and edited and deleted on that node's Networking page, and left
+alone by a cluster teardown. Teardown releases the Core *address*; the link
+that carried it was never the cluster's to take away.
+
+Destroy is the typed-name confirmation the console uses everywhere
+destruction is meant.
 A cluster below five nodes with unassigned nodes available carries **Add
 node** on its card: one form — the newcomer, its preflight, its seats, its
 BMC — then the same live per-step progress as a create, regime change

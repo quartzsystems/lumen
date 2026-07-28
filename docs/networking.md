@@ -167,6 +167,13 @@ The installer's `NetworkConfig` and `lumen-net`'s `IpConfig` are separate types
 with an identical wire format (`{"mode":"dhcp"}` /
 `{"mode":"static","cidr":…,"gateway":…,"dns":[…]}`).
 
+An **empty `gateway` means no default route** — a cluster's Core interconnect,
+a storage-only link, anything addressed that routes nowhere. NetworkManager
+does not read `""` that way: it rejects it as an invalid address and refuses
+the whole profile, so the backend omits `ipv4.gateway` entirely rather than
+writing an empty one. It reads back as `""`, so the desired state round-trips.
+Pinned by `backend::nm::settings::tests::a_static_address_with_no_gateway_omits_the_property`.
+
 Sharing the type would mean the installer depending on `lumen-net`, and even
 with `default-features = false` the optional dependency still lands in
 `lumen-installer/app/Cargo.lock` — so `cargo fetch --locked` for a GTK4

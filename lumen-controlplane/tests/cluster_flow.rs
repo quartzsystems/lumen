@@ -229,6 +229,7 @@ async fn every_environment_route_requires_a_session() {
         (Method::POST, "/api/environment/tokens"),
         (Method::POST, "/api/environment/join"),
         (Method::POST, "/api/environment/preflight"),
+        (Method::POST, "/api/environment/nodes/alpha-2/bond"),
         (Method::POST, "/api/environment/clusters"),
         (Method::GET, "/api/environment/clusters/pending"),
         (Method::DELETE, "/api/environment/clusters/alpha"),
@@ -587,6 +588,102 @@ async fn minting_takes_a_declared_but_empty_json_body() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+// --- the Core-redundancy shortcut -------------------------------------------
+
+/// The wizard's "bond these NICs for Core" reaches the named member through
+/// the peer channel and lands in that node's own networking domain. The bond
+/// is an ordinary link afterwards — nothing about it belongs to the cluster.
+#[tokio::test]
+async fn bonding_a_members_nics_goes_through_that_nodes_networking() {
+    let membership = membership_of(&[("alpha-1", None), ("alpha-2", None)]);
+    let peers = MockPeers::new()
+        .with_healthy_node(
+            "alpha-1",
+            env!("CARGO_PKG_VERSION"),
+            &["nic0", "nic1", "nic2"],
+        )
+        .with_healthy_node(
+            "alpha-2",
+            env!("CARGO_PKG_VERSION"),
+            &["nic0", "nic1", "nic2"],
+        );
+    let harness = harness("bond", MockBackend::appliance(), peers, Some(&membership));
+    let cookie = sign_in(&harness.router).await;
+
+    let (status, body) = request(
+        &harness.router,
+        Method::POST,
+        "/api/environment/nodes/alpha-2/bond",
+        Some(&cookie),
+        None,
+        Some(serde_json::json!({
+            "name": "bond0",
+            "mode": "active-backup",
+            "ports": ["nic1", "nic2"],
+            "miimon": 100,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["bonded"], true);
+
+    // The node reports the bond now, so the wizard's Core picker can seat
+    // ring 0 on it.
+    let (status, views) = request(
+        &harness.router,
+        Method::POST,
+        "/api/environment/preflight",
+        Some(&cookie),
+        None,
+        Some(serde_json::json!({ "nodes": ["alpha-2"] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{views}");
+    let links = views[0]["report"]["links"].as_array().unwrap();
+    let bond = links
+        .iter()
+        .find(|link| link["name"] == "bond0")
+        .unwrap_or_else(|| panic!("the bond is missing: {views}"));
+    assert_eq!(bond["kind"], "bond");
+}
+
+#[tokio::test]
+async fn a_bond_needs_two_ports_and_a_node_in_the_environment() {
+    let membership = membership_of(&[("alpha-1", None), ("alpha-2", None)]);
+    let peers = MockPeers::new().with_healthy_node(
+        "alpha-2",
+        env!("CARGO_PKG_VERSION"),
+        &["nic0", "nic1", "nic2"],
+    );
+    let harness = harness(
+        "bond-bad",
+        MockBackend::appliance(),
+        peers,
+        Some(&membership),
+    );
+    let cookie = sign_in(&harness.router).await;
+
+    for (node, ports) in [
+        // One port is the cable the bond was meant to survive…
+        ("alpha-2", vec!["nic1"]),
+        // …and a node outside the environment is not ours to configure.
+        ("nobody", vec!["nic1", "nic2"]),
+    ] {
+        let (status, answer) = request(
+            &harness.router,
+            Method::POST,
+            &format!("/api/environment/nodes/{node}/bond"),
+            Some(&cookie),
+            None,
+            Some(serde_json::json!({
+                "name": "bond0", "mode": "active-backup", "ports": ports,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{node} {ports:?} → {answer}");
+    }
 }
 
 // --- peer authentication ----------------------------------------------------

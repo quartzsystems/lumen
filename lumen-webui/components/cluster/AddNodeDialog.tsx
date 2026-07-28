@@ -8,7 +8,9 @@ import { ApiError } from "@/lib/authClient";
 import {
   addClusterNode,
   fetchCreateProgress,
+  linkLabel,
   preflightNodes,
+  seatableLinks,
   type ClusterView,
   type CreateProgress,
   type PreflightView,
@@ -68,7 +70,7 @@ export function AddNodeDialog({
     }
   };
 
-  const links = preflight?.report?.links ?? [];
+  const links = seatableLinks(preflight?.report?.links ?? []);
   const sameLink = coreInterface !== "" && coreInterface === managementInterface;
   const ready =
     node !== "" &&
@@ -251,8 +253,7 @@ export function AddNodeDialog({
                     <option value="">Choose…</option>
                     {links.map((link) => (
                       <option key={link.name} value={link.name}>
-                        {link.name}
-                        {link.carrier ? "" : " — no carrier"}
+                        {linkLabel(link, "carrier")}
                       </option>
                     ))}
                   </SelectInput>
@@ -269,8 +270,7 @@ export function AddNodeDialog({
                     <option value="">Choose…</option>
                     {links.map((link) => (
                       <option key={link.name} value={link.name}>
-                        {link.name}
-                        {link.addresses.length > 0 ? ` — ${link.addresses[0]}` : ""}
+                        {linkLabel(link, "address")}
                       </option>
                     ))}
                   </SelectInput>

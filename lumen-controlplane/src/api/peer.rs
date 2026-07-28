@@ -61,6 +61,18 @@ pub async fn prepare(
     Ok(Json(serde_json::json!({ "prepared": true })))
 }
 
+/// POST /api/peer/network/bond — build a bond here, through this node's own
+/// networking domain. The create wizard's Core-redundancy shortcut; the bond
+/// that results is an ordinary link, owned and edited by Networking.
+pub async fn create_bond(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+    Json(bond): Json<lumen_net::Bond>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state.cluster.peer_create_bond(&bond).await?;
+    Ok(Json(serde_json::json!({ "bonded": true })))
+}
+
 /// POST /api/peer/cluster/start — enable and start the cluster stack.
 pub async fn start(
     _peer: PeerSession,

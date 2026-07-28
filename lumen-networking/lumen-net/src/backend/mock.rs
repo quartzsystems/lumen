@@ -205,7 +205,12 @@ fn apply_spec(link: &mut ObservedLink, spec: &ConnectionSpec) {
 fn addresses_for(spec: &ConnectionSpec, previous: &[String]) -> (Vec<String>, Option<String>) {
     match &spec.ip {
         IpConfig::Disabled => (Vec::new(), None),
-        IpConfig::Static { cidr, gateway, .. } => (vec![cidr.clone()], Some(gateway.clone())),
+        // An empty gateway is no gateway, which is how the NetworkManager
+        // backend reports a link that has none.
+        IpConfig::Static { cidr, gateway, .. } => (
+            vec![cidr.clone()],
+            Some(gateway.clone()).filter(|g| !g.is_empty()),
+        ),
         IpConfig::Dhcp => {
             let leased = previous
                 .first()
