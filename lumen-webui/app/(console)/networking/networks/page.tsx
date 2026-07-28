@@ -2,24 +2,37 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { AlertTriangle, Plus } from "lucide-react";
+import { AlertTriangle, Plus, RotateCcw } from "lucide-react";
 import { Page, PageBody, PageHeader } from "@/components/PageHeader";
 import { DataTable, Dash, type Column, type FilterDef } from "@/components/console/DataTable";
+import { RowActions } from "@/components/console/RowActions";
 import { Status } from "@/components/dashboard/DashboardBits";
 import { Button } from "@/components/ui/Button";
 import { ApiError } from "@/lib/authClient";
 import {
   fetchClusterNetworks,
   fetchEnvironment,
+  forgetExternalNetwork,
+  recoverClusterVip,
   type ClusterNetworks,
   type ClusterView,
   type EnvironmentResponse,
   type ExternalNetwork,
+  type RingLink,
+  type VipView,
 } from "@/lib/clusterClient";
-import { externalState, ringState, vipState, type StatusTone } from "@/lib/networkStatus";
+import {
+  externalState,
+  ringsByNode,
+  ringState,
+  vipState,
+  type StatusTone,
+} from "@/lib/networkStatus";
 import { fetchInventory, type InventoryResponse } from "@/lib/inventoryClient";
+import { shortNodeName, shortNodeNames } from "@/lib/nodeNames";
 import { useConsole } from "@/lib/ConsoleContext";
 import { CreateExternalNetworkDialog } from "@/components/network/CreateExternalNetworkDialog";
+import { EditClusterVipDialog } from "@/components/network/EditClusterVipDialog";
 
 const POLL_MS = 5000;
 
@@ -39,10 +52,18 @@ interface NetworkRow {
   name: string;
   kind: "Core" | "Management" | "External";
   /// Host addressing, or null for External — a network with no address on the
-  /// host is the whole point of that type.
+  /// host is the whole point of that type. Only ever a subnet: the cluster
+  /// address is a single address and belongs in `addresses`, where the thing
+  /// above the column heading is true of what is under it.
   subnet: string | null;
-  /// The cluster VIP, the only second address any of these has.
-  vip: string | null;
+  /// What answers on this network, per member — and for the cluster address
+  /// row, the floating address itself.
+  ///
+  /// Its own column because the subnet alone does not answer the question an
+  /// operator actually has here, which is "what do I type to reach that
+  /// node?". Reading it off the Interfaces table means knowing which link
+  /// carries which network first.
+  addresses: { node: string; address: string }[];
   /// MTU for Core, VLAN semantics for External, nothing for Management.
   detail: string | null;
   tone: StatusTone;
@@ -50,13 +71,32 @@ interface NetworkRow {
   /// Which members carry it, for the column that answers "is this everywhere?"
   members: string[];
   of: number;
+  /// What this row can be acted on as. Core and Management carry no actions
+  /// yet; the cluster address and the External networks do, and they are
+  /// different actions — so the row says which it is rather than the actions
+  /// column guessing from the name.
+  acts: "vip" | "external" | null;
+  /// The External network behind the row, for the edit dialog.
+  external?: ExternalNetwork;
+  /// The cluster address's state, for the recovery.
+  vipState?: VipView;
 }
 
 /// The rows one cluster contributes: Core, Management, and each External
 /// network it defines.
-function networkRows(cluster: ClusterView, networks: ClusterNetworks): NetworkRow[] {
-  const core = ringState(cluster, 0, networks.core.members);
-  const management = ringState(cluster, 1, networks.management.members);
+function networkRows(
+  cluster: ClusterView,
+  networks: ClusterNetworks,
+  /// Every member's rings, gathered across the environment. Without it only
+  /// the node serving the page has an observed link and the rest read as
+  /// unknown — see `ringsByNode`.
+  rings: Map<string, RingLink[]>,
+): NetworkRow[] {
+  const core = ringState(cluster, 0, networks.core.members, rings);
+  const management = ringState(cluster, 1, networks.management.members, rings);
+
+  const seats = (members: typeof networks.core.members) =>
+    members.map((member) => ({ node: member.node, address: member.address }));
 
   return [
     {
@@ -65,12 +105,13 @@ function networkRows(cluster: ClusterView, networks: ClusterNetworks): NetworkRo
       name: "Core",
       kind: "Core",
       subnet: networks.core.subnet,
-      vip: null,
+      addresses: seats(networks.core.members),
       detail: `MTU ${networks.core.mtu}`,
       tone: core.tone,
       status: core.status,
       members: networks.core.members.map((member) => member.node),
       of: cluster.nodes.length,
+      acts: null,
     },
     {
       key: `${cluster.name}/management`,
@@ -78,14 +119,13 @@ function networkRows(cluster: ClusterView, networks: ClusterNetworks): NetworkRo
       name: "Management",
       kind: "Management",
       subnet: networks.management.subnet,
-      // The floating address is its own row below, with its own state. Naming
-      // it here too would say it twice and, worse, say it without a state.
-      vip: null,
+      addresses: seats(networks.management.members),
       detail: null,
       tone: management.tone,
       status: management.status,
       members: networks.management.members.map((member) => member.node),
       of: cluster.nodes.length,
+      acts: null,
     },
     // The cluster address gets a row of its own rather than a footnote on the
     // Management one. It is the address every console bookmark points at, it
@@ -95,20 +135,26 @@ function networkRows(cluster: ClusterView, networks: ClusterNetworks): NetworkRo
     ...(cluster.vip
       ? [
           (() => {
-            const state = vipState(cluster, cluster.vip);
-            const holder = cluster.vip.state?.node;
+            const vip = cluster.vip!;
+            const state = vipState(cluster, vip);
+            const holder = vip.state?.node;
             return {
               key: `${cluster.name}/vip`,
               cluster: cluster.name,
               name: "Cluster address",
               kind: "Management" as const,
-              subnet: cluster.vip.address,
-              vip: null,
-              detail: holder ? `on ${holder}` : null,
+              // It has no subnet of its own — it lives in Management's, whose
+              // own row says so. Putting the address here was the column
+              // heading claiming something it was not.
+              subnet: null,
+              addresses: [{ node: holder ?? "", address: vip.address }],
+              detail: holder ? `on ${shortNodeName(holder)}` : null,
               tone: state.tone,
               status: state.status,
               members: holder ? [holder] : [],
               of: cluster.nodes.length,
+              acts: "vip" as const,
+              vipState: vip,
             };
           })(),
         ]
@@ -121,13 +167,17 @@ function networkRows(cluster: ClusterView, networks: ClusterNetworks): NetworkRo
         cluster: cluster.name,
         name: network.name,
         kind: "External",
+        // No host addressing at all — that is what makes it External rather
+        // than a second Management network.
         subnet: null,
-        vip: null,
+        addresses: [],
         detail: `${network.bridge} · ${vlanText(network)}`,
         tone: state.tone,
         status: state.status,
         members: nodes,
         of: cluster.nodes.length,
+        acts: "external",
+        external: network,
       };
     }),
   ];
@@ -146,6 +196,8 @@ const columns: Column<NetworkRow>[] = [
     key: "cluster",
     header: "Cluster",
     value: (row) => row.cluster,
+    // Whole, unlike a node's: a cluster's name carries no domain, and
+    // trimming at a dot would eat part of the name an operator chose.
     render: (row) => (
       <span className="qz-mono text-[12px] truncate" title={row.cluster}>
         {row.cluster}
@@ -176,17 +228,19 @@ const columns: Column<NetworkRow>[] = [
     key: "subnet",
     header: "Subnet",
     value: (row) => row.subnet ?? "",
-    render: (row) =>
-      row.subnet ? (
-        <span className="whitespace-nowrap">
-          {row.subnet}
-          {row.vip && <span className="qz-dim"> · VIP {row.vip}</span>}
-        </span>
-      ) : (
-        <Dash />
-      ),
+    render: (row) => (row.subnet ? <span className="whitespace-nowrap">{row.subnet}</span> : <Dash />),
     mono: true,
-    width: 220,
+    width: 160,
+  },
+  {
+    key: "addresses",
+    header: "Addresses",
+    // Sorted on the addresses themselves rather than the node names: an
+    // operator scanning this column is looking for an address.
+    value: (row) => row.addresses.map((seat) => seat.address).join(" "),
+    render: (row) => <AddressesCell row={row} />,
+    mono: true,
+    width: 260,
   },
   {
     key: "detail",
@@ -201,7 +255,7 @@ const columns: Column<NetworkRow>[] = [
     header: "Members",
     value: (row) => String(row.members.length),
     render: (row) => (
-      <span className="qz-mono whitespace-nowrap" title={row.members.join(", ")}>
+      <span className="qz-mono whitespace-nowrap" title={shortNodeNames(row.members)}>
         {row.members.length} / {row.of}
       </span>
     ),
@@ -210,14 +264,47 @@ const columns: Column<NetworkRow>[] = [
   },
 ];
 
+/// Who answers on this network, and where.
+///
+/// One address per member, each labelled with the member holding it — because
+/// "which of these is the node I want" is the question, and a bare list of
+/// four addresses does not answer it. The cluster address has no node to
+/// label it with while it is stopped, and shows alone rather than beside an
+/// empty name.
+function AddressesCell({ row }: { row: NetworkRow }) {
+  if (row.addresses.length === 0) return <Dash />;
+  return (
+    <span className="inline-flex flex-col gap-[2px] min-w-0">
+      {row.addresses.map((seat) => (
+        <span key={`${seat.node}/${seat.address}`} className="whitespace-nowrap truncate">
+          {seat.node && (
+            <span className="qz-dim" title={seat.node}>
+              {shortNodeName(seat.node)}{" "}
+            </span>
+          )}
+          {seat.address}
+        </span>
+      ))}
+    </span>
+  );
+}
+
 function NetworksTable({
   rows,
   onRefresh,
   toolbar,
+  busy,
+  onEdit,
+  onDelete,
+  onRecover,
 }: {
   rows: NetworkRow[];
   onRefresh: () => Promise<void>;
   toolbar?: React.ReactNode;
+  busy: boolean;
+  onEdit: (row: NetworkRow) => void;
+  onDelete: (row: NetworkRow) => Promise<void>;
+  onRecover: (row: NetworkRow) => Promise<void>;
 }) {
   const filters: FilterDef<NetworkRow>[] = useMemo(
     () => [
@@ -252,6 +339,46 @@ function NetworksTable({
       searchPlaceholder="Search networks…"
       emptyMessage="No cluster networks defined."
       onRefresh={onRefresh}
+      actions={(row) => (
+        <div className="flex items-center gap-1">
+          {/* Offered only on the address that is actually failing. A
+              recovery on a running one would clear a history nobody is
+              reading and re-probe a resource that is already up. */}
+          {row.acts === "vip" && row.tone === "crit" && (
+            <button
+              type="button"
+              className="icon-button"
+              disabled={busy}
+              title="Clear the recorded failure and probe the address again — do this after fixing what stopped it"
+              onClick={() => void onRecover(row)}
+            >
+              <RotateCcw size={15} />
+            </button>
+          )}
+          <RowActions
+            label={row.name}
+            onEdit={() => onEdit(row)}
+            onDelete={() => onDelete(row)}
+            editDisabled={busy || row.acts === null}
+            editTitle={
+              row.acts === null
+                ? "Core and Management are defined when the cluster is created"
+                : undefined
+            }
+            // The cluster address is removed by editing it — clearing the
+            // field is what "no cluster address" means, and a delete control
+            // beside it would be a second way to say the same thing.
+            deleteDisabled={busy || row.acts !== "external"}
+            deleteTitle={
+              row.acts === "vip"
+                ? "Clear the address in the edit dialog to remove it"
+                : row.acts === null
+                  ? "Core and Management go when the cluster does"
+                  : undefined
+            }
+          />
+        </div>
+      )}
     />
   );
 }
@@ -265,6 +392,14 @@ export default function NetworksPage() {
   const [answers, setAnswers] = useState<Record<string, NetworksAnswer>>({});
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  /// The External network being changed, with the cluster it belongs to —
+  /// the table spans clusters, so a name alone does not identify one.
+  const [editing, setEditing] = useState<{ cluster: string; network: ExternalNetwork } | null>(
+    null,
+  );
+  /// The cluster whose address is being changed.
+  const [editingVip, setEditingVip] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
   const [inventory, setInventory] = useState<InventoryResponse | null>(null);
   const { setToast } = useConsole();
 
@@ -313,7 +448,7 @@ export default function NetworksPage() {
   const rows = clusters.flatMap((cluster) => {
     const answer = answers[cluster.name];
     if (!answer || "error" in answer) return [];
-    return networkRows(cluster, answer.networks);
+    return networkRows(cluster, answer.networks, ringsByNode(cluster, inventory));
   });
 
   const unreadable = clusters.flatMap((cluster): [string, string][] => {
@@ -329,6 +464,53 @@ export default function NetworksPage() {
       <Plus size={15} /> Create Network
     </Button>
   );
+
+  /// One action, its outcome reported the same way whichever it was. The
+  /// reload afterwards is what makes the table show what the cluster now
+  /// says rather than what the console asked for.
+  ///
+  /// An empty `success` leaves the toast to the action: some outcomes are not
+  /// a single sentence known in advance.
+  const run = async (action: () => Promise<unknown>, success: string) => {
+    setBusy(true);
+    try {
+      await action();
+      if (success) setToast(success);
+      await load();
+    } catch (err) {
+      setToast(err instanceof Error ? err.message : "Something went wrong.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const edit = (row: NetworkRow) => {
+    if (row.acts === "vip") setEditingVip(row.cluster);
+    else if (row.external) setEditing({ cluster: row.cluster, network: row.external });
+  };
+
+  const remove = (row: NetworkRow) =>
+    run(
+      () => forgetExternalNetwork(row.cluster, row.name),
+      `${row.name} is no longer defined. Its bridges were left on each member — remove them on Interfaces if nothing is using them.`,
+    );
+
+  // The recovery answers with the address as Pacemaker has it a moment
+  // later, and that answer is the point: a cause that is still there comes
+  // back saying so, and telling the operator "recovered" would be a lie the
+  // next poll would contradict anyway.
+  const recover = (row: NetworkRow) =>
+    run(async () => {
+      const vip = await recoverClusterVip(row.cluster);
+      const state = vip.state;
+      setToast(
+        state?.active
+          ? `The cluster address is up on ${shortNodeName(state.node ?? "a member")}.`
+          : `The failure was cleared and the address probed again — Pacemaker still reports ${
+              state?.reason ?? state?.role ?? "it stopped"
+            }. Whatever stopped it is still there.`,
+      );
+    }, "");
 
   return (
     <Page>
@@ -357,7 +539,15 @@ export default function NetworksPage() {
           )}
 
           {clusters.length > 0 && (
-            <NetworksTable rows={rows} onRefresh={load} toolbar={createControl} />
+            <NetworksTable
+              rows={rows}
+              onRefresh={load}
+              toolbar={createControl}
+              busy={busy}
+              onEdit={edit}
+              onDelete={remove}
+              onRecover={recover}
+            />
           )}
 
           {/* A cluster whose record could not be read contributes no rows, so
@@ -400,6 +590,42 @@ export default function NetworksPage() {
           onClose={() => setCreating(false)}
           onCreated={(message) => {
             setCreating(false);
+            setToast(message);
+            void load();
+          }}
+        />
+      )}
+
+      {/* The same dialog, opened against an existing definition. One form
+          rather than two: the fields an External network has do not change
+          because it already exists, and two forms is two places for the
+          every-member rule to be spelled differently. */}
+      {editing && (
+        <CreateExternalNetworkDialog
+          clusters={clusters}
+          inventory={inventory}
+          editing={editing}
+          onClose={() => setEditing(null)}
+          onCreated={(message) => {
+            setEditing(null);
+            setToast(message);
+            void load();
+          }}
+        />
+      )}
+
+      {editingVip && (
+        <EditClusterVipDialog
+          cluster={clusters.find((c) => c.name === editingVip) ?? null}
+          networks={
+            (() => {
+              const answer = answers[editingVip];
+              return answer && !("error" in answer) ? answer.networks : null;
+            })()
+          }
+          onClose={() => setEditingVip(null)}
+          onSaved={(message) => {
+            setEditingVip(null);
             setToast(message);
             void load();
           }}

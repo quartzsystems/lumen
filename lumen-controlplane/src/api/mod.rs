@@ -116,6 +116,13 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/environment/storage/pools",
             post(cluster::create_cluster_pool),
         )
+        // Clearing one member's disk from any member's console. The disk
+        // picker spans the environment, so the operation that unblocks it has
+        // to as well — see the handler for why the node is in the path.
+        .route(
+            "/api/environment/nodes/{node}/disks/{disk}/wipe",
+            post(cluster::wipe_node_disk),
+        )
         .route("/api/environment/tokens", post(cluster::mint_token))
         .route("/api/environment/join", post(cluster::join))
         .route("/api/environment/preflight", post(cluster::preflight))
@@ -145,6 +152,27 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/environment/clusters/{name}/networks/external",
             post(cluster::create_external_network),
+        )
+        // Changing an External network rebuilds it everywhere before the
+        // record admits the change, exactly as defining one does. Removing
+        // it forgets the definition and leaves the bridges — see the handler.
+        .route(
+            "/api/environment/clusters/{name}/networks/external/{network}",
+            put(cluster::update_external_network).delete(cluster::forget_external_network),
+        )
+        // Moving the cluster address, or taking it away. Acknowledged rather
+        // than refused: there is no version of this that does not drop the
+        // address for a moment.
+        .route(
+            "/api/environment/clusters/{name}/vip",
+            put(cluster::set_vip),
+        )
+        // Clearing the cluster address's latched failure and probing it
+        // again — the step that turns "I fixed the cause" into an address
+        // that actually comes back up.
+        .route(
+            "/api/environment/clusters/{name}/vip/recover",
+            post(cluster::recover_vip),
         )
         .route(
             "/api/environment/nodes/{name}",
@@ -188,6 +216,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/peer/network/bridge", post(peer::create_bridge))
         .route("/api/peer/node/inventory", post(peer::inventory))
         .route("/api/peer/storage/pool", post(peer::create_pool))
+        .route("/api/peer/storage/wipe", post(peer::wipe_disk))
         .route("/api/peer/cluster/teardown", post(peer::teardown))
         .route("/api/peer/cluster/reconfigure", post(peer::reconfigure))
         .route("/api/peer/volume/prepare", post(peer::prepare_volume))

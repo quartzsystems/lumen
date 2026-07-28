@@ -590,6 +590,60 @@ completing the handshake over real TLS — the fingerprint pin and the
 certificate chain. That is the manual test: two nodes, mint on one, paste on
 the other, and `openssl s_client` against both afterwards shows the same CA.
 
+## Editing the networks
+
+A cluster's typed networks are defined when it is created, and two of the
+three can be changed afterwards.
+
+**External networks** change the way they are defined: `PUT
+/api/environment/clusters/{name}/networks/external/{network}` rebuilds the
+bridge on every member and only then rewrites the record. Same order and
+same reason as the create — a definition the record claims and a member has
+not built is exactly the inconsistency the every-member rule forbids. The
+name is the one field that does not move: it is what a machine's adapter
+refers to, so renaming would strand every machine on the network, and the
+route refuses it rather than quietly rebuilding under a new identity. The
+`DELETE` forgets the definition and leaves the bridges — they are ordinary
+links with machines possibly still attached, and Interfaces is the page that
+can say what is still on one. Neither verb can undo a rebuild that succeeded
+on one member and failed on the next; the error names the member, the record
+stays on the old definition, and a retry finishes the job.
+
+**The cluster address** moves through `PUT
+/api/environment/clusters/{name}/vip`, with `null` to take it away. A move is
+a remove and a create: `IPaddr2` has no notion of its address changing under
+it, and without the removal the old address stays up on whichever member
+holds it. That means the address is down in between — and it is very likely
+the address the console is being reached on, so the route is guarded by an
+acknowledgement rather than a refusal. There is no safe version of this. What
+makes it recoverable rather than a lockout is that every member's own
+address stays valid throughout, which is what the dialog says before asking.
+
+**Recovering it** is a separate verb and a more common need: `POST
+/api/environment/clusters/{name}/vip/recover` runs `pcs resource cleanup`.
+Pacemaker latches a failed operation — the `rc_text` the console shows, "Not
+installed" among them, stays in the node history and the resource is left
+alone until somebody clears it. Fixing the cause is therefore not enough on
+its own; installing the missing tool changes nothing until something asks
+again. This asks again, and answers with what Pacemaker says next rather
+than with a success flag: a recovery run before the cause is fixed re-probes,
+fails the same way, and the console reports that instead of a green toast
+over an address nobody answers on.
+
+**Core and Management cannot be changed here**, and the omission is
+deliberate rather than pending. Their subnets and per-member addresses are
+corosync's ring addressing, written into `corosync.conf` on every member;
+changing one means rewriting that file everywhere, reloading corosync, and
+re-addressing each node's link — with DRBD's peer addresses riding Core and
+the console's own session riding Management. The machinery for the writes
+exists (`ReconfigurePayload` does exactly this for the scale-out); what does
+not exist is the part that matters, which is a staged apply with a confirm
+window and an automatic rollback, of the kind the networking domain already
+keeps for an ordinary link change. Without it a member that drops out
+mid-change leaves a cluster whose members disagree about their own ring, and
+that is a split, not a failed edit. It belongs behind that machinery, not in
+front of it.
+
 ## Out of scope
 
 The clustering program this document set out — environment, clusters,

@@ -83,6 +83,25 @@ fn harness(
     peers: MockPeers,
     membership: Option<&EnvironmentMembership>,
 ) -> Harness {
+    harness_with_storage(
+        tag,
+        backend,
+        peers,
+        membership,
+        Arc::new(lumen_zfs::backend::mock::MockBackend::appliance()),
+    )
+}
+
+/// The same, with the node's disks arranged by the caller — for the tests
+/// about clearing one, which need a node that actually has a disk in the
+/// state a wipe is offered in.
+fn harness_with_storage(
+    tag: &str,
+    backend: MockBackend,
+    peers: MockPeers,
+    membership: Option<&EnvironmentMembership>,
+    disks: Arc<lumen_zfs::backend::mock::MockBackend>,
+) -> Harness {
     let mut config = Config::from_env();
     config.webui_dir = std::env::temp_dir().join("lumen-webui-none");
     config.no_tls = true;
@@ -93,9 +112,7 @@ fn harness(
         &state_dir.0.join("net"),
         60,
     ));
-    let storage = Arc::new(StorageService::new(Arc::new(
-        lumen_zfs::backend::mock::MockBackend::appliance(),
-    )));
+    let storage = Arc::new(StorageService::new(disks).with_root_pool(Some("boot".into())));
     let virt = Arc::new(VirtService::new(
         Arc::new(lumen_virt::backend::mock::MockBackend::appliance()),
         storage.clone(),
@@ -352,7 +369,10 @@ async fn a_member_that_cannot_be_asked_is_a_row_carrying_its_reason() {
     assert_eq!(peer["reachable"], false);
     assert!(peer["inventory"].is_null() || peer.get("inventory").is_none());
     assert!(
-        peer["error"].as_str().unwrap().contains("could not be asked"),
+        peer["error"]
+            .as_str()
+            .unwrap()
+            .contains("could not be asked"),
         "{peer}"
     );
 }
@@ -1612,4 +1632,550 @@ async fn an_unassigned_node_can_be_removed_but_a_member_cannot() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert!(answer["error"].as_str().unwrap().contains("beta"));
+}
+
+// --- changing an external network --------------------------------------------
+
+/// The whole rule, on the way back out: a change is built on every member
+/// before the record admits it, exactly as a create is.
+#[tokio::test]
+async fn changing_an_external_network_rebuilds_it_on_every_member() {
+    let harness = harness(
+        "external-update",
+        MockBackend::environment(),
+        MockPeers::new(),
+        Some(&membership_with_networks()),
+    );
+    let cookie = sign_in(&harness.router).await;
+
+    let (status, answer) = request(
+        &harness.router,
+        Method::PUT,
+        "/api/environment/clusters/alpha/networks/external/vm-lan",
+        Some(&cookie),
+        None,
+        Some(serde_json::json!({
+            "name": "vm-lan",
+            "bridge": "vmbr9",
+            "mode": "access",
+            "vlan": 30,
+            "uplinks": [
+                { "node": "alpha-1", "interface": "nic4" },
+                { "node": "alpha-2", "interface": "nic4" },
+            ],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["bridge"], "vmbr9");
+    assert_eq!(answer["mode"], "access");
+
+    // Rebuilt on both, and as an access network this time: the bridge sits on
+    // a VLAN interface rather than on the raw uplink.
+    let built = harness.peers.bridges();
+    assert_eq!(built.len(), 2, "one bridge per member");
+    for (_, seat) in &built {
+        assert_eq!(seat.bridge.name, "vmbr9");
+        assert!(
+            !seat.bridge.vlan_filtering,
+            "an access network is not a trunk"
+        );
+        assert_eq!(
+            seat.vlan.as_ref().map(|vlan| vlan.vlan_id),
+            Some(30),
+            "the tag is put on by a VLAN interface underneath"
+        );
+        assert_eq!(seat.bridge.ports, vec!["nic4.30".to_string()]);
+    }
+
+    let (_, networks) = request(
+        &harness.router,
+        Method::GET,
+        "/api/environment/clusters/alpha/networks",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(networks["external"][0]["bridge"], "vmbr9");
+    assert_eq!(networks["external"][0]["vlan"], 30);
+}
+
+/// The name is what a machine's adapter refers to. Renaming would leave every
+/// machine pointing at a network that no longer exists, so it is refused
+/// rather than quietly accepted and rebuilt under a new identity.
+#[tokio::test]
+async fn an_external_network_cannot_be_renamed_through_an_edit() {
+    let harness = harness(
+        "external-rename",
+        MockBackend::environment(),
+        MockPeers::new(),
+        Some(&membership_with_networks()),
+    );
+    let cookie = sign_in(&harness.router).await;
+
+    let (status, answer) = request(
+        &harness.router,
+        Method::PUT,
+        "/api/environment/clusters/alpha/networks/external/vm-lan",
+        Some(&cookie),
+        None,
+        Some(serde_json::json!({
+            "name": "vm-lan-2",
+            "bridge": "vmbr1",
+            "mode": "trunk",
+            "allowed": [10, 20],
+            "uplinks": [
+                { "node": "alpha-1", "interface": "nic2" },
+                { "node": "alpha-2", "interface": "nic2" },
+            ],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert!(
+        answer["error"]
+            .as_str()
+            .unwrap()
+            .contains("cannot be changed"),
+        "{answer}"
+    );
+    assert!(harness.peers.bridges().is_empty(), "nothing was rebuilt");
+}
+
+/// The every-member rule holds for a change too — and a member left without an
+/// uplink is caught before anything is built, not halfway through.
+#[tokio::test]
+async fn an_edit_that_drops_a_member_is_refused_and_builds_nothing() {
+    let harness = harness(
+        "external-update-partial",
+        MockBackend::environment(),
+        MockPeers::new(),
+        Some(&membership_with_networks()),
+    );
+    let cookie = sign_in(&harness.router).await;
+
+    let (status, answer) = request(
+        &harness.router,
+        Method::PUT,
+        "/api/environment/clusters/alpha/networks/external/vm-lan",
+        Some(&cookie),
+        None,
+        Some(serde_json::json!({
+            "name": "vm-lan",
+            "bridge": "vmbr1",
+            "mode": "trunk",
+            "allowed": [10],
+            "uplinks": [{ "node": "alpha-1", "interface": "nic2" }],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert!(
+        answer["error"].as_str().unwrap().contains("alpha-2"),
+        "{answer}"
+    );
+    assert!(harness.peers.bridges().is_empty(), "nothing was built");
+}
+
+/// Removing one forgets the definition and leaves the links. The bridges are
+/// ordinary links with machines possibly still attached, and the answer says
+/// so rather than letting an operator find a stray link later and wonder.
+#[tokio::test]
+async fn forgetting_an_external_network_leaves_its_bridges_alone() {
+    let harness = harness(
+        "external-forget",
+        MockBackend::environment(),
+        MockPeers::new(),
+        Some(&membership_with_networks()),
+    );
+    let cookie = sign_in(&harness.router).await;
+
+    let (status, answer) = request(
+        &harness.router,
+        Method::DELETE,
+        "/api/environment/clusters/alpha/networks/external/vm-lan",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert!(
+        answer["note"].as_str().unwrap().contains("left in place"),
+        "{answer}"
+    );
+
+    let (_, networks) = request(
+        &harness.router,
+        Method::GET,
+        "/api/environment/clusters/alpha/networks",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert!(
+        networks["external"].as_array().unwrap().is_empty(),
+        "{networks}"
+    );
+
+    let (status, answer) = request(
+        &harness.router,
+        Method::DELETE,
+        "/api/environment/clusters/alpha/networks/external/vm-lan",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{answer}");
+}
+
+// --- the cluster address ------------------------------------------------------
+
+/// The operation the console offers against a latched failure.
+///
+/// Pacemaker keeps a failed operation's result until somebody clears it, so an
+/// address stopped with "Not installed" stays stopped after the missing piece
+/// is installed. This clears it and probes again — and answers with what
+/// Pacemaker says next, not with a success flag.
+#[tokio::test]
+async fn recovering_the_cluster_address_clears_its_failure_and_reports_what_followed() {
+    let backend = MockBackend::environment().with_stopped_vip("alpha", "Not installed");
+    let harness = harness(
+        "vip-recover",
+        backend,
+        MockPeers::new(),
+        Some(&membership_with_networks()),
+    );
+    let cookie = sign_in(&harness.router).await;
+
+    // Before: the console can see exactly why it is down.
+    let (_, cluster) = request(
+        &harness.router,
+        Method::GET,
+        "/api/environment/clusters/alpha",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(cluster["vip"]["state"]["reason"], "Not installed");
+    assert_eq!(cluster["vip"]["state"]["active"], false);
+
+    let (status, answer) = request(
+        &harness.router,
+        Method::POST,
+        "/api/environment/clusters/alpha/vip/recover",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["address"], "192.168.10.100");
+    assert_eq!(answer["state"]["active"], true, "{answer}");
+    assert!(answer["state"]["reason"].is_null(), "{answer}");
+}
+
+/// A recovery run before the cause is fixed re-probes and fails the same way.
+/// The answer says so instead of reporting the cleanup as a repair — the
+/// console would otherwise show a green toast over an address nobody answers
+/// on.
+#[tokio::test]
+async fn a_recovery_before_the_cause_is_fixed_answers_with_the_same_failure() {
+    let backend = MockBackend::environment()
+        .with_stopped_vip("alpha", "Not installed")
+        .with_unfixed_cause();
+    let harness = harness(
+        "vip-recover-unfixed",
+        backend,
+        MockPeers::new(),
+        Some(&membership_with_networks()),
+    );
+    let cookie = sign_in(&harness.router).await;
+
+    let (status, answer) = request(
+        &harness.router,
+        Method::POST,
+        "/api/environment/clusters/alpha/vip/recover",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["state"]["active"], false, "{answer}");
+    assert_eq!(answer["state"]["reason"], "Not installed", "{answer}");
+}
+
+/// Moving the address is a remove and a create: `IPaddr2` has no notion of its
+/// address changing underneath it, and without the removal the old address
+/// stays up on whichever member holds it.
+#[tokio::test]
+async fn moving_the_cluster_address_removes_the_old_resource_first() {
+    let harness = harness(
+        "vip-move",
+        MockBackend::environment(),
+        MockPeers::new(),
+        Some(&membership_with_networks()),
+    );
+    let cookie = sign_in(&harness.router).await;
+
+    let (status, answer) = request(
+        &harness.router,
+        Method::PUT,
+        "/api/environment/clusters/alpha/vip",
+        Some(&cookie),
+        None,
+        Some(serde_json::json!({
+            "address": "192.168.10.150",
+            "i_understand_this_may_disconnect_me": true,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["vip"]["address"], "192.168.10.150");
+
+    let (_, networks) = request(
+        &harness.router,
+        Method::GET,
+        "/api/environment/clusters/alpha/networks",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(networks["management"]["vip"], "192.168.10.150");
+}
+
+/// Without the acknowledgement, nothing happens. There is no safe version of
+/// this — the old address comes down before the new one goes up — so the guard
+/// is a refusal until the operator has been told.
+#[tokio::test]
+async fn changing_the_cluster_address_needs_the_acknowledgement() {
+    let harness = harness(
+        "vip-unacked",
+        MockBackend::environment(),
+        MockPeers::new(),
+        Some(&membership_with_networks()),
+    );
+    let cookie = sign_in(&harness.router).await;
+
+    let (status, answer) = request(
+        &harness.router,
+        Method::PUT,
+        "/api/environment/clusters/alpha/vip",
+        Some(&cookie),
+        None,
+        Some(serde_json::json!({ "address": "192.168.10.150" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+
+    let (_, networks) = request(
+        &harness.router,
+        Method::GET,
+        "/api/environment/clusters/alpha/networks",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(networks["management"]["vip"], "192.168.10.100", "unchanged");
+}
+
+/// An address outside the Management subnet, or one a member already holds, is
+/// refused before the old one comes down — the two ways a cluster address
+/// becomes a resource that never starts.
+#[tokio::test]
+async fn an_unusable_cluster_address_is_refused_before_anything_moves() {
+    let harness = harness(
+        "vip-invalid",
+        MockBackend::environment(),
+        MockPeers::new(),
+        Some(&membership_with_networks()),
+    );
+    let cookie = sign_in(&harness.router).await;
+
+    for (address, why) in [("10.99.0.5", "outside"), ("192.168.10.1", "already")] {
+        let (status, answer) = request(
+            &harness.router,
+            Method::PUT,
+            "/api/environment/clusters/alpha/vip",
+            Some(&cookie),
+            None,
+            Some(serde_json::json!({
+                "address": address,
+                "i_understand_this_may_disconnect_me": true,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{address}: {answer}");
+        assert!(
+            answer.to_string().contains(why),
+            "{address} should be refused as {why}: {answer}"
+        );
+    }
+
+    let (_, networks) = request(
+        &harness.router,
+        Method::GET,
+        "/api/environment/clusters/alpha/networks",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(networks["management"]["vip"], "192.168.10.100", "unchanged");
+}
+
+/// Clearing the address is how it is removed — the resource goes and the
+/// members keep their own addresses, which is what a cluster defined without
+/// one looks like.
+#[tokio::test]
+async fn clearing_the_cluster_address_removes_it() {
+    let harness = harness(
+        "vip-clear",
+        MockBackend::environment(),
+        MockPeers::new(),
+        Some(&membership_with_networks()),
+    );
+    let cookie = sign_in(&harness.router).await;
+
+    let (status, answer) = request(
+        &harness.router,
+        Method::PUT,
+        "/api/environment/clusters/alpha/vip",
+        Some(&cookie),
+        None,
+        Some(serde_json::json!({
+            "address": serde_json::Value::Null,
+            "i_understand_this_may_disconnect_me": true,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert!(answer["vip"].is_null(), "{answer}");
+
+    let (_, networks) = request(
+        &harness.router,
+        Method::GET,
+        "/api/environment/clusters/alpha/networks",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert!(networks["management"]["vip"].is_null(), "{networks}");
+
+    // And there is nothing left to recover.
+    let (status, answer) = request(
+        &harness.router,
+        Method::POST,
+        "/api/environment/clusters/alpha/vip/recover",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert!(
+        answer["error"]
+            .as_str()
+            .unwrap()
+            .contains("no cluster address"),
+        "{answer}"
+    );
+}
+
+// --- clearing a disk across the environment ----------------------------------
+
+/// The local node short-circuits to its own storage domain, the same way the
+/// inventory read does — there is no socket to itself, and the answer is the
+/// disk as the node now reports it.
+#[tokio::test]
+async fn clearing_a_disk_on_this_node_goes_through_its_own_storage_domain() {
+    const TB: u64 = 1_000_000_000_000;
+    let membership = membership_of(&[("alpha-1", None)]);
+    let harness = harness_with_storage(
+        "wipe-local",
+        MockBackend::appliance(),
+        MockPeers::new(),
+        Some(&membership),
+        Arc::new(
+            lumen_zfs::backend::mock::MockBackend::appliance().with_disks(vec![
+                lumen_zfs::backend::mock::MockBackend::partitioned_disk("sdb", TB, 2),
+            ]),
+        ),
+    );
+    let cookie = sign_in(&harness.router).await;
+
+    let (status, answer) = request(
+        &harness.router,
+        Method::POST,
+        "/api/environment/nodes/alpha-1/disks/sdb/wipe",
+        Some(&cookie),
+        None,
+        Some(serde_json::json!({ "i_understand_this_may_lose_data": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["name"], "sdb");
+    assert_eq!(answer["in_use"], false, "{answer}");
+    assert_eq!(answer["partitions"], 0, "{answer}");
+}
+
+/// Without the acknowledgement, nothing is touched — checked once at the
+/// environment layer, before the request is routed anywhere.
+#[tokio::test]
+async fn clearing_a_disk_needs_the_acknowledgement() {
+    let membership = membership_of(&[("alpha-1", None)]);
+    let harness = harness(
+        "wipe-unacked",
+        MockBackend::appliance(),
+        MockPeers::new(),
+        Some(&membership),
+    );
+    let cookie = sign_in(&harness.router).await;
+
+    let (status, answer) = request(
+        &harness.router,
+        Method::POST,
+        "/api/environment/nodes/alpha-1/disks/sdb/wipe",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert!(
+        answer["error"].as_str().unwrap().contains("no undo"),
+        "{answer}"
+    );
+}
+
+/// A node that is not in the environment is a 404, not an attempt to reach it.
+#[tokio::test]
+async fn clearing_a_disk_on_a_stranger_is_refused() {
+    let membership = membership_of(&[("alpha-1", None)]);
+    let harness = harness(
+        "wipe-stranger",
+        MockBackend::appliance(),
+        MockPeers::new(),
+        Some(&membership),
+    );
+    let cookie = sign_in(&harness.router).await;
+
+    let (status, answer) = request(
+        &harness.router,
+        Method::POST,
+        "/api/environment/nodes/somewhere-else/disks/sdb/wipe",
+        Some(&cookie),
+        None,
+        Some(serde_json::json!({ "i_understand_this_may_lose_data": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{answer}");
 }

@@ -285,6 +285,38 @@ pub struct BlockDevice {
     /// partitions". Absent when the disk is genuinely empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub used_by: Option<String>,
+    /// How many partitions it carries.
+    ///
+    /// Split out from `in_use` because the two halves lead to different
+    /// offers. A disk that is spoken for only by a partition table is one an
+    /// operator can reclaim; a disk something is actively using is not.
+    #[serde(default)]
+    pub partitions: usize,
+    /// A mount or swap has this disk, or one of its partitions, open right
+    /// now. The half of `in_use` nothing may override — clearing a partition
+    /// table out from under a mounted filesystem takes the node with it.
+    #[serde(default)]
+    pub claimed: bool,
+    /// The console may offer to clear this disk.
+    ///
+    /// Filled in by the service, never by the `/sys` scan, and that is the
+    /// point: an imported ZFS pool does not appear in `/proc/mounts` as the
+    /// disk it was built on — its members carry partitions and nothing else —
+    /// so a live pool member looks exactly like a reclaimable disk to the
+    /// scan. Only the layer that can also ask `zpool` may answer this.
+    #[serde(default)]
+    pub wipeable: bool,
+}
+
+impl BlockDevice {
+    /// What the node's own `/sys` view says about clearing this disk: there
+    /// is something to clear, and nothing live is using it.
+    ///
+    /// Deliberately not the final answer — see [`BlockDevice::wipeable`],
+    /// which is what the console reads.
+    pub fn looks_wipeable(&self) -> bool {
+        !self.claimed && self.partitions > 0
+    }
 }
 
 /// A pool to create.

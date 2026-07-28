@@ -69,6 +69,14 @@ impl ClusterBackend for UnavailableBackend {
         self.error()
     }
 
+    async fn remove_resource(&self, _resource: &str) -> Result<()> {
+        self.error()
+    }
+
+    async fn cleanup_resource(&self, _resource: &str) -> Result<()> {
+        self.error()
+    }
+
     async fn create_fence_device(
         &self,
         _device: &crate::topology::FenceDevice,

@@ -74,7 +74,7 @@ export function deriveAlarms({ vms, pools, links, pending, nodes }: AlarmSources
         severity: lost ? "critical" : "warning",
         source: "Storage",
         summary: `Pool ${pool.name} is ${pool.health}.`,
-        href: "/storage",
+        href: "/storage/pools",
       });
       continue;
     }
@@ -84,7 +84,7 @@ export function deriveAlarms({ vms, pools, links, pending, nodes }: AlarmSources
         severity: pool.used_percent >= POOL_CRIT_PERCENT ? "critical" : "warning",
         source: "Storage",
         summary: `Pool ${pool.name} is ${Math.round(pool.used_percent)}% full.`,
-        href: "/storage",
+        href: "/storage/pools",
       });
     }
   }

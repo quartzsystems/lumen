@@ -189,11 +189,120 @@ impl StorageService {
     /// can refuse the disk the appliance is running from rather than listing it
     /// next to the empty ones with nothing to tell them apart.
     pub async fn block_devices(&self) -> Result<DevicesResponse> {
+        let mut devices = self.backend.block_devices().await?;
+        // The half the `/sys` scan cannot answer. A pool member is a disk
+        // with a couple of partitions and nothing in `/proc/mounts`, which is
+        // exactly what a disk somebody finished with looks like — so the disk
+        // reads as reclaimable until `zpool` is asked, and offering a wipe on
+        // that reading would destroy a running pool.
+        //
+        // A `zpool` that cannot be asked leaves every disk unwipeable rather
+        // than every disk wipeable. The console loses a button; the
+        // alternative loses a pool.
+        let members = self.backend.pool_members().await.unwrap_or_default();
+        for device in &mut devices {
+            let pool = members
+                .iter()
+                .find_map(|(path, pool)| claims_device(path, device).then(|| pool.clone()));
+            match pool {
+                Some(pool) => {
+                    // Said in the disk's own row rather than left for the
+                    // operator to work out from a partition count: "2
+                    // partitions" and "in pool tank" are the same disk and
+                    // very different decisions.
+                    device.in_use = true;
+                    device.used_by = Some(format!("in pool {pool}"));
+                    device.wipeable = false;
+                }
+                None => device.wipeable = device.looks_wipeable(),
+            }
+        }
         Ok(DevicesResponse {
             node: self.node.clone(),
-            devices: self.backend.block_devices().await?,
+            devices,
             root_pool: self.root_pool.clone(),
         })
+    }
+
+    /// Clear a disk so it can hold a pool again.
+    ///
+    /// The gap this closes: a disk that carries a partition table and nothing
+    /// else is refused by the pool picker with "2 partitions" and no way to
+    /// act on it, so an operator reusing hardware has to leave the console to
+    /// get anywhere. It is offered in that one state and no other.
+    ///
+    /// Every guard is here rather than in the backend, and they are the
+    /// point. A disk something has mounted, a disk holding an imported pool,
+    /// and the disk the appliance boots from are all refused — the last one
+    /// unconditionally, because nothing this console offers may take the
+    /// appliance away from the operator using it.
+    pub async fn wipe_disk(&self, name: &str, ack: Acknowledgements) -> Result<BlockDevice> {
+        let _guard = self.gate.lock().await;
+
+        if !ack.may_lose_data {
+            return Err(ZfsError::Invalid(vec![ValidationError::new(
+                ValidationCode::UnacknowledgedDestructiveOperation,
+                None,
+                format!(
+                    "Clearing \"{name}\" removes its partition table and every filesystem and \
+                     pool signature on it. Whatever was on that disk becomes unreachable, and \
+                     there is no undo. Confirm that you understand this may lose data."
+                ),
+            )]));
+        }
+
+        // Asked first and allowed to fail the request: this is what says
+        // whether the disk is holding a pool, and a wipe decided without that
+        // answer is a wipe decided on half the facts.
+        let members = self.backend.pool_members().await?;
+        let devices = self.backend.block_devices().await?;
+        let Some(device) = devices
+            .iter()
+            .find(|d| d.name == name || d.path == name || d.kernel_path == name)
+        else {
+            return Err(ZfsError::NotFound(format!(
+                "This node has no disk called \"{name}\"."
+            )));
+        };
+
+        if let Some((_, pool)) = members.iter().find(|(path, _)| claims_device(path, device)) {
+            return Err(ZfsError::Conflict(format!(
+                "\"{}\" is one of the disks pool \"{pool}\" is built on. Destroy the pool first \
+                 — clearing a disk out from under a live pool loses the pool, not just the disk.",
+                device.name
+            )));
+        }
+        if device.claimed {
+            return Err(ZfsError::Conflict(format!(
+                "\"{}\" is in use — {}. Clearing it would pull the disk out from under whatever \
+                 has it open.",
+                device.name,
+                device.used_by.as_deref().unwrap_or("something has it open")
+            )));
+        }
+        if device.partitions == 0 {
+            return Err(ZfsError::Conflict(format!(
+                "\"{}\" has nothing on it to clear — it is already free for a pool.",
+                device.name
+            )));
+        }
+
+        self.backend.wipe_disk(device).await?;
+        tracing::info!(disk = %device.name, path = %device.path, "disk cleared");
+
+        // Read back rather than reporting the disk as it was: what the
+        // console shows next has to be what the node now says, and a wipe
+        // that half-worked is worth seeing.
+        let devices = self.backend.block_devices().await?;
+        devices
+            .into_iter()
+            .find(|d| d.name == device.name)
+            .ok_or_else(|| {
+                ZfsError::Backend(anyhow::anyhow!(
+                    "cleared \"{}\" but the node no longer lists it",
+                    device.name
+                ))
+            })
     }
 
     /// Build a pool.
@@ -484,6 +593,48 @@ impl StorageService {
             .iter()
             .any(|image| image.path == path))
     }
+}
+
+/// Whether a path a pool is built on refers to this disk — the disk itself,
+/// or any partition of it.
+///
+/// The shapes have to be reconciled rather than compared, because a pool is
+/// built on whatever it was given: a by-id path, a partition of one
+/// (`…-part1`), or a bare kernel name. A pool built on `nvme0n1p3` is a pool
+/// that owns `nvme0n1`, and missing that is the difference between refusing a
+/// wipe and destroying the pool.
+///
+/// Which suffix means "a partition of this" depends on the last character of
+/// the name, and getting that wrong is not cosmetic. The kernel appends a
+/// bare number to a name ending in a letter (`sda` → `sda2`) and `p` plus a
+/// number to one ending in a digit (`nvme0n1` → `nvme0n1p2`) — precisely so
+/// the two can be told apart. Accepting a bare number after a digit would
+/// read `nvme0n11`, a different disk entirely, as a partition of `nvme0n1`,
+/// and refuse a wipe that should have been allowed.
+fn claims_device(pool_path: &str, device: &BlockDevice) -> bool {
+    let digits = |value: &str| !value.is_empty() && value.chars().all(|c| c.is_ascii_digit());
+    let claims = |base: &str| -> bool {
+        if pool_path == base {
+            return true;
+        }
+        let Some(suffix) = pool_path.strip_prefix(base) else {
+            return false;
+        };
+        // A by-id link to a partition. Named this way by udev, not derived,
+        // and the same whatever the disk's name ends in.
+        if let Some(rest) = suffix.strip_prefix("-part") {
+            return digits(rest);
+        }
+        match base.chars().last() {
+            Some(last) if last.is_ascii_digit() => suffix.strip_prefix('p').is_some_and(digits),
+            _ => digits(suffix),
+        }
+    };
+    // An empty base would make every path a match. It cannot happen with a
+    // disk the scan produced, and the check costs nothing.
+    [&device.path, &device.kernel_path]
+        .iter()
+        .any(|base| !base.is_empty() && claims(base))
 }
 
 fn reject_bad_pool(pool: &str) -> Result<()> {
@@ -991,5 +1142,162 @@ mod tests {
             .create_volume("boot", "vm-101-disk-0", 0, None)
             .await
             .is_err());
+    }
+
+    // --- clearing a disk ------------------------------------------------------
+
+    /// A node with the three states a wipe has to tell apart: a disk the
+    /// system is running from, a disk carrying nothing but an old partition
+    /// table, and an empty one.
+    fn node_with_reclaimable_disks() -> (StorageService, Arc<MockBackend>) {
+        const TB: u64 = 1_000_000_000_000;
+        let backend = Arc::new(MockBackend::appliance().with_disks(vec![
+            MockBackend::busy_disk("sda", TB),
+            MockBackend::partitioned_disk("sdb", TB, 2),
+            MockBackend::free_disk("sdc", TB),
+        ]));
+        (
+            StorageService::new(backend.clone()).with_root_pool(Some("boot".into())),
+            backend,
+        )
+    }
+
+    /// The three states, as the console reads them off one call.
+    #[tokio::test]
+    async fn a_disk_is_offered_for_clearing_only_when_something_is_on_it_and_nothing_uses_it() {
+        let (service, _backend) = node_with_reclaimable_disks();
+        let devices = service.block_devices().await.unwrap().devices;
+        let find = |name: &str| devices.iter().find(|d| d.name == name).unwrap();
+
+        // Mounted: in use, and not this page's to take.
+        assert!(find("sda").in_use);
+        assert!(!find("sda").wipeable);
+        // A partition table and nothing using it: a decision away from free.
+        assert!(find("sdb").in_use);
+        assert!(find("sdb").wipeable);
+        // Already empty: nothing to clear.
+        assert!(!find("sdc").in_use);
+        assert!(!find("sdc").wipeable);
+    }
+
+    /// Clearing leaves the disk reading as empty, so the picker that refused
+    /// it a moment ago can offer it.
+    #[tokio::test]
+    async fn clearing_a_reclaimable_disk_makes_it_free_for_a_pool() {
+        let (service, backend) = node_with_reclaimable_disks();
+        let cleared = service.wipe_disk("sdb", acknowledged()).await.unwrap();
+        assert!(!cleared.in_use, "{cleared:?}");
+        assert_eq!(cleared.partitions, 0);
+        assert!(cleared.used_by.is_none());
+        assert_eq!(backend.wiped(), vec!["sdb"]);
+    }
+
+    /// The acknowledgement is the guard, not a formality: without it nothing
+    /// is touched.
+    #[tokio::test]
+    async fn clearing_a_disk_needs_the_acknowledgement() {
+        let (service, backend) = node_with_reclaimable_disks();
+        let err = service
+            .wipe_disk(
+                "sdb",
+                Acknowledgements {
+                    may_lose_data: false,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no undo"), "{err}");
+        assert!(backend.wiped().is_empty(), "nothing was cleared");
+    }
+
+    /// A mounted disk is refused, and the refusal names what has it — the
+    /// operator has to know what to free before they can act.
+    #[tokio::test]
+    async fn a_disk_something_has_open_is_refused() {
+        let (service, backend) = node_with_reclaimable_disks();
+        let err = service.wipe_disk("sda", acknowledged()).await.unwrap_err();
+        assert!(err.to_string().contains("mounted at /"), "{err}");
+        assert!(backend.wiped().is_empty());
+    }
+
+    /// The case the `/sys` scan cannot see on its own, and the reason
+    /// `pool_members` exists. A live pool's members carry partitions and
+    /// appear in no mount table, so they look exactly like a disk somebody
+    /// finished with — and clearing one destroys the pool.
+    #[tokio::test]
+    async fn a_disk_holding_an_imported_pool_is_refused_even_though_it_looks_reclaimable() {
+        const TB: u64 = 1_000_000_000_000;
+        let backend = Arc::new(
+            MockBackend::appliance()
+                .with_disks(vec![MockBackend::partitioned_disk("sdb", TB, 2)])
+                // As zpool reports it: a partition of the by-id path, which
+                // has to be recognised as claiming the whole disk.
+                .with_pool_member("/dev/disk/by-id/scsi-sdb-part1", "tank"),
+        );
+        let service = StorageService::new(backend.clone()).with_root_pool(Some("boot".into()));
+
+        // The listing says so before the operator even reaches for the
+        // control, in the pool's own name rather than as "2 partitions".
+        let devices = service.block_devices().await.unwrap().devices;
+        let sdb = devices.iter().find(|d| d.name == "sdb").unwrap();
+        assert!(!sdb.wipeable, "{sdb:?}");
+        assert_eq!(sdb.used_by.as_deref(), Some("in pool tank"));
+
+        let err = service.wipe_disk("sdb", acknowledged()).await.unwrap_err();
+        assert!(err.to_string().contains("tank"), "{err}");
+        assert!(backend.wiped().is_empty(), "the pool was not touched");
+    }
+
+    /// An empty disk has nothing to clear, and saying so beats a no-op that
+    /// looks like it worked.
+    #[tokio::test]
+    async fn an_already_empty_disk_has_nothing_to_clear() {
+        let (service, backend) = node_with_reclaimable_disks();
+        let err = service.wipe_disk("sdc", acknowledged()).await.unwrap_err();
+        assert!(err.to_string().contains("already free"), "{err}");
+        assert!(backend.wiped().is_empty());
+    }
+
+    /// The shapes a pool can be built on, reconciled against the shapes a disk
+    /// reports. A pool built on `nvme0n1p3` owns `nvme0n1`, and missing that
+    /// is the difference between refusing a wipe and destroying the pool.
+    #[test]
+    fn a_pool_path_is_matched_against_the_disk_and_its_partitions() {
+        let device = BlockDevice {
+            name: "nvme0n1".into(),
+            path: "/dev/disk/by-id/nvme-INTEL_SSDPE2KX010T8_ABC".into(),
+            kernel_path: "/dev/nvme0n1".into(),
+            ..BlockDevice::default()
+        };
+
+        // The disk itself, either way it can be named.
+        assert!(claims_device("/dev/nvme0n1", &device));
+        assert!(claims_device(
+            "/dev/disk/by-id/nvme-INTEL_SSDPE2KX010T8_ABC",
+            &device
+        ));
+        // Its partitions: the udev `-part` link, and the kernel's `p` suffix.
+        assert!(claims_device(
+            "/dev/disk/by-id/nvme-INTEL_SSDPE2KX010T8_ABC-part1",
+            &device
+        ));
+        assert!(claims_device("/dev/nvme0n1p3", &device));
+
+        // A different disk whose name merely starts the same way. This is the
+        // case a prefix check alone gets wrong, and getting it wrong here
+        // refuses a wipe that should have been allowed.
+        assert!(!claims_device("/dev/nvme0n11", &device));
+        assert!(!claims_device("/dev/nvme0n1x", &device));
+        assert!(!claims_device("/dev/sdb", &device));
+
+        // The other partition spelling, on a name ending in a letter.
+        let sda = BlockDevice {
+            name: "sda".into(),
+            path: "/dev/disk/by-id/scsi-sda".into(),
+            kernel_path: "/dev/sda".into(),
+            ..BlockDevice::default()
+        };
+        assert!(claims_device("/dev/sda2", &sda));
+        assert!(!claims_device("/dev/sdab", &sda));
     }
 }

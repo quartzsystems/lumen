@@ -5,25 +5,41 @@ import { AlertTriangle } from "lucide-react";
 import { ModalHeader, ModalShell } from "@/components/ui/Modal";
 import { Field, ModalFooter, SelectInput, TextInput } from "@/components/ui/formkit";
 import { ApiError } from "@/lib/authClient";
+import { shortNodeName, shortNodeNames } from "@/lib/nodeNames";
 import {
   createExternalNetwork,
+  updateExternalNetwork,
   type ClusterView,
+  type ExternalNetwork,
   type ExternalNetworkCreate,
   type Uplink,
 } from "@/lib/clusterClient";
 import { linksByMember, type InventoryResponse } from "@/lib/inventoryClient";
 
-/// Define an External network across a cluster.
+/// An External network being changed, with the cluster it belongs to. The
+/// table this is opened from spans clusters, so a name alone does not
+/// identify one.
+export interface ExternalNetworkEdit {
+  cluster: string;
+  network: ExternalNetwork;
+}
+
+/// Define an External network across a cluster, or change one.
 ///
-/// The dialog's shape follows the one rule that makes these networks usable:
-/// an External network is on every member or on none. A machine that fails
-/// over onto a node where its network does not resolve is the failure HA
-/// exists to prevent, so this collects an uplink per member and will not
-/// submit until every member has one — rather than accepting a partial
-/// definition and leaving the operator to discover the hole during an outage.
+/// One dialog for both, because the fields an External network has do not
+/// change because it already exists — and two forms would be two places for
+/// the every-member rule to be spelled differently.
+///
+/// That rule is what the shape follows: an External network is on every
+/// member or on none. A machine that fails over onto a node where its network
+/// does not resolve is the failure HA exists to prevent, so this collects an
+/// uplink per member and will not submit until every member has one — rather
+/// than accepting a partial definition and leaving the operator to discover
+/// the hole during an outage.
 export function CreateExternalNetworkDialog({
   clusters,
   inventory,
+  editing,
   onClose,
   onCreated,
 }: {
@@ -32,16 +48,26 @@ export function CreateExternalNetworkDialog({
   /// environment read failed, which is the one case the pickers fall back to
   /// free text.
   inventory: InventoryResponse | null;
+  /// The definition being changed, or absent to define a new one.
+  editing?: ExternalNetworkEdit;
   onClose: () => void;
   onCreated: (message: string) => void;
 }) {
-  const [cluster, setCluster] = useState(clusters[0]?.name ?? "");
-  const [name, setName] = useState("");
-  const [bridge, setBridge] = useState("");
-  const [mode, setMode] = useState<"trunk" | "access">("trunk");
-  const [vlan, setVlan] = useState("");
-  const [allowed, setAllowed] = useState("");
-  const [uplinks, setUplinks] = useState<Record<string, string>>({});
+  const [cluster, setCluster] = useState(editing?.cluster ?? clusters[0]?.name ?? "");
+  const [name, setName] = useState(editing?.network.name ?? "");
+  const [bridge, setBridge] = useState(editing?.network.bridge ?? "");
+  const [mode, setMode] = useState<"trunk" | "access">(editing?.network.mode ?? "trunk");
+  const [vlan, setVlan] = useState(
+    editing?.network.mode === "access" ? String(editing.network.vlan) : "",
+  );
+  const [allowed, setAllowed] = useState(
+    editing?.network.mode === "trunk" ? editing.network.allowed.join(", ") : "",
+  );
+  const [uplinks, setUplinks] = useState<Record<string, string>>(() =>
+    Object.fromEntries(
+      (editing?.network.uplinks ?? []).map((uplink) => [uplink.node, uplink.interface]),
+    ),
+  );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -103,21 +129,38 @@ export function CreateExternalNetworkDialog({
             allowed: vlanNumbers,
           };
     try {
-      await createExternalNetwork(cluster, body);
-      onCreated(`${name.trim()} defined on every member of ${cluster}.`);
+      if (editing) {
+        await updateExternalNetwork(editing.cluster, editing.network.name, body);
+        onCreated(`${editing.network.name} rebuilt on every member of ${editing.cluster}.`);
+      } else {
+        await createExternalNetwork(cluster, body);
+        onCreated(`${name.trim()} defined on every member of ${cluster}.`);
+      }
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) return;
-      setError(err instanceof Error ? err.message : "The network could not be created.");
+      setError(
+        err instanceof Error
+          ? err.message
+          : editing
+            ? "The network could not be changed."
+            : "The network could not be created.",
+      );
     } finally {
       setBusy(false);
     }
   };
 
+  const renamedBridge = editing !== undefined && bridge.trim() !== editing.network.bridge;
+
   return (
     <ModalShell onClose={busy ? () => {} : onClose}>
       <ModalHeader
-        title="Create External network"
-        subtitle="Virtual machine traffic, on an identically named bridge on every member."
+        title={editing ? `Edit ${editing.network.name}` : "Create External network"}
+        subtitle={
+          editing
+            ? "The change is built on every member before the cluster records it."
+            : "Virtual machine traffic, on an identically named bridge on every member."
+        }
         onClose={busy ? () => {} : onClose}
       />
       <div className="flex flex-col gap-4">
@@ -128,7 +171,7 @@ export function CreateExternalNetworkDialog({
           </div>
         )}
 
-        {clusters.length > 1 && (
+        {clusters.length > 1 && !editing && (
           <Field label="Cluster" htmlFor="external-cluster">
             <SelectInput
               id="external-cluster"
@@ -153,10 +196,21 @@ export function CreateExternalNetworkDialog({
         <Field
           label="Name"
           htmlFor="external-name"
-          hint="What machines attach to, and what every member calls it."
+          hint={
+            editing
+              ? "The name is what a machine's adapter refers to, so it cannot change — renaming it would strand every machine on this network."
+              : "What machines attach to, and what every member calls it."
+          }
           required
         >
-          <TextInput id="external-name" value={name} onChange={setName} mono autoFocus />
+          <TextInput
+            id="external-name"
+            value={name}
+            onChange={setName}
+            mono
+            autoFocus={!editing}
+            disabled={editing !== undefined}
+          />
         </Field>
 
         <Field
@@ -235,7 +289,12 @@ export function CreateExternalNetworkDialog({
             members.map((node) => {
               const options = candidatesFor(node);
               return (
-                <Field key={node} label={node} htmlFor={`uplink-${node}`} required>
+                <Field
+                  key={node}
+                  label={shortNodeName(node)}
+                  htmlFor={`uplink-${node}`}
+                  required
+                >
                   {options.length > 0 ? (
                     <SelectInput
                       id={`uplink-${node}`}
@@ -274,9 +333,24 @@ export function CreateExternalNetworkDialog({
           <div className="callout callout-warn">
             <AlertTriangle size={17} className="flex-shrink-0 text-[var(--qz-warn)] mt-[1px]" />
             <div className="text-[13px] text-[var(--qz-fg-2)]">
-              {missing.join(", ")} {missing.length === 1 ? "has" : "have"} no uplink yet. An
+              {shortNodeNames(missing)} {missing.length === 1 ? "has" : "have"} no uplink yet. An
               External network is defined on every member or on none — a machine that fails over
               onto a member without it comes up with no network.
+            </div>
+          </div>
+        )}
+
+        {/* The old bridge is not torn down, and saying so beats an operator
+            finding a stray link on Interfaces and wondering what left it. */}
+        {renamedBridge && (
+          <div className="callout callout-warn">
+            <AlertTriangle size={17} className="flex-shrink-0 text-[var(--qz-warn)] mt-[1px]" />
+            <div className="text-[13px] text-[var(--qz-fg-2)]">
+              <span className="qz-mono">{editing?.network.bridge}</span> stays on every member —
+              machines may still be attached to it, and this dialog will not pull a network out
+              from under a running guest. Move them onto{" "}
+              <span className="qz-mono">{bridge.trim() || "the new bridge"}</span>, then remove the
+              old link per node on Interfaces.
             </div>
           </div>
         )}
@@ -285,8 +359,8 @@ export function CreateExternalNetworkDialog({
           onCancel={onClose}
           saving={busy}
           disabled={!ready}
-          submitLabel="Create network"
-          savingLabel="Creating…"
+          submitLabel={editing ? "Save changes" : "Create network"}
+          savingLabel={editing ? "Rebuilding…" : "Creating…"}
           onSubmit={() => void submit()}
         />
       </div>

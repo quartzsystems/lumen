@@ -19,6 +19,7 @@ import { ModalFooter } from "@/components/ui/formkit";
 import { LinkDialog, dialogKindFor, type DialogKind } from "@/components/network/LinkDialog";
 import { ApiError } from "@/lib/authClient";
 import { titleCase, titleCaseOptions } from "@/lib/labels";
+import { shortNodeName } from "@/lib/nodeNames";
 import { useConsole } from "@/lib/ConsoleContext";
 import { useNetworkCheckpoint } from "@/lib/NetworkCheckpointContext";
 import {
@@ -312,7 +313,7 @@ export default function InterfacesPage() {
             <div className="callout callout-warn">
               <AlertTriangle size={17} className="flex-shrink-0 text-[var(--qz-warn)] mt-[1px]" />
               <div className="text-[13px] text-[var(--qz-fg-2)]">
-                {missing.map((member) => member.node).join(", ")}{" "}
+                {missing.map((member) => shortNodeName(member.node)).join(", ")}{" "}
                 {missing.length === 1 ? "could not be asked" : "could not be asked"} for its
                 interfaces, so none are listed below.
                 {missing[0]?.error && (
@@ -401,15 +402,11 @@ const columns: Column<OwnedLink>[] = [
     value: (row) => row.node,
     sortable: true,
     width: 190,
+    // The domain is the same on every row and the full name is one hover
+    // away; see lib/nodeNames.ts.
     render: (row) => (
-      <span className="inline-flex items-center gap-2 min-w-0">
-        <span className="qz-mono text-[12px] truncate" title={row.node}>
-          {row.node}
-        </span>
-        {/* Only this appliance's own links can be edited from here, and a row
-            that cannot be acted on should say why before the operator finds
-            out by clicking a greyed-out pencil. */}
-        {!row.local && <span className="badge badge-muted">remote</span>}
+      <span className="qz-mono text-[12px] truncate" title={row.node}>
+        {shortNodeName(row.node)}
       </span>
     ),
   },
@@ -566,10 +563,11 @@ function InterfaceTable({
         key: "node",
         label: "Node",
         // Node names are not titles and must not be capitalised — they are
-        // what corosync matches on.
+        // what corosync matches on. The value stays the whole name for
+        // exactly that reason; only the label is shortened.
         options: Array.from(new Set(rows.map((row) => row.node)))
           .sort()
-          .map((node) => ({ value: node, label: node })),
+          .map((node) => ({ value: node, label: shortNodeName(node) })),
         predicate: (row, value) => row.node === value,
       },
       {
@@ -606,9 +604,13 @@ function InterfaceTable({
           onEdit={() => onEdit(row.link)}
           onDelete={() => onDelete(row.link)}
           editDisabled={busy || !row.local || row.link.kind === "other"}
+          // Named by its owner rather than contrasted with wherever this
+          // console happens to be pointed: which node is serving the page is
+          // not something an operator should have to keep track of, and
+          // "that node's console" only means anything if they do.
           editTitle={
             !row.local
-              ? `Owned by ${row.node} — edit it from that node's console`
+              ? `Owned by ${shortNodeName(row.node)} — edit it on ${shortNodeName(row.node)}`
               : row.link.kind === "other"
                 ? "Not managed by Lumen"
                 : undefined
@@ -618,7 +620,7 @@ function InterfaceTable({
           // the backend supplies the reason for a local row.
           deleteTitle={
             !row.local
-              ? `Owned by ${row.node} — delete it from that node's console`
+              ? `Owned by ${shortNodeName(row.node)} — delete it on ${shortNodeName(row.node)}`
               : (row.link.delete_blocked_reason ?? undefined)
           }
         />

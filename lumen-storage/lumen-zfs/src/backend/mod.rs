@@ -30,6 +30,35 @@ pub trait ZfsBackend: Send + Sync {
     /// the appliance boots from" needs a node with that disk on it.
     async fn block_devices(&self) -> Result<Vec<BlockDevice>>;
 
+    /// Every device path an imported pool is currently built on, and the
+    /// pool that has it.
+    ///
+    /// Exists because the disk scan cannot answer this. A pool member is a
+    /// disk with a couple of partitions and nothing in `/proc/mounts`, which
+    /// is indistinguishable from a disk somebody finished with — and the
+    /// difference is whether clearing it destroys a running pool. `zpool` is
+    /// the only thing that knows, so it is asked.
+    ///
+    /// Paths are as `zpool` reports them, which is whatever the pool was
+    /// built on: a by-id path, a partition of one, or a bare kernel name.
+    /// Matching is the caller's problem precisely because the shapes vary.
+    async fn pool_members(&self) -> Result<Vec<(String, String)>>;
+
+    /// Clear a disk: remove every filesystem and pool signature on it and the
+    /// partition table with them, then re-read it.
+    ///
+    /// Destructive and not undoable, so every guard is the service's and is
+    /// applied before this is reached. What this does *not* do is erase the
+    /// data — the blocks are still there, the labels that named them are not.
+    /// That is what makes the disk selectable again, which is the whole
+    /// purpose; a console that promised more than it does would be lying
+    /// about a disk somebody is about to hand back.
+    /// The whole device rather than a path: clearing a disk means clearing
+    /// its partitions too, and the kernel names of those are derived from the
+    /// disk's own — which the by-id path the rest of this trait speaks in
+    /// cannot give back.
+    async fn wipe_disk(&self, device: &BlockDevice) -> Result<()>;
+
     /// Create a pool.
     ///
     /// The one operation in this trait that cannot happen inside the control

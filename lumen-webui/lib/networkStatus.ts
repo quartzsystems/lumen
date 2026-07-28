@@ -1,4 +1,5 @@
-import type { AddressedMember, ClusterView, VipView } from "@/lib/clusterClient";
+import type { AddressedMember, ClusterView, RingLink, VipView } from "@/lib/clusterClient";
+import type { InventoryResponse } from "@/lib/inventoryClient";
 
 // What corosync sees of a cluster's addressed networks, in one place because
 // two pages ask it — the dashboard's networks panel and Networking → Networks
@@ -12,29 +13,55 @@ export interface RingStatus {
   status: string;
 }
 
+/// Every member's rings, gathered from wherever they can be had.
+///
+/// `corosync-cfgtool -s` answers for the node it runs on and no other, so a
+/// cluster view assembled from one member carries one member's link health.
+/// The environment-wide inventory asks every member at once and each answers
+/// for itself, which is what fills the gaps — so the inventory wins where it
+/// has something to say, and the cluster view is the fallback for a member
+/// that could not be asked.
+export function ringsByNode(
+  cluster: ClusterView,
+  inventory: InventoryResponse | null,
+): Map<string, RingLink[]> {
+  const rings = new Map<string, RingLink[]>();
+  for (const node of cluster.nodes) {
+    if (node.rings.length > 0) rings.set(node.node, node.rings);
+  }
+  for (const member of inventory?.members ?? []) {
+    const own = member.inventory?.rings ?? [];
+    if (own.length > 0) rings.set(member.node, own);
+  }
+  return rings;
+}
+
 /// Every member's seat on the ring a network carries.
 ///
-/// A cluster that could not be asked, or a member the cluster has nothing to
-/// say about, is unknown — this may not report a link as up or down on the
+/// A cluster that could not be asked, or a member nothing has anything to say
+/// about, is unknown — this may not report a link as up or down on the
 /// strength of a definition alone.
 ///
-/// The ratio counts only members that were actually observed. `corosync-cfgtool`
-/// answers for the local node alone, so until federation carries peers' rings
-/// the members it said nothing about are unknown rather than down; counting
-/// them in the denominator reads a healthy two-node cluster as "1 / 2 up".
+/// The ratio counts only members that were actually observed. A member whose
+/// rings nobody could report is unknown rather than down; counting it in the
+/// denominator would read a two-node cluster with one node rebooting as "1 /
+/// 2 up", which is a link fault, not an absent node.
 export function ringState(
   cluster: ClusterView,
   ring: number,
   members: AddressedMember[],
+  /// Every member's rings, from `ringsByNode`. Omitted falls back to what the
+  /// cluster view alone carries, which is the local node's.
+  rings?: Map<string, RingLink[]>,
 ): RingStatus {
   if (cluster.error || members.length === 0) return { tone: "muted", status: "Unknown" };
+  const known = rings ?? ringsByNode(cluster, null);
 
   let observed = 0;
   let connected = 0;
   for (const member of members) {
-    const node = cluster.nodes.find((candidate) => candidate.node === member.node);
-    const link = node?.rings.find((candidate) => candidate.link === ring);
-    if (!node || !link) continue;
+    const link = known.get(member.node)?.find((candidate) => candidate.link === ring);
+    if (!link) continue;
     observed += 1;
     if (link.connected) connected += 1;
   }

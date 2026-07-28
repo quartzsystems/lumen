@@ -54,6 +54,24 @@ pub trait InventoryPeers: Send + Sync {
         node: &EnvironmentNode,
         request: &lumen_zfs::PoolCreate,
     ) -> Result<(), ClusterError>;
+
+    /// Clear one disk on one member.
+    ///
+    /// The exception to this module's own rule that writing belongs to the
+    /// node that owns the thing, and it earns it: the operator choosing disks
+    /// for a pool is looking at every member's disks in one picker, and the
+    /// ones they cannot choose are the ones carrying an old partition table.
+    /// Sending them to another console to clear a disk they are already
+    /// looking at is the console refusing to finish a job it started.
+    ///
+    /// Narrower than a pool destroy on purpose. This clears a disk nothing is
+    /// using; the member's own guards decide what that means, and a disk
+    /// holding a pool or a mount is refused there.
+    async fn wipe_disk(
+        &self,
+        node: &EnvironmentNode,
+        disk: &str,
+    ) -> Result<BlockDevice, ClusterError>;
 }
 
 /// A control plane with no peer channel behind it: it can answer for itself
@@ -83,6 +101,17 @@ impl InventoryPeers for NoPeers {
             node.name
         )))
     }
+
+    async fn wipe_disk(
+        &self,
+        node: &EnvironmentNode,
+        _disk: &str,
+    ) -> Result<BlockDevice, ClusterError> {
+        Err(ClusterError::Conflict(format!(
+            "This control plane has no peer channel, so nothing on \"{}\" could be cleared.",
+            node.name
+        )))
+    }
 }
 
 /// One node's answer: what it is, what it is plugged into, and what it can
@@ -106,6 +135,17 @@ pub struct NodeInventory {
     /// round trip per node would show them the members at different moments.
     #[serde(default)]
     pub devices: Vec<BlockDevice>,
+    /// This node's own corosync links, one per ring.
+    ///
+    /// Here for the same reason the disks are: the question is asked across
+    /// the environment and cannot be answered one node at a time.
+    /// `corosync-cfgtool -s` speaks only for the node it runs on, so a
+    /// cluster view assembled from one member knows one member's link health
+    /// — which is what makes a healthy two-node cluster read as "Connected ·
+    /// 1 unknown". Gathering every member's answer at one moment is what
+    /// resolves the unknowns.
+    #[serde(default)]
+    pub rings: Vec<lumen_cluster::RingLink>,
 }
 
 /// One member as the environment view carries it: its inventory, or why it
@@ -145,8 +185,7 @@ pub async fn create_cluster_pool(
 ) -> Result<ClusterPoolOutcome, ClusterError> {
     if !request.i_understand_this_erases_the_disks {
         return Err(ClusterError::Conflict(
-            "Building a pool reformats every disk it is given. Acknowledge that first."
-                .to_string(),
+            "Building a pool reformats every disk it is given. Acknowledge that first.".to_string(),
         ));
     }
     if request.seats.is_empty() {
@@ -219,6 +258,55 @@ pub async fn create_cluster_pool(
         name: request.name.clone(),
         built,
     })
+}
+
+/// Clear one disk on one member of the environment.
+///
+/// Routed here rather than left to `/api/storage/devices/{disk}/wipe` because
+/// the operator is acting from a table that spans every member, and the node
+/// is part of what they picked. The local node still goes through its own
+/// storage domain — the same short-circuit the inventory read uses, for the
+/// same reason: only this process holds that service.
+///
+/// The acknowledgement is checked once, here, and the member is then told to
+/// clear the disk. It deliberately does not travel: consent was given to the
+/// console the operator is looking at, and a peer route that accepted "yes,
+/// erase it" from a body would be a second, quieter way to clear a node's
+/// disks.
+pub async fn wipe_node_disk(
+    state: &Arc<AppState>,
+    node: &str,
+    disk: &str,
+    acknowledged: bool,
+) -> Result<BlockDevice, ClusterError> {
+    if !acknowledged {
+        return Err(ClusterError::Conflict(format!(
+            "Clearing \"{disk}\" removes its partition table and every signature on it. \
+             Whatever was on that disk becomes unreachable, and there is no undo. Acknowledge \
+             that first."
+        )));
+    }
+
+    if node == state.cluster.node() {
+        return state
+            .storage
+            .wipe_disk(
+                disk,
+                lumen_zfs::Acknowledgements {
+                    may_lose_data: true,
+                },
+            )
+            .await
+            .map_err(|err| ClusterError::Conflict(err.to_string()));
+    }
+
+    let nodes = state.cluster.environment_nodes()?;
+    let Some(member) = nodes.iter().find(|candidate| candidate.name == node) else {
+        return Err(ClusterError::NotFound(format!(
+            "\"{node}\" is not a node in this environment."
+        )));
+    };
+    state.peers.wipe_disk(member, disk).await
 }
 
 /// Every member's inventory, asked for concurrently.
@@ -366,11 +454,16 @@ pub async fn local(state: &Arc<AppState>) -> NodeInventory {
         Err(_) => Vec::new(),
     };
 
+    // Never fails: a node that is not in a cluster, or whose stack cannot be
+    // asked, has no rings, and an empty list is the honest answer.
+    let rings = state.cluster.local_rings().await;
+
     NodeInventory {
         node,
         capacity,
         interfaces,
         pools,
         devices,
+        rings,
     }
 }

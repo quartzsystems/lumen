@@ -32,6 +32,12 @@ struct Inner {
     created: Vec<PoolRequest>,
     /// Snapshots by dataset path, oldest first.
     snapshots: std::collections::HashMap<String, Vec<crate::model::SnapshotInfo>>,
+    /// `(device path, pool)` for every disk an imported pool is built on —
+    /// what the real backend reads out of `zpool list -v`, and what a wipe
+    /// has to be refused against.
+    members: Vec<(String, String)>,
+    /// Every disk this backend was asked to clear, in order.
+    wiped: Vec<String>,
 }
 
 pub struct MockBackend {
@@ -138,6 +144,9 @@ impl MockBackend {
             removable: false,
             in_use: false,
             used_by: None,
+            partitions: 0,
+            claimed: false,
+            wipeable: false,
         }
     }
 
@@ -147,8 +156,44 @@ impl MockBackend {
         BlockDevice {
             in_use: true,
             used_by: Some("mounted at /".into()),
+            partitions: 3,
+            claimed: true,
             ..Self::free_disk(name, size)
         }
+    }
+
+    /// A disk somebody finished with: a partition table and nothing using it.
+    ///
+    /// The state the whole wipe exists for, and the one that makes a disk
+    /// unselectable in the pool picker without saying it can be reclaimed.
+    pub fn partitioned_disk(name: &str, size: u64, partitions: usize) -> BlockDevice {
+        BlockDevice {
+            in_use: true,
+            used_by: Some(format!(
+                "{partitions} partition{}",
+                if partitions == 1 { "" } else { "s" }
+            )),
+            partitions,
+            claimed: false,
+            ..Self::free_disk(name, size)
+        }
+    }
+
+    /// Put a disk into a pool without going through `create_pool` — for a
+    /// test that needs a live pool member the disk scan cannot see, which is
+    /// the case a wipe must refuse.
+    pub fn with_pool_member(self, path: &str, pool: &str) -> Self {
+        self.inner
+            .lock()
+            .unwrap()
+            .members
+            .push((path.to_string(), pool.to_string()));
+        self
+    }
+
+    /// Every disk this backend was asked to clear, in order.
+    pub fn wiped(&self) -> Vec<String> {
+        self.inner.lock().unwrap().wiped.clone()
     }
 
     /// Every pool this backend was asked to build.
@@ -180,6 +225,26 @@ impl ZfsBackend for MockBackend {
 
     async fn block_devices(&self) -> Result<Vec<BlockDevice>> {
         Ok(self.inner.lock().unwrap().devices.clone())
+    }
+
+    async fn pool_members(&self) -> Result<Vec<(String, String)>> {
+        Ok(self.inner.lock().unwrap().members.clone())
+    }
+
+    async fn wipe_disk(&self, device: &BlockDevice) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        // The disk becomes what a cleared one is: no partitions, nothing on
+        // it, and free for a pool — so a read after this sees what a real one
+        // would rather than the state the test started with.
+        if let Some(disk) = inner.devices.iter_mut().find(|d| d.name == device.name) {
+            disk.partitions = 0;
+            disk.claimed = false;
+            disk.in_use = false;
+            disk.used_by = None;
+            disk.wipeable = false;
+        }
+        inner.wiped.push(device.name.clone());
+        Ok(())
     }
 
     async fn create_pool(&self, request: &PoolRequest) -> Result<Pool> {

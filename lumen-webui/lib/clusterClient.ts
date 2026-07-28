@@ -215,6 +215,61 @@ export const createExternalNetwork = (
 ): Promise<ExternalNetwork> =>
   post(`/environment/clusters/${encodeURIComponent(cluster)}/networks/external`, network);
 
+const externalPath = (cluster: string, network: string): string =>
+  `/environment/clusters/${encodeURIComponent(cluster)}/networks/external/${encodeURIComponent(network)}`;
+
+/// Change an External network and rebuild it on every member.
+///
+/// The name is the identity — machines refer to it — so it travels in the path
+/// and cannot be changed. Everything else can: the bridge, the VLAN
+/// semantics, and each member's uplink.
+export const updateExternalNetwork = (
+  cluster: string,
+  name: string,
+  network: ExternalNetworkCreate,
+): Promise<ExternalNetwork> =>
+  apiFetch<ExternalNetwork>(externalPath(cluster, name), {
+    method: "PUT",
+    body: JSON.stringify(network),
+  });
+
+/// Forget an External network. The definition goes and the bridges stay —
+/// machines may still be attached to them, and Interfaces is where a link is
+/// removed.
+export const forgetExternalNetwork = (
+  cluster: string,
+  name: string,
+): Promise<{ removed: boolean; note: string }> =>
+  apiFetch(externalPath(cluster, name), { method: "DELETE" });
+
+/// Move the cluster address, or take it away with `null`.
+///
+/// The old address comes down before the new one goes up, so a console reached
+/// on the VIP loses its connection mid-operation. The change still completes
+/// and every member's own address stays valid, which is why the
+/// acknowledgement is a warning rather than a refusal.
+export const setClusterVip = (
+  cluster: string,
+  address: string | null,
+): Promise<{ vip: VipView | null }> =>
+  apiFetch(`/environment/clusters/${encodeURIComponent(cluster)}/vip`, {
+    method: "PUT",
+    body: JSON.stringify({
+      address,
+      i_understand_this_may_disconnect_me: true,
+    }),
+  });
+
+/// Clear the cluster address's recorded failures and probe it again.
+///
+/// Pacemaker latches a failed operation: an address stopped with "Not
+/// installed" stays stopped after the missing piece is installed, because
+/// nothing asks again. This asks again — it does not repair anything, so an
+/// address whose cause is still there comes back reporting the same failure,
+/// and that is the honest answer rather than a broken one.
+export const recoverClusterVip = (cluster: string): Promise<VipView> =>
+  post(`/environment/clusters/${encodeURIComponent(cluster)}/vip/recover`, {});
+
 // --- workflows ---------------------------------------------------------------
 
 export interface MintedToken {

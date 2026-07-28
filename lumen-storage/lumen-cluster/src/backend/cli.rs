@@ -288,6 +288,24 @@ impl ClusterBackend for CliBackend {
         .await
     }
 
+    async fn remove_resource(&self, resource: &str) -> Result<()> {
+        self.run_privileged(
+            format!("removing {resource} failed"),
+            ExecRequest::new("remove a cluster resource", PCS)
+                .args(["resource", "delete", resource]),
+        )
+        .await
+    }
+
+    async fn cleanup_resource(&self, resource: &str) -> Result<()> {
+        self.run_privileged(
+            format!("clearing the recorded failures of {resource} failed"),
+            ExecRequest::new("clear a resource's recorded failures", PCS)
+                .args(["resource", "cleanup", resource]),
+        )
+        .await
+    }
+
     async fn create_fence_device(
         &self,
         device: &crate::topology::FenceDevice,

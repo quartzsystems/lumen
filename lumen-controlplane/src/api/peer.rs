@@ -90,6 +90,43 @@ pub async fn create_pool(
     Ok(Json(serde_json::json!({ "built": true })))
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WipeDiskRequest {
+    /// The disk as this node names it — a kernel name, a `/dev` path, or the
+    /// by-id path. The storage domain matches all three.
+    pub disk: String,
+}
+
+/// POST /api/peer/storage/wipe — clear one disk here, on behalf of an
+/// operator working from another member's console.
+///
+/// The acknowledgement is not taken from the wire, for the same reason
+/// `create_pool` does not take it: consent was given to the console the
+/// operator is looking at, and a peer route that accepted it from a body
+/// would be a second, quieter way to clear a node's disks.
+///
+/// Every guard that matters is still this node's. A disk holding a pool, a
+/// mount, or swap is refused here regardless of what the caller believes,
+/// because this node is the only one that can see what is actually on it.
+pub async fn wipe_disk(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<WipeDiskRequest>,
+) -> Result<Json<lumen_zfs::BlockDevice>, ApiError> {
+    Ok(Json(
+        state
+            .storage
+            .wipe_disk(
+                &request.disk,
+                lumen_zfs::Acknowledgements {
+                    may_lose_data: true,
+                },
+            )
+            .await?,
+    ))
+}
+
 /// POST /api/peer/cluster/prepare — realize this node's Core seat and write
 /// the cluster configuration.
 pub async fn prepare(

@@ -1,4 +1,5 @@
 import { apiFetch } from "@/lib/authClient";
+import type { RingLink } from "@/lib/clusterClient";
 import type { LinkView } from "@/lib/networkClient";
 import type { NodeView } from "@/lib/nodeClient";
 import type { BlockDevice, Compression, PoolView, VdevKind } from "@/lib/storageClient";
@@ -22,6 +23,11 @@ export interface NodeInventory {
   /// them across members at one moment, which is why they ride here rather
   /// than costing a request per node.
   devices: BlockDevice[];
+  /// This node's own corosync links, one per ring. Here for the same reason
+  /// the disks are: `corosync-cfgtool` speaks only for the node it runs on,
+  /// so link health across a cluster can only be had by asking every member
+  /// at once.
+  rings: RingLink[];
 }
 
 /// One member, or the reason it has no inventory.
@@ -114,6 +120,42 @@ export interface OwnedDevice {
 export const devicesByMember = (inventory: InventoryResponse | null): OwnedDevice[] =>
   (inventory?.members ?? []).flatMap((member) =>
     (member.inventory?.devices ?? []).map((device) => ({ node: member.node, device })),
+  );
+
+/// One member's pools, with the node they belong to.
+///
+/// The same shape as the links: the Pools table spans the environment, so the
+/// node stops being a heading and becomes a column. `local` rides along
+/// because destroying a pool still lands on the node that owns it.
+export interface OwnedPool {
+  node: string;
+  local: boolean;
+  pool: PoolView;
+}
+
+export const poolsByMember = (inventory: InventoryResponse | null): OwnedPool[] =>
+  (inventory?.members ?? []).flatMap((member) =>
+    (member.inventory?.pools ?? []).map((pool) => ({
+      node: member.node,
+      local: member.local,
+      pool,
+    })),
+  );
+
+/// Clear one member's disk: its partition table and every filesystem and pool
+/// signature on it.
+///
+/// Destructive and not undoable, which is why the acknowledgement is spelled
+/// out in the name of the field rather than being a bare boolean. The owning
+/// node applies its own guards regardless — a disk holding a pool, a mount, or
+/// swap is refused there, whatever this console believed when it asked.
+export const wipeNodeDisk = (node: string, disk: string): Promise<BlockDevice> =>
+  apiFetch<BlockDevice>(
+    `/environment/nodes/${encodeURIComponent(node)}/disks/${encodeURIComponent(disk)}/wipe`,
+    {
+      method: "POST",
+      body: JSON.stringify({ i_understand_this_may_lose_data: true }),
+    },
   );
 
 /// What the members' pools add up to.

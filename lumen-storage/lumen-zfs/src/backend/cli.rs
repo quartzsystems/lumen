@@ -62,6 +62,13 @@ const DATASET_COLUMNS: &str = "name,type,used,avail,refer,volsize,volblocksize,m
 /// delegated — which looks exactly like a hung `zpool create` and is not one.
 const DEADLINE: Duration = Duration::from_secs(30);
 
+/// util-linux, which is on every node there has ever been — so clearing a
+/// disk adds no package dependency. Absolute for the same reason `zpool` is:
+/// the transient unit systemd starts has its own environment and should not
+/// be resolving a program out of this daemon's `PATH`.
+const WIPEFS: &str = "/usr/sbin/wipefs";
+const BLOCKDEV: &str = "/usr/sbin/blockdev";
+
 pub struct CliBackend {
     zfs: String,
     zpool: String,
@@ -113,6 +120,26 @@ impl CliBackend {
         if !outcome.ok() {
             // The tool's own words. "The pool operation failed" helps nobody,
             // and zpool's messages are unusually good.
+            return Err(ZfsError::Conflict(outcome.failure()));
+        }
+        Ok(())
+    }
+
+    /// A privileged command that is not `zpool`. Clearing a disk needs
+    /// util-linux, and it needs it outside the sandbox for the same reason
+    /// `zpool create` runs outside it: this writes to a block device.
+    async fn run_privileged_program(
+        &self,
+        description: String,
+        program: &str,
+        args: Vec<String>,
+    ) -> Result<()> {
+        let outcome = self
+            .exec
+            .run(ExecRequest::new(description, program).args(args))
+            .await
+            .map_err(ZfsError::Backend)?;
+        if !outcome.ok() {
             return Err(ZfsError::Conflict(outcome.failure()));
         }
         Ok(())
@@ -261,6 +288,53 @@ fn parse_pools(stdout: &str) -> Vec<Pool> {
         .collect()
 }
 
+/// `zpool list -vHP`: which device each imported pool is built on.
+///
+/// The tree arrives flattened, and indentation is the only thing that says
+/// what belongs to what. A row starting at the left margin names a pool; an
+/// indented row is one of its vdevs, which is either a container
+/// (`mirror-0`, `raidz1-0`, `logs`, `spares`) or an actual device. Only the
+/// devices matter here, and `-P` is what makes them recognisable: with whole
+/// paths, a device row is exactly the one starting with a slash.
+///
+/// Log, cache, and spare devices are counted the same as data ones. They
+/// carry pool labels too, and clearing one out from under a running pool is
+/// the accident this list exists to prevent.
+fn parse_pool_members(stdout: &str) -> Vec<(String, String)> {
+    let mut members = Vec::new();
+    let mut pool: Option<&str> = None;
+
+    for line in stdout.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let indented = line.starts_with(char::is_whitespace);
+        // A child row begins with the separator itself, so the first field is
+        // empty and the name is in the second. Taking the first field with
+        // anything in it covers both shapes without counting tabs.
+        let Some(first) = fields(line)
+            .into_iter()
+            .map(str::trim)
+            .find(|f| !f.is_empty())
+        else {
+            continue;
+        };
+        if !indented {
+            pool = Some(first);
+            continue;
+        }
+        // A container vdev, not a disk. Named rather than pathed, which is
+        // what tells them apart once `-P` is in play.
+        if !first.starts_with('/') {
+            continue;
+        }
+        if let Some(name) = pool {
+            members.push((first.to_string(), name.to_string()));
+        }
+    }
+    members
+}
+
 fn parse_datasets(stdout: &str) -> Vec<Dataset> {
     stdout
         .lines()
@@ -328,6 +402,60 @@ impl ZfsBackend for CliBackend {
 
     async fn block_devices(&self) -> Result<Vec<BlockDevice>> {
         Ok(devices::list(&self.devices).await)
+    }
+
+    async fn pool_members(&self) -> Result<Vec<(String, String)>> {
+        // `-v` descends into the vdev tree, `-P` forces whole paths rather
+        // than the shortened names the human format prints, and `-H` drops
+        // the header and separates with tabs.
+        let stdout = self
+            .run(&self.zpool, &["list", "-vHP", "-o", "name"])
+            .await?;
+        Ok(parse_pool_members(&stdout))
+    }
+
+    async fn wipe_disk(&self, device: &BlockDevice) -> Result<()> {
+        // Every partition, then the disk. In that order and never the other
+        // way round: clearing the table first makes the partitions disappear
+        // as devices, and the ZFS labels on them survive to be found by the
+        // next `zpool create`.
+        let mut targets = devices::partition_paths(&self.devices, &device.name);
+        targets.push(device.kernel_path.clone());
+
+        // ZFS labels first, with the tool that knows where they are — four
+        // per device, two at each end, which no signature scanner finds all
+        // of. Failure here is expected and ignored: most of these devices
+        // never held a pool, and `labelclear` says so rather than shrugging.
+        for target in &targets {
+            let _ = self
+                .run_privileged_program(
+                    format!("clear any pool label on {target}"),
+                    &self.zpool_path,
+                    vec!["labelclear".into(), "-f".into(), target.clone()],
+                )
+                .await;
+        }
+
+        // Then every remaining signature, the partition table included. This
+        // one must succeed — it is what makes the disk read as empty.
+        self.run_privileged_program(
+            format!("clear the signatures on {}", device.kernel_path),
+            WIPEFS,
+            std::iter::once("-a".to_string())
+                .chain(targets.iter().cloned())
+                .collect(),
+        )
+        .await?;
+
+        // Tell the kernel the table changed, so the partitions stop existing
+        // now rather than at the next reboot. A disk the console still lists
+        // partitions for is a disk an operator will think the wipe missed.
+        self.run_privileged_program(
+            format!("re-read the partition table of {}", device.kernel_path),
+            BLOCKDEV,
+            vec!["--rereadpt".into(), device.kernel_path.clone()],
+        )
+        .await
     }
 
     async fn create_pool(&self, request: &PoolRequest) -> Result<Pool> {
@@ -759,5 +887,64 @@ mod tests {
         assert!(reject_bad_pool("boot").is_ok());
         assert!(reject_bad_pool("boot/lumen").is_err());
         assert!(reject_bad_pool("-rf").is_err());
+    }
+
+    /// `zpool list -vHP` on a node with a mirrored root pool and a raidz data
+    /// pool with a log device — the shapes the parser has to walk past to find
+    /// the disks.
+    const ZPOOL_LIST_VERBOSE: &str = "\
+boot\t928G\t8.1G\t920G\t-\t-\t0%\t0%\t1.00x\tONLINE\t-
+\tmirror-0\t928G\t8.1G\t920G\t-\t-\t0%\t0%\t-\t-\t-
+\t  /dev/disk/by-id/nvme-Samsung_SSD_983_A-part3\t930G\t-\t-\t-\t-\t-\t-\t-\tONLINE\t-
+\t  /dev/disk/by-id/nvme-Samsung_SSD_983_B-part3\t930G\t-\t-\t-\t-\t-\t-\t-\tONLINE\t-
+tank\t3.6T\t1.2T\t2.4T\t-\t-\t2%\t33%\t1.00x\tONLINE\t-
+\traidz1-0\t3.6T\t1.2T\t2.4T\t-\t-\t2%\t33%\t-\t-\t-
+\t  /dev/disk/by-id/nvme-INTEL_A\t932G\t-\t-\t-\t-\t-\t-\t-\tONLINE\t-
+\t  /dev/disk/by-id/nvme-INTEL_B\t932G\t-\t-\t-\t-\t-\t-\t-\tONLINE\t-
+\t  /dev/disk/by-id/nvme-INTEL_C\t932G\t-\t-\t-\t-\t-\t-\t-\tONLINE\t-
+\tlogs\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-
+\t  /dev/nvme4n1p1\t100G\t-\t-\t-\t-\t-\t-\t-\tONLINE\t-
+";
+
+    /// Only the devices, attributed to the pool whose subtree they are in.
+    ///
+    /// The container vdevs are the trap: `mirror-0`, `raidz1-0`, and `logs`
+    /// are indented exactly as the disks are, and the only thing telling them
+    /// apart is that `-P` prints a whole path for a real device.
+    #[test]
+    fn the_verbose_pool_listing_yields_every_device_and_the_pool_that_has_it() {
+        let members = parse_pool_members(ZPOOL_LIST_VERBOSE);
+        let pool_of = |path: &str| {
+            members
+                .iter()
+                .find(|(candidate, _)| candidate == path)
+                .map(|(_, pool)| pool.as_str())
+        };
+
+        assert_eq!(members.len(), 6, "{members:?}");
+        assert_eq!(
+            pool_of("/dev/disk/by-id/nvme-Samsung_SSD_983_A-part3"),
+            Some("boot")
+        );
+        assert_eq!(pool_of("/dev/disk/by-id/nvme-INTEL_C"), Some("tank"));
+        // A log device is a pool member too. It carries labels, and clearing
+        // it out from under a running pool is exactly what this list prevents.
+        assert_eq!(pool_of("/dev/nvme4n1p1"), Some("tank"));
+
+        // No container vdev made it in.
+        assert!(
+            !members
+                .iter()
+                .any(|(path, _)| path == "mirror-0" || path == "raidz1-0" || path == "logs"),
+            "{members:?}"
+        );
+    }
+
+    /// A node with no pools answers with no members — not with an error, and
+    /// not with a phantom entry that would make every disk look spoken for.
+    #[test]
+    fn a_node_with_no_pools_has_no_members() {
+        assert!(parse_pool_members("").is_empty());
+        assert!(parse_pool_members("\n\n").is_empty());
     }
 }

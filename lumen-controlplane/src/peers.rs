@@ -365,6 +365,25 @@ impl crate::inventory::InventoryPeers for HttpPeerChannel {
             .await?;
         Ok(())
     }
+
+    async fn wipe_disk(
+        &self,
+        node: &EnvironmentNode,
+        disk: &str,
+    ) -> Result<lumen_zfs::BlockDevice, ClusterError> {
+        self.call(
+            &node.address,
+            "/api/peer/storage/wipe",
+            &serde_json::json!({ "disk": disk }),
+            self.ca_client_config()?,
+            Some(self.peer_ticket()?),
+            // Clearing labels and a partition table is several small writes
+            // per partition, and a disk that has stopped responding takes the
+            // kernel's own time to say so.
+            SLOW_CALL_DEADLINE,
+        )
+        .await
+    }
 }
 
 #[async_trait]

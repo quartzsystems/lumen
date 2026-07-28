@@ -386,6 +386,38 @@ impl ClusterService {
         Ok(self.cluster_view(name, &membership).await)
     }
 
+    /// This node's own corosync links, one per ring.
+    ///
+    /// Exists because `corosync-cfgtool -s` answers for the node it is run on
+    /// and no other. A cluster view assembled from one member therefore knows
+    /// one member's link health and nothing about the rest, which is why a
+    /// healthy two-node cluster reads as "Connected · 1 unknown" — the peer's
+    /// ring was never asked about, not found down.
+    ///
+    /// Carried in the environment-wide inventory so every member's answer
+    /// arrives alongside every other, and the unknowns resolve. Empty on a
+    /// node that is not in a cluster, or whose stack cannot be asked: an empty
+    /// list is honest, and this must never fail a read that is mostly about
+    /// something else.
+    pub async fn local_rings(&self) -> Vec<RingLink> {
+        let Ok(Some(membership)) = self.environment_record() else {
+            return Vec::new();
+        };
+        let Some(cluster) = membership
+            .node(&self.node)
+            .and_then(|n| n.cluster.as_deref())
+        else {
+            return Vec::new();
+        };
+        let Ok(state) = self.backend.cluster_state(cluster).await else {
+            return Vec::new();
+        };
+        state
+            .node(&self.node)
+            .map(|node| node.rings.clone())
+            .unwrap_or_default()
+    }
+
     /// One cluster's typed networks — Core, Management, and the External
     /// list — as the replicated record carries them. This is the definition
     /// the members share; what each node has realized of it is the
@@ -407,6 +439,77 @@ impl ClusterService {
             ))
         })?;
         Ok(record.networks.clone())
+    }
+
+    /// Clear the cluster address's recorded failures and let Pacemaker probe
+    /// it again.
+    ///
+    /// The operation an operator needs after fixing whatever stopped the
+    /// address, and it exists because fixing the cause is not enough on its
+    /// own. Pacemaker latches a failed operation: the `rc_text` the console
+    /// shows — "Not installed" when the agent is missing something it shells
+    /// out to — stays in the node history, and the resource is left alone
+    /// until somebody forgets it. Installing the missing tool changes nothing
+    /// until then, which is a trap worth a button rather than a paragraph of
+    /// documentation.
+    ///
+    /// Deliberately not a repair: this asks again, it does not make the
+    /// answer different. A recovery run before the cause is fixed re-probes,
+    /// fails the same way, and the view says so — which is the honest
+    /// outcome, not a failure of this call.
+    pub async fn recover_vip(&self, cluster: &str) -> Result<VipView> {
+        let _guard = self.gate.lock().await;
+        let membership = self.require_membership()?;
+        let Some(record) = membership.cluster_record(cluster) else {
+            return Err(ClusterError::NotFound(format!(
+                "There is no cluster called \"{cluster}\" in this environment."
+            )));
+        };
+        let Some(address) = record.networks.management.vip else {
+            return Err(ClusterError::Conflict(format!(
+                "\"{cluster}\" defines no cluster address, so there is nothing to recover."
+            )));
+        };
+
+        // From inside the cluster: pcs writes reach the CIB from any member,
+        // and only from a member. Same rule as the fence test.
+        if membership
+            .node(&self.node)
+            .and_then(|n| n.cluster.as_deref())
+            != Some(cluster)
+        {
+            return Err(ClusterError::Conflict(format!(
+                "A recovery runs from inside the cluster. Open the console of a member of \
+                 \"{cluster}\"."
+            )));
+        }
+
+        let state = self.backend.cluster_state(cluster).await?;
+        let Some(vip) = state.vip.as_ref() else {
+            return Err(ClusterError::Conflict(format!(
+                "Pacemaker has no address resource for \"{cluster}\" at all. There is no failure \
+                 to clear — the resource is missing, which is a different fault: the cluster was \
+                 built without it, or something removed it."
+            )));
+        };
+
+        self.backend.cleanup_resource(&vip.resource).await?;
+        tracing::info!(
+            cluster = cluster,
+            resource = %vip.resource,
+            "cleared the cluster address's recorded failures"
+        );
+
+        // Read back rather than reporting success: the probe is what decides
+        // whether the address comes up, and the operator asked about the
+        // address, not about the cleanup. A view that still says "Not
+        // installed" means the cause is still there, and saying so beats a
+        // green toast over an address nobody answers on.
+        let state = self.backend.cluster_state(cluster).await?;
+        Ok(VipView {
+            address,
+            state: state.vip,
+        })
     }
 
     /// What one member has to build for an External network, given the port
@@ -520,26 +623,7 @@ impl ClusterService {
 
         // Every member or none, checked before anything is built rather than
         // discovered halfway through.
-        let members: Vec<EnvironmentNode> =
-            membership.members_of(cluster).into_iter().cloned().collect();
-        for member in &members {
-            if !network.uplinks.iter().any(|up| up.node == member.name) {
-                return Err(ClusterError::Conflict(format!(
-                    "\"{}\" has no uplink for this network. An External network is defined on \
-                     every member or on none — a machine that fails over onto a member without \
-                     it comes up with no network.",
-                    member.name
-                )));
-            }
-        }
-        for uplink in &network.uplinks {
-            if !members.iter().any(|member| member.name == uplink.node) {
-                return Err(ClusterError::Conflict(format!(
-                    "\"{}\" is not a member of \"{cluster}\".",
-                    uplink.node
-                )));
-            }
-        }
+        let members = Self::check_uplinks(&membership, cluster, &network)?;
 
         // Build it everywhere. The bridge carries no host addressing — that
         // is what makes it an External network rather than a second
@@ -581,6 +665,308 @@ impl ClusterService {
             "external network defined on every member"
         );
         Ok(network)
+    }
+
+    /// Change an External network's definition and rebuild it on every
+    /// member.
+    ///
+    /// The name is the identity — it is what a machine's adapter refers to —
+    /// so it is the one field this does not change. Everything else can move:
+    /// the bridge, the VLAN semantics, and which port each member carries it
+    /// on.
+    ///
+    /// Rebuilt everywhere before the record admits the change, the same order
+    /// and for the same reason as the create: an External network the record
+    /// claims and a member has not built is exactly the state the consistency
+    /// rule forbids. What this cannot do is undo a rebuild that succeeded on
+    /// one member and failed on the next — the members that changed keep the
+    /// new bridge, the record keeps the old definition, and the error names
+    /// the member so a retry finishes the job.
+    ///
+    /// A renamed bridge leaves the old one behind. It is an ordinary link
+    /// with machines possibly still attached to it, and tearing it out from
+    /// under them is not an edit's business; Interfaces is where a link is
+    /// removed, and it is the page that can say what is still on one.
+    pub async fn update_external_network(
+        &self,
+        cluster: &str,
+        name: &str,
+        network: ExternalNetwork,
+    ) -> Result<ExternalNetwork> {
+        let _guard = self.gate.lock().await;
+        let mut membership = self.require_membership()?;
+        let Some(record) = membership.cluster_record(cluster).cloned() else {
+            return Err(ClusterError::NotFound(format!(
+                "There is no cluster called \"{cluster}\" in this environment."
+            )));
+        };
+        if !record.networks.external.iter().any(|e| e.name == name) {
+            return Err(ClusterError::NotFound(format!(
+                "\"{cluster}\" defines no External network called \"{name}\"."
+            )));
+        }
+        if network.name != name {
+            return Err(ClusterError::Conflict(format!(
+                "An External network's name is what a machine's adapter refers to, so it cannot \
+                 be changed here — renaming it would leave every machine on \"{name}\" pointing \
+                 at a network that no longer exists. Define a new one and move the machines onto \
+                 it."
+            )));
+        }
+        if !valid_bridge_name(&network.bridge) {
+            return Err(ClusterError::Conflict(format!(
+                "\"{}\" is not a usable bridge name.",
+                network.bridge
+            )));
+        }
+        // Another network's bridge. Its own is fine, and that is most edits.
+        if record
+            .networks
+            .external
+            .iter()
+            .any(|other| other.name != name && other.bridge == network.bridge)
+        {
+            return Err(ClusterError::Conflict(format!(
+                "\"{cluster}\" already has an External network on bridge \"{}\" — two networks \
+                 sharing a bridge are one network with two names.",
+                network.bridge
+            )));
+        }
+
+        let members = Self::check_uplinks(&membership, cluster, &network)?;
+        for member in &members {
+            let uplink = network
+                .uplinks
+                .iter()
+                .find(|up| up.node == member.name)
+                .expect("every member was checked to have one above");
+            let seat = Self::external_seat(&network, &uplink.interface);
+            if let Err(err) = self.peers.create_bridge(member, &seat).await {
+                return Err(ClusterError::Conflict(format!(
+                    "\"{}\" could not build the network as changed, so the change was not \
+                     recorded: {err}. The members that did build it are on the new definition \
+                     and the record is still on the old one — fix that member and ask again.",
+                    member.name
+                )));
+            }
+        }
+
+        let Some(stored) = membership
+            .clusters
+            .iter_mut()
+            .find(|candidate| candidate.definition.name == cluster)
+        else {
+            return Err(ClusterError::NotFound(format!(
+                "There is no cluster called \"{cluster}\" in this environment."
+            )));
+        };
+        if let Some(slot) = stored.networks.external.iter_mut().find(|e| e.name == name) {
+            *slot = network.clone();
+        }
+        membership.version += 1;
+        self.store.save_membership(&membership)?;
+        tracing::info!(
+            cluster = cluster,
+            network = name,
+            bridge = %network.bridge,
+            "external network changed on every member"
+        );
+        Ok(network)
+    }
+
+    /// Forget an External network.
+    ///
+    /// The definition goes and the bridges stay. Not an oversight: a bridge
+    /// is an ordinary link that machines may still be attached to, and a
+    /// definition being removed says nothing about whether those machines
+    /// should lose their network. What this ends is the cluster's promise
+    /// that the network exists on every member; removing the links is done
+    /// per node on Interfaces, which is the page that can say what is still
+    /// using one.
+    pub async fn forget_external_network(&self, cluster: &str, name: &str) -> Result<()> {
+        let _guard = self.gate.lock().await;
+        let mut membership = self.require_membership()?;
+        let Some(stored) = membership
+            .clusters
+            .iter_mut()
+            .find(|candidate| candidate.definition.name == cluster)
+        else {
+            return Err(ClusterError::NotFound(format!(
+                "There is no cluster called \"{cluster}\" in this environment."
+            )));
+        };
+        let before = stored.networks.external.len();
+        stored.networks.external.retain(|e| e.name != name);
+        if stored.networks.external.len() == before {
+            return Err(ClusterError::NotFound(format!(
+                "\"{cluster}\" defines no External network called \"{name}\"."
+            )));
+        }
+        membership.version += 1;
+        self.store.save_membership(&membership)?;
+        tracing::info!(
+            cluster = cluster,
+            network = name,
+            "external network removed from the definition; its bridges were left in place"
+        );
+        Ok(())
+    }
+
+    /// Move the cluster address, or take it away.
+    ///
+    /// `None` removes it: the resource goes and the members keep their own
+    /// addresses, which is what a cluster defined without a VIP looks like.
+    /// `Some` moves it, which is a remove and a create — Pacemaker's
+    /// `IPaddr2` has no notion of an address changing under it, and asking it
+    /// to would leave the old address up on whichever member holds it.
+    ///
+    /// **This is the address the console is very likely being reached on.**
+    /// The old one comes down before the new one goes up, so a session on the
+    /// VIP will lose its connection mid-operation. That is not a failure and
+    /// the console says so before asking; the operation completes on the node
+    /// regardless of whether anyone is still listening, and the members' own
+    /// addresses stay valid throughout, which is what makes it recoverable.
+    ///
+    /// Validated against the Management network as recorded: an address
+    /// outside its subnet, or one a member already holds, is refused here
+    /// rather than becoming a resource that never starts.
+    pub async fn set_vip(
+        &self,
+        cluster: &str,
+        address: Option<std::net::Ipv4Addr>,
+    ) -> Result<Option<VipView>> {
+        let _guard = self.gate.lock().await;
+        let mut membership = self.require_membership()?;
+        let Some(record) = membership.cluster_record(cluster).cloned() else {
+            return Err(ClusterError::NotFound(format!(
+                "There is no cluster called \"{cluster}\" in this environment."
+            )));
+        };
+        if membership
+            .node(&self.node)
+            .and_then(|n| n.cluster.as_deref())
+            != Some(cluster)
+        {
+            return Err(ClusterError::Conflict(format!(
+                "The cluster address is changed from inside the cluster. Open the console of a \
+                 member of \"{cluster}\"."
+            )));
+        }
+
+        let management = &record.networks.management;
+        if let Some(wanted) = address {
+            if !management.subnet.contains(wanted) {
+                return Err(ClusterError::invalid(ValidationError::new(
+                    ValidationCode::InvalidVip,
+                    Some("management.vip"),
+                    format!(
+                        "The cluster address {wanted} is outside the Management subnet {} — \
+                         nothing would route to it.",
+                        management.subnet
+                    ),
+                )));
+            }
+            if let Some(member) = management.members.iter().find(|m| m.address == wanted) {
+                return Err(ClusterError::invalid(ValidationError::new(
+                    ValidationCode::InvalidVip,
+                    Some("management.vip"),
+                    format!(
+                        "{wanted} is already \"{}\"'s own address. The cluster address has to be \
+                         one nothing else holds — it moves between members, and two things \
+                         answering on it is a broken console for whoever gets the wrong one.",
+                        member.node
+                    ),
+                )));
+            }
+        }
+        if management.vip == address {
+            return Err(ClusterError::Conflict(match address {
+                Some(current) => format!("The cluster address is already {current}."),
+                None => format!("\"{cluster}\" has no cluster address to remove."),
+            }));
+        }
+
+        // The existing resource first, whether this is a move or a removal.
+        // Pacemaker holds the old address up until it is told not to, and
+        // creating the new one alongside it would leave two.
+        let state = self.backend.cluster_state(cluster).await?;
+        if let Some(existing) = state.vip.as_ref() {
+            self.backend.remove_resource(&existing.resource).await?;
+        }
+        if let Some(wanted) = address {
+            self.backend
+                .create_vip(cluster, wanted, management.subnet.prefix)
+                .await?;
+        }
+
+        let Some(stored) = membership
+            .clusters
+            .iter_mut()
+            .find(|candidate| candidate.definition.name == cluster)
+        else {
+            return Err(ClusterError::NotFound(format!(
+                "There is no cluster called \"{cluster}\" in this environment."
+            )));
+        };
+        stored.networks.management.vip = address;
+        membership.version += 1;
+        self.store.save_membership(&membership)?;
+        tracing::info!(
+            cluster = cluster,
+            address = ?address,
+            "cluster address changed"
+        );
+
+        let Some(address) = address else {
+            return Ok(None);
+        };
+        // Read back, for the same reason the recovery does: Pacemaker
+        // decides whether the address comes up, and a console told "done"
+        // over an address nobody answers on has been told nothing.
+        let state = self.backend.cluster_state(cluster).await?;
+        Ok(Some(VipView {
+            address,
+            state: state.vip,
+        }))
+    }
+
+    /// Every member has an uplink and every uplink names a member — the
+    /// every-member-or-none rule, checked before anything is built rather
+    /// than discovered halfway through.
+    ///
+    /// Shared by the create and the change because it is the same rule: a
+    /// machine that fails over onto a member without the network comes up
+    /// with no network, and it makes no difference whether that member was
+    /// missed when the network was defined or when it was edited.
+    fn check_uplinks(
+        membership: &EnvironmentMembership,
+        cluster: &str,
+        network: &ExternalNetwork,
+    ) -> Result<Vec<EnvironmentNode>> {
+        let members: Vec<EnvironmentNode> = membership
+            .members_of(cluster)
+            .into_iter()
+            .cloned()
+            .collect();
+        for member in &members {
+            if !network.uplinks.iter().any(|up| up.node == member.name) {
+                return Err(ClusterError::Conflict(format!(
+                    "\"{}\" has no uplink for this network. An External network is defined on \
+                     every member or on none — a machine that fails over onto a member without \
+                     it comes up with no network.",
+                    member.name
+                )));
+            }
+        }
+        for uplink in &network.uplinks {
+            if !members.iter().any(|member| member.name == uplink.node) {
+                return Err(ClusterError::Conflict(format!(
+                    "\"{}\" is not a member of \"{cluster}\".",
+                    uplink.node
+                )));
+            }
+        }
+        Ok(members)
     }
 
     // --- environment membership -------------------------------------------

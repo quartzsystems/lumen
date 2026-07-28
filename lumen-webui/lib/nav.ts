@@ -3,6 +3,8 @@ import {
   ArrowUpCircle,
   Boxes,
   Cable,
+  Copy,
+  Database,
   Gauge,
   HardDrive,
   KeyRound,
@@ -63,7 +65,17 @@ export const NAV: NavItem[] = [
       { id: "diagnostics", label: "Diagnostics", href: "/networking/diagnostics", icon: Activity },
     ],
   },
-  { id: "storage", label: "Storage", icon: HardDrive, href: "/storage" },
+  {
+    id: "storage",
+    label: "Storage",
+    icon: HardDrive,
+    href: "/storage",
+    children: [
+      { id: "pools",   label: "Pools",   href: "/storage/pools",   icon: Database },
+      { id: "disks",   label: "Disks",   href: "/storage/disks",   icon: HardDrive },
+      { id: "volumes", label: "Volumes", href: "/storage/volumes", icon: Copy },
+    ],
+  },
   {
     id: "infrastructure",
     label: "Infrastructure",

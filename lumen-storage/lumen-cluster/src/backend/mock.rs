@@ -38,6 +38,12 @@ struct Inner {
     reloads: usize,
     delay_updates: Vec<(String, u32)>,
     fence_devices_removed: Vec<String>,
+    cleanups: Vec<String>,
+    resources_removed: Vec<String>,
+    /// The cause behind a stopped resource is still there, so a cleanup
+    /// re-probes and the same failure comes straight back. Off by default:
+    /// the ordinary case is an operator who fixed the cause first.
+    cause_unfixed: bool,
 }
 
 pub struct MockBackend {
@@ -145,6 +151,34 @@ impl MockBackend {
         self
     }
 
+    /// The cluster address never came up, with Pacemaker's own words for why.
+    ///
+    /// The state the recovery exists for: `rc_text` is what the agent's
+    /// return code meant, and "Not installed" is the one an operator meets
+    /// when the agent is missing something it shells out to.
+    pub fn with_stopped_vip(self, cluster: &str, reason: &str) -> Self {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(state) = inner.clusters.get_mut(cluster) {
+                if let Some(vip) = state.vip.as_mut() {
+                    vip.active = false;
+                    vip.node = None;
+                    vip.role = Some("Stopped".into());
+                    vip.reason = Some(reason.to_string());
+                }
+            }
+        }
+        self
+    }
+
+    /// Whatever stopped the address is still wrong, so clearing the recorded
+    /// failure changes nothing — the re-probe fails the same way. This is the
+    /// operator who asked for a recovery before fixing the cause.
+    pub fn with_unfixed_cause(self) -> Self {
+        self.inner.lock().unwrap().cause_unfixed = true;
+        self
+    }
+
     /// Make a cluster stop answering, as a cluster whose members are all
     /// down would: the record still names it, its state cannot be read.
     pub fn with_unreachable_cluster(self, cluster: &str) -> Self {
@@ -234,6 +268,16 @@ impl MockBackend {
 
     pub fn fence_devices_removed(&self) -> Vec<String> {
         self.inner.lock().unwrap().fence_devices_removed.clone()
+    }
+
+    /// Every resource whose failures were cleared, in order.
+    pub fn cleanups(&self) -> Vec<String> {
+        self.inner.lock().unwrap().cleanups.clone()
+    }
+
+    /// Every resource taken out of the CIB, in order.
+    pub fn resources_removed(&self) -> Vec<String> {
+        self.inner.lock().unwrap().resources_removed.clone()
     }
 
     fn take_failure(&self) -> Option<ClusterError> {
@@ -448,11 +492,70 @@ impl ClusterBackend for MockBackend {
         if let Some(err) = self.take_failure() {
             return Err(err);
         }
-        self.inner
-            .lock()
-            .unwrap()
+        let mut inner = self.inner.lock().unwrap();
+        // Observable straight away, the way a CIB write shows up in the next
+        // crm_mon — so a caller that reads the address back after creating it
+        // sees a resource rather than nothing.
+        if let Some(state) = inner.clusters.get_mut(cluster) {
+            state.vip = Some(VipState {
+                resource: format!("{cluster}-vip"),
+                active: true,
+                node: state.nodes.first().map(|node| node.name.clone()),
+                failed: false,
+                blocked: false,
+                role: Some("Started".into()),
+                reason: None,
+            });
+        }
+        inner
             .vips
             .push((cluster.to_string(), format!("{address}/{prefix}")));
+        Ok(())
+    }
+
+    async fn remove_resource(&self, resource: &str) -> Result<()> {
+        if let Some(err) = self.take_failure() {
+            return Err(err);
+        }
+        let mut inner = self.inner.lock().unwrap();
+        // Pacemaker stops knowing about it, so a read after this sees what a
+        // real one would: a cluster with no address resource at all.
+        for state in inner.clusters.values_mut() {
+            if state.vip.as_ref().is_some_and(|v| v.resource == resource) {
+                state.vip = None;
+            }
+        }
+        inner.resources_removed.push(resource.to_string());
+        Ok(())
+    }
+
+    async fn cleanup_resource(&self, resource: &str) -> Result<()> {
+        if let Some(err) = self.take_failure() {
+            return Err(err);
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let cause_unfixed = inner.cause_unfixed;
+        // The recorded failure is forgotten and the resource probed again, so
+        // a read after this sees what a real one would. Whether it then comes
+        // up is not the cleanup's doing — it is whether the cause was fixed.
+        for state in inner.clusters.values_mut() {
+            let Some(vip) = state.vip.as_mut() else {
+                continue;
+            };
+            if vip.resource != resource {
+                continue;
+            }
+            if cause_unfixed {
+                continue;
+            }
+            vip.failed = false;
+            vip.blocked = false;
+            vip.reason = None;
+            vip.active = true;
+            vip.role = Some("Started".into());
+            vip.node = state.nodes.first().map(|node| node.name.clone());
+        }
+        inner.cleanups.push(resource.to_string());
         Ok(())
     }
 

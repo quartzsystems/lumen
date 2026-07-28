@@ -356,6 +356,48 @@ What in-memory tests cannot cover is DRBD itself replicating — that is the
 two-node manual test: create a volume, write on one node, read it on the
 other, pull the Core cable and watch I/O suspend rather than diverge.
 
+## Clearing a disk
+
+`zpool create` refuses a disk that already has something on it, and the
+picker refuses it first, with what is on it in words. That is right, and
+until recently it was also a dead end: a disk carrying nothing but an old
+partition table reads as spoken for, and the only way out was a shell on the
+node. **Storage → Disks** is the way out — every member's disks in one
+table, and a clear on the ones that can take it.
+
+The offer is made in exactly one state: something is on the disk, and
+nothing live is using it. Two facts decide that, and they come from
+different places:
+
+- **`/proc/mounts` and `/proc/swaps`**, through the same `/sys` scan that
+  fills the picker. A disk with a mount or swap on it — or on any of its
+  partitions — is claimed, and no acknowledgement overrides that.
+- **`zpool list -vHP`**, which is the half the scan cannot answer. A live
+  pool's members carry a couple of partitions and appear in no mount table,
+  so they look *exactly* like a disk somebody finished with. Only `zpool`
+  knows, so it is asked; a `zpool` that cannot be asked leaves every disk
+  unclearable rather than every disk clearable. The console loses a button;
+  the alternative loses a pool.
+
+What the clear does is remove the labels, not the data: `zpool labelclear`
+on every partition and the disk (ZFS keeps four labels per device, two at
+each end, which no signature scanner finds all of), then `wipefs -a` over
+the same list, then `blockdev --rereadpt`. Partitions first and the disk
+second — clearing the table first makes the partitions vanish as devices
+and strands the labels on them. util-linux only, so no new package
+dependency. The console says as much in the dialog: the blocks stay until
+something writes over them, and what changes is that the node now reports
+the disk as empty.
+
+It works across the environment. `POST
+/api/environment/nodes/{node}/disks/{disk}/wipe` reaches the owning member
+through the peer channel, and the acknowledgement deliberately does not
+travel with it — consent was given to the console the operator is looking
+at, and a peer route that accepted "yes, erase it" from a body would be a
+second, quieter way to clear a node's disks. Every guard is still the owning
+node's, because it is the only thing that can see what is actually on the
+disk.
+
 ## Out of scope
 
 The replicated-storage program is complete: the HA manager, snapshots and

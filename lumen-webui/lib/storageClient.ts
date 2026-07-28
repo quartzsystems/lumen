@@ -57,8 +57,18 @@ export interface BlockDevice {
   rotational: boolean;
   removable: boolean;
   in_use: boolean;
-  /// What is on it, in words — "mounted at /", "3 partitions".
+  /// What is on it, in words — "mounted at /", "in pool tank", "3 partitions".
   used_by?: string;
+  /// How many partitions it carries.
+  partitions: number;
+  /// A mount or swap has it open right now. The half of `in_use` nothing may
+  /// override; the other half is a partition table nobody is using.
+  claimed: boolean;
+  /// The console may offer to clear it: something is on it, and nothing live
+  /// is using it. Decided by the node, which is the only thing that can also
+  /// ask `zpool` — an imported pool's members carry partitions and appear in
+  /// no mount table, so they look reclaimable until it does.
+  wipeable: boolean;
 }
 
 export interface DevicesResponse {

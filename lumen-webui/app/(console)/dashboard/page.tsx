@@ -43,7 +43,7 @@ import {
   type InventoryResponse,
   type PooledCapacity,
 } from "@/lib/inventoryClient";
-import { ringState, vipState } from "@/lib/networkStatus";
+import { ringsByNode, ringState, vipState } from "@/lib/networkStatus";
 
 /// Matches lib/VmContext.tsx: often enough that the page feels live, slow
 /// enough to cost nothing.
@@ -228,7 +228,7 @@ export default function DashboardPage() {
         qualifier: `MTU ${shared.core.mtu}`,
         address: shared.core.subnet,
         alsoAt: null,
-        ...ringState(cluster, 0, shared.core.members),
+        ...ringState(cluster, 0, shared.core.members, ringsByNode(cluster, inventory)),
       });
       rows.push({
         key: `${cluster.name}/management`,
@@ -238,7 +238,7 @@ export default function DashboardPage() {
         qualifier: null,
         address: shared.management.subnet,
         alsoAt: null,
-        ...ringState(cluster, 1, shared.management.members),
+        ...ringState(cluster, 1, shared.management.members, ringsByNode(cluster, inventory)),
       });
       // The floating address, with what Pacemaker has actually done about it.
       // Its own row and its own state: the ring being up says nothing about

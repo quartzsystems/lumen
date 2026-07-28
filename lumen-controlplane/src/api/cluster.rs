@@ -80,6 +80,40 @@ pub async fn create_cluster_pool(
     Ok((StatusCode::CREATED, Json(outcome)))
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WipeDiskRequest {
+    #[serde(default)]
+    pub i_understand_this_may_lose_data: bool,
+}
+
+/// POST /api/environment/nodes/{node}/disks/{disk}/wipe — clear one member's
+/// disk so a pool can be built on it.
+///
+/// The node rides the path for the same reason the bond route's does: a
+/// `node` field in a body means "this appliance" everywhere else in this API,
+/// and this route means a member that is deliberately not necessarily us.
+///
+/// Answers with the disk as the owning node now reports it, so the picker
+/// that could not offer it a moment ago can offer it without a second read.
+pub async fn wipe_node_disk(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    Path((node, disk)): Path<(String, String)>,
+    raw: Body,
+) -> Result<Json<lumen_zfs::BlockDevice>, ApiError> {
+    let request: WipeDiskRequest = body(raw)?;
+    Ok(Json(
+        crate::inventory::wipe_node_disk(
+            &state,
+            &node,
+            &disk,
+            request.i_understand_this_may_lose_data,
+        )
+        .await?,
+    ))
+}
+
 /// GET /api/environment/clusters/{name}/networks — the cluster's typed
 /// networks: Core, Management, and the External list, as the replicated
 /// record carries them. The console's Networks page reads this.
@@ -106,8 +140,114 @@ pub async fn create_external_network(
     raw: Body,
 ) -> Result<(StatusCode, Json<ExternalNetwork>), ApiError> {
     let network: ExternalNetwork = required_body(raw)?;
-    let created = state.cluster.create_external_network(&name, network).await?;
+    let created = state
+        .cluster
+        .create_external_network(&name, network)
+        .await?;
     Ok((StatusCode::CREATED, Json(created)))
+}
+
+/// PUT /api/environment/clusters/{name}/networks/external/{network} — change
+/// an External network and rebuild it on every member.
+///
+/// The name is in the path and not changeable through it: it is what a
+/// machine's adapter refers to, so renaming would strand every machine on the
+/// network. Everything else — the bridge, the VLAN semantics, each member's
+/// uplink — moves here.
+pub async fn update_external_network(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    Path((name, network)): Path<(String, String)>,
+    raw: Body,
+) -> Result<Json<ExternalNetwork>, ApiError> {
+    let wanted: ExternalNetwork = required_body(raw)?;
+    Ok(Json(
+        state
+            .cluster
+            .update_external_network(&name, &network, wanted)
+            .await?,
+    ))
+}
+
+/// DELETE /api/environment/clusters/{name}/networks/external/{network} —
+/// forget an External network.
+///
+/// The definition goes; the bridges the members built stay. They are ordinary
+/// links with machines possibly still on them, and Interfaces is the page that
+/// can say what is still using one.
+pub async fn forget_external_network(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    Path((name, network)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state
+        .cluster
+        .forget_external_network(&name, &network)
+        .await?;
+    Ok(Json(serde_json::json!({
+        "removed": true,
+        "note": "The bridges on each member were left in place — machines may still be attached \
+                 to them. Remove them per node on Networking → Interfaces."
+    })))
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetVipRequest {
+    /// The new address, or `null` to take the cluster address away.
+    #[serde(default)]
+    pub address: Option<std::net::Ipv4Addr>,
+    /// The operator has been told this drops the address the console may
+    /// itself be reached on.
+    #[serde(default)]
+    pub i_understand_this_may_disconnect_me: bool,
+}
+
+/// PUT /api/environment/clusters/{name}/vip — move the cluster address, or
+/// take it away with a `null` address.
+///
+/// Guarded by an acknowledgement rather than by a refusal, because there is no
+/// safe version of this: the old address comes down before the new one goes
+/// up, and a session held on the VIP loses its connection in between. The
+/// members' own addresses stay valid throughout, which is what makes that
+/// recoverable rather than a lockout — and is what the console says before
+/// asking.
+pub async fn set_vip(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    raw: Body,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let request: SetVipRequest = required_body(raw)?;
+    if !request.i_understand_this_may_disconnect_me {
+        return Err(ApiError::Conflict(
+            "Changing the cluster address takes the old one down before the new one comes up. \
+             If this console is reached on it, the connection drops mid-operation — the change \
+             still completes, and each member's own address still works. Acknowledge that first."
+                .to_string(),
+        ));
+    }
+    let vip = state.cluster.set_vip(&name, request.address).await?;
+    Ok(Json(serde_json::json!({ "vip": vip })))
+}
+
+/// POST /api/environment/clusters/{name}/vip/recover — clear the cluster
+/// address's recorded failures and let Pacemaker probe it again.
+///
+/// The other half of a fault the console can only otherwise describe.
+/// Pacemaker latches a failed operation, so an address stopped with "Not
+/// installed" stays stopped after the missing piece is installed — nothing
+/// asks again on its own. This asks again.
+///
+/// Answers with the address as Pacemaker has it immediately afterwards, not
+/// with a success flag: the probe decides the outcome, and a recovery run
+/// before the cause was fixed answers with the same failure it started with.
+pub async fn recover_vip(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<lumen_cluster::VipView>, ApiError> {
+    Ok(Json(state.cluster.recover_vip(&name).await?))
 }
 
 #[derive(Debug, Default, Deserialize)]

@@ -45,6 +45,18 @@ impl ZfsBackend for UnavailableBackend {
     async fn block_devices(&self) -> Result<Vec<BlockDevice>> {
         Ok(crate::devices::list(&crate::devices::DeviceRoots::default()).await)
     }
+    /// Answers with nothing rather than with an error, and that is the safe
+    /// direction only because of what the service does with it: an empty list
+    /// means "no pool claims this disk", which would make a wipe look allowed.
+    /// The service refuses a wipe outright when the pools cannot be listed —
+    /// see `StorageService::wipe_disk`, which asks `pools()` first, and that
+    /// call does error here.
+    async fn pool_members(&self) -> Result<Vec<(String, String)>> {
+        Ok(Vec::new())
+    }
+    async fn wipe_disk(&self, _device: &BlockDevice) -> Result<()> {
+        self.error()
+    }
     async fn create_pool(&self, _request: &PoolRequest) -> Result<Pool> {
         self.error()
     }

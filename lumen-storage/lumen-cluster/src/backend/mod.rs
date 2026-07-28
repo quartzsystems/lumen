@@ -82,6 +82,30 @@ pub trait ClusterBackend: Send + Sync {
         prefix: u8,
     ) -> Result<()>;
 
+    /// `pcs resource delete <resource>` — stop a resource and take it out of
+    /// the CIB.
+    ///
+    /// The half of moving the cluster address that has to come first.
+    /// `IPaddr2` has no notion of its address changing underneath it, so a
+    /// move is a removal and a create; without the removal the old address
+    /// stays up on whichever member is holding it and the cluster answers on
+    /// two.
+    async fn remove_resource(&self, resource: &str) -> Result<()>;
+
+    /// `pcs resource cleanup <resource>` — forget one resource's recorded
+    /// failures and probe it again on every node.
+    ///
+    /// Pacemaker latches a failure. Once an operation returns non-zero the
+    /// result stays in that node's history and the resource is left alone,
+    /// which means fixing the cause is not enough on its own: the tool the
+    /// agent was missing can be installed and the address still will not come
+    /// up, because nothing asks again. This is the step that asks again, and
+    /// it is why the console can offer a recovery instead of a command to
+    /// paste into a shell.
+    ///
+    /// Cluster-wide from any member, like every other pcs write here.
+    async fn cleanup_resource(&self, resource: &str) -> Result<()>;
+
     /// Create one `fence_ipmilan` STONITH device. The password travels
     /// separately from the rendered device because it must never enter the
     /// membership record, a journal line, or an argument vector — the CLI

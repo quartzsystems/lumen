@@ -1,7 +1,8 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { AlertTriangle, HardDrive } from "lucide-react";
+import Link from "next/link";
+import { AlertTriangle, HardDrive, Info } from "lucide-react";
 import { ModalHeader, ModalShell } from "@/components/ui/Modal";
 import { Field, ModalFooter, SelectInput, TextInput } from "@/components/ui/formkit";
 import { ApiError } from "@/lib/authClient";
@@ -11,6 +12,7 @@ import {
   type InventoryResponse,
   type PoolSeat,
 } from "@/lib/inventoryClient";
+import { shortNodeName } from "@/lib/nodeNames";
 import type { Compression, VdevKind } from "@/lib/storageClient";
 import { formatBytes } from "@/lib/vmClient";
 
@@ -50,6 +52,11 @@ export function PoolAcrossNodesDialog({
     () => Array.from(new Set(candidates.map((row) => row.node))).sort(),
     [candidates],
   );
+
+  /// Disks the picker has to refuse but an operator could reclaim: a
+  /// partition table and nothing using it. Counted so the dialog can point at
+  /// the page that clears them instead of just greying the row.
+  const reclaimable = candidates.filter((row) => row.device.wipeable).length;
 
   const key = (node: string, path: string) => `${node}/${path}`;
   const toggle = (node: string, path: string) => {
@@ -194,8 +201,11 @@ export function PoolAcrossNodesDialog({
             return (
               <section key={node} className="flex flex-col gap-2">
                 <div className="flex items-center gap-2">
-                  <span className="qz-mono text-[13px] font-semibold text-[var(--qz-fg-2)]">
-                    {node}
+                  <span
+                    className="qz-mono text-[13px] font-semibold text-[var(--qz-fg-2)]"
+                    title={node}
+                  >
+                    {shortNodeName(node)}
                   </span>
                   <span className="text-[12px] text-[var(--qz-fg-4)]">
                     {chosen} of {rows.length} chosen
@@ -231,8 +241,15 @@ export function PoolAcrossNodesDialog({
                           {row.device.model && ` · ${row.device.model}`}
                           {row.device.rotational ? " · spinning" : " · solid state"}
                         </span>
+                        {/* A disk carrying nothing but an old partition table
+                            is a decision away from usable, and saying only
+                            "2 partitions" beside a greyed-out checkbox is
+                            where an operator reusing hardware gets stuck.
+                            The badge says which kind of unavailable it is. */}
                         {disabled && (
-                          <span className="badge badge-muted ml-auto">
+                          <span
+                            className={`badge ml-auto ${row.device.wipeable ? "badge-warn" : "badge-muted"}`}
+                          >
                             {row.device.used_by ?? "in use"}
                           </span>
                         )}
@@ -243,6 +260,25 @@ export function PoolAcrossNodesDialog({
               </section>
             );
           })
+        )}
+
+        {/* The way out of the state this dialog can otherwise only refuse.
+            A disk carrying an old partition table and nothing else can be
+            cleared; one holding a pool or a mount cannot, and Disks is the
+            page that draws that line. */}
+        {reclaimable > 0 && (
+          <div className="callout">
+            <Info size={17} className="flex-shrink-0 text-[var(--qz-fg-4)] mt-[1px]" />
+            <div className="text-[13px] text-[var(--qz-fg-3)]">
+              {reclaimable} {reclaimable === 1 ? "disk carries" : "disks carry"} an old partition
+              table and nothing using it. Clear{" "}
+              {reclaimable === 1 ? "it" : "them"} on{" "}
+              <Link href="/storage/disks" className="text-[var(--qz-accent)] no-underline">
+                Storage → Disks
+              </Link>{" "}
+              and {reclaimable === 1 ? "it becomes" : "they become"} selectable here.
+            </div>
+          </div>
         )}
 
         {short.length > 0 && (

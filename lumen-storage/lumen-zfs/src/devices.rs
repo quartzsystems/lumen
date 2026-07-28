@@ -134,6 +134,10 @@ fn scan(roots: &DeviceRoots) -> Vec<BlockDevice> {
                     used_by.push(claim.clone());
                 }
             }
+            // Whether anything live has it, recorded before the partition
+            // count is folded into the same sentence. The two are the same
+            // word to a reader and different answers to a wipe.
+            let claimed = !used_by.is_empty();
             if used_by.is_empty() && !partitions.is_empty() {
                 used_by.push(format!(
                     "{} partition{}",
@@ -145,6 +149,11 @@ fn scan(roots: &DeviceRoots) -> Vec<BlockDevice> {
             used_by.dedup();
 
             Some(BlockDevice {
+                claimed,
+                partitions: partitions.len(),
+                // The scan does not get a vote on this: it cannot see an
+                // imported pool. The service decides; see `BlockDevice`.
+                wipeable: false,
                 path: by_id
                     .get(&name)
                     .cloned()
@@ -166,6 +175,18 @@ fn scan(roots: &DeviceRoots) -> Vec<BlockDevice> {
     // name so the order does not change between reads.
     disks.sort_by(|a, b| a.in_use.cmp(&b.in_use).then_with(|| a.name.cmp(&b.name)));
     disks
+}
+
+/// The `/dev` paths of one disk's partitions, in order.
+///
+/// Public because clearing a disk has to clear them too: a ZFS label lives on
+/// the partition, not on the disk, so wiping the table alone leaves labels
+/// behind that the next `zpool create` will find and object to.
+pub fn partition_paths(roots: &DeviceRoots, disk: &str) -> Vec<String> {
+    partitions_of(&roots.sys_block.join(disk), disk)
+        .into_iter()
+        .map(|part| format!("/dev/{part}"))
+        .collect()
 }
 
 /// The partitions of one disk: subdirectories carrying a `partition` file.
