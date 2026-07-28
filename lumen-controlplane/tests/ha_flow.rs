@@ -188,6 +188,7 @@ fn harness(tag: &str, cluster_backend: ClusterMockBackend) -> Harness {
         cluster,
         drbd,
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
+        drain: Default::default(),
     });
     Harness {
         state,
@@ -293,4 +294,73 @@ async fn a_machine_without_the_flag_or_without_replicas_stays_down() {
         "neither machine may restart: {:?}",
         harness.virt_backend.names()
     );
+}
+
+/// The reason maintenance mode is a replicated flag rather than a note on the
+/// node going down: a member that is absent on purpose must not look like a
+/// failure to anybody else's sweep. Without this, rebooting a node for an
+/// update scatters the machines that were just evacuated off it.
+#[tokio::test]
+async fn a_node_in_maintenance_is_not_a_lost_node() {
+    let harness = harness(
+        "maintenance",
+        ClusterMockBackend::environment().with_partition("alpha", "alpha-2"),
+    );
+    harness
+        .cluster_backend
+        .confirm_node_dead("alpha-2")
+        .await
+        .unwrap();
+    harness
+        .state
+        .cluster
+        .peer_store_definition(&ha_definition())
+        .unwrap();
+
+    // alpha-2 went down while flagged out of service. Every rule that would
+    // otherwise fire — clean loss, HA flag set, a replica here — is met.
+    let mut membership = harness.state.cluster.environment_record().unwrap().unwrap();
+    membership.version += 1;
+    membership
+        .nodes
+        .iter_mut()
+        .find(|n| n.name == "alpha-2")
+        .unwrap()
+        .maintenance = Some(lumen_cluster::Maintenance {
+        since: 1_785_000_000,
+        by: "root@pam".into(),
+    });
+    harness
+        .state
+        .cluster
+        .receive_membership(membership)
+        .await
+        .unwrap();
+
+    ha::sweep(&harness.state).await;
+    assert!(
+        harness.virt_backend.names().is_empty(),
+        "a node in maintenance is where the operator put it, not lost: {:?}",
+        harness.virt_backend.names()
+    );
+
+    // Out of maintenance and still down, the same sweep acts — the flag is
+    // the only thing that was holding it.
+    let mut membership = harness.state.cluster.environment_record().unwrap().unwrap();
+    membership.version += 1;
+    membership
+        .nodes
+        .iter_mut()
+        .find(|n| n.name == "alpha-2")
+        .unwrap()
+        .maintenance = None;
+    harness
+        .state
+        .cluster
+        .receive_membership(membership)
+        .await
+        .unwrap();
+
+    ha::sweep(&harness.state).await;
+    assert!(harness.virt_backend.is_defined("web01"));
 }

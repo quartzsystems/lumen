@@ -310,34 +310,10 @@ pub async fn migrate(
 
 /// The migration destination URI: the target's seat on its cluster's Core
 /// network. Management carries the console; the machine's memory rides the
-/// same dedicated link its disks already replicate over.
+/// same dedicated link its disks already replicate over. Shared with the
+/// maintenance drain, which moves machines the same way one at a time.
 fn core_uri_of(state: &AppState, target: &str) -> Result<String, ApiError> {
-    let membership = state
-        .cluster
-        .environment_record()
-        .map_err(ApiError::from)?
-        .ok_or_else(|| {
-            ApiError::Conflict("This node has not joined an environment.".to_string())
-        })?;
-    let address = membership
-        .clusters
-        .iter()
-        .find_map(|record| {
-            record
-                .networks
-                .core
-                .members
-                .iter()
-                .find(|m| m.node == target)
-                .map(|m| m.address)
-        })
-        .ok_or_else(|| {
-            ApiError::Conflict(format!(
-                "\"{target}\" has no seat on a cluster's Core network, so there is no path to \
-                 migrate over."
-            ))
-        })?;
-    Ok(format!("qemu+tcp://{address}/system"))
+    crate::maintenance::core_uri_of(state, target).map_err(ApiError::Conflict)
 }
 
 pub async fn start(

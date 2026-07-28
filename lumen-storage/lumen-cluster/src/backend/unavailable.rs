@@ -81,6 +81,10 @@ impl ClusterBackend for UnavailableBackend {
         self.error()
     }
 
+    async fn set_standby(&self, _target: &str, _standby: bool) -> Result<()> {
+        self.error()
+    }
+
     async fn confirm_node_dead(&self, _target: &str) -> Result<()> {
         self.error()
     }

@@ -606,6 +606,7 @@ mod tests {
                     address: "192.168.10.1".into(),
                     controlplane_version: "0.3.0".into(),
                     cluster: None,
+                    maintenance: None,
                 })
                 .collect(),
             clusters: Vec::new(),

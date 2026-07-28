@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { AlertTriangle, Check, Copy, X, Zap } from "lucide-react";
 import { ModalHeader, ModalShell } from "@/components/ui/Modal";
 import { Tabs } from "@/components/ui/Tabs";
@@ -9,11 +9,15 @@ import { ApiError } from "@/lib/authClient";
 import {
   confirmNodeDead,
   destroyCluster,
+  enterMaintenance,
+  exitMaintenance,
+  fetchDrain,
   joinEnvironment,
   mintToken,
   testFence,
   type ClusterView,
   type FenceTestView,
+  type MaintenanceProgress,
 } from "@/lib/clusterClient";
 
 /// Both directions of the join-token flow in one dialog: mint a token here
@@ -320,6 +324,205 @@ export function FenceTestDialog({
         )}
       </div>
     </ModalShell>
+  );
+}
+
+/// How often the drain feed is re-read while machines are moving. A live
+/// migration takes as long as the machine's memory takes to copy, so this is
+/// about watching progress, not about catching a fast transition.
+const DRAIN_POLL_MS = 1500;
+
+/// Taking this node out of service, and watching it empty.
+///
+/// One dialog for both directions, because they are one decision an operator
+/// makes twice: out for the work, back afterwards. The drain's per-machine
+/// steps are shown as they happen — a live migration is slow enough that a
+/// spinner with no detail is worse than useless — and a machine that could
+/// not move is named with its reason rather than folded into a count.
+export function MaintenanceDialog({
+  cluster,
+  node,
+  inMaintenance,
+  onClose,
+  onChanged,
+}: {
+  cluster: string;
+  node: string;
+  /// Whether the node is already out of service, which is what decides
+  /// whether this dialog offers to leave or to return.
+  inMaintenance: boolean;
+  onClose: () => void;
+  onChanged: () => void;
+}) {
+  const [evacuate, setEvacuate] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [progress, setProgress] = useState<MaintenanceProgress | null>(null);
+
+  // Pick up a drain that is already running — the operator may have closed
+  // this dialog and come back, and the work does not stop when they do.
+  const poll = useCallback(async () => {
+    try {
+      const latest = await fetchDrain();
+      if (latest && latest.node === node) setProgress(latest);
+    } catch {
+      // A feed that cannot be read is not worth an error banner while the
+      // real work is reported by the request itself.
+    }
+  }, [node]);
+
+  useEffect(() => {
+    void poll();
+  }, [poll]);
+
+  const draining = progress?.phase === "running";
+  useEffect(() => {
+    if (!draining) return;
+    const timer = setInterval(() => void poll(), DRAIN_POLL_MS);
+    return () => clearInterval(timer);
+  }, [draining, poll]);
+
+  const run = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      if (inMaintenance) {
+        await exitMaintenance(cluster, node);
+        onChanged();
+        onClose();
+        return;
+      }
+      setProgress(await enterMaintenance(cluster, node, evacuate));
+      onChanged();
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) return;
+      setError(err instanceof Error ? err.message : "The request was refused.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const stranded = progress?.stranded ?? [];
+  const finished = progress !== null && progress.phase !== "running";
+
+  return (
+    <ModalShell onClose={busy ? () => {} : onClose}>
+      <ModalHeader
+        title={inMaintenance ? `Return ${node} to service` : `Take ${node} out of service`}
+        subtitle={
+          inMaintenance
+            ? "Pacemaker runs things here again, and the cluster stops expecting this node to be away."
+            : "Move the running machines off, and tell the cluster this absence is deliberate."
+        }
+        onClose={busy ? () => {} : onClose}
+      />
+      <div className="flex flex-col gap-4">
+        {error && (
+          <div className="callout callout-crit">
+            <AlertTriangle size={17} className="flex-shrink-0 text-[var(--qz-danger)] mt-[1px]" />
+            <div className="text-[13px] text-[var(--qz-fg-2)]">{error}</div>
+          </div>
+        )}
+
+        {progress && <DrainSteps progress={progress} />}
+
+        {finished && stranded.length > 0 && (
+          <div className="callout callout-warn">
+            <AlertTriangle size={17} className="flex-shrink-0 text-[var(--qz-warn)] mt-[1px]" />
+            <div className="flex flex-col gap-2 text-[13px] text-[var(--qz-fg-2)]">
+              <span>
+                {node} is out of service, but {stranded.length}{" "}
+                {stranded.length === 1 ? "machine is" : "machines are"} still running on it.
+                Restarting the node now stops {stranded.length === 1 ? "it" : "them"}.
+              </span>
+              <ul className="m-0 pl-4 flex flex-col gap-1">
+                {stranded.map((machine) => (
+                  <li key={machine.vmid}>
+                    <span className="qz-mono">{machine.name}</span> — {machine.reason}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        )}
+
+        {finished && stranded.length === 0 && (
+          <div className="callout">
+            <Check size={17} className="flex-shrink-0 text-[var(--qz-success)] mt-[1px]" />
+            <div className="text-[13px] text-[var(--qz-fg-2)]">
+              {node} is empty and out of service. Restart or shut it down whenever you are ready;
+              nothing here will be restarted elsewhere while it is away.
+            </div>
+          </div>
+        )}
+
+        {!progress && !inMaintenance && (
+          <>
+            <div className="callout">
+              <AlertTriangle size={17} className="flex-shrink-0 text-[var(--qz-warn)] mt-[1px]" />
+              <div className="text-[13px] text-[var(--qz-fg-2)]">
+                The cluster VIP moves off {node} straight away, so work on this node through its
+                own address rather than the VIP. Machines that move stay where they went — there
+                is no automatic move back.
+              </div>
+            </div>
+            <label className="qz-check">
+              <input
+                type="checkbox"
+                checked={evacuate}
+                onChange={() => setEvacuate(!evacuate)}
+                style={{ accentColor: "var(--qz-accent)" }}
+              />
+              <span className="text-[13px] text-[var(--qz-fg-2)]">
+                Move the running machines to other members first.
+              </span>
+            </label>
+          </>
+        )}
+
+        {finished || (inMaintenance && progress) ? (
+          <div className="flex justify-end">
+            <button type="button" className="btn btn-primary" onClick={onClose}>
+              Close
+            </button>
+          </div>
+        ) : (
+          <ModalFooter
+            onCancel={onClose}
+            saving={busy || draining}
+            disabled={draining}
+            submitLabel={inMaintenance ? "Return to service" : "Take out of service"}
+            savingLabel={inMaintenance ? "Returning…" : "Draining…"}
+            onSubmit={() => void run()}
+          />
+        )}
+      </div>
+    </ModalShell>
+  );
+}
+
+/// The drain's steps, one line each: the node leaving service, then every
+/// machine that has to move and where it went.
+function DrainSteps({ progress }: { progress: MaintenanceProgress }) {
+  const tone = (state: string): string =>
+    state === "done" ? "ok" : state === "failed" ? "crit" : state === "running" ? "warn" : "muted";
+  return (
+    <ul className="m-0 p-0 flex flex-col gap-[6px]" style={{ listStyle: "none" }}>
+      {progress.steps.map((step) => (
+        <li key={step.step} className="flex items-center gap-2 text-[13px]">
+          <span className={`state-dot-${tone(step.state)}`} />
+          <span className="qz-mono text-[var(--qz-fg-2)]">{step.step}</span>
+          {step.node && (
+            <span className="text-[12px] text-[var(--qz-fg-4)]">→ {step.node}</span>
+          )}
+          {step.detail && (
+            <span className="text-[12px] text-[var(--qz-fg-4)] ml-auto text-right">
+              {step.detail}
+            </span>
+          )}
+        </li>
+      ))}
+    </ul>
   );
 }
 

@@ -19,7 +19,7 @@ use tokio::sync::Mutex;
 use crate::backend::ClusterBackend;
 use crate::environment::{
     hash_secret, issue_node_certificate, mint_ca, pem_fingerprint, random_hex, ClusterRecord,
-    EnvironmentMembership, EnvironmentNode, JoinToken, TOKEN_TTL_SECS,
+    EnvironmentMembership, EnvironmentNode, JoinToken, Maintenance, TOKEN_TTL_SECS,
 };
 use crate::error::{ClusterError, Result};
 use crate::join::{
@@ -110,8 +110,28 @@ pub struct ClusterNodeView {
     pub address: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub controlplane_version: Option<String>,
+    /// Set while the operator has this node out of service. Read from the
+    /// membership record rather than from Pacemaker, so it is known even when
+    /// the cluster itself cannot be asked — which is exactly the state a node
+    /// being worked on tends to produce.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maintenance: Option<Maintenance>,
     /// This is the node answering the request.
     pub local: bool,
+}
+
+/// POST/DELETE /api/environment/clusters/{name}/nodes/{node}/maintenance.
+#[derive(Debug, Clone, Serialize)]
+pub struct MaintenanceView {
+    pub node: String,
+    pub cluster: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maintenance: Option<Maintenance>,
+    /// Whether the rest of the cluster would still be quorate without this
+    /// node's vote. Maintenance itself never costs the vote — corosync keeps
+    /// running — but the reboot the operator is heading towards does, and
+    /// this is where they find that out while it is still a decision.
+    pub quorum_safe: bool,
 }
 
 /// The fencing panel's one-line summary. IPMI is the only fence path, so a
@@ -381,6 +401,7 @@ impl ClusterService {
                         address: address.to_string(),
                         controlplane_version: self.controlplane_version.clone(),
                         cluster: None,
+                        maintenance: None,
                     }],
                     clusters: Vec::new(),
                 };
@@ -494,6 +515,7 @@ impl ClusterService {
             address: request.address.clone(),
             controlplane_version: request.controlplane_version.clone(),
             cluster: None,
+            maintenance: None,
         });
         self.store.save_membership(&membership)?;
         tracing::info!(node = %request.node, "node joined the environment");
@@ -1516,6 +1538,145 @@ impl ClusterService {
         Ok(())
     }
 
+    // --- maintenance --------------------------------------------------------
+
+    /// Take this node out of service, or put it back.
+    ///
+    /// Two things happen, in an order chosen so that no failure leaves a node
+    /// that HA will act on while an operator is working on it. Going out, the
+    /// **record is written first** and Pacemaker standby second: the record is
+    /// what stops every member's HA manager treating this node's absence as a
+    /// failure, and it must be true before anything starts moving. Coming
+    /// back, the order reverses — standby is lifted first, and the flag is
+    /// cleared only once Pacemaker will really run things here again.
+    ///
+    /// A failure part-way unwinds rather than leaving the pair disagreeing.
+    /// A node flagged out of service but still holding the VIP is a node whose
+    /// console says one thing and whose cluster does another, and that is a
+    /// worse place to debug from than either end state.
+    ///
+    /// Local only, deliberately: standby is cluster-wide from any member, but
+    /// what makes maintenance worth having is the evacuation that goes with it
+    /// — and the machines can only be moved by the node that is running them.
+    /// Rather than offer half the operation remotely, this refuses and names
+    /// the console to open.
+    pub async fn set_maintenance(
+        &self,
+        target: &str,
+        on: bool,
+        by: &str,
+    ) -> Result<MaintenanceView> {
+        let _guard = self.gate.lock().await;
+        let mut membership = self.require_membership()?;
+        let Some(record) = membership.node(target) else {
+            return Err(ClusterError::NotFound(format!(
+                "\"{target}\" is not a node in this environment."
+            )));
+        };
+        if target != self.node {
+            return Err(ClusterError::Conflict(format!(
+                "Maintenance runs on the node it is about — its machines can only be moved by \
+                 the node running them. Open the console of \"{target}\"."
+            )));
+        }
+        let Some(cluster) = record.cluster.clone() else {
+            return Err(ClusterError::Conflict(
+                "This node is not in a cluster, so there is nowhere for its machines to go and \
+                 nothing that would restart them. Shut it down when you are ready to work on it."
+                    .to_string(),
+            ));
+        };
+
+        let state = self.backend.cluster_state(&cluster).await?;
+        if on {
+            // Both of these are "the cluster is already having a bad day".
+            // Taking a second node out of service now turns one problem into
+            // an outage.
+            if let Some(unclean) = state.nodes.iter().find(|n| n.unclean) {
+                return Err(ClusterError::Conflict(format!(
+                    "\"{}\" is lost and has not been fenced yet. Let the cluster finish with it \
+                     before taking another node out of service.",
+                    unclean.name
+                )));
+            }
+            if !state.quorum.quorate {
+                return Err(ClusterError::Conflict(
+                    "This cluster is not quorate. Taking a node out of service now would leave \
+                     less of it, not more."
+                        .to_string(),
+                ));
+            }
+        }
+
+        let at = now_unix();
+        let entry = on.then(|| Maintenance {
+            since: at,
+            by: by.to_string(),
+        });
+        let previous = record.maintenance.clone();
+        if previous.is_some() == on {
+            // Already where it was asked to be. Answer with the state rather
+            // than bumping the record's counter for a no-op — the version is
+            // how gossip decides who is newer, and spending it on nothing
+            // makes every other node re-read the record for no reason.
+            return Ok(MaintenanceView {
+                node: target.to_string(),
+                cluster,
+                maintenance: previous,
+                quorum_safe: quorum_survives_loss(&state.quorum),
+            });
+        }
+
+        let write = |membership: &mut EnvironmentMembership, value: Option<Maintenance>| {
+            membership.version += 1;
+            if let Some(node) = membership.nodes.iter_mut().find(|n| n.name == target) {
+                node.maintenance = value;
+            }
+        };
+
+        if on {
+            write(&mut membership, entry.clone());
+            self.store.save_membership(&membership)?;
+        }
+        if let Err(err) = self.backend.set_standby(target, on).await {
+            if on {
+                // Unwind: the record claimed this node was out of service and
+                // Pacemaker never agreed.
+                write(&mut membership, previous);
+                self.store.save_membership(&membership)?;
+            }
+            return Err(err);
+        }
+        if !on {
+            write(&mut membership, None);
+            self.store.save_membership(&membership)?;
+        }
+
+        drop(_guard);
+        self.gossip_once().await;
+        tracing::warn!(
+            cluster,
+            node = target,
+            maintenance = on,
+            "the node's service state changed"
+        );
+        Ok(MaintenanceView {
+            node: target.to_string(),
+            cluster,
+            maintenance: entry,
+            quorum_safe: quorum_survives_loss(&state.quorum),
+        })
+    }
+
+    /// This node's maintenance state as the record has it, with no side
+    /// effects — what the evacuation workflow checks before it starts and what
+    /// the power guard consults before it lets a node go down.
+    pub fn maintenance_of(&self, node: &str) -> Result<Option<Maintenance>> {
+        Ok(self
+            .environment_record()?
+            .and_then(|m| m.node(node).and_then(|n| n.maintenance.clone())))
+    }
+
     // --- replicated machine definitions -------------------------------------
 
     /// Keep a machine's definition on every member of this node's cluster —
@@ -1690,6 +1851,10 @@ impl ClusterService {
                         fence: None,
                         address: Some(member.address.clone()),
                         controlplane_version: Some(member.controlplane_version.clone()),
+                        // Known even here: maintenance is Lumen's own record,
+                        // and a node being worked on is a common reason for
+                        // the cluster to be unaskable in the first place.
+                        maintenance: member.maintenance.clone(),
                         local: member.name == self.node,
                     })
                     .collect();
@@ -1728,6 +1893,7 @@ impl ClusterService {
                     fence: state.fence_for(&node.name).cloned(),
                     address: record.map(|r| r.address.clone()),
                     controlplane_version: record.map(|r| r.controlplane_version.clone()),
+                    maintenance: record.and_then(|r| r.maintenance.clone()),
                     local: node.name == self.node,
                 }
             })
@@ -1772,6 +1938,22 @@ impl ClusterService {
             local: node.name == self.node,
         }
     }
+}
+
+/// Whether the cluster would still be quorate if one more vote went away —
+/// the question behind "is it safe to reboot this node".
+///
+/// The two-node regime answers yes on purpose. That regime exists precisely so
+/// one survivor carries on, and it pays for it with fencing: `two_node` plus
+/// `wait_for_all` means the survivor is quorate once it has fenced its peer,
+/// and a cold start with only one node up is not. Applying the majority rule
+/// there would refuse the one case the regime was chosen for.
+pub fn quorum_survives_loss(quorum: &QuorumState) -> bool {
+    if quorum.two_node {
+        return true;
+    }
+    let majority = quorum.expected_votes / 2 + 1;
+    quorum.votes.saturating_sub(1) >= majority
 }
 
 fn now_unix() -> u64 {
@@ -2775,5 +2957,184 @@ mod tests {
         stranger.version = 99;
         let kept = service.receive_membership(stranger).await.unwrap();
         assert_eq!(kept.version, 9, "a stranger's record is never adopted");
+    }
+
+    // --- maintenance --------------------------------------------------------
+
+    #[tokio::test]
+    async fn maintenance_writes_the_record_and_reaches_pacemaker_both_ways() {
+        let backend = Arc::new(MockBackend::environment());
+        let service = Arc::new(
+            ClusterService::new(
+                backend.clone(),
+                Arc::new(MockPeers::new()),
+                network(),
+                &test_dir("maint"),
+                "0.3.0",
+            )
+            .with_node("alpha-1")
+            .with_environment(&environment_membership()),
+        );
+
+        let view = service
+            .set_maintenance("alpha-1", true, "root@pam")
+            .await
+            .unwrap();
+        assert_eq!(view.cluster, "alpha");
+        assert_eq!(view.maintenance.as_ref().unwrap().by, "root@pam");
+        assert!(
+            view.quorum_safe,
+            "the two-node regime carries one survivor on purpose"
+        );
+        assert_eq!(backend.standby_calls(), vec![("alpha-1".into(), true)]);
+        assert!(service.maintenance_of("alpha-1").unwrap().is_some());
+
+        // The record is what every other node's HA manager reads, so it has
+        // to be in the gossiped document, not just in memory.
+        let record = service.environment_record().unwrap().unwrap();
+        assert!(record.node("alpha-1").unwrap().in_maintenance());
+        assert!(!record.node("alpha-2").unwrap().in_maintenance());
+
+        // And the view an operator reads shows it on the member row.
+        let cluster = service.cluster("alpha").await.unwrap();
+        let node = cluster.nodes.iter().find(|n| n.node == "alpha-1").unwrap();
+        assert!(node.maintenance.is_some());
+        assert!(node.standby, "standby is what Pacemaker was told");
+
+        let view = service
+            .set_maintenance("alpha-1", false, "root@pam")
+            .await
+            .unwrap();
+        assert!(view.maintenance.is_none());
+        assert_eq!(
+            backend.standby_calls(),
+            vec![("alpha-1".into(), true), ("alpha-1".into(), false)]
+        );
+        assert!(service.maintenance_of("alpha-1").unwrap().is_none());
+    }
+
+    /// The record must never claim a node is out of service when Pacemaker
+    /// never agreed — that pair disagreeing is worse than either end state.
+    #[tokio::test]
+    async fn a_standby_that_fails_unwinds_the_record() {
+        let backend = Arc::new(MockBackend::environment());
+        let service = Arc::new(
+            ClusterService::new(
+                backend.clone(),
+                Arc::new(MockPeers::new()),
+                network(),
+                &test_dir("maint-unwind"),
+                "0.3.0",
+            )
+            .with_node("alpha-1")
+            .with_environment(&environment_membership()),
+        );
+        let before = service.environment_record().unwrap().unwrap().version;
+
+        backend.fail_standby("pcs is not answering");
+        let err = service
+            .set_maintenance("alpha-1", true, "root@pam")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not answering"), "{err}");
+        assert!(
+            service.maintenance_of("alpha-1").unwrap().is_none(),
+            "the flag is gone again"
+        );
+        // The unwind bumps the counter rather than restoring it: a peer that
+        // already took the flagged record has to see something newer, or it
+        // would keep believing this node is out of service.
+        assert_eq!(
+            service.environment_record().unwrap().unwrap().version,
+            before + 2
+        );
+    }
+
+    #[tokio::test]
+    async fn maintenance_refuses_what_it_should() {
+        let service = service_with(
+            MockBackend::environment(),
+            MockPeers::new(),
+            Some(&environment_membership()),
+        );
+
+        // Another node's maintenance is run from that node's console.
+        let err = service
+            .set_maintenance("alpha-2", true, "root@pam")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("alpha-2"), "{err}");
+        assert!(err.to_string().contains("console"), "{err}");
+
+        let err = service
+            .set_maintenance("ghost", true, "root@pam")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ClusterError::NotFound(_)), "{err}");
+
+        // A cluster mid-fence is not a cluster to take another node out of.
+        let service = service_with(
+            MockBackend::environment().with_partition("alpha", "alpha-2"),
+            MockPeers::new(),
+            Some(&environment_membership()),
+        );
+        let err = service
+            .set_maintenance("alpha-1", true, "root@pam")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("fenced"), "{err}");
+
+        // Leaving service is guarded; returning to it is not — a node coming
+        // back must never be blocked by the state it is coming back from.
+        assert!(service
+            .set_maintenance("alpha-1", false, "root@pam")
+            .await
+            .is_ok());
+    }
+
+    /// A standalone node has nowhere to drain to and nothing that would
+    /// restart its machines, so the answer is a sentence, not a flag.
+    #[tokio::test]
+    async fn a_node_in_no_cluster_is_told_why_maintenance_is_meaningless() {
+        let service = service_with(
+            MockBackend::appliance(),
+            MockPeers::new(),
+            Some(&membership_of(&[("alpha-1", None)])),
+        );
+        let err = service
+            .set_maintenance("alpha-1", true, "root@pam")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not in a cluster"), "{err}");
+    }
+
+    #[test]
+    fn quorum_safety_counts_the_vote_that_is_about_to_go_away() {
+        let three = |votes: u32| QuorumState {
+            quorate: true,
+            votes,
+            expected_votes: 3,
+            two_node: false,
+            wait_for_all: false,
+        };
+        assert!(quorum_survives_loss(&three(3)), "3 of 3 can spare one");
+        assert!(!quorum_survives_loss(&three(2)), "2 of 3 cannot");
+
+        // The two-node regime exists so one survivor carries on.
+        assert!(quorum_survives_loss(&QuorumState {
+            quorate: true,
+            votes: 2,
+            expected_votes: 2,
+            two_node: true,
+            wait_for_all: true,
+        }));
+
+        assert!(quorum_survives_loss(&QuorumState {
+            quorate: true,
+            votes: 5,
+            expected_votes: 5,
+            two_node: false,
+            wait_for_all: false,
+        }));
     }
 }

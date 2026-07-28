@@ -403,6 +403,47 @@ renders the same shape it will render for a six-node environment. A
 quietly falling back to standalone would make the environment appear to
 vanish, which is far worse than an error message.
 
+### Maintenance is Lumen's flag, not Pacemaker's standby
+
+Standby moves the resources Pacemaker owns, and on this appliance those are
+the Management VIP and the fence devices — nothing else. The machines are
+libvirt domains that Lumen's own HA manager restarts, so `pcs node standby`
+on its own would take a node out of service and move not one virtual machine.
+
+Maintenance is therefore a field on the membership record — `since` and `by`
+— that rides the same gossip as everything else in it, with standby set
+alongside as one step of the operation rather than as the operation. Putting
+it in the replicated record is what makes it useful: every member's HA sweep
+reads it, so a node that goes down while flagged is a node the cluster
+*leaves alone* rather than a member it thinks it lost. Without that, rebooting
+a node for an update scatters the machines that were just evacuated off it.
+
+The flag is written before standby is set, and cleared after standby is
+lifted, so no failure part-way leaves a node that HA will act on while
+somebody is working on it. A standby that fails unwinds the record — and
+unwinds it by *bumping* the version rather than restoring the old one, because
+a peer that already took the flagged record has to see something newer.
+
+The drain that goes with it lives in the control plane
+(`lumen-controlplane/src/maintenance.rs`), because it is the one part that
+spans three domains: the machines are compute's, where they may legally run is
+replicated storage's, and who is eligible to receive them is clustering's. It
+moves one machine at a time to the in-service member holding a **current**
+replica of every disk that has taken the fewest machines so far — spreading
+without capacity information rather than packing everything onto the
+lowest-named survivor. It never shuts a machine down to move it, and it never
+moves one onto a replica that is not `UpToDate`. A machine that cannot move —
+media attached, a local disk, no ready target — is left running and named in
+the result with its reason. "Out of service" and "empty" are different facts,
+and an operator about to reboot needs both.
+
+Maintenance runs on the node it is about. Standby is cluster-wide from any
+member, but the machines can only be moved by the node running them, and
+offering half the operation remotely would be worse than refusing it.
+Consequence worth knowing: standby moves the VIP off at the *start* of the
+window, so work on a node through its own address rather than the VIP, or the
+rest of the drain is reported by a console that has no progress to show.
+
 ### An unreachable cluster is presented, not dropped
 
 The environment view lists every cluster the membership record names. One
@@ -435,6 +476,15 @@ one level upward: grouped by cluster, then by node.
 | POST | `/api/environment/clusters/:name/nodes` | Add a node to a running cluster — `202`, then poll the same pending feed a create uses |
 | POST | `/api/environment/clusters/:name/fence/:node/test` | Guarded live fence test — the node really power-cycles; `i_understand_this_power_cycles_the_node` required |
 | POST | `/api/environment/clusters/:name/nodes/:node/confirm-dead` | Break-glass — only for an unfenced-unreachable node; `i_have_verified_the_node_is_powered_off` required |
+| POST | `/api/environment/clusters/:name/nodes/:node/maintenance` | Take this node out of service and drain it — `202`, then poll; `{"evacuate": false}` to leave the machines where they are |
+| DELETE | `/api/environment/clusters/:name/nodes/:node/maintenance` | Return this node to service |
+| GET | `/api/environment/maintenance` | The drain of this node, or `null` |
+
+`POST /api/system/power` gained one guard from the same work: it refuses to
+restart or shut down a node whose cluster would lose quorum without it,
+unless the node is already in maintenance or the caller sends
+`i_understand_the_cluster_loses_quorum`. Before this, the console would
+happily stop the last vote a cluster had to spare.
 
 A node that never joined an environment answers `GET /api/environment` with
 no `environment` object and itself as the one entry in `unassigned` — the
@@ -481,7 +531,16 @@ page cannot know which. Removing an unassigned node is an inline confirm,
 not a modal: the node can simply join again. Each member row carries the
 fencing actions: the live fence test behind its own dialog — what will
 happen, the acknowledgement, then the answer, pass or fail — and, only while
-a node is unfenced-unreachable, the break-glass **Confirm dead**.
+a node is unfenced-unreachable, the break-glass **Confirm dead**. The current
+node's own row also carries **Maintenance**: one dialog for both directions,
+showing the drain's steps as they happen — a live migration is slow enough
+that a spinner with no detail is worse than useless — and ending either with
+"this node is empty" or with the machines that are still on it and why. The
+state pill reads *Maintenance* ahead of Offline and Standby, because a node
+somebody is deliberately working on being offline is the expected part; only
+*Unfenced* outranks it. That pill survives an unreachable cluster, since
+maintenance is read from the record rather than asked of corosync — and a node
+being worked on is a common reason for the cluster to be unaskable.
 
 Both pages poll at five seconds and render straight from `/api/environment`;
 the health pill is derived in the service, so the console and the API can

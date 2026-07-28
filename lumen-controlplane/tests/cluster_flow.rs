@@ -138,6 +138,7 @@ fn harness(
         cluster,
         drbd,
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
+        drain: Default::default(),
     };
     Harness {
         router: app(Arc::new(state)),
@@ -549,6 +550,40 @@ async fn the_first_token_bootstraps_and_a_join_spends_it() {
     assert!(refused["error"].as_str().unwrap().contains("one-time"));
 }
 
+/// The console mints with a bodiless POST, and a browser's `fetch` sends that
+/// as `Content-Type: application/json` with zero bytes behind it. An optional
+/// body has to stay optional when the request says it is sending JSON and then
+/// sends none — this came back 400 out of the extractor, before the handler
+/// that would have bootstrapped the environment ever ran.
+///
+/// Built by hand rather than through `request`, which only sets the header when
+/// there is a body and so could never have caught this.
+#[tokio::test]
+async fn minting_takes_a_declared_but_empty_json_body() {
+    let harness = harness(
+        "empty-body",
+        MockBackend::appliance(),
+        MockPeers::new(),
+        None,
+    );
+    let cookie = sign_in(&harness.router).await;
+
+    let response = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post("/api/environment/tokens")
+                .header(header::COOKIE, cookie)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
 // --- peer authentication ----------------------------------------------------
 
 #[tokio::test]
@@ -719,6 +754,7 @@ async fn a_cluster_create_reports_per_node_per_step_progress_and_completes() {
         cluster,
         drbd,
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
+        drain: Default::default(),
     }));
 
     let cookie = sign_in(&router).await;

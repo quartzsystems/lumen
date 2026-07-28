@@ -39,6 +39,14 @@ export interface FenceDeviceState {
   last_test: FenceTest | null;
 }
 
+/// A node the operator has taken out of service. Read off the replicated
+/// record, so it is known even when the cluster itself cannot be asked.
+export interface Maintenance {
+  /// Unix seconds.
+  since: number;
+  by: string;
+}
+
 export interface ClusterNodeView {
   node: string;
   online: boolean;
@@ -49,6 +57,7 @@ export interface ClusterNodeView {
   fence?: FenceDeviceState;
   address?: string;
   controlplane_version?: string;
+  maintenance?: Maintenance;
   /// This is the node whose console answered.
   local: boolean;
 }
@@ -282,6 +291,56 @@ export const testFence = (cluster: string, node: string): Promise<FenceTestView>
     { i_understand_this_power_cycles_the_node: true },
   );
 
+// --- maintenance -------------------------------------------------------------
+
+/// One machine still running on the node after a drain, and why it did not
+/// move. An empty list is what "safe to restart" means.
+export interface Stranded {
+  vmid: number;
+  name: string;
+  reason: string;
+}
+
+/// A drain, in the same shape a cluster create publishes — one step per
+/// machine, plus the step for taking the node out of service.
+export interface MaintenanceProgress {
+  node: string;
+  cluster: string;
+  phase: WorkflowPhase;
+  error?: string;
+  steps: StepProgress[];
+  stranded: Stranded[];
+}
+
+/// What the node's own maintenance state is, with no drain attached.
+export interface MaintenanceView {
+  node: string;
+  cluster: string;
+  maintenance?: Maintenance;
+  /// Whether the cluster stays quorate without this node's vote — what
+  /// decides whether the reboot after the drain is safe.
+  quorum_safe: boolean;
+}
+
+const maintenancePath = (cluster: string, node: string): string =>
+  `/environment/clusters/${encodeURIComponent(cluster)}/nodes/${encodeURIComponent(node)}/maintenance`;
+
+/// 202 with the first progress when the machines are moving, 200 with the
+/// finished one when they were left alone. Poll `fetchDrain` either way.
+export const enterMaintenance = (
+  cluster: string,
+  node: string,
+  evacuate: boolean,
+): Promise<MaintenanceProgress> => post(maintenancePath(cluster, node), { evacuate });
+
+export const exitMaintenance = (cluster: string, node: string): Promise<MaintenanceView> =>
+  apiFetch<MaintenanceView>(maintenancePath(cluster, node), { method: "DELETE" });
+
+/// The drain of the node this console is talking to, or null if it has not
+/// been drained since its control plane started.
+export const fetchDrain = (): Promise<MaintenanceProgress | null> =>
+  apiFetch<MaintenanceProgress | null>("/environment/maintenance");
+
 export const confirmNodeDead = (cluster: string, node: string): Promise<{ confirmed: boolean }> =>
   post(
     `/environment/clusters/${encodeURIComponent(cluster)}/nodes/${encodeURIComponent(node)}/confirm-dead`,
@@ -310,8 +369,15 @@ export const REGIME_LABEL: Record<Regime, string> = {
 };
 
 /// The state pill for one member row, most alarming condition first.
+///
+/// Maintenance outranks standby and offline but not unfenced: a node the
+/// operator took out of service is expected to be both of those, and saying
+/// "Offline" about a node somebody is deliberately working on hides the one
+/// fact that explains the rest of the row. Unfenced still wins, because a node
+/// waiting on a fence is a data-integrity problem whoever put it there.
 export const nodeTone = (node: ClusterNodeView): { tone: string; label: string } => {
   if (node.unclean) return { tone: "crit", label: "Unfenced" };
+  if (node.maintenance) return { tone: "warn", label: "Maintenance" };
   if (!node.online) return { tone: "muted", label: "Offline" };
   if (node.standby) return { tone: "warn", label: "Standby" };
   return { tone: "ok", label: "Online" };

@@ -98,15 +98,21 @@ export function Bar({ percent, tone }: { percent: number; tone?: Tone }) {
 export function DashPanel({
   title,
   action,
+  grow,
   children,
 }: {
   title: string;
   /// Usually a link to the page that owns this data in full.
   action?: ReactNode;
+  /// Take up whatever height is left in the column. Set on the panel that ends
+  /// a column so two columns of unequal content still finish on the same line
+  /// — a short column that stops early reads as a gap in the page rather than
+  /// as the end of a column.
+  grow?: boolean;
   children: ReactNode;
 }) {
   return (
-    <section className="surface flex flex-col min-w-0">
+    <section className={`surface flex flex-col min-w-0${grow ? " flex-1" : ""}`}>
       <header className="flex items-center justify-between gap-3 px-5 py-[13px] border-b border-[var(--qz-border)]">
         <h2 className="text-[14px] font-bold text-[var(--qz-fg-1)] m-0 truncate">{title}</h2>
         {action}

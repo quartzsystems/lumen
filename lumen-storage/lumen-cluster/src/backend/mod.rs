@@ -99,6 +99,15 @@ pub trait ClusterBackend: Send + Sync {
     /// a result.
     async fn fence_node(&self, target: &str) -> Result<()>;
 
+    /// `pcs node standby|unstandby` — stop Pacemaker running anything on a
+    /// node, and let it run things there again.
+    ///
+    /// This moves the resources Pacemaker owns, which on this appliance is
+    /// the Management VIP and nothing else: the machines are libvirt domains
+    /// and they are Lumen's to move. Standby is one step of taking a node out
+    /// of service, not the whole of it.
+    async fn set_standby(&self, target: &str, standby: bool) -> Result<()>;
+
     /// Break-glass: tell Pacemaker an unfenced-unreachable node is verified
     /// down, so recovery proceeds without a successful fence. The guards —
     /// only an unclean node, never this node, an explicit acknowledgement —

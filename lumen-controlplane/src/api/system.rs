@@ -48,6 +48,10 @@ struct PowerRequest {
     /// Seconds since the epoch. Absent means now.
     #[serde(default)]
     at: Option<u64>,
+    /// Go ahead even though the cluster needs this node. Required only when
+    /// it does; see [`guard_cluster_power`].
+    #[serde(default)]
+    i_understand_the_cluster_loses_quorum: bool,
 }
 
 /// GET /api/system/users — every local account, and what may be done to each.
@@ -145,6 +149,7 @@ pub async fn set_power(
     use axum::response::IntoResponse;
 
     let request: PowerRequest = required_body(raw)?;
+    guard_cluster_power(&state, request.i_understand_the_cluster_loses_quorum).await?;
     match request.at {
         Some(at) => Ok(Json(state.sys.power_at(request.action, at).await?).into_response()),
         None => {
@@ -152,6 +157,55 @@ pub async fn set_power(
             Ok(axum::http::StatusCode::ACCEPTED.into_response())
         }
     }
+}
+
+/// Refuse to take down a node its cluster cannot spare.
+///
+/// The system domain answers for one node and knows nothing about clusters,
+/// which is right — but it means nothing stood between an operator and
+/// shutting down the last vote of a quorate cluster. The check belongs here,
+/// where both domains are in reach.
+///
+/// Three ways past it, and they are all deliberate. A node already in
+/// maintenance has been through the entering guards and its operator has been
+/// told; a cluster that would stay quorate is nobody's problem; and an
+/// explicit acknowledgement is always allowed, because an appliance that
+/// cannot be powered off by its owner is a worse appliance. What is not
+/// allowed is doing it by accident.
+async fn guard_cluster_power(state: &Arc<AppState>, acknowledged: bool) -> Result<(), ApiError> {
+    if acknowledged {
+        return Ok(());
+    }
+    let node = state.cluster.node().to_string();
+    let Some(membership) = state.cluster.environment_record()? else {
+        return Ok(());
+    };
+    let Some(cluster) = membership.node(&node).and_then(|n| n.cluster.clone()) else {
+        return Ok(());
+    };
+    if membership
+        .node(&node)
+        .is_some_and(lumen_cluster::EnvironmentNode::in_maintenance)
+    {
+        return Ok(());
+    }
+    // A cluster that cannot be asked is not evidence that going down is safe,
+    // but it is not evidence of the opposite either — and refusing every
+    // restart on an unreachable cluster would take the console's power page
+    // away exactly when an operator needs it most.
+    let Ok(view) = state.cluster.cluster(&cluster).await else {
+        return Ok(());
+    };
+    if view.error.is_some() || lumen_cluster::quorum_survives_loss(&view.quorum) {
+        return Ok(());
+    }
+    Err(ApiError::Conflict(format!(
+        "\"{cluster}\" would lose quorum without this node: {} of {} votes are present, and one \
+         more going away stops the cluster. Put this node into maintenance first — it moves the \
+         machines off and tells the other members to expect the absence — or acknowledge \
+         \"i_understand_the_cluster_loses_quorum\".",
+        view.quorum.votes, view.quorum.expected_votes
+    )))
 }
 
 /// DELETE /api/system/power — call off whatever is scheduled.

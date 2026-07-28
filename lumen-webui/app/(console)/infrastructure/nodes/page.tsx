@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { AlertTriangle, Plus, Trash2, Zap } from "lucide-react";
+import { AlertTriangle, Plus, Trash2, Wrench, Zap } from "lucide-react";
 import { Page, PageBody, PageHeader } from "@/components/PageHeader";
 import { DataTable, Dash, type Column } from "@/components/console/DataTable";
 import { Button } from "@/components/ui/Button";
@@ -9,6 +9,7 @@ import {
   AddNodeDialog,
   ConfirmDeadDialog,
   FenceTestDialog,
+  MaintenanceDialog,
 } from "@/components/cluster/ClusterDialogs";
 import { ApiError } from "@/lib/authClient";
 import { useConsole } from "@/lib/ConsoleContext";
@@ -34,6 +35,10 @@ export default function NodesPage() {
   // The fencing dialogs: a guarded live test, and the break-glass confirm.
   const [fencing, setFencing] = useState<{ cluster: string; node: ClusterNodeView } | null>(null);
   const [confirming, setConfirming] = useState<{ cluster: string; node: string } | null>(null);
+  const [maintaining, setMaintaining] = useState<{
+    cluster: string;
+    node: ClusterNodeView;
+  } | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -53,10 +58,12 @@ export default function NodesPage() {
   useEffect(() => {
     // Paused while a dialog is open: a poll must not redraw the token out
     // from under the operator copying it, or the fencing dialogs mid-act.
-    if (adding || fencing || confirming) return;
+    // The maintenance dialog polls the drain itself, which is the feed that
+    // actually changes while it is open.
+    if (adding || fencing || confirming || maintaining) return;
     const timer = setInterval(() => void load(), POLL_MS);
     return () => clearInterval(timer);
-  }, [load, adding, fencing, confirming]);
+  }, [load, adding, fencing, confirming, maintaining]);
 
   const remove = async (node: UnassignedNodeView) => {
     try {
@@ -120,6 +127,7 @@ export default function NodesPage() {
                 onRefresh={load}
                 onTestFence={(node) => setFencing({ cluster: cluster.name, node })}
                 onConfirmDead={(node) => setConfirming({ cluster: cluster.name, node: node.node })}
+                onMaintenance={(node) => setMaintaining({ cluster: cluster.name, node })}
               />
             </section>
           ))}
@@ -158,6 +166,19 @@ export default function NodesPage() {
         />
       )}
 
+      {maintaining && (
+        <MaintenanceDialog
+          cluster={maintaining.cluster}
+          node={maintaining.node.node}
+          inMaintenance={Boolean(maintaining.node.maintenance)}
+          onClose={() => {
+            setMaintaining(null);
+            void load();
+          }}
+          onChanged={() => void load()}
+        />
+      )}
+
       {confirming && (
         <ConfirmDeadDialog
           cluster={confirming.cluster}
@@ -184,6 +205,7 @@ function SelfCard({
   cluster: string | null;
 }) {
   const rings = "rings" in self ? self.rings : [];
+  const maintenance = "maintenance" in self ? self.maintenance : undefined;
   return (
     <section className="surface p-5">
       <header className="flex items-center gap-3 mb-4">
@@ -194,10 +216,20 @@ function SelfCard({
           {self.node}
         </h2>
         <span className="badge badge-muted">this node</span>
+        {maintenance && <span className="badge badge-warn">Out of service</span>}
       </header>
       <dl className="qz-facts m-0">
         <dt>Cluster</dt>
         <dd>{cluster ?? "Unassigned — standalone hypervisor"}</dd>
+        {maintenance && (
+          <>
+            <dt>Maintenance</dt>
+            <dd>
+              Since {new Date(maintenance.since * 1000).toLocaleString()}, by{" "}
+              <span className="qz-mono">{maintenance.by}</span>
+            </dd>
+          </>
+        )}
         <dt>Version</dt>
         <dd className="qz-mono">{self.controlplane_version ?? "—"}</dd>
         {rings.length > 0 && (
@@ -230,9 +262,25 @@ const memberColumns = (unreachable: boolean): Column<ClusterNodeView>[] => [
     sortable: true,
     width: 110,
     render: (node) => {
-      if (unreachable) return <span className="badge badge-muted">Unknown</span>;
+      // Maintenance survives an unreachable cluster: it is Lumen's own record,
+      // not something corosync was asked, and a node being worked on is a
+      // common reason for the cluster to be unaskable in the first place.
+      if (unreachable && !node.maintenance) {
+        return <span className="badge badge-muted">Unknown</span>;
+      }
       const { tone, label } = nodeTone(node);
-      return <span className={`badge badge-${tone}`}>{label}</span>;
+      return (
+        <span
+          className={`badge badge-${tone}`}
+          title={
+            node.maintenance
+              ? `Out of service since ${new Date(node.maintenance.since * 1000).toLocaleString()}, by ${node.maintenance.by}`
+              : undefined
+          }
+        >
+          {label}
+        </span>
+      );
     },
   },
   {
@@ -326,12 +374,14 @@ function MemberTable({
   onRefresh,
   onTestFence,
   onConfirmDead,
+  onMaintenance,
 }: {
   rows: ClusterNodeView[];
   unreachable: boolean;
   onRefresh: () => Promise<void>;
   onTestFence: (node: ClusterNodeView) => void;
   onConfirmDead: (node: ClusterNodeView) => void;
+  onMaintenance: (node: ClusterNodeView) => void;
 }) {
   const columns = useMemo(() => memberColumns(unreachable), [unreachable]);
   return (
@@ -343,7 +393,7 @@ function MemberTable({
       searchPlaceholder="Search nodes…"
       emptyMessage="No members."
       onRefresh={onRefresh}
-      actionsWidth={130}
+      actionsWidth={190}
       actions={(node) => (
         <span className="inline-flex items-center gap-1">
           {/* The break-glass, offered in exactly the one state it exists
@@ -355,6 +405,26 @@ function MemberTable({
               onClick={() => onConfirmDead(node)}
             >
               Confirm dead
+            </button>
+          )}
+          {/* Only on this node's own row: a drain moves machines, and only
+              the node running them can move them. Offered even when the
+              cluster is unreachable if the node is already out of service,
+              because getting *back* is the one thing an operator must never
+              be locked out of. */}
+          {node.local && !node.unclean && (!unreachable || node.maintenance) && (
+            <button
+              type="button"
+              className="btn btn-sm"
+              title={
+                node.maintenance
+                  ? `Let Pacemaker run things on ${node.node} again`
+                  : `Move the machines off ${node.node} and hold it out of service`
+              }
+              onClick={() => onMaintenance(node)}
+            >
+              <Wrench size={13} className="mr-[6px]" />
+              {node.maintenance ? "Return to service" : "Maintenance"}
             </button>
           )}
           {!unreachable && !node.unclean && node.fence && (

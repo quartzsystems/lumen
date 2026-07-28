@@ -17,11 +17,19 @@ import {
 } from "@/components/dashboard/DashboardBits";
 import { deriveAlarms, SEVERITY_TONE, worstSeverity, type Alarm } from "@/lib/alarms";
 import { ApiError } from "@/lib/authClient";
-import { titleCase } from "@/lib/labels";
+import {
+  fetchClusterNetworks,
+  fetchEnvironment,
+  HEALTH_LABEL,
+  HEALTH_TONE,
+  REGIME_LABEL,
+  type AddressedMember,
+  type ClusterNetworks,
+  type ClusterView,
+} from "@/lib/clusterClient";
 import {
   fetchInterfaces,
   fetchPending,
-  type LinkKind,
   type LinkView,
   type PendingResponse,
 } from "@/lib/networkClient";
@@ -39,18 +47,29 @@ const POLL_MS = 5000;
 const NETWORK_ROWS = 8;
 const LOG_ROWS = 12;
 
-/// The order the networks panel reads in: the link the appliance is managed
-/// over, then the ones machines attach to, then the plumbing underneath. A
-/// "top" list with no metric to rank by ranks by what an operator looks at
-/// first — there are no traffic counters behind this page to sort on, and
-/// inventing an order that looks like throughput would be a lie.
-const KIND_ORDER: Record<LinkKind, number> = {
-  bridge: 0,
-  bond: 1,
-  vlan: 2,
-  ethernet: 3,
-  other: 4,
-};
+/// One row of the networks panel: a cluster-wide network, not a node's link.
+/// The panel ranks by the order the three types are defined in — Core, then
+/// Management, then External — because there are no traffic counters behind
+/// this page to sort on, and inventing an order that looks like throughput
+/// would be a lie.
+interface NetworkRow {
+  key: string;
+  /// Which cluster defines it. Shown only when the environment has more than
+  /// one, the way Networking → Networks names its sections.
+  cluster: string;
+  name: string;
+  kind: "Core" | "Management" | "External";
+  /// The one fact that distinguishes this network from another of its type.
+  qualifier: string | null;
+  /// Null where the network has no host addressing at all, which is what an
+  /// External network is.
+  address: string | null;
+  /// A second address the same network answers on — the cluster VIP, which is
+  /// the only one of these there is.
+  alsoAt: string | null;
+  tone: Tone;
+  status: string;
+}
 
 /// The console's landing page: what this appliance is running, what is wrong
 /// with it, and what has been done to it lately.
@@ -68,19 +87,28 @@ export default function DashboardPage() {
   const [pending, setPending] = useState<PendingResponse | null>(null);
   const [pools, setPools] = useState<PoolView[] | null>(null);
   const [tasks, setTasks] = useState<TaskView[] | null>(null);
+  const [clusters, setClusters] = useState<ClusterView[] | null>(null);
+  /// The networks document per cluster, keyed by cluster name. A cluster whose
+  /// record could not be read is simply absent — its rows go missing rather
+  /// than being invented.
+  const [networks, setNetworks] = useState<Record<string, ClusterNetworks>>({});
+  /// Whether a networks pass has finished at all. Without it an empty panel
+  /// cannot tell "not asked yet" from "asked, and nobody would answer".
+  const [networksAsked, setNetworksAsked] = useState(false);
   /// Which subsystems could not be read this poll. Named rather than counted:
   /// "storage could not be read" is actionable and "0 pools" is a lie.
   const [unread, setUnread] = useState<string[]>([]);
 
-  // Settled rather than all: a dashboard is five independent readings, and one
-  // subsystem being down must not blank the four that are up.
+  // Settled rather than all: a dashboard is six independent readings, and one
+  // subsystem being down must not blank the five that are up.
   const load = useCallback(async () => {
-    const [nodes, interfaces, staged, storage, log] = await Promise.allSettled([
+    const [nodes, interfaces, staged, storage, log, environment] = await Promise.allSettled([
       fetchNodes(),
       fetchInterfaces(),
       fetchPending(),
       fetchPools(),
       fetchRecentTasks(LOG_ROWS),
+      fetchEnvironment(),
     ]);
 
     const failed: string[] = [];
@@ -106,7 +134,30 @@ export default function DashboardPage() {
     take(staged, "staged network changes", setPending);
     take(storage, "storage", (value) => setPools(value.nodes.flatMap((node) => node.pools)));
     take(log, "the log", (value) => setTasks(value.tasks));
+    take(environment, "the environment", (value) => setClusters(value.clusters));
     setUnread(failed);
+
+    // The shared network definitions live one request per cluster behind the
+    // environment, so they can only be asked for once it has answered. A
+    // cluster that will not hand its record over drops out of the map and out
+    // of the panel with it.
+    if (environment.status === "fulfilled") {
+      const documents = await Promise.all(
+        environment.value.clusters.map(async (cluster) => {
+          try {
+            return [cluster.name, await fetchClusterNetworks(cluster.name)] as const;
+          } catch {
+            return [cluster.name, null] as const;
+          }
+        }),
+      );
+      setNetworks(
+        Object.fromEntries(
+          documents.filter((entry): entry is [string, ClusterNetworks] => entry[1] !== null),
+        ),
+      );
+      setNetworksAsked(true);
+    }
   }, []);
 
   useEffect(() => {
@@ -116,8 +167,6 @@ export default function DashboardPage() {
   }, [load]);
 
   const running = vms.filter((vm) => vm.state === "running").length;
-  const bridges = useMemo(() => (links ?? []).filter((link) => link.kind === "bridge"), [links]);
-  const bridgesUp = bridges.filter((link) => link.oper_state === "activated").length;
 
   const alarms = useMemo(
     () =>
@@ -132,18 +181,59 @@ export default function DashboardPage() {
   );
   const worst = worstSeverity(alarms);
 
-  const topLinks = useMemo(
-    () =>
-      [...(links ?? [])]
-        .sort((a, b) => {
-          if (a.management !== b.management) return a.management ? -1 : 1;
-          if (KIND_ORDER[a.kind] !== KIND_ORDER[b.kind])
-            return KIND_ORDER[a.kind] - KIND_ORDER[b.kind];
-          return a.name.localeCompare(b.name);
-        })
-        .slice(0, NETWORK_ROWS),
-    [links],
-  );
+  // Every cluster's networks, in the order the three types are defined, with
+  // the live ring state each addressed network's members are sitting on.
+  const clusterNetworks = useMemo(() => {
+    const rows: NetworkRow[] = [];
+    for (const cluster of clusters ?? []) {
+      const shared = networks[cluster.name];
+      if (!shared) continue;
+      rows.push({
+        key: `${cluster.name}/core`,
+        cluster: cluster.name,
+        name: "Core",
+        kind: "Core",
+        qualifier: `MTU ${shared.core.mtu}`,
+        address: shared.core.subnet,
+        alsoAt: null,
+        ...ringState(cluster, 0, shared.core.members),
+      });
+      rows.push({
+        key: `${cluster.name}/management`,
+        cluster: cluster.name,
+        name: "Management",
+        kind: "Management",
+        qualifier: null,
+        address: shared.management.subnet,
+        alsoAt: shared.management.vip ? `VIP ${shared.management.vip}` : null,
+        ...ringState(cluster, 1, shared.management.members),
+      });
+      for (const external of shared.external) {
+        rows.push({
+          key: `${cluster.name}/external/${external.name}`,
+          cluster: cluster.name,
+          name: external.name,
+          kind: "External",
+          qualifier:
+            external.mode === "trunk"
+              ? external.allowed.length > 0
+                ? `Trunk ${external.allowed.join(", ")}`
+                : "Trunk"
+              : `VLAN ${external.vlan}`,
+          // No host addressing by definition, and nothing watches an External
+          // bridge yet — so the row claims neither.
+          address: null,
+          alsoAt: null,
+          tone: "muted",
+          status: "Defined",
+        });
+      }
+    }
+    return rows;
+  }, [clusters, networks]);
+
+  const topNetworks = clusterNetworks.slice(0, NETWORK_ROWS);
+  const clustersHealthy = (clusters ?? []).filter((cluster) => cluster.health === "ok").length;
 
   // The log records identifiers, not names, because a machine can be renamed
   // and its history must not be rewritten when it is. The name is looked up
@@ -196,17 +286,33 @@ export default function DashboardPage() {
             />
             <StatTile
               label="Networks"
-              href="/networking/interfaces"
-              value={links === null ? "—" : String(bridgesUp)}
-              of={links === null ? undefined : String(bridges.length)}
-              bar={<Bar percent={share(bridgesUp, bridges.length)} tone="ok" />}
-              note="Bridges, which is what a machine attaches to."
+              href="/networking/networks"
+              value={
+                !networksAsked && clusterNetworks.length === 0
+                  ? "—"
+                  : String(clusterNetworks.length)
+              }
+              // Cluster-wide networks have no denominator — a cluster defines
+              // as many External networks as it needs, and two of three is not
+              // a proportion of anything.
+              bar={<Bar percent={clusterNetworks.length > 0 ? 100 : 0} tone="ok" />}
+              note={
+                clusters !== null && clusters.length === 0
+                  ? "No cluster yet — links are per node."
+                  : "Core, Management, and External, shared by every member."
+              }
             />
             <StatTile
               label="Clusters"
               href="/infrastructure/clusters"
-              value="—"
-              note="Clustering has not landed yet."
+              value={clusters === null ? "—" : String(clustersHealthy)}
+              of={clusters === null ? undefined : String(clusters.length)}
+              bar={<Bar percent={share(clustersHealthy, clusters?.length ?? 0)} tone="ok" />}
+              note={
+                clusters !== null && clusters.length === 0
+                  ? "This node is not in a cluster."
+                  : undefined
+              }
             />
             <StatTile
               label="Nodes"
@@ -236,18 +342,51 @@ export default function DashboardPage() {
             </div>
           )}
 
+          {/* Both columns stretch to the taller of the two, and the panel that
+              ends each column takes up the slack — otherwise the shorter column
+              stops early and the gap above Logs reads as wider than every other
+              gap on the page. */}
           <div
-            className="grid gap-4 items-start"
+            className="grid gap-4"
             style={{ gridTemplateColumns: "repeat(auto-fit, minmax(430px, 1fr))" }}
           >
             <div className="flex flex-col gap-4 min-w-0">
-              <DashPanel title="Top Compute Clusters">
-                <PanelEmpty>
-                  This appliance is not part of a cluster. Clusters land here when clustering does.
-                </PanelEmpty>
+              <DashPanel
+                title="Top Compute Clusters"
+                action={
+                  clusters !== null && clusters.length > 0 ? (
+                    <MoreLink href="/infrastructure/clusters">Clusters</MoreLink>
+                  ) : undefined
+                }
+              >
+                {clusters === null ? (
+                  <PanelEmpty>Reading the environment…</PanelEmpty>
+                ) : clusters.length === 0 ? (
+                  <PanelEmpty>
+                    This node is not part of a cluster. Clusters are created on Infrastructure →
+                    Clusters.
+                  </PanelEmpty>
+                ) : (
+                  <table className="qz-table">
+                    <thead>
+                      <tr>
+                        <th style={{ width: 120 }}>Status</th>
+                        <th>Name</th>
+                        <th style={{ width: 100 }}>Nodes</th>
+                        <th style={{ width: 170 }}>Quorum</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {clusters.map((cluster) => (
+                        <ClusterRow key={cluster.name} cluster={cluster} />
+                      ))}
+                    </tbody>
+                  </table>
+                )}
               </DashPanel>
 
               <DashPanel
+                grow
                 title="Compute Nodes"
                 action={<MoreLink href="/infrastructure/nodes">Nodes</MoreLink>}
               >
@@ -274,27 +413,48 @@ export default function DashboardPage() {
               </DashPanel>
             </div>
 
+            {/* The cluster's shared networks, not this node's links: Core,
+                Management, and each External network, as every member sees
+                them. The per-node links realizing them are on Networking →
+                Interfaces, which is a different question. */}
+            {/* No `grow` needed: this panel is a grid item and already
+                stretches to the row. The left column needs it because its
+                panels are stacked in a flex column of their own. */}
             <DashPanel
               title="Top Networks"
-              action={<MoreLink href="/networking/interfaces">Interfaces</MoreLink>}
+              action={<MoreLink href="/networking/networks">Networks</MoreLink>}
             >
-              {links === null ? (
-                <PanelEmpty>Reading the network configuration…</PanelEmpty>
-              ) : topLinks.length === 0 ? (
-                <PanelEmpty>This node has no interfaces configured.</PanelEmpty>
+              {topNetworks.length === 0 && !networksAsked ? (
+                <PanelEmpty>Reading the cluster networks…</PanelEmpty>
+              ) : topNetworks.length === 0 && (clusters?.length ?? 0) === 0 ? (
+                <PanelEmpty>
+                  Networks are a cluster&apos;s shared definition, and this node is not in a
+                  cluster. Its own links are on Networking → Interfaces.
+                </PanelEmpty>
+              ) : topNetworks.length === 0 ? (
+                // Clusters exist but none would hand over its record. Saying so
+                // is the whole job here — an empty table would read as a
+                // cluster that defines no networks, which cannot happen.
+                <PanelEmpty>Could not read the networks of any cluster.</PanelEmpty>
               ) : (
                 <table className="qz-table">
                   <thead>
                     <tr>
                       <th style={{ width: 120 }}>Status</th>
                       <th style={{ width: 150 }}>Name</th>
-                      <th style={{ width: 130 }}>Type</th>
-                      <th>Address</th>
+                      <th style={{ width: 160 }}>Type</th>
+                      <th>Subnet</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {topLinks.map((link) => (
-                      <LinkRow key={link.name} link={link} />
+                    {topNetworks.map((row) => (
+                      <NetworkRowView
+                        key={row.key}
+                        row={row}
+                        // Whose network it is only needs saying when more than
+                        // one cluster is being shown at once.
+                        named={(clusters?.length ?? 0) > 1}
+                      />
                     ))}
                   </tbody>
                 </table>
@@ -416,31 +576,60 @@ function NodeRow({ node }: { node: NodeView }) {
   );
 }
 
-function LinkRow({ link }: { link: LinkView }) {
-  const tone: Tone = !link.present
-    ? "muted"
-    : link.oper_state === "activated"
-      ? "ok"
-      : link.oper_state === "activating"
-        ? "warn"
-        : "muted";
-  const address = link.addresses.join(", ");
+function ClusterRow({ cluster }: { cluster: ClusterView }) {
+  const online = cluster.nodes.filter((node) => node.online).length;
   return (
     <tr style={staticRow}>
       <td>
-        <Status tone={tone} label={titleCase(link.present ? link.oper_state : "staged")} />
+        <Status tone={HEALTH_TONE[cluster.health]} label={HEALTH_LABEL[cluster.health]} />
       </td>
-      <td className="mono truncate" title={link.name}>
-        {link.name}
+      <td className="mono truncate" title={REGIME_LABEL[cluster.regime]}>
+        {cluster.name}
+      </td>
+      <td className="mono">
+        {online} / {cluster.nodes.length}
+      </td>
+      <td>
+        {cluster.error ? (
+          <span className="qz-dim">Unknown</span>
+        ) : (
+          <span className="whitespace-nowrap">
+            <span className="mono">
+              {cluster.quorum.votes} / {cluster.quorum.expected_votes}
+            </span>
+            {!cluster.quorum.quorate && <span className="badge badge-crit ml-2">inquorate</span>}
+          </span>
+        )}
+      </td>
+    </tr>
+  );
+}
+
+/// One cluster-wide network. The type cell carries the kind and the one fact
+/// that tells two networks of that kind apart, the way the old interface row
+/// carried a kind and its `mgmt` badge.
+function NetworkRowView({ row, named }: { row: NetworkRow; named: boolean }) {
+  return (
+    <tr style={staticRow}>
+      <td>
+        <Status tone={row.tone} label={row.status} />
+      </td>
+      <td className="mono truncate" title={named ? `${row.cluster} · ${row.name}` : row.name}>
+        {named && <span className="qz-dim">{row.cluster} · </span>}
+        {row.name}
       </td>
       <td>
         <span className="whitespace-nowrap">
-          {titleCase(link.kind)}
-          {link.management && <span className="badge badge-info ml-2">mgmt</span>}
+          {row.kind}
+          {row.qualifier && <span className="badge badge-muted ml-2">{row.qualifier}</span>}
         </span>
       </td>
-      <td className="mono truncate" title={address}>
-        {address || <span className="qz-dim">—</span>}
+      <td
+        className="mono truncate"
+        title={[row.address, row.alsoAt].filter(Boolean).join(" · ") || undefined}
+      >
+        {row.address ?? <span className="qz-dim">—</span>}
+        {row.alsoAt && <span className="qz-dim"> · {row.alsoAt}</span>}
       </td>
     </tr>
   );
@@ -464,6 +653,33 @@ function Usage({ used, of, percent }: { used: string; of: string; percent: numbe
 /// by — a node with no processors reported is a node with an empty meter, not
 /// a broken one.
 const share = (part: number, whole: number): number => (whole > 0 ? (part / whole) * 100 : 0);
+
+/// What corosync sees of one addressed network: every member's seat on the ring
+/// that network carries. A cluster that could not be asked, or a member the
+/// cluster has nothing to say about, is "Unknown" — the dashboard may not
+/// report a link as up or down on the strength of a definition alone.
+function ringState(
+  cluster: ClusterView,
+  ring: number,
+  members: AddressedMember[],
+): { tone: Tone; status: string } {
+  if (cluster.error || members.length === 0) return { tone: "muted", status: "Unknown" };
+
+  let observed = 0;
+  let connected = 0;
+  for (const member of members) {
+    const node = cluster.nodes.find((candidate) => candidate.node === member.node);
+    const link = node?.rings.find((candidate) => candidate.link === ring);
+    if (!node || !link) continue;
+    observed += 1;
+    if (link.connected) connected += 1;
+  }
+
+  if (observed === 0) return { tone: "muted", status: "Unknown" };
+  if (connected === members.length) return { tone: "ok", status: "Connected" };
+  if (connected === 0) return { tone: "crit", status: "Down" };
+  return { tone: "warn", status: `${connected} / ${members.length} up` };
+}
 
 /// When, as an operator reads it: absolute and in their own locale, because
 /// "3 minutes ago" is useless in an incident review. Matches

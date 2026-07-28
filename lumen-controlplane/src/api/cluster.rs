@@ -225,7 +225,7 @@ pub async fn add_node(
     // Deserialized directly, not through `required_body`: its `node` field
     // names the node being *added*, which is exactly what the cross-node
     // guard would strip and refuse.
-    let Some(axum::Json(value)) = raw else {
+    let Some(value) = raw.into_value() else {
         return Err(ApiError::BadRequest("A request body is required.".into()));
     };
     let request: lumen_cluster::MemberCreate =
@@ -309,6 +309,109 @@ pub async fn confirm_node_dead(
         )
         .await?;
     Ok(Json(serde_json::json!({ "confirmed": true })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintenanceRequest {
+    /// Move the running machines off before answering. Default on: a node
+    /// declared out of service with its machines still on it is the surprising
+    /// outcome, not the expected one. `false` is for the operator who is about
+    /// to shut those machines down anyway.
+    #[serde(default = "yes")]
+    pub evacuate: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// Written out rather than derived, and that is the whole point: a request
+/// with no body at all is deserialized by `body()` as `T::default()`, which
+/// never runs serde's field defaults. Deriving this would silently turn the
+/// bodiless "put this node into maintenance" into "and leave the machines on
+/// it" — the opposite of what the field says.
+impl Default for MaintenanceRequest {
+    fn default() -> Self {
+        MaintenanceRequest { evacuate: true }
+    }
+}
+
+/// POST /api/environment/clusters/{name}/nodes/{node}/maintenance — take this
+/// node out of service, and drain it unless told not to.
+///
+/// 202 with the drain's first progress: the flag and standby are done by the
+/// time this answers, the machines are still moving. Poll
+/// `GET /api/environment/maintenance`.
+pub async fn enter_maintenance(
+    session: Session,
+    State(state): State<Arc<AppState>>,
+    Path((name, node)): Path<(String, String)>,
+    raw: Body,
+) -> Result<(StatusCode, Json<crate::maintenance::MaintenanceProgress>), ApiError> {
+    let request: MaintenanceRequest = body(raw)?;
+    guard_cluster(&state, &name, &node)?;
+    let progress =
+        crate::maintenance::begin(&state, &principal(&session), request.evacuate).await?;
+    let status = if request.evacuate {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(progress)))
+}
+
+/// DELETE /api/environment/clusters/{name}/nodes/{node}/maintenance — put the
+/// node back into service. Machines that were evacuated stay where they went;
+/// failback is an operator's decision, the same as it is after an HA restart.
+pub async fn exit_maintenance(
+    session: Session,
+    State(state): State<Arc<AppState>>,
+    Path((name, node)): Path<(String, String)>,
+) -> Result<Json<lumen_cluster::MaintenanceView>, ApiError> {
+    guard_cluster(&state, &name, &node)?;
+    Ok(Json(
+        crate::maintenance::end(&state, &principal(&session)).await?,
+    ))
+}
+
+/// GET /api/environment/maintenance — the drain of this node, while there is
+/// one to report. `null` when this node has never been drained since the
+/// control plane started.
+pub async fn drain_progress(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+) -> Json<Option<crate::maintenance::MaintenanceProgress>> {
+    Json(state.drain.get())
+}
+
+/// Both maintenance routes carry a cluster and a node in the path for the
+/// same reason every other cluster route does — so the URL says what it is
+/// about. Only one pairing is answerable: this node, in the cluster it is
+/// actually in.
+fn guard_cluster(state: &AppState, cluster: &str, node: &str) -> Result<(), ApiError> {
+    if node != state.cluster.node() {
+        return Err(ApiError::Conflict(format!(
+            "Maintenance runs on the node it is about — its machines can only be moved by the \
+             node running them. Open the console of \"{node}\"."
+        )));
+    }
+    let membership = state.cluster.environment_record()?.ok_or_else(|| {
+        ApiError::Conflict("This node has not joined an environment.".to_string())
+    })?;
+    match membership.node(node).and_then(|n| n.cluster.as_deref()) {
+        Some(actual) if actual == cluster => Ok(()),
+        Some(actual) => Err(ApiError::Conflict(format!(
+            "\"{node}\" is a member of \"{actual}\", not \"{cluster}\"."
+        ))),
+        None => Err(ApiError::Conflict(format!(
+            "\"{node}\" is not in a cluster."
+        ))),
+    }
+}
+
+fn principal(session: &Session) -> String {
+    format!("{}@{}", session.0.sub, session.0.realm)
 }
 
 /// DELETE /api/environment/nodes/{name} — remove an unassigned node from

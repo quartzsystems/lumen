@@ -124,6 +124,7 @@ async fn harness(tag: &str) -> Harness {
         cluster,
         drbd,
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
+        drain: Default::default(),
     }));
 
     // Sign in once; every networking route requires the session.

@@ -19,6 +19,13 @@
 //! No automatic failback, deliberately: a machine that restarted here stays
 //! here, visible as "away from home", until an operator migrates it back.
 //! Failback that fires on its own turns one failure into two moves.
+//!
+//! A node in maintenance is absent on purpose, and this sweep leaves it
+//! alone in both directions: its machines are not restarted elsewhere when it
+//! goes down, and nothing is restarted *onto* it. Without the first rule an
+//! operator who reboots a node for an update watches HA scatter the machines
+//! they just evacuated; without the second, a node being worked on gets
+//! handed machines mid-update.
 
 use crate::AppState;
 use lumen_drbd::VmVolumes;
@@ -45,20 +52,25 @@ pub async fn sweep(state: &AppState) {
     }
 
     // Lost and clean: offline, and not waiting on a fence. Unclean waits —
-    // that is the fence-confirmed rule, not an optimization.
+    // that is the fence-confirmed rule, not an optimization. A node in
+    // maintenance is not lost at all; it is where the operator put it.
     let lost: Vec<String> = view
         .nodes
         .iter()
-        .filter(|n| !n.online && !n.unclean)
+        .filter(|n| !n.online && !n.unclean && n.maintenance.is_none())
         .map(|n| n.node.clone())
         .collect();
     if lost.is_empty() {
         return;
     }
+    // Eligible to receive: online, and not out of service. A node in
+    // maintenance is online right up until it reboots — standby keeps
+    // Pacemaker off it, but the machines are Lumen's, so this is the only
+    // thing standing between an update window and a machine landing in it.
     let survivors: Vec<String> = view
         .nodes
         .iter()
-        .filter(|n| n.online)
+        .filter(|n| n.online && n.maintenance.is_none())
         .map(|n| n.node.clone())
         .collect();
 

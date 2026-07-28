@@ -10,7 +10,8 @@
 //!   lands, and quietly applying a request meant for another node to this one
 //!   is exactly the wrong failure.
 
-use axum::Json;
+use axum::body::Bytes;
+use axum::extract::{FromRequest, Request};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
@@ -18,12 +19,47 @@ use crate::error::ApiError;
 
 /// An optional JSON body. The console sends one only when it has something to
 /// say, and every mutating route accepts one either way.
-pub type Body = Option<Json<Value>>;
+///
+/// An extractor of its own rather than `Option<Json<Value>>`, which answers
+/// `None` only when the request carries no `Content-Type` at all: a request
+/// that declares JSON and then sends nothing — which is what a browser `fetch`
+/// with no body does — is rejected as a syntax error before the handler is
+/// reached. "Optional" was true only for clients that also remembered to drop
+/// the header, and no body is no body whatever the request calls it.
+pub struct Body(Option<Value>);
+
+impl<S: Send + Sync> FromRequest<S> for Body {
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let bytes = Bytes::from_request(req, state)
+            .await
+            .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+        if bytes.is_empty() {
+            return Ok(Self(None));
+        }
+        serde_json::from_slice(&bytes)
+            .map(|value| Self(Some(value)))
+            .map_err(|err| {
+                ApiError::BadRequest(format!("The request body is not valid JSON: {err}"))
+            })
+    }
+}
+
+impl Body {
+    /// The body as it arrived, with no cross-node guard applied. For the one
+    /// route whose `node` field names a *different* node on purpose — adding a
+    /// member to a cluster — where [`check_node`] would strip exactly the field
+    /// the request is about.
+    pub fn into_value(self) -> Option<Value> {
+        self.0
+    }
+}
 
 /// Split the optional `node` field off a request body and deserialize the rest
 /// into a domain type. A missing or empty body is that type's default.
 pub fn body<T: DeserializeOwned + Default>(raw: Body) -> Result<T, ApiError> {
-    let Some(Json(mut value)) = raw else {
+    let Body(Some(mut value)) = raw else {
         return Ok(T::default());
     };
     check_node(&mut value)?;
@@ -35,7 +71,7 @@ pub fn body<T: DeserializeOwned + Default>(raw: Body) -> Result<T, ApiError> {
 
 /// Same as [`body`], for bodies that must be present.
 pub fn required_body<T: DeserializeOwned>(raw: Body) -> Result<T, ApiError> {
-    let Some(Json(mut value)) = raw else {
+    let Body(Some(mut value)) = raw else {
         return Err(ApiError::BadRequest("A request body is required.".into()));
     };
     check_node(&mut value)?;
@@ -45,7 +81,7 @@ pub fn required_body<T: DeserializeOwned>(raw: Body) -> Result<T, ApiError> {
 /// For routes whose body carries nothing but the optional `node` field. The
 /// node still has to be checked — that is the whole point.
 pub fn node_only(raw: Body) -> Result<(), ApiError> {
-    if let Some(Json(mut value)) = raw {
+    if let Body(Some(mut value)) = raw {
         check_node(&mut value)?;
     }
     Ok(())

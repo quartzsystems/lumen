@@ -33,6 +33,21 @@ use crate::networks::ClusterNetworks;
 /// is a curiosity rather than a credential.
 pub const TOKEN_TTL_SECS: u64 = 900;
 
+/// A node deliberately out of service. Lumen's own state, not Pacemaker's:
+/// standby moves Pacemaker resources, and the only resources this appliance
+/// puts in the CIB are the VIP and the fence devices — the machines are
+/// libvirt domains that Lumen's own HA manager restarts. So "out of service"
+/// has to be a fact every node's control plane can read, which means the
+/// membership record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Maintenance {
+    /// Unix seconds. A node that has been out of service since Tuesday is a
+    /// different conversation from one that went out five minutes ago.
+    pub since: u64,
+    /// The operator who took it out.
+    pub by: String,
+}
+
 /// One node's standing in the environment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentNode {
@@ -48,6 +63,22 @@ pub struct EnvironmentNode {
     /// The cluster this node belongs to, or `None` for an unassigned node —
     /// a valid standalone hypervisor, not a node in a broken state.
     pub cluster: Option<String>,
+    /// Set while the node is out of service. Rides the replicated record so
+    /// that every member's HA manager knows not to act on this node's
+    /// absence — which is the whole point of the flag, and why it must not
+    /// live only on the node going down.
+    ///
+    /// `default` because records written before maintenance existed have no
+    /// such field, and a node that has never been out of service should not
+    /// have to say so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance: Option<Maintenance>,
+}
+
+impl EnvironmentNode {
+    pub fn in_maintenance(&self) -> bool {
+        self.maintenance.is_some()
+    }
 }
 
 /// One node's seat on a replicated volume: which pool on that node carries
@@ -373,6 +404,7 @@ mod tests {
                     address: "192.168.10.1".into(),
                     controlplane_version: "0.3.0".into(),
                     cluster: cluster.map(str::to_string),
+                    maintenance: None,
                 })
                 .collect(),
             clusters: Vec::new(),

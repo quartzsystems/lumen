@@ -22,6 +22,7 @@ struct Inner {
     preflight: LocalPreflight,
     fail_next: Option<String>,
     fail_fence: Option<String>,
+    fail_standby: Option<String>,
     // What the node was asked to do, for assertions.
     written_configs: Vec<(String, String)>,
     stack_enabled: bool,
@@ -31,6 +32,7 @@ struct Inner {
     fence_devices_created: Vec<(crate::topology::FenceDevice, String)>,
     fenced: Vec<String>,
     confirmed_dead: Vec<String>,
+    standby_calls: Vec<(String, bool)>,
     reloads: usize,
     delay_updates: Vec<(String, u32)>,
     fence_devices_removed: Vec<String>,
@@ -173,6 +175,13 @@ impl MockBackend {
         self.inner.lock().unwrap().fail_fence = Some(reason.into());
     }
 
+    /// The next standby call fails with this reason, once — targeted for the
+    /// same reason as `fail_fence`: taking a node out of service reads the
+    /// cluster first, and `fail_next` would be spent on that read.
+    pub fn fail_standby(&self, reason: impl Into<String>) {
+        self.inner.lock().unwrap().fail_standby = Some(reason.into());
+    }
+
     // --- assertion accessors ------------------------------------------------
 
     pub fn written_configs(&self) -> Vec<(String, String)> {
@@ -205,6 +214,12 @@ impl MockBackend {
 
     pub fn confirmed_dead(&self) -> Vec<String> {
         self.inner.lock().unwrap().confirmed_dead.clone()
+    }
+
+    /// Every standby call in order, `(node, standby)` — so a test can assert
+    /// that leaving service and returning to it both reached Pacemaker.
+    pub fn standby_calls(&self) -> Vec<(String, bool)> {
+        self.inner.lock().unwrap().standby_calls.clone()
     }
 
     pub fn reloads(&self) -> usize {
@@ -276,6 +291,7 @@ fn node_record(name: &str, address: &str, cluster: Option<&str>) -> EnvironmentN
         address: address.into(),
         controlplane_version: "0.3.0".into(),
         cluster: cluster.map(str::to_string),
+        maintenance: None,
     }
 }
 
@@ -465,6 +481,25 @@ impl ClusterBackend for MockBackend {
             return Err(ClusterError::Backend(anyhow::anyhow!(reason)));
         }
         inner.fenced.push(target.to_string());
+        Ok(())
+    }
+
+    async fn set_standby(&self, target: &str, standby: bool) -> Result<()> {
+        if let Some(err) = self.take_failure() {
+            return Err(err);
+        }
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(reason) = inner.fail_standby.take() {
+            return Err(ClusterError::Backend(anyhow::anyhow!(reason)));
+        }
+        // Pacemaker's own view changes, so a read after this call sees what a
+        // real one would.
+        for state in inner.clusters.values_mut() {
+            if let Some(node) = state.nodes.iter_mut().find(|n| n.name == target) {
+                node.standby = standby;
+            }
+        }
+        inner.standby_calls.push((target.to_string(), standby));
         Ok(())
     }
 

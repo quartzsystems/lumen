@@ -103,7 +103,14 @@ export const apiFetch = async <T>(path: string, init?: RequestInit): Promise<T> 
     res = await fetch(`/api${path}`, {
       ...init,
       credentials: "include",
-      headers: { "Content-Type": "application/json", ...init?.headers },
+      headers: {
+        // Only when there is something to describe. A request that declares a
+        // JSON body and then sends nothing is rejected by the extractor before
+        // the handler is ever reached, which is how every bodiless POST — mint
+        // a token, apply a network change, start a machine — came back 400.
+        ...(init?.body === undefined ? {} : { "Content-Type": "application/json" }),
+        ...init?.headers,
+      },
     });
   } catch {
     throw new ApiError("Could not reach the server.", 0);
@@ -116,13 +123,19 @@ export const apiFetch = async <T>(path: string, init?: RequestInit): Promise<T> 
   }
 
   if (!res.ok) {
+    // Read the body once, as text, and parse it afterwards: a rejection from
+    // the framework rather than from a handler is plain text, and consuming it
+    // with res.json() throws away the one sentence saying what was wrong.
+    const text = await res.text().catch(() => "");
     let message = `Request failed (${res.status})`;
     let payload: unknown;
     try {
-      const body = await res.json();
+      const body = JSON.parse(text);
       payload = body;
       if (body?.error) message = body.error;
-    } catch {}
+    } catch {
+      if (text.trim()) message = text.trim().slice(0, 300);
+    }
     throw new ApiError(message, res.status, payload);
   }
 

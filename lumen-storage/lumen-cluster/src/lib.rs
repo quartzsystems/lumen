@@ -48,7 +48,8 @@ pub mod topology;
 pub mod validate;
 
 pub use environment::{
-    ClusterRecord, EnvironmentMembership, EnvironmentNode, JoinToken, VolumeRecord, VolumeSeat,
+    ClusterRecord, EnvironmentMembership, EnvironmentNode, JoinToken, Maintenance, VolumeRecord,
+    VolumeSeat,
 };
 pub use error::{ClusterError, Result};
 pub use join::{
@@ -64,8 +65,9 @@ pub use networks::{
     ManagementNetwork, Subnet, Uplink, VlanMode,
 };
 pub use service::{
-    AddNodePlan, ClusterHealth, ClusterNodeView, ClusterService, ClusterView, EnvironmentResponse,
-    EnvironmentView, FenceSummaryView, FenceTestView, JoinOutcome, MintedToken, UnassignedNodeView,
+    quorum_survives_loss, AddNodePlan, ClusterHealth, ClusterNodeView, ClusterService, ClusterView,
+    EnvironmentResponse, EnvironmentView, FenceSummaryView, FenceTestView, JoinOutcome,
+    MaintenanceView, MintedToken, UnassignedNodeView,
 };
 pub use state::{ClusterState, FenceDeviceState, FenceTest, NodeState, QuorumState, RingLink};
 pub use store::{EnvironmentStore, Identity, StoredDefinition};

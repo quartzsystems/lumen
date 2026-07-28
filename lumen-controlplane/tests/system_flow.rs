@@ -175,6 +175,7 @@ async fn harness(tag: &str, signed_in_as: &str) -> Harness {
         cluster,
         drbd,
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
+        drain: Default::default(),
     }));
 
     let response = router

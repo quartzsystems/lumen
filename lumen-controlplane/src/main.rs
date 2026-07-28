@@ -248,6 +248,7 @@ async fn main() -> Result<()> {
         cluster,
         drbd,
         tasks: lumen_controlplane::tasks::TaskLog::open(state_dir.join("vm-tasks.jsonl")),
+        drain: Default::default(),
     });
 
     // The HA manager: one sweep every fifteen seconds. Quiet when there is

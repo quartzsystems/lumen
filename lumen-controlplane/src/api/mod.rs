@@ -148,6 +148,15 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/environment/clusters/{name}/nodes/{node}/confirm-dead",
             post(cluster::confirm_node_dead),
         )
+        // Maintenance: take this node out of service and drain it, put it
+        // back, and watch the drain in between. The node in the path is
+        // always this one — the machines can only be moved by whoever is
+        // running them — and the handler says so when it is not.
+        .route(
+            "/api/environment/clusters/{name}/nodes/{node}/maintenance",
+            post(cluster::enter_maintenance).delete(cluster::exit_maintenance),
+        )
+        .route("/api/environment/maintenance", get(cluster::drain_progress))
         // The peer surface: one control plane answering another, peer-ticket
         // authenticated — except join, whose one-time token is the
         // authentication; see src/api/peer.rs.

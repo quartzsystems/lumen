@@ -170,6 +170,7 @@ fn harness(tag: &str, membership: &EnvironmentMembership) -> Harness {
         cluster: cluster.clone(),
         drbd,
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
+        drain: Default::default(),
     }));
     Harness {
         router,

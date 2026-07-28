@@ -318,6 +318,15 @@ impl ClusterBackend for CliBackend {
         .await
     }
 
+    async fn set_standby(&self, target: &str, standby: bool) -> Result<()> {
+        let verb = if standby { "standby" } else { "unstandby" };
+        self.run_privileged(
+            format!("putting {target} into {verb} failed"),
+            ExecRequest::new("set a node's standby state", PCS).args(["node", verb, target]),
+        )
+        .await
+    }
+
     async fn confirm_node_dead(&self, target: &str) -> Result<()> {
         // --force answers pcs's own are-you-sure prompt; the human
         // confirmation this operation actually rests on happened in the

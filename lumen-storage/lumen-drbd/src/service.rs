@@ -1750,12 +1750,14 @@ mod tests {
             address: "192.168.20.1:8443".into(),
             controlplane_version: "0.3.0".into(),
             cluster: Some("beta".into()),
+            maintenance: None,
         });
         membership.nodes.push(lumen_cluster::EnvironmentNode {
             name: "beta-2".into(),
             address: "192.168.20.2:8443".into(),
             controlplane_version: "0.3.0".into(),
             cluster: Some("beta".into()),
+            maintenance: None,
         });
         let (b1, core1) = seat("beta-1", 1);
         let (b2, core2) = seat("beta-2", 2);
@@ -2131,6 +2133,7 @@ mod tests {
             address: "192.168.10.3:8443".into(),
             controlplane_version: "0.3.0".into(),
             cluster: Some("alpha".into()),
+            maintenance: None,
         });
         let record = membership
             .clusters

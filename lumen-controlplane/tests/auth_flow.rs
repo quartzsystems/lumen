@@ -95,6 +95,7 @@ fn test_app() -> axum::Router {
         cluster,
         drbd,
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
+        drain: Default::default(),
     };
     app(Arc::new(state))
 }

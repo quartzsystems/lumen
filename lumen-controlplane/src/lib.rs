@@ -2,6 +2,7 @@ pub mod api;
 pub mod config;
 pub mod error;
 pub mod ha;
+pub mod maintenance;
 pub mod peers;
 pub mod realm;
 pub mod security;
@@ -58,6 +59,9 @@ pub struct AppState {
     pub drbd: Arc<DrbdService>,
     /// What has been done to each machine — the console's Tasks table.
     pub tasks: tasks::TaskLog,
+    /// The drain of this node, while one is running. Node-local by nature:
+    /// only the node running the machines can move them.
+    pub drain: maintenance::DrainHandle,
 }
 
 /// The full application router: /api plus the static web UI fallback.
