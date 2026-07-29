@@ -21,6 +21,19 @@
 //! segment story: a frame that was written, never flushed, and survived a
 //! crash intact can be replayed — its entry was real, merely never
 //! promised, and replay validates every reference before applying it.
+//!
+//! What makes that acceptance safe is the **recovery epoch**. Every
+//! recovery starts writing under a higher epoch than anything it saw, every
+//! frame carries its epoch, and replay accepts a run only while epochs
+//! never decrease. Without it there is a real trap: a recovery adopts the
+//! failed tail's seq at the failed tail's position, so a *later* crash
+//! could chain out of this history's frames and into the previous
+//! history's debris — same seqs, aligned positions — and replay stale
+//! entries *after* acknowledged ones. The epoch fence makes that chain
+//! impossible: once a frame of the current epoch is accepted, every older
+//! frame is refused. Debris can therefore only ever resurrect *whole and
+//! first*, when the history after it never got a single frame to disk —
+//! and such a run is entirely unacknowledged by construction.
 
 use crate::brick::Brick;
 use crate::disk::Disk;
@@ -29,8 +42,8 @@ use crate::hash::full_check;
 
 const FRAME_MAGIC: &[u8; 8] = b"LFSWAL\0\0";
 
-/// magic 8 + seq 8 + length 4 + pad 4.
-const FRAME_HEADER_LEN: usize = 24;
+/// magic 8 + seq 8 + epoch 8 + length 4 + pad 4.
+const FRAME_HEADER_LEN: usize = 32;
 /// BLAKE3 over header + payload, appended after the payload.
 const FRAME_CHECK_LEN: usize = 32;
 
@@ -42,11 +55,12 @@ fn frame_len(payload_len: usize) -> u64 {
     (FRAME_HEADER_LEN + payload_len + FRAME_CHECK_LEN) as u64
 }
 
-fn encode_frame(seq: u64, payload: &[u8]) -> Vec<u8> {
+fn encode_frame(seq: u64, epoch: u64, payload: &[u8]) -> Vec<u8> {
     let mut buf = vec![0u8; frame_len(payload.len()) as usize];
     buf[0..8].copy_from_slice(FRAME_MAGIC);
     buf[8..16].copy_from_slice(&seq.to_le_bytes());
-    buf[16..20].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    buf[16..24].copy_from_slice(&epoch.to_le_bytes());
+    buf[24..28].copy_from_slice(&(payload.len() as u32).to_le_bytes());
     buf[FRAME_HEADER_LEN..FRAME_HEADER_LEN + payload.len()].copy_from_slice(payload);
     let check = full_check(&buf[..FRAME_HEADER_LEN + payload.len()]);
     buf[FRAME_HEADER_LEN + payload.len()..].copy_from_slice(&check);
@@ -63,6 +77,9 @@ pub struct Wal {
     cursor: u64,
     /// The next frame's seq.
     next_seq: u64,
+    /// The epoch new frames are written under — strictly above everything
+    /// any earlier history wrote, which is the whole fence.
+    epoch: u64,
     /// Where live history begins — the anchor's replay position. Everything
     /// from here to the cursor must survive; everything else is dead.
     replay_start: u64,
@@ -75,6 +92,7 @@ pub struct Wal {
 pub struct RecoveredFrame {
     pub payload: Vec<u8>,
     pub seq: u64,
+    pub epoch: u64,
     pub cursor_after: u64,
 }
 
@@ -87,34 +105,38 @@ impl Wal {
 
     /// A ring with no live history, positioned by the anchor at format time
     /// or after every checkpoint.
-    pub fn empty(start: u64, size: u64, cursor: u64, next_seq: u64) -> Wal {
+    pub fn empty(start: u64, size: u64, cursor: u64, next_seq: u64, epoch: u64) -> Wal {
         Wal {
             start,
             size,
             cursor,
             next_seq,
+            epoch,
             replay_start: cursor,
         }
     }
 
     /// Scan live history from the anchor's position, returning every frame
-    /// that decodes in sequence. The caller applies its own validation on
-    /// top and truncates; [`Wal::adopt`] then fixes the ring's position.
+    /// that decodes in sequence under a never-decreasing epoch at or above
+    /// `floor_epoch`. The caller applies its own validation on top and
+    /// truncates; [`Wal::adopt`] then fixes the ring's position.
     pub fn recover<D: Disk>(
         brick: &Brick<D>,
         replay_offset: u64,
         replay_seq: u64,
+        floor_epoch: u64,
     ) -> Result<Vec<RecoveredFrame>> {
         let (start, size) = brick.wal_bounds();
         let end = start + size;
         let mut frames = Vec::new();
         let mut pos = replay_offset;
         let mut seq = replay_seq;
+        let mut epoch_floor = floor_epoch;
         let mut travelled = 0u64;
 
         loop {
-            match Self::decode_at(brick, pos, end, seq)? {
-                Some((payload, len)) => {
+            match Self::decode_at(brick, pos, end, seq, epoch_floor)? {
+                Some((payload, len, epoch)) => {
                     travelled += len;
                     if travelled >= size {
                         // A full lap can only mean the ring never had a
@@ -126,16 +148,20 @@ impl Wal {
                     frames.push(RecoveredFrame {
                         payload,
                         seq,
+                        epoch,
                         cursor_after: pos,
                     });
                     seq += 1;
+                    epoch_floor = epoch;
                 }
                 None => {
                     // Not a frame here. If we are not at the ring's start,
                     // this may be the writer's wrap point — the one other
                     // place the run can continue is the start.
                     if pos != start {
-                        if let Some((payload, len)) = Self::decode_at(brick, start, end, seq)? {
+                        if let Some((payload, len, epoch)) =
+                            Self::decode_at(brick, start, end, seq, epoch_floor)?
+                        {
                             travelled += len + (end - pos);
                             if travelled >= size {
                                 break;
@@ -144,9 +170,11 @@ impl Wal {
                             frames.push(RecoveredFrame {
                                 payload,
                                 seq,
+                                epoch,
                                 cursor_after: pos,
                             });
                             seq += 1;
+                            epoch_floor = epoch;
                             continue;
                         }
                     }
@@ -157,13 +185,15 @@ impl Wal {
         Ok(frames)
     }
 
-    /// Decode one frame at `pos` if a valid one with `seq` lies there.
+    /// Decode one frame at `pos` if a valid one with `seq` and an epoch at
+    /// or above `min_epoch` lies there.
     fn decode_at<D: Disk>(
         brick: &Brick<D>,
         pos: u64,
         end: u64,
         seq: u64,
-    ) -> Result<Option<(Vec<u8>, u64)>> {
+        min_epoch: u64,
+    ) -> Result<Option<(Vec<u8>, u64, u64)>> {
         if pos + frame_len(0) > end {
             return Ok(None);
         }
@@ -175,7 +205,13 @@ impl Wal {
         if u64::from_le_bytes(header[8..16].try_into().unwrap()) != seq {
             return Ok(None);
         }
-        let length = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+        let epoch = u64::from_le_bytes(header[16..24].try_into().unwrap());
+        if epoch < min_epoch {
+            // An older history's debris. Refusing it here is what keeps a
+            // stale entry from ever landing after a current one.
+            return Ok(None);
+        }
+        let length = u32::from_le_bytes(header[24..28].try_into().unwrap()) as usize;
         if length > MAX_WAL_PAYLOAD || pos + frame_len(length) > end {
             return Ok(None);
         }
@@ -187,7 +223,7 @@ impl Wal {
         if full_check(&covered) != rest[length..] {
             return Ok(None);
         }
-        Ok(Some((rest[..length].to_vec(), frame_len(length))))
+        Ok(Some((rest[..length].to_vec(), frame_len(length), epoch)))
     }
 
     /// Adopt the position after a validated replay: the ring continues from
@@ -216,11 +252,23 @@ impl Wal {
         if spent + len >= self.size {
             return Err(FsError::WalFull);
         }
-        brick.aux_write(at, &encode_frame(self.next_seq, payload))?;
+        brick.aux_write(at, &encode_frame(self.next_seq, self.epoch, payload))?;
         let seq = self.next_seq;
         self.cursor = at + len;
         self.next_seq += 1;
         Ok(seq)
+    }
+
+    /// Set the epoch new frames are written under. Recovery calls this with
+    /// one more than anything it accepted — the fence itself.
+    pub fn set_epoch(&mut self, epoch: u64) {
+        self.epoch = epoch;
+    }
+
+    /// The epoch new frames carry — what a checkpoint's anchor records as
+    /// the floor for the next recovery.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// A checkpoint has made everything up to the cursor redundant: live
@@ -260,7 +308,7 @@ mod tests {
 
     fn fresh_wal(brick: &Brick<SimDisk>) -> Wal {
         let (start, size) = brick.wal_bounds();
-        Wal::empty(start, size, start, 1)
+        Wal::empty(start, size, start, 1, 1)
     }
 
     #[test]
@@ -272,11 +320,12 @@ mod tests {
         }
         brick.flush().unwrap();
         let (start, _) = brick.wal_bounds();
-        let frames = Wal::recover(&brick, start, 1).unwrap();
+        let frames = Wal::recover(&brick, start, 1, 1).unwrap();
         assert_eq!(frames.len(), 5);
         for (i, frame) in frames.iter().enumerate() {
             assert_eq!(frame.payload, vec![i as u8; 10]);
             assert_eq!(frame.seq, 1 + i as u64);
+            assert_eq!(frame.epoch, 1);
         }
     }
 
@@ -294,7 +343,7 @@ mod tests {
         wal.append(&mut brick, &big).unwrap(); // fits before the end
         wal.append(&mut brick, &big).unwrap(); // must wrap to the start
         brick.flush().unwrap();
-        let frames = Wal::recover(&brick, cursor, next_seq).unwrap();
+        let frames = Wal::recover(&brick, cursor, next_seq, 1).unwrap();
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[1].payload, big);
     }
@@ -335,8 +384,48 @@ mod tests {
         brick.aux_write(second_end - 4, &[0xFF; 4]).unwrap();
         brick.flush().unwrap();
         let (start, _) = brick.wal_bounds();
-        let frames = Wal::recover(&brick, start, 1).unwrap();
+        let frames = Wal::recover(&brick, start, 1, 1).unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].payload, vec![1; 100]);
+    }
+
+    #[test]
+    fn an_older_epochs_debris_cannot_chain_after_a_newer_frame() {
+        // The trap the epoch exists for: an earlier history's unacked tail
+        // sits at exactly the positions and seqs a later history will use.
+        // Write the "old" history at epoch 5, overwrite only its first
+        // frame at epoch 7 — as if the later history wrote one frame and
+        // crashed — and replay: the epoch-7 frame is accepted, and the
+        // aligned epoch-5 frame behind it must be refused, not chained.
+        {
+            let mut brick = brick(5);
+            let (start, size) = brick.wal_bounds();
+            let mut old = Wal::empty(start, size, start, 1, 5);
+            old.append(&mut brick, &[0xAA; 100]).unwrap();
+            old.append(&mut brick, &[0xBB; 100]).unwrap();
+            old.append(&mut brick, &[0xCC; 100]).unwrap();
+            brick.flush().unwrap();
+            let mut new = Wal::empty(start, size, start, 1, 7);
+            new.append(&mut brick, &[0xDD; 100]).unwrap();
+            brick.flush().unwrap();
+
+            let frames = Wal::recover(&brick, start, 1, 5).unwrap();
+            assert_eq!(frames.len(), 1, "the debris chained: {frames:?}");
+            assert_eq!(frames[0].payload, vec![0xDD; 100]);
+            assert_eq!(frames[0].epoch, 7);
+        }
+
+        // Whole-and-first is still allowed: with no newer frame in front,
+        // the old run replays intact from its own start.
+        {
+            let mut brick = brick(6);
+            let (start, size) = brick.wal_bounds();
+            let mut old = Wal::empty(start, size, start, 1, 5);
+            old.append(&mut brick, &[0xAA; 100]).unwrap();
+            old.append(&mut brick, &[0xBB; 100]).unwrap();
+            brick.flush().unwrap();
+            let frames = Wal::recover(&brick, start, 1, 5).unwrap();
+            assert_eq!(frames.len(), 2);
+        }
     }
 }

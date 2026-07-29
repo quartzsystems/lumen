@@ -14,18 +14,23 @@ docs/storage.md (DRBD replicated volumes) remains what exists in production
 and keeps carrying machines until LumenFS has earned them.
 
 **Status: phase 1 has begun.** The `lumen-fs` crate exists with the
-simulation harness and the write path — the deterministic disk with crash
-and torn-write injection, the v1 on-disk format (superblock, dual anchor
-slots, WAL area, segment incarnations, self-validating block records), the
-single-brick extent store with scan-based recovery, the write-ahead ring,
-the COW map trees whose nodes are ordinary pool blocks, and the pool layer
-that ties them into vdisks: write, read, flush-to-acknowledge, and the
-two-flush checkpoint that folds dirty maps into trees and retires WAL
-history. Two crash suites replay seeded power-loss histories under
-`cargo test`: the brick-level contract (an acknowledged block survives
-intact) and the vdisk-level one (an acknowledged write survives; an
-unacknowledged write lands whole or not at all, never as garbage). Still
-design: dedupe refcounts and GC, scrub, snapshots-as-API, NBD export.
+simulation harness and the full single-node data path — the deterministic
+disk with crash and torn-write injection, the v1 on-disk format
+(superblock, dual anchor slots, WAL area, segment incarnations,
+self-validating block records), the single-brick extent store with
+salvage-scan recovery (one rotted record cannot take its neighbors down),
+the epoch-fenced write-ahead ring (stale debris can never chain after
+acknowledged history), the COW map trees whose nodes are ordinary pool
+blocks, and the pool layer over them: write, read, trim, vdisk create and
+delete, flush-to-acknowledge, the two-flush checkpoint, mark-and-sweep
+garbage collection with segment compaction (invisible to maps — a block's
+identity is its hash, not its location), and the scrub that reports rot
+and missing references. Two crash suites replay seeded power-loss
+histories under `cargo test`: the brick-level contract (an acknowledged
+block survives intact) and the vdisk-level one (an acknowledged write
+survives; an unacknowledged write lands whole or not at all, never as
+garbage — with trims and collections interleaved through the crashes).
+Still design: snapshots-as-API and the NBD export.
 
 ## Why not Ceph, revisited
 
@@ -96,8 +101,13 @@ like it knows that.
   hash. The map's own nodes are content-addressed blocks in the pool, so
   replication, checksums, and snapshots cover metadata by construction. A
   snapshot pins a map root; a clone is a new vdisk pointing at a shared
-  root. Space reclaim is by refcount, with deltas batched through the WAL
-  and compacted asynchronously — never a synchronous refcount write per I/O.
+  root. Space reclaim is mark-and-sweep from the anchored roots, with
+  compaction of sparse segments — a recorded deviation from this design's
+  earlier refcount sketch. With the index rebuilt by scan, liveness is
+  already a pure function of durable state, and a sweep has no persistent
+  counter to ever desync; refcount deltas may return alongside the
+  persisted dedupe index if scan-marking ever grows too slow, and nothing
+  on disk precludes them.
 - **WAL** — a small per-node write-ahead log on the fastest tier,
   synchronously replicated to the peer holding the same slices. A guest
   write is acknowledged when the block and its WAL entry are durable on

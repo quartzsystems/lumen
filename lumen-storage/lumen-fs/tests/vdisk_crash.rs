@@ -13,9 +13,11 @@
 //! - the pool recovers into a usable state after every crash.
 //!
 //! Two vdisks run side by side, one deep enough to force depth-two map
-//! trees, and checkpoints are interleaved with crashes so recovery leans on
-//! every combination of manifest, tree, and WAL replay. Every assertion
-//! carries its seed.
+//! trees; trims run beside writes (a trim is a write whose value is
+//! "unmapped"); and checkpoints *and garbage collections* are interleaved
+//! with crashes, so recovery leans on every combination of manifest, tree,
+//! WAL replay, and post-compaction geometry. Every assertion carries its
+//! seed.
 
 use std::collections::HashMap;
 
@@ -38,14 +40,23 @@ fn params() -> BrickParams {
     }
 }
 
-/// What one block may legitimately read as.
+/// What one block may legitimately read as. A trim is just a write whose
+/// value is `None` — "unmapped" is a value like any other.
 #[derive(Debug, Clone, Default)]
 struct BlockModel {
     /// The durable value — `None` is unmapped.
     acked: Option<Vec<u8>>,
-    /// Values written since the last acknowledgement, oldest first. A crash
-    /// may land the block on any of these, or leave it on `acked`.
-    pending: Vec<Vec<u8>>,
+    /// Values recorded since the last acknowledgement, oldest first. A
+    /// crash may land the block on any of these, or leave it on `acked`.
+    pending: Vec<Option<Vec<u8>>>,
+    /// Values that were pending at some earlier crash and never surfaced.
+    /// A never-acknowledged write's bytes stay physically present until
+    /// overwritten, and the WAL's epoch fence permits exactly one shape of
+    /// return: whole-and-first, when no later history landed a single
+    /// frame — so an old pending value may lawfully reappear at a later
+    /// crash. What the fence forbids — and `acked` checks — is stale
+    /// values landing after acknowledged ones.
+    ghosts: Vec<Option<Vec<u8>>>,
 }
 
 struct Model {
@@ -53,19 +64,20 @@ struct Model {
 }
 
 impl Model {
-    fn write(&mut self, vdisk: u64, index: u64, payload: Vec<u8>) {
+    fn record(&mut self, vdisk: u64, index: u64, value: Option<Vec<u8>>) {
         self.blocks
             .entry((vdisk, index))
             .or_default()
             .pending
-            .push(payload);
+            .push(value);
     }
 
-    /// A flush or checkpoint returned: everything pending is now the value.
+    /// A flush, checkpoint, or collection returned: everything pending is
+    /// now the value.
     fn acknowledge_all(&mut self) {
         for block in self.blocks.values_mut() {
             if let Some(last) = block.pending.pop() {
-                block.acked = Some(last);
+                block.acked = last;
             }
             block.pending.clear();
         }
@@ -74,7 +86,10 @@ impl Model {
     /// What the block must read as right now, mid-workload.
     fn current(&self, vdisk: u64, index: u64) -> Option<&Vec<u8>> {
         let block = self.blocks.get(&(vdisk, index))?;
-        block.pending.last().or(block.acked.as_ref())
+        match block.pending.last() {
+            Some(latest) => latest.as_ref(),
+            None => block.acked.as_ref(),
+        }
     }
 }
 
@@ -93,18 +108,19 @@ fn verify_and_collapse(pool: &Pool<SimDisk>, model: &mut Model, seed: u64) {
             .read_block(*vdisk, *index)
             .unwrap_or_else(|err| panic!("seed {seed}: read after recovery failed: {err}"));
         let legitimate = observed == block.acked
-            || observed
-                .as_ref()
-                .map(|seen| block.pending.iter().any(|p| p == seen))
-                .unwrap_or(false);
+            || block.pending.contains(&observed)
+            || block.ghosts.contains(&observed);
         assert!(
             legitimate,
             "seed {seed}: vdisk {vdisk} block {index} recovered to a value it \
-             never legitimately held ({} pending writes)",
+             never legitimately held ({} pending, {} ghosts)",
             block.pending.len(),
+            block.ghosts.len(),
         );
+        // What did not surface this time may still surface at a later
+        // crash, until something acknowledged writes over it.
+        block.ghosts.append(&mut block.pending);
         block.acked = observed;
-        block.pending.clear();
     }
     // Blocks nothing ever wrote stay unmapped.
     for (vdisk, capacity) in VDISKS {
@@ -133,28 +149,46 @@ fn run_history(seed: u64) {
         let ops = 10 + workload.next_below(30);
         for _ in 0..ops {
             let roll = workload.next_below(100);
-            if roll < 70 {
+            if roll < 60 {
                 let (vdisk, capacity) = VDISKS[workload.next_below(2) as usize];
                 // Reserve the last block as never-written.
                 let index = workload.next_below(capacity - 1);
                 let data = payload(&mut workload);
                 match pool.write_block(vdisk, index, &data) {
-                    Ok(()) => model.write(vdisk, index, data),
+                    Ok(()) => model.record(vdisk, index, Some(data)),
                     Err(FsError::WalFull) => {
                         // A checkpoint acknowledges everything, then makes
                         // room; the write goes again.
                         pool.checkpoint().unwrap();
                         model.acknowledge_all();
                         pool.write_block(vdisk, index, &data).unwrap();
-                        model.write(vdisk, index, data);
+                        model.record(vdisk, index, Some(data));
                     }
                     Err(other) => panic!("seed {seed}: write failed: {other}"),
                 }
-            } else if roll < 85 {
+            } else if roll < 72 {
+                let (vdisk, capacity) = VDISKS[workload.next_below(2) as usize];
+                let index = workload.next_below(capacity - 1);
+                match pool.trim_block(vdisk, index) {
+                    Ok(()) => model.record(vdisk, index, None),
+                    Err(FsError::WalFull) => {
+                        pool.checkpoint().unwrap();
+                        model.acknowledge_all();
+                        pool.trim_block(vdisk, index).unwrap();
+                        model.record(vdisk, index, None);
+                    }
+                    Err(other) => panic!("seed {seed}: trim failed: {other}"),
+                }
+            } else if roll < 84 {
                 pool.flush().unwrap();
                 model.acknowledge_all();
-            } else if roll < 92 {
+            } else if roll < 90 {
                 pool.checkpoint().unwrap();
+                model.acknowledge_all();
+            } else if roll < 93 {
+                // A collection is a checkpoint plus a sweep: everything
+                // acknowledged, geometry rearranged underneath.
+                pool.collect_garbage().unwrap();
                 model.acknowledge_all();
             } else {
                 // A mid-workload read must see the newest write, pending or
@@ -194,7 +228,7 @@ fn run_history(seed: u64) {
 
 #[test]
 fn every_acknowledged_vdisk_write_survives_every_crash_history() {
-    for seed in 0..48 {
+    for seed in 0..96 {
         run_history(seed);
     }
 }

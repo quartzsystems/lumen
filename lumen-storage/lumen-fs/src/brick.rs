@@ -32,7 +32,7 @@
 //! persisted LSM index arrives with the dedupe-refcount work. Nothing on
 //! disk assumes the index exists.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::disk::Disk;
 use crate::error::{FsError, Result};
@@ -86,6 +86,19 @@ pub struct BrickStats {
     pub segments_free: u64,
     /// Payload bytes the index points at (not the padded on-disk spans).
     pub payload_bytes: u64,
+}
+
+/// What one garbage collection accomplished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GcStats {
+    /// Index entries dropped as unreachable.
+    pub blocks_dropped: u64,
+    /// Live blocks rewritten out of sparse segments.
+    pub blocks_moved: u64,
+    /// Segments returned to the free list.
+    pub segments_freed: u64,
+    /// Of those, segments that needed evacuating first.
+    pub segments_compacted: u64,
 }
 
 #[derive(Debug)]
@@ -159,6 +172,7 @@ impl<D: Disk> Brick<D> {
             generation: 1,
             wal_replay_offset: WAL_AREA_START,
             wal_replay_seq: 1,
+            wal_epoch: 1,
             manifest_hash: [0; 32],
         };
         let mut anchor_sector = vec![0u8; SECTOR_SIZE as usize];
@@ -241,19 +255,25 @@ impl<D: Disk> Brick<D> {
             let mut head = [0u8; RECORD_HEADER_LEN];
             self.disk.read_at(cursor, &mut head)?;
             let record = match RecordHeader::decode(&head, header.seq, self.sb.block_size) {
-                Some(record) => record,
-                None => break,
+                Some(record) if cursor + record_span(record.length) <= end => record,
+                _ => {
+                    // Not a record of this incarnation — a torn tail, rot,
+                    // or debris. Resync at the next sector rather than
+                    // giving up on the segment: a valid record beyond this
+                    // point is either acknowledged data that must not be
+                    // lost to a neighbor's failure, or an unacknowledged
+                    // survivor the contract allows either way.
+                    cursor += SECTOR_SIZE;
+                    continue;
+                }
             };
-            if cursor + record_span(record.length) > end {
-                break;
-            }
             let mut payload = vec![0u8; record.length as usize];
             self.disk
                 .read_at(cursor + RECORD_HEADER_LEN as u64, &mut payload)?;
             if hash_block(&payload) != record.hash {
-                // A record whose header survived but whose payload tore.
-                // Everything from here on was never acknowledged.
-                break;
+                // A record whose header survived but whose payload did not.
+                cursor += SECTOR_SIZE;
+                continue;
             }
             self.index.insert(
                 record.hash,
@@ -293,7 +313,14 @@ impl<D: Disk> Brick<D> {
         if self.index.contains_key(&hash) {
             return Ok(hash);
         }
+        let location = self.append_record(hash, payload)?;
+        self.index.insert(hash, location);
+        Ok(hash)
+    }
 
+    /// Append one record at the write head, regardless of the index — the
+    /// shared tail of a put and of a compaction move.
+    fn append_record(&mut self, hash: BlockHash, payload: &[u8]) -> Result<Location> {
         let span = record_span(payload.len() as u32);
         let open = self.writable_segment(span)?;
         let header = RecordHeader {
@@ -305,20 +332,15 @@ impl<D: Disk> Brick<D> {
         record[..RECORD_HEADER_LEN].copy_from_slice(&header.encode());
         record[RECORD_HEADER_LEN..RECORD_HEADER_LEN + payload.len()].copy_from_slice(payload);
         self.disk.write_at(open.cursor, &record)?;
-
-        self.index.insert(
-            hash,
-            Location {
-                offset: open.cursor,
-                length: payload.len() as u32,
-                seq: open.seq,
-            },
-        );
         self.open = Some(OpenSegment {
             cursor: open.cursor + span,
             ..open
         });
-        Ok(hash)
+        Ok(Location {
+            offset: open.cursor,
+            length: payload.len() as u32,
+            seq: open.seq,
+        })
     }
 
     /// A write head with room for `span` bytes, opening a fresh segment
@@ -369,6 +391,12 @@ impl<D: Disk> Brick<D> {
             Some(location) => *location,
             None => return Ok(None),
         };
+        Ok(Some(self.read_location(hash, &location)?))
+    }
+
+    /// Read and fully verify the record at a known location — the shared
+    /// heart of a get, a compaction move, and the scrub.
+    fn read_location(&self, hash: &BlockHash, location: &Location) -> Result<Vec<u8>> {
         let mut head = [0u8; RECORD_HEADER_LEN];
         self.disk.read_at(location.offset, &mut head)?;
         let record = RecordHeader::decode(&head, location.seq, self.sb.block_size)
@@ -382,7 +410,7 @@ impl<D: Disk> Brick<D> {
         if hash_block(&payload) != *hash {
             return Err(FsError::Corrupt("payload fails its content address"));
         }
-        Ok(Some(payload))
+        Ok(payload)
     }
 
     /// The durability barrier: every put before this call is on stable
@@ -449,6 +477,127 @@ impl<D: Disk> Brick<D> {
         let mut sector = vec![0u8; SECTOR_SIZE as usize];
         sector[..anchor.encode().len()].copy_from_slice(&anchor.encode());
         self.aux_write(Anchor::slot_offset(anchor.generation), &sector)
+    }
+
+    /// The sweep half of garbage collection: keep exactly the blocks in
+    /// `live`, reclaim what that empties out.
+    ///
+    /// The caller (the pool) must have made `live` computable from durable
+    /// state alone — checkpointed, WAL retired — before calling; that
+    /// contract is what lets this run with no persistent bookkeeping at
+    /// all. Three moves, in an order a crash cannot break:
+    ///
+    /// 1. Unreachable index entries are dropped. Their records stay on disk
+    ///    until their segment is reused; if a crash resurrects them into a
+    ///    future index, they are unreferenced blocks the next collection
+    ///    drops again — noise, not loss.
+    /// 2. Sparse segments (live spans at most half the usable space) are
+    ///    evacuated: live records rewritten at the write head. Content
+    ///    addressing makes the move invisible to every map that references
+    ///    the block. The moves are **flushed before** any source becomes
+    ///    reusable — a reused source overwrites history, and history may
+    ///    not die before its replacement is durable.
+    /// 3. Emptied segments get their headers zeroed (pending — either fate
+    ///    in a crash is safe) and join the free list.
+    ///
+    /// An evacuation stopped by a full brick keeps its source segment live
+    /// with whatever remains; the copies already made are merely dead
+    /// weight for the next collection.
+    pub fn retain_and_reclaim(&mut self, live: &HashSet<BlockHash>) -> Result<GcStats> {
+        let before = self.index.len() as u64;
+        self.index.retain(|hash, _| live.contains(hash));
+        let mut stats = GcStats {
+            blocks_dropped: before - self.index.len() as u64,
+            ..Default::default()
+        };
+
+        let mut by_segment: HashMap<u64, Vec<BlockHash>> = HashMap::new();
+        for (hash, location) in &self.index {
+            let segment = (location.offset - self.sb.segment_area_start) / self.sb.segment_size;
+            by_segment.entry(segment).or_default().push(*hash);
+        }
+
+        let open_segment = self.open.map(|open| open.index);
+        let already_free: HashSet<u64> = self.free.iter().copied().collect();
+        let mut reclaimed = Vec::new();
+        let mut moved_any = false;
+        for segment in 0..self.sb.segment_count {
+            if Some(segment) == open_segment || already_free.contains(&segment) {
+                continue;
+            }
+            let hashes = match by_segment.get(&segment) {
+                None => {
+                    // Nothing live at all — reclaim without touching data.
+                    reclaimed.push(segment);
+                    continue;
+                }
+                Some(hashes) => {
+                    let mut hashes = hashes.clone();
+                    hashes.sort_unstable();
+                    hashes
+                }
+            };
+            let live_span: u64 = hashes
+                .iter()
+                .map(|hash| record_span(self.index[hash].length))
+                .sum();
+            if live_span * 2 > self.sb.segment_size - SECTOR_SIZE {
+                continue;
+            }
+            let mut whole = true;
+            for hash in &hashes {
+                let location = self.index[hash];
+                let payload = self.read_location(hash, &location)?;
+                match self.append_record(*hash, &payload) {
+                    Ok(new_location) => {
+                        self.index.insert(*hash, new_location);
+                        stats.blocks_moved += 1;
+                        moved_any = true;
+                    }
+                    Err(FsError::Full) => {
+                        whole = false;
+                        break;
+                    }
+                    Err(other) => return Err(other),
+                }
+            }
+            if whole {
+                stats.segments_compacted += 1;
+                reclaimed.push(segment);
+            }
+        }
+
+        if moved_any {
+            self.disk.flush()?;
+        }
+        let zero = vec![0u8; SECTOR_SIZE as usize];
+        for segment in reclaimed {
+            self.disk.write_at(self.sb.segment_offset(segment), &zero)?;
+            self.free.push(segment);
+            stats.segments_freed += 1;
+        }
+        Ok(stats)
+    }
+
+    /// Verify every indexed record against its content address. Returns how
+    /// many verified and the addresses that did not — rot found on a
+    /// schedule instead of by an unlucky read. Repair belongs to phase 2
+    /// and a peer's replica; this layer's whole duty is to never let wrong
+    /// bytes pass as right ones.
+    pub fn scrub(&self) -> Result<(u64, Vec<BlockHash>)> {
+        let mut hashes: Vec<BlockHash> = self.index.keys().copied().collect();
+        hashes.sort_unstable();
+        let mut verified = 0u64;
+        let mut corrupt = Vec::new();
+        for hash in hashes {
+            let location = self.index[&hash];
+            match self.read_location(&hash, &location) {
+                Ok(_) => verified += 1,
+                Err(FsError::Corrupt(_)) => corrupt.push(hash),
+                Err(other) => return Err(other),
+            }
+        }
+        Ok((verified, corrupt))
     }
 
     pub fn contains(&self, hash: &BlockHash) -> bool {

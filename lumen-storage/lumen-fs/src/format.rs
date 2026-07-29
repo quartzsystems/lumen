@@ -31,10 +31,16 @@
 //!   segment gets a higher seq, so leftover records from the previous
 //!   incarnation fail the seq comparison and end the scan — stale data
 //!   cannot masquerade as current.
-//! - **The scan stops at the first invalid record.** Everything before it
-//!   was flushed or happened to survive; everything after it was never
-//!   acknowledged (the flush barrier orders writes), so stopping loses
-//!   nothing a caller was promised.
+//! - **The scan keeps what verifies and resyncs past what does not.** An
+//!   invalid record does not end the segment: the scan advances to the
+//!   next sector boundary and tries again. What it skips is a torn,
+//!   never-acknowledged tail or a rotted record for scrub to report; what
+//!   it finds beyond a failure is either acknowledged data — which one bad
+//!   neighbor must not take down — or an unacknowledged survivor the
+//!   durability contract permits in either fate. (Payload bytes that
+//!   happen to parse as a record are just a valid block: in a
+//!   content-addressed store, any pair of hash and matching payload is
+//!   legitimate content, referenced by nothing until a map says so.)
 //!
 //! Fixed little-endian layouts, hand-encoded. No serde: the bytes on disk
 //! are a contract with future versions of this code, not a serialization
@@ -71,7 +77,7 @@ pub const WAL_AREA_START: u64 = ANCHOR_AREA_START + SECTOR_SIZE * ANCHOR_SLOTS;
 /// Encoded sizes. The structs occupy the front of their sector; the rest is
 /// zeros.
 const SUPERBLOCK_LEN: usize = 128;
-const ANCHOR_LEN: usize = 96;
+const ANCHOR_LEN: usize = 104;
 const SEGMENT_HEADER_LEN: usize = 72;
 pub const RECORD_HEADER_LEN: usize = 64;
 
@@ -200,14 +206,16 @@ impl Superblock {
 ///   8..16   generation          u64   highest valid generation wins
 ///   16..24  wal_replay_offset   u64   absolute; where replay begins
 ///   24..32  wal_replay_seq      u64   the seq expected there
-///   32..64  manifest_hash       the vdisk manifest block; all-zeros = none
-///   64..96  checksum            BLAKE3 of bytes 0..64
+///   32..40  wal_epoch           u64   the epoch floor for replay
+///   40..72  manifest_hash       the vdisk manifest block; all-zeros = none
+///   72..104 checksum            BLAKE3 of bytes 0..72
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Anchor {
     pub generation: u64,
     pub wal_replay_offset: u64,
     pub wal_replay_seq: u64,
+    pub wal_epoch: u64,
     pub manifest_hash: [u8; 32],
 }
 
@@ -218,9 +226,10 @@ impl Anchor {
         put_u64(&mut buf, 8, self.generation);
         put_u64(&mut buf, 16, self.wal_replay_offset);
         put_u64(&mut buf, 24, self.wal_replay_seq);
-        buf[32..64].copy_from_slice(&self.manifest_hash);
-        let check = full_check(&buf[0..64]);
-        buf[64..96].copy_from_slice(&check);
+        put_u64(&mut buf, 32, self.wal_epoch);
+        buf[40..72].copy_from_slice(&self.manifest_hash);
+        let check = full_check(&buf[0..72]);
+        buf[72..104].copy_from_slice(&check);
         buf
     }
 
@@ -230,15 +239,16 @@ impl Anchor {
         if buf.len() < ANCHOR_LEN || &buf[0..8] != ANCHOR_MAGIC {
             return None;
         }
-        if full_check(&buf[0..64]) != buf[64..96] {
+        if full_check(&buf[0..72]) != buf[72..104] {
             return None;
         }
         let mut manifest_hash = [0u8; 32];
-        manifest_hash.copy_from_slice(&buf[32..64]);
+        manifest_hash.copy_from_slice(&buf[40..72]);
         Some(Anchor {
             generation: get_u64(buf, 8),
             wal_replay_offset: get_u64(buf, 16),
             wal_replay_seq: get_u64(buf, 24),
+            wal_epoch: get_u64(buf, 32),
             manifest_hash,
         })
     }
@@ -429,11 +439,12 @@ mod tests {
             generation: 12,
             wal_replay_offset: WAL_AREA_START + 4096,
             wal_replay_seq: 88,
+            wal_epoch: 4,
             manifest_hash: [9; 32],
         };
         let mut buf = anchor.encode();
         assert_eq!(Anchor::decode(&buf), Some(anchor));
-        for bit_of in [0usize, 10, 20, 40, 70] {
+        for bit_of in [0usize, 10, 20, 36, 50, 90] {
             buf[bit_of] ^= 0x01;
             assert_eq!(Anchor::decode(&buf), None, "byte {bit_of}");
             buf[bit_of] ^= 0x01;

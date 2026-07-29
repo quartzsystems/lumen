@@ -38,10 +38,10 @@ pub mod pool;
 pub mod sim;
 pub mod wal;
 
-pub use brick::{Brick, BrickParams, BrickStats};
+pub use brick::{Brick, BrickParams, BrickStats, GcStats};
 pub use disk::Disk;
 pub use error::{FsError, Result};
 pub use format::{SECTOR_SIZE, SUPERBLOCK_SLOTS};
 pub use hash::{hash_block, BlockHash};
-pub use pool::Pool;
+pub use pool::{Pool, ScrubReport};
 pub use sim::{SimDisk, SplitMix64};

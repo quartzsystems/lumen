@@ -37,15 +37,25 @@
 //! timers, snapshot requests — belongs to the daemon; the engine only
 //! promises that a checkpoint always makes room.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::brick::Brick;
+use crate::brick::{Brick, GcStats};
 use crate::disk::Disk;
 use crate::error::{FsError, Result};
 use crate::format::Anchor;
-use crate::hash::BlockHash;
+use crate::hash::{hash_block, BlockHash};
 use crate::map;
 use crate::wal::Wal;
+
+/// What a scrub found. Empty vectors are the healthy answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScrubReport {
+    pub blocks_verified: u64,
+    /// Stored blocks whose bytes fail their content address.
+    pub corrupt: Vec<BlockHash>,
+    /// `(vdisk, index)` pairs mapped to blocks the store cannot produce.
+    pub missing: Vec<(u64, u64)>,
+}
 
 const MANIFEST_MAGIC: &[u8; 8] = b"LFSMAN\0\0";
 const MANIFEST_HEADER_LEN: usize = 16; // magic 8 + version 4 + count 4
@@ -59,8 +69,9 @@ struct VdiskState {
     /// The checkpointed tree, if any writes have ever been checkpointed.
     root: Option<BlockHash>,
     /// Mutations since the last checkpoint — replayable from the WAL, so
-    /// purely in-memory. BTreeMap so a fold is deterministic.
-    dirty: BTreeMap<u64, BlockHash>,
+    /// purely in-memory. `Some` maps an index, `None` is a trim tombstone.
+    /// BTreeMap so a fold is deterministic.
+    dirty: BTreeMap<u64, Option<BlockHash>>,
 }
 
 pub struct Pool<D: Disk> {
@@ -84,6 +95,13 @@ enum WalEntry {
         index: u64,
         hash: BlockHash,
     },
+    TrimBlock {
+        vdisk: u64,
+        index: u64,
+    },
+    DeleteVdisk {
+        id: u64,
+    },
 }
 
 impl WalEntry {
@@ -102,6 +120,17 @@ impl WalEntry {
                 buf.extend_from_slice(hash.as_bytes());
                 buf
             }
+            WalEntry::TrimBlock { vdisk, index } => {
+                let mut buf = vec![3u8];
+                buf.extend_from_slice(&vdisk.to_le_bytes());
+                buf.extend_from_slice(&index.to_le_bytes());
+                buf
+            }
+            WalEntry::DeleteVdisk { id } => {
+                let mut buf = vec![4u8];
+                buf.extend_from_slice(&id.to_le_bytes());
+                buf
+            }
         }
     }
 
@@ -115,6 +144,13 @@ impl WalEntry {
                 vdisk: u64::from_le_bytes(buf[1..9].try_into().unwrap()),
                 index: u64::from_le_bytes(buf[9..17].try_into().unwrap()),
                 hash: BlockHash::from_bytes(buf[17..49].try_into().unwrap()),
+            }),
+            3 if buf.len() == 17 => Some(WalEntry::TrimBlock {
+                vdisk: u64::from_le_bytes(buf[1..9].try_into().unwrap()),
+                index: u64::from_le_bytes(buf[9..17].try_into().unwrap()),
+            }),
+            4 if buf.len() == 9 => Some(WalEntry::DeleteVdisk {
+                id: u64::from_le_bytes(buf[1..9].try_into().unwrap()),
             }),
             _ => None,
         }
@@ -147,12 +183,18 @@ impl<D: Disk> Pool<D> {
         }
 
         let (wal_start, wal_size) = brick.wal_bounds();
-        let frames = Wal::recover(&brick, anchor.wal_replay_offset, anchor.wal_replay_seq)?;
+        let frames = Wal::recover(
+            &brick,
+            anchor.wal_replay_offset,
+            anchor.wal_replay_seq,
+            anchor.wal_epoch,
+        )?;
         let mut wal = Wal::empty(
             wal_start,
             wal_size,
             anchor.wal_replay_offset,
             anchor.wal_replay_seq,
+            anchor.wal_epoch,
         );
         wal.adopt(
             anchor.wal_replay_offset,
@@ -169,7 +211,10 @@ impl<D: Disk> Pool<D> {
 
         // Replay: apply each entry only while everything it references
         // verifies; the first failure is the tail, and the ring continues
-        // from exactly there.
+        // from exactly there. New frames then write under a strictly
+        // higher epoch than anything replay accepted — the fence that
+        // keeps this history's debris out of the next recovery's chain.
+        let mut max_epoch = anchor.wal_epoch;
         for frame in frames {
             let entry = match WalEntry::decode(&frame.payload) {
                 Some(entry) => entry,
@@ -178,9 +223,11 @@ impl<D: Disk> Pool<D> {
             if !pool.apply_replayed(&entry) {
                 break;
             }
+            max_epoch = max_epoch.max(frame.epoch);
             pool.wal
                 .adopt(frame.cursor_after, frame.seq + 1, anchor.wal_replay_offset);
         }
+        pool.wal.set_epoch(max_epoch + 1);
         Ok(pool)
     }
 
@@ -216,9 +263,25 @@ impl<D: Disk> Pool<D> {
                     .get_mut(vdisk)
                     .unwrap()
                     .dirty
-                    .insert(*index, *hash);
+                    .insert(*index, Some(*hash));
                 true
             }
+            WalEntry::TrimBlock { vdisk, index } => {
+                let capacity = match self.vdisks.get(vdisk) {
+                    Some(state) => self.capacity_of(state),
+                    None => return false,
+                };
+                if *index >= capacity {
+                    return false;
+                }
+                self.vdisks
+                    .get_mut(vdisk)
+                    .unwrap()
+                    .dirty
+                    .insert(*index, None);
+                true
+            }
+            WalEntry::DeleteVdisk { id } => self.vdisks.remove(id).is_some(),
         }
     }
 
@@ -278,7 +341,42 @@ impl<D: Disk> Pool<D> {
             .get_mut(&vdisk)
             .unwrap()
             .dirty
-            .insert(index, hash);
+            .insert(index, Some(hash));
+        Ok(())
+    }
+
+    /// Unmap one block — a guest's discard. The read contract flips to
+    /// "unmapped" immediately; the space itself returns at the collection
+    /// after the next checkpoint.
+    pub fn trim_block(&mut self, vdisk: u64, index: u64) -> Result<()> {
+        let state = self
+            .vdisks
+            .get(&vdisk)
+            .ok_or(FsError::UnknownVdisk(vdisk))?;
+        let capacity = self.capacity_of(state);
+        if index >= capacity {
+            return Err(FsError::OutOfRange { index, capacity });
+        }
+        let entry = WalEntry::TrimBlock { vdisk, index };
+        self.wal.append(&mut self.brick, &entry.encode())?;
+        self.vdisks
+            .get_mut(&vdisk)
+            .unwrap()
+            .dirty
+            .insert(index, None);
+        Ok(())
+    }
+
+    /// Forget a vdisk. Its tree becomes unreachable at the checkpoint after
+    /// this lands, and its space returns at the collection after that —
+    /// deletion is a promise about reachability, reclaim is GC's schedule.
+    pub fn delete_vdisk(&mut self, id: u64) -> Result<()> {
+        if !self.vdisks.contains_key(&id) {
+            return Err(FsError::UnknownVdisk(id));
+        }
+        let entry = WalEntry::DeleteVdisk { id };
+        self.wal.append(&mut self.brick, &entry.encode())?;
+        self.vdisks.remove(&id);
         Ok(())
     }
 
@@ -294,7 +392,10 @@ impl<D: Disk> Pool<D> {
             return Err(FsError::OutOfRange { index, capacity });
         }
         let hash = match state.dirty.get(&index) {
-            Some(hash) => Some(*hash),
+            Some(Some(hash)) => Some(*hash),
+            // Trimmed since the last checkpoint: unmapped, whatever the
+            // tree still says underneath.
+            Some(None) => None,
             None => match &state.root {
                 Some(root) => map::lookup(&self.brick, root, self.depth_of(state), index)?,
                 None => None,
@@ -332,8 +433,9 @@ impl<D: Disk> Pool<D> {
             let depth = self.depth_of(state);
             let state = self.vdisks.get_mut(id).unwrap();
             let dirty = std::mem::take(&mut state.dirty);
-            let root = map::fold(&mut self.brick, state.root.as_ref(), depth, &dirty)?;
-            self.vdisks.get_mut(id).unwrap().root = Some(root);
+            let previous = state.root;
+            let root = map::fold(&mut self.brick, previous.as_ref(), depth, &dirty)?;
+            self.vdisks.get_mut(id).unwrap().root = root;
         }
 
         let manifest_hash = if self.vdisks.is_empty() {
@@ -351,9 +453,95 @@ impl<D: Disk> Pool<D> {
             generation: self.anchor_generation,
             wal_replay_offset,
             wal_replay_seq,
+            wal_epoch: self.wal.epoch(),
             manifest_hash,
         })?;
         self.brick.flush()
+    }
+
+    /// Collect garbage: checkpoint, mark everything reachable from the
+    /// anchored state, and hand the brick the live set to sweep against.
+    ///
+    /// The checkpoint is not an optimization — it is the correctness
+    /// precondition. It retires the WAL and empties every dirty map, so
+    /// afterwards liveness is computable from the manifest and trees alone;
+    /// without it, a swept block could still be referenced by a live WAL
+    /// entry, and replay after a crash would mistake an acknowledged write
+    /// for an invalid tail.
+    pub fn collect_garbage(&mut self) -> Result<GcStats> {
+        self.checkpoint()?;
+
+        let mut ids: Vec<u64> = self.vdisks.keys().copied().collect();
+        ids.sort_unstable();
+        let mut live: HashSet<BlockHash> = HashSet::new();
+        if !self.vdisks.is_empty() {
+            // The same bytes the checkpoint just anchored, so the same hash
+            // — recomputed rather than remembered, one source of truth.
+            live.insert(hash_block(&encode_manifest(&ids, &self.vdisks)));
+        }
+        let roots: Vec<(Option<BlockHash>, u32)> = ids
+            .iter()
+            .map(|id| {
+                let state = &self.vdisks[id];
+                (state.root, self.depth_of(state))
+            })
+            .collect();
+        for (root, depth) in roots {
+            if let Some(root) = root {
+                map::walk(&self.brick, &root, depth, &mut |item| match item {
+                    map::MapItem::Node(hash) => {
+                        live.insert(hash);
+                    }
+                    map::MapItem::Block { hash, .. } => {
+                        live.insert(hash);
+                    }
+                })?;
+            }
+        }
+        self.brick.retain_and_reclaim(&live)
+    }
+
+    /// Verify everything: every stored block against its content address,
+    /// and every map reference against the store. Repair is phase 2's
+    /// business; a truthful report is this one's. A missing *map node* is
+    /// an error rather than a report line — with the tree's shape gone,
+    /// there is no honest way to say which blocks are missing.
+    pub fn scrub(&self) -> Result<ScrubReport> {
+        let (blocks_verified, corrupt) = self.brick.scrub()?;
+        let mut missing = Vec::new();
+        let mut ids: Vec<u64> = self.vdisks.keys().copied().collect();
+        ids.sort_unstable();
+        for id in ids {
+            let state = &self.vdisks[&id];
+            for (index, value) in &state.dirty {
+                if let Some(hash) = value {
+                    if !self.brick.contains(hash) {
+                        missing.push((id, *index));
+                    }
+                }
+            }
+            if let Some(root) = &state.root {
+                let mut tree_refs = Vec::new();
+                map::walk(&self.brick, root, self.depth_of(state), &mut |item| {
+                    if let map::MapItem::Block { index, hash } = item {
+                        tree_refs.push((index, hash));
+                    }
+                })?;
+                for (index, hash) in tree_refs {
+                    // A dirty entry supersedes the tree at this index; only
+                    // the reference a read would actually follow counts.
+                    if !state.dirty.contains_key(&index) && !self.brick.contains(&hash) {
+                        missing.push((id, index));
+                    }
+                }
+            }
+        }
+        missing.sort_unstable();
+        Ok(ScrubReport {
+            blocks_verified,
+            corrupt,
+            missing,
+        })
     }
 
     /// Every vdisk's `(id, size_bytes)`, sorted — the listing a console
@@ -577,5 +765,140 @@ mod tests {
         pool.checkpoint().unwrap();
         let pool = reopen(pool);
         assert_eq!(pool.vdisks(), vec![]);
+    }
+
+    #[test]
+    fn a_trim_unmaps_through_wal_and_tree_alike() {
+        let mut pool = pool(9);
+        pool.create_vdisk(1, 40 * BLOCK as u64).unwrap();
+        pool.write_block(1, 3, b"here today").unwrap();
+        pool.checkpoint().unwrap();
+        pool.trim_block(1, 3).unwrap();
+        // The trim overlays the checkpointed tree immediately...
+        assert_eq!(pool.read_block(1, 3).unwrap(), None);
+        pool.flush().unwrap();
+        // ...survives reopen through the WAL...
+        let mut pool = reopen(pool);
+        assert_eq!(pool.read_block(1, 3).unwrap(), None);
+        pool.checkpoint().unwrap();
+        // ...and survives reopen through the folded tree.
+        let mut pool = reopen(pool);
+        assert_eq!(pool.read_block(1, 3).unwrap(), None);
+        pool.write_block(1, 3, b"back again").unwrap();
+        assert_eq!(pool.read_block(1, 3).unwrap().unwrap(), b"back again");
+    }
+
+    #[test]
+    fn a_deleted_vdisk_is_gone_through_wal_and_manifest_alike() {
+        let mut pool = pool(10);
+        pool.create_vdisk(1, 10 * BLOCK as u64).unwrap();
+        pool.create_vdisk(2, 10 * BLOCK as u64).unwrap();
+        pool.checkpoint().unwrap();
+        pool.delete_vdisk(1).unwrap();
+        pool.flush().unwrap();
+        let mut pool = reopen(pool);
+        assert_eq!(pool.vdisks(), vec![(2, 10 * BLOCK as u64)]);
+        assert_eq!(pool.read_block(1, 0).unwrap_err(), FsError::UnknownVdisk(1));
+        pool.checkpoint().unwrap();
+        let mut pool = reopen(pool);
+        assert_eq!(pool.vdisks(), vec![(2, 10 * BLOCK as u64)]);
+        // The id is free again — a new vdisk, not a resurrection.
+        pool.create_vdisk(1, 20 * BLOCK as u64).unwrap();
+        assert_eq!(pool.read_block(1, 0).unwrap(), None);
+    }
+
+    #[test]
+    fn a_collection_reclaims_overwritten_history_and_current_data_survives() {
+        let mut pool = pool(11);
+        pool.create_vdisk(1, 40 * BLOCK as u64).unwrap();
+        // Rounds of overwrites with checkpoints between: old data blocks,
+        // old tree nodes, and old manifests all become garbage.
+        for round in 0..6u8 {
+            for index in 0..20u64 {
+                let mut payload = vec![round; 3000];
+                payload[0..8].copy_from_slice(&index.to_le_bytes());
+                pool.write_block(1, index, &payload).unwrap();
+            }
+            pool.checkpoint().unwrap();
+        }
+        let stats = pool.collect_garbage().unwrap();
+        assert!(stats.blocks_dropped > 0, "nothing collected: {stats:?}");
+        assert!(stats.segments_freed > 0, "nothing reclaimed: {stats:?}");
+        for index in 0..20u64 {
+            let payload = pool.read_block(1, index).unwrap().unwrap();
+            assert_eq!(payload[8], 5, "index {index} lost its last round");
+        }
+        let pool = reopen(pool);
+        assert_eq!(pool.read_block(1, 19).unwrap().unwrap()[8], 5);
+    }
+
+    #[test]
+    fn deleting_a_vdisk_and_collecting_returns_its_space() {
+        let mut pool = pool(12);
+        pool.create_vdisk(1, 40 * BLOCK as u64).unwrap();
+        pool.create_vdisk(2, 40 * BLOCK as u64).unwrap();
+        for index in 0..30u64 {
+            pool.write_block(1, index, &[7u8; 2000]).unwrap();
+            let mut other = vec![8u8; 2000];
+            other[0..8].copy_from_slice(&index.to_le_bytes());
+            pool.write_block(2, index, &other).unwrap();
+        }
+        pool.checkpoint().unwrap();
+        pool.delete_vdisk(1).unwrap();
+        let stats = pool.collect_garbage().unwrap();
+        assert!(
+            stats.blocks_dropped > 0,
+            "the dead tree lingered: {stats:?}"
+        );
+        // The survivor is untouched, here and after reopen.
+        let pool = reopen(pool);
+        assert_eq!(
+            pool.read_block(2, 12).unwrap().unwrap()[8..12],
+            [8, 8, 8, 8]
+        );
+        assert_eq!(pool.vdisks().len(), 1);
+    }
+
+    #[test]
+    fn a_healthy_pool_scrubs_clean() {
+        let mut pool = pool(13);
+        pool.create_vdisk(1, 40 * BLOCK as u64).unwrap();
+        for index in 0..10u64 {
+            pool.write_block(1, index, &index.to_le_bytes()).unwrap();
+        }
+        pool.checkpoint().unwrap();
+        let report = pool.scrub().unwrap();
+        assert!(report.blocks_verified > 10, "{report:?}");
+        assert_eq!(report.corrupt, vec![]);
+        assert_eq!(report.missing, vec![]);
+    }
+
+    #[test]
+    fn scrub_names_the_vdisk_block_whose_data_rotted_away() {
+        use crate::disk::Disk;
+        let mut pool = pool(14);
+        pool.create_vdisk(1, 40 * BLOCK as u64).unwrap();
+        let marker = b"scrub will come looking for exactly these bytes";
+        pool.write_block(1, 6, marker).unwrap();
+        pool.checkpoint().unwrap();
+        // Rot the payload on the raw device, then reopen: the recovery scan
+        // refuses the record, so the store no longer holds a block the tree
+        // still references.
+        let mut disk = pool.into_brick().into_disk();
+        let mut whole = vec![0u8; disk.size() as usize];
+        disk.read_at(0, &mut whole).unwrap();
+        let at = whole
+            .windows(marker.len())
+            .position(|w| w == marker)
+            .expect("the payload must be somewhere on the disk") as u64;
+        disk.write_at(at, &[!marker[0]]).unwrap();
+        disk.flush().unwrap();
+        let pool = Pool::open(Brick::open(disk).unwrap()).unwrap();
+        let report = pool.scrub().unwrap();
+        assert_eq!(report.missing, vec![(1, 6)]);
+        assert_eq!(
+            pool.read_block(1, 6).unwrap_err(),
+            FsError::Corrupt("a mapped block is missing from the store")
+        );
     }
 }

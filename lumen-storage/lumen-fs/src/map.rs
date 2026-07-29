@@ -13,10 +13,16 @@
 //! size; level 0 nodes are leaves whose entries are data-block addresses.
 //!
 //! Updates are path copies: [`fold`] takes a batch of mutations (the pool's
-//! dirty set at checkpoint), rewrites each touched path bottom-up, and
-//! returns the new root. Nothing is modified in place, so the old root —
-//! and every consistent state under it — remains readable until GC decides
-//! otherwise.
+//! dirty set at checkpoint) — a `Some` maps an index, a `None` unmaps it —
+//! rewrites each touched path bottom-up, and returns the new root. A node
+//! folded down to all zeros is not written at all; its parent entry goes to
+//! zero, and a tree emptied entirely folds to no root. Nothing is modified
+//! in place, so the old root — and every consistent state under it — stays
+//! readable until GC decides otherwise.
+//!
+//! [`walk`] visits every node and mapped block under a root — the mark
+//! phase of garbage collection and the reachability half of scrub, which
+//! must agree with `fold` about the tree's shape and so live beside it.
 
 use std::collections::BTreeMap;
 
@@ -66,6 +72,14 @@ fn entry(node: &[u8], slot: u64) -> Option<BlockHash> {
     }
 }
 
+fn set_entry(node: &mut [u8], slot: u64, value: Option<&BlockHash>) {
+    let at = slot as usize * ENTRY_LEN;
+    match value {
+        Some(hash) => node[at..at + ENTRY_LEN].copy_from_slice(hash.as_bytes()),
+        None => node[at..at + ENTRY_LEN].copy_from_slice(&ZERO_ENTRY),
+    }
+}
+
 /// Resolve one block index through the tree. `Ok(None)` is "unmapped" — a
 /// region never written, which the consumer renders as zeros.
 pub fn lookup<D: Disk>(
@@ -87,16 +101,16 @@ pub fn lookup<D: Disk>(
     Ok(Some(hash))
 }
 
-/// Apply a batch of mutations to the tree rooted at `root` (or to the empty
-/// tree), writing new nodes along every touched path, and return the new
-/// root. Old nodes are untouched — this is where copy-on-write lives.
+/// Apply a batch of mutations to the tree rooted at `root` (or to the
+/// empty tree), writing new nodes along every touched path, and return the
+/// new root — `None` if the tree folded away entirely.
 pub fn fold<D: Disk>(
     brick: &mut Brick<D>,
     root: Option<&BlockHash>,
     depth: u32,
-    mutations: &BTreeMap<u64, BlockHash>,
-) -> Result<BlockHash> {
-    let entries: Vec<(u64, BlockHash)> = mutations.iter().map(|(i, h)| (*i, *h)).collect();
+    mutations: &BTreeMap<u64, Option<BlockHash>>,
+) -> Result<Option<BlockHash>> {
+    let entries: Vec<(u64, Option<BlockHash>)> = mutations.iter().map(|(i, h)| (*i, *h)).collect();
     fold_level(brick, root, depth - 1, &entries)
 }
 
@@ -104,8 +118,8 @@ fn fold_level<D: Disk>(
     brick: &mut Brick<D>,
     node_hash: Option<&BlockHash>,
     level: u32,
-    mutations: &[(u64, BlockHash)],
-) -> Result<BlockHash> {
+    mutations: &[(u64, Option<BlockHash>)],
+) -> Result<Option<BlockHash>> {
     let block_size = brick.block_size();
     let epn = entries_per_node(block_size);
     let mut node = match node_hash {
@@ -114,27 +128,80 @@ fn fold_level<D: Disk>(
     };
 
     if level == 0 {
-        for (index, hash) in mutations {
-            let at = (index % epn) as usize * ENTRY_LEN;
-            node[at..at + ENTRY_LEN].copy_from_slice(hash.as_bytes());
+        for (index, value) in mutations {
+            set_entry(&mut node, index % epn, value.as_ref());
         }
     } else {
         let stride = epn.pow(level);
-        let mut children: BTreeMap<u64, Vec<(u64, BlockHash)>> = BTreeMap::new();
-        for (index, hash) in mutations {
+        let mut children: BTreeMap<u64, Vec<(u64, Option<BlockHash>)>> = BTreeMap::new();
+        for (index, value) in mutations {
             children
                 .entry((index / stride) % epn)
                 .or_default()
-                .push((*index, *hash));
+                .push((*index, *value));
         }
         for (slot, child_mutations) in children {
             let existing = entry(&node, slot);
             let new_child = fold_level(brick, existing.as_ref(), level - 1, &child_mutations)?;
-            let at = slot as usize * ENTRY_LEN;
-            node[at..at + ENTRY_LEN].copy_from_slice(new_child.as_bytes());
+            set_entry(&mut node, slot, new_child.as_ref());
         }
     }
-    brick.put(&node)
+
+    // A node of nothing is not a node: prune it, and let the parent's entry
+    // go to zero. The whole tree can fold away this way.
+    if node.iter().all(|b| *b == 0) {
+        Ok(None)
+    } else {
+        Ok(Some(brick.put(&node)?))
+    }
+}
+
+/// What [`walk`] visits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapItem {
+    /// A tree node, by its content address.
+    Node(BlockHash),
+    /// A mapped data block: which index points at which address.
+    Block { index: u64, hash: BlockHash },
+}
+
+/// Visit every node and mapped block under a root — GC's mark phase and
+/// scrub's reachability sweep.
+pub fn walk<D: Disk>(
+    brick: &Brick<D>,
+    root: &BlockHash,
+    depth: u32,
+    visit: &mut dyn FnMut(MapItem),
+) -> Result<()> {
+    walk_level(brick, root, depth - 1, 0, visit)
+}
+
+fn walk_level<D: Disk>(
+    brick: &Brick<D>,
+    hash: &BlockHash,
+    level: u32,
+    base: u64,
+    visit: &mut dyn FnMut(MapItem),
+) -> Result<()> {
+    visit(MapItem::Node(*hash));
+    let node = load_node(brick, hash, brick.block_size())?;
+    let epn = entries_per_node(brick.block_size());
+    let stride = epn.pow(level);
+    for slot in 0..epn {
+        let child = match entry(&node, slot) {
+            Some(child) => child,
+            None => continue,
+        };
+        if level == 0 {
+            visit(MapItem::Block {
+                index: base + slot,
+                hash: child,
+            });
+        } else {
+            walk_level(brick, &child, level - 1, base + slot * stride, visit)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -161,6 +228,12 @@ mod tests {
         .unwrap()
     }
 
+    fn map_one(index: u64, hash: BlockHash) -> BTreeMap<u64, Option<BlockHash>> {
+        let mut muts = BTreeMap::new();
+        muts.insert(index, Some(hash));
+        muts
+    }
+
     #[test]
     fn depth_grows_exactly_when_capacity_outruns_a_level() {
         assert_eq!(depth_for(1, 128), 1);
@@ -174,9 +247,9 @@ mod tests {
     fn a_folded_mutation_is_found_and_the_rest_stay_unmapped() {
         let mut brick = brick(1);
         let data = brick.put(b"the data block").unwrap();
-        let mut muts = BTreeMap::new();
-        muts.insert(5u64, data);
-        let root = fold(&mut brick, None, 1, &muts).unwrap();
+        let root = fold(&mut brick, None, 1, &map_one(5, data))
+            .unwrap()
+            .unwrap();
         assert_eq!(lookup(&brick, &root, 1, 5).unwrap(), Some(data));
         assert_eq!(lookup(&brick, &root, 1, 6).unwrap(), None);
     }
@@ -187,9 +260,9 @@ mod tests {
         let a = brick.put(b"a").unwrap();
         let b = brick.put(b"b").unwrap();
         let mut muts = BTreeMap::new();
-        muts.insert(3u64, a); // leaf 0
-        muts.insert(130u64, b); // leaf 1 (128 entries per node)
-        let root = fold(&mut brick, None, 2, &muts).unwrap();
+        muts.insert(3u64, Some(a)); // leaf 0
+        muts.insert(130u64, Some(b)); // leaf 1 (128 entries per node)
+        let root = fold(&mut brick, None, 2, &muts).unwrap().unwrap();
         assert_eq!(lookup(&brick, &root, 2, 3).unwrap(), Some(a));
         assert_eq!(lookup(&brick, &root, 2, 130).unwrap(), Some(b));
         assert_eq!(lookup(&brick, &root, 2, 129).unwrap(), None);
@@ -200,12 +273,10 @@ mod tests {
         let mut brick = brick(3);
         let a = brick.put(b"first").unwrap();
         let b = brick.put(b"second").unwrap();
-        let mut first = BTreeMap::new();
-        first.insert(1u64, a);
-        let root_one = fold(&mut brick, None, 1, &first).unwrap();
-        let mut second = BTreeMap::new();
-        second.insert(2u64, b);
-        let root_two = fold(&mut brick, Some(&root_one), 1, &second).unwrap();
+        let root_one = fold(&mut brick, None, 1, &map_one(1, a)).unwrap().unwrap();
+        let root_two = fold(&mut brick, Some(&root_one), 1, &map_one(2, b))
+            .unwrap()
+            .unwrap();
         // The new root sees both writes; the old root still sees only the
         // first — that is the copy, and it is what a snapshot will pin.
         assert_eq!(lookup(&brick, &root_two, 1, 1).unwrap(), Some(a));
@@ -221,12 +292,76 @@ mod tests {
         for i in 0..40u64 {
             let hash = brick_one.put(&i.to_le_bytes()).unwrap();
             brick_two.put(&i.to_le_bytes()).unwrap();
-            muts.insert(i * 7, hash);
+            muts.insert(i * 7, Some(hash));
         }
         let root_one = fold(&mut brick_one, None, 2, &muts).unwrap();
         let root_two = fold(&mut brick_two, None, 2, &muts).unwrap();
         // Content addressing makes map state canonical: same mappings, same
         // root, on any brick anywhere. Replication will lean on this.
         assert_eq!(root_one, root_two);
+        assert!(root_one.is_some());
+    }
+
+    #[test]
+    fn unmapping_the_last_entry_folds_the_tree_away() {
+        let mut brick = brick(6);
+        let data = brick.put(b"soon gone").unwrap();
+        let root = fold(&mut brick, None, 2, &map_one(200, data))
+            .unwrap()
+            .unwrap();
+        let mut unmap = BTreeMap::new();
+        unmap.insert(200u64, None);
+        let root = fold(&mut brick, Some(&root), 2, &unmap).unwrap();
+        assert_eq!(root, None);
+    }
+
+    #[test]
+    fn unmapping_one_leaf_prunes_it_without_touching_its_siblings() {
+        let mut brick = brick(7);
+        let a = brick.put(b"stays").unwrap();
+        let b = brick.put(b"goes").unwrap();
+        let mut muts = BTreeMap::new();
+        muts.insert(3u64, Some(a)); // leaf 0
+        muts.insert(300u64, Some(b)); // leaf 2
+        let root = fold(&mut brick, None, 2, &muts).unwrap().unwrap();
+        let mut unmap = BTreeMap::new();
+        unmap.insert(300u64, None);
+        let root = fold(&mut brick, Some(&root), 2, &unmap).unwrap().unwrap();
+        assert_eq!(lookup(&brick, &root, 2, 3).unwrap(), Some(a));
+        assert_eq!(lookup(&brick, &root, 2, 300).unwrap(), None);
+        // The pruned leaf is gone from the tree's shape, not merely zeroed:
+        // the walk sees one leaf node, not two.
+        let mut nodes = 0;
+        walk(&brick, &root, 2, &mut |item| {
+            if matches!(item, MapItem::Node(_)) {
+                nodes += 1;
+            }
+        })
+        .unwrap();
+        assert_eq!(nodes, 2, "root and one leaf");
+    }
+
+    #[test]
+    fn the_walk_visits_every_node_and_every_mapping_exactly_once() {
+        let mut brick = brick(8);
+        let mut muts = BTreeMap::new();
+        let mut expected = Vec::new();
+        for i in [0u64, 5, 127, 128, 129, 256 * 128 - 1] {
+            let hash = brick.put(&i.to_le_bytes()).unwrap();
+            muts.insert(i, Some(hash));
+            expected.push((i, hash));
+        }
+        let root = fold(&mut brick, None, 3, &muts).unwrap().unwrap();
+        let mut blocks = Vec::new();
+        let mut nodes = Vec::new();
+        walk(&brick, &root, 3, &mut |item| match item {
+            MapItem::Node(hash) => nodes.push(hash),
+            MapItem::Block { index, hash } => blocks.push((index, hash)),
+        })
+        .unwrap();
+        blocks.sort_unstable();
+        assert_eq!(blocks, expected);
+        let unique: std::collections::HashSet<_> = nodes.iter().collect();
+        assert_eq!(unique.len(), nodes.len(), "no node visited twice");
     }
 }
