@@ -95,8 +95,41 @@ moves it in one durable step, so there is no instant in between when both
 could write. Every path out closes the window, `abort_handover` included,
 because a window left open is how two writers eventually happen.
 
-Still ahead: streaming writes while a resync runs, and the slice map that
-takes this past two nodes.
+**A resync no longer stops the guests.** A source with era superiority —
+the fence-verdict survivor, the node actually running the machines — keeps
+serving and acknowledging through the whole pull. It cuts the offer at a
+checkpoint and streams every op from that point on; the target buffers the
+stream, adopts the offer, then replays the buffer, landing exactly on the
+source's live state with no gap and no overlap. Three things carry the
+correctness, each pinned by a test that fails without it:
+
+- **Sync pins.** The offered roots are held live against garbage
+  collection on both ends for the duration of the pull — the source's own
+  checkpoints orphan the offer it is still serving blocks from, and the
+  target's fetched fragment is referenced by nothing in its own manifest
+  until adoption. Collection stays legal mid-resync on both ends; the
+  pins are volatile because a crash ends the session that needed them.
+- **The witnessed-era floor.** A fence-verdict bump now clears every era
+  the node has ever heard a peer claim, not just its own. A survivor
+  fenced mid-pull still carries its old era; bumping from that alone
+  would mint a second copy of the era it was adopting, and the next
+  reconnect would tie two divergent lineages — with the tie-break
+  pointing at the dead node's disk. (The floor is volatile too; the
+  narrow residue — hear an era, crash before adopting any of it, then
+  survive a verdict — is accepted and recorded here rather than closed.)
+- **The closing handshake.** Adoption hands the target the source's era,
+  after which the eras cannot order the two nodes — so a single-copy
+  acknowledgement issued after adoption would be a write a later
+  equal-era tie could discard. The target therefore asks leave
+  (`SyncReady`), the source stops serving first and answers
+  (`SyncAdopt`), and only then does the target adopt, replay, flush, and
+  confirm (`SyncDone`). The guests' one interruption is that closing
+  exchange — a round trip plus the stream still in flight — not the
+  pull. The equal-era tie keeps refusing writes for its (cheap) diff, as
+  before: without a verdict there is no honest single-copy promise.
+
+Still ahead in phase 3: the ublk export and the compute-side integration;
+then the slice map that takes this past two nodes.
 
 ## Burning it in
 

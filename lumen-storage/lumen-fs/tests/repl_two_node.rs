@@ -29,6 +29,19 @@ const KIB: u64 = 1024;
 const BLOCK: usize = 4 * KIB as usize;
 const VDISK: u64 = 1;
 const CAPACITY: u64 = 60;
+/// A second, larger vdisk for the streaming-resync tests: big enough that
+/// a pull takes several SyncNeed round trips, so there is a real "middle"
+/// for guests to keep writing through.
+const VDISK2: u64 = 2;
+const CAP2: u64 = 256;
+
+/// A distinct, recognizable payload for `(index, generation)`.
+fn payload(index: u64, generation: u8) -> Vec<u8> {
+    let mut data = vec![0u8; 700];
+    data[0..8].copy_from_slice(&index.to_le_bytes());
+    data[8] = generation;
+    data
+}
 
 fn params(id: u8) -> BrickParams {
     BrickParams {
@@ -69,44 +82,64 @@ struct Guests {
     failed: [HashSet<u64>; 2],
 }
 
-/// Drain effects and deliver messages until nothing moves.
-fn pump(a: &mut ReplNode<SimDisk>, b: &mut ReplNode<SimDisk>, net: &mut Net, guests: &mut Guests) {
-    loop {
-        let mut moved = false;
-        for (side, node) in [(0usize, &mut *a), (1usize, &mut *b)] {
-            for effect in node.take_effects() {
-                moved = true;
-                match effect {
-                    Effect::Send(message) => {
-                        if net.up {
-                            if side == 0 {
-                                net.to_b.push_back(message);
-                            } else {
-                                net.to_a.push_back(message);
-                            }
+/// Route both nodes' effects: sends onto the wire (if up), flush fates to
+/// the guests. Returns whether anything moved.
+fn drain_effects(
+    a: &mut ReplNode<SimDisk>,
+    b: &mut ReplNode<SimDisk>,
+    net: &mut Net,
+    guests: &mut Guests,
+) -> bool {
+    let mut moved = false;
+    for (side, node) in [(0usize, &mut *a), (1usize, &mut *b)] {
+        for effect in node.take_effects() {
+            moved = true;
+            match effect {
+                Effect::Send(message) => {
+                    if net.up {
+                        if side == 0 {
+                            net.to_b.push_back(message);
+                        } else {
+                            net.to_a.push_back(message);
                         }
                     }
-                    Effect::FlushDone(ticket) => {
-                        guests.done[side].insert(ticket);
-                    }
-                    Effect::FlushFailed(ticket) => {
-                        guests.failed[side].insert(ticket);
-                    }
+                }
+                Effect::FlushDone(ticket) => {
+                    guests.done[side].insert(ticket);
+                }
+                Effect::FlushFailed(ticket) => {
+                    guests.failed[side].insert(ticket);
                 }
             }
         }
-        if let Some(message) = net.to_a.pop_front() {
-            a.handle(message).unwrap();
-            moved = true;
-        }
-        if let Some(message) = net.to_b.pop_front() {
-            b.handle(message).unwrap();
-            moved = true;
-        }
-        if !moved {
-            break;
-        }
     }
+    moved
+}
+
+/// One pump iteration: drain effects, then deliver at most one queued
+/// message to each side. The fine grain is the point — a test can act
+/// between deliveries, which is where a resync is mid-flight.
+fn pump_step(
+    a: &mut ReplNode<SimDisk>,
+    b: &mut ReplNode<SimDisk>,
+    net: &mut Net,
+    guests: &mut Guests,
+) -> bool {
+    let mut moved = drain_effects(a, b, net, guests);
+    if let Some(message) = net.to_a.pop_front() {
+        a.handle(message).unwrap();
+        moved = true;
+    }
+    if let Some(message) = net.to_b.pop_front() {
+        b.handle(message).unwrap();
+        moved = true;
+    }
+    moved
+}
+
+/// Drain effects and deliver messages until nothing moves.
+fn pump(a: &mut ReplNode<SimDisk>, b: &mut ReplNode<SimDisk>, net: &mut Net, guests: &mut Guests) {
+    while pump_step(a, b, net, guests) {}
 }
 
 /// Bring a fresh pair to Synced with the shared vdisk, A as writer.
@@ -212,49 +245,33 @@ fn an_acknowledged_write_survives_its_writers_death() {
     assert_eq!(a.read_block(VDISK, 2).unwrap().unwrap(), b"after the storm");
 }
 
-/// Pump until a batch of resync data lands on `a`, then stop — the shape
-/// of a link that dies partway through a walk, leaving the target holding
-/// an interior node whose children never arrived.
-fn pump_until_sync_data_lands_on_a(
+/// Pump until a batch of resync data lands on one side, then stop — the
+/// shape of a link that dies partway through a walk, leaving the target
+/// holding an interior node whose children never arrived; also simply the
+/// middle of a pull, where a test wants to act.
+fn pump_until_sync_data_lands_on(
+    target: usize,
     a: &mut ReplNode<SimDisk>,
     b: &mut ReplNode<SimDisk>,
     net: &mut Net,
     guests: &mut Guests,
 ) -> bool {
     loop {
-        let mut moved = false;
-        for (side, node) in [(0usize, &mut *a), (1usize, &mut *b)] {
-            for effect in node.take_effects() {
-                moved = true;
-                match effect {
-                    Effect::Send(message) => {
-                        if net.up {
-                            if side == 0 {
-                                net.to_b.push_back(message);
-                            } else {
-                                net.to_a.push_back(message);
-                            }
-                        }
-                    }
-                    Effect::FlushDone(ticket) => {
-                        guests.done[side].insert(ticket);
-                    }
-                    Effect::FlushFailed(ticket) => {
-                        guests.failed[side].insert(ticket);
-                    }
-                }
-            }
-        }
+        let mut moved = drain_effects(a, b, net, guests);
         if let Some(message) = net.to_a.pop_front() {
             let was_data = matches!(message, PeerMessage::SyncData(_));
             a.handle(message).unwrap();
-            if was_data {
+            if was_data && target == 0 {
                 return true;
             }
             moved = true;
         }
         if let Some(message) = net.to_b.pop_front() {
+            let was_data = matches!(message, PeerMessage::SyncData(_));
             b.handle(message).unwrap();
+            if was_data && target == 1 {
+                return true;
+            }
             moved = true;
         }
         if !moved {
@@ -513,7 +530,7 @@ fn a_resync_interrupted_partway_resumes_without_adopting_a_hole() {
         net.up = true;
         a.connect();
         b.connect();
-        let interrupted = pump_until_sync_data_lands_on_a(&mut a, &mut b, &mut net, &mut guests);
+        let interrupted = pump_until_sync_data_lands_on(0, &mut a, &mut b, &mut net, &mut guests);
         assert!(interrupted, "seed {seed}: the pull never carried data");
         net.partition();
         a.peer_lost();
@@ -542,6 +559,267 @@ fn a_resync_interrupted_partway_resumes_without_adopting_a_hole() {
         let report = a.pool().scrub().unwrap();
         assert_eq!(report.corrupt, vec![], "seed {seed}");
         assert_eq!(report.missing, vec![], "seed {seed}");
+    }
+}
+
+/// Bring the pair to: A dead and stale, B a fenced-verdict survivor at era
+/// 2 holding VDISK plus a fully-written VDISK2 — the state every streaming
+/// test starts a resync from.
+fn survivor_with_history(seed: u64) -> (ReplNode<SimDisk>, ReplNode<SimDisk>, Net, Guests) {
+    let (a, mut b, mut net, mut guests) = synced_pair(seed);
+    net.partition();
+    b.peer_lost();
+    let a_down = crash_and_restart(a, 0);
+    b.set_peer_fenced().unwrap();
+    b.claim_writer(VDISK).unwrap();
+    b.create_vdisk(VDISK2, CAP2 * BLOCK as u64).unwrap();
+    for index in 0..CAP2 {
+        b.write_block(VDISK2, index, &payload(index, 1)).unwrap();
+    }
+    b.flush().unwrap();
+    pump_one(&mut b, &mut guests, 1);
+    (a_down, b, net, guests)
+}
+
+#[test]
+fn a_survivor_keeps_serving_guests_while_its_peer_resyncs() {
+    // The whole point of the streaming resync: a returning node must never
+    // freeze the guests on the healthy one. B serves and acknowledges
+    // through the entire pull; the one exception is the single round trip
+    // at the very end, after B has agreed to let A adopt.
+    let (a_down, mut b, mut net, mut guests) = survivor_with_history(70);
+    let mut a = a_down;
+    net.up = true;
+    a.connect();
+    b.connect();
+
+    let mut acked_mid_resync: u64 = 0;
+    let mut refused: u64 = 0;
+    loop {
+        let moved = pump_step(&mut a, &mut b, &mut net, &mut guests);
+        if b.state() == (ReplState::Resyncing { source: true }) {
+            let index = acked_mid_resync % CAP2;
+            if b.accepts_writes() {
+                // A guest write in the middle of the pull: accepted, and
+                // acknowledged without waiting for anything remote.
+                b.write_block(VDISK2, index, &payload(index, 2)).unwrap();
+                let ticket = b.flush().unwrap();
+                drain_effects(&mut a, &mut b, &mut net, &mut guests);
+                assert!(
+                    guests.done[1].contains(&ticket),
+                    "a mid-resync flush kept a guest waiting"
+                );
+                acked_mid_resync += 1;
+                continue;
+            }
+            // The closing window: the target asked to adopt, so writes
+            // refuse — honestly, with Suspended — until lockstep resumes.
+            assert_eq!(
+                b.write_block(VDISK2, index, &payload(index, 2))
+                    .unwrap_err(),
+                FsError::Suspended
+            );
+            refused += 1;
+        }
+        if !moved {
+            break;
+        }
+    }
+    assert!(
+        acked_mid_resync >= 10,
+        "the resync never really overlapped guest writes ({acked_mid_resync} acked)"
+    );
+    assert!(
+        refused >= 1,
+        "the closing window never refused a write, so it was never entered"
+    );
+    assert_eq!(a.state(), ReplState::Synced);
+    assert_eq!(b.state(), ReplState::Synced);
+
+    // The target converged to the source's LIVE state: the offer plus
+    // everything written during the pull.
+    for index in 0..CAP2 {
+        let generation = if index < acked_mid_resync { 2 } else { 1 };
+        let expected = payload(index, generation);
+        for node in [&a, &b] {
+            assert_eq!(
+                node.read_block(VDISK2, index).unwrap().as_deref(),
+                Some(expected.as_slice()),
+                "block {index} did not carry generation {generation}"
+            );
+        }
+    }
+    assert_identical(&a, &b);
+    for node in [&a, &b] {
+        let report = node.pool().scrub().unwrap();
+        assert_eq!(report.corrupt, vec![]);
+        assert_eq!(report.missing, vec![]);
+    }
+
+    // And lockstep really resumed on the stream's numbering.
+    b.write_block(VDISK2, 0, &payload(0, 3)).unwrap();
+    let ticket = b.flush().unwrap();
+    pump(&mut a, &mut b, &mut net, &mut guests);
+    assert!(guests.done[1].contains(&ticket));
+    assert_eq!(
+        a.read_block(VDISK2, 0).unwrap().as_deref(),
+        Some(payload(0, 3).as_slice())
+    );
+}
+
+#[test]
+fn an_equal_era_source_still_suspends_its_guests_for_the_diff() {
+    // A tie has no fence verdict, so there is no honest way to acknowledge
+    // a write single-copy — the source suspends for the (cheap) diff,
+    // exactly as before streaming existed.
+    let (mut a, mut b, mut net, mut guests) = synced_pair(71);
+    a.write_block(VDISK, 3, b"shared history").unwrap();
+    a.flush().unwrap();
+    pump(&mut a, &mut b, &mut net, &mut guests);
+
+    net.partition();
+    a.peer_lost();
+    b.peer_lost();
+    net.up = true;
+    a.connect();
+    b.connect();
+    while a.state() != (ReplState::Resyncing { source: true }) {
+        assert!(
+            pump_step(&mut a, &mut b, &mut net, &mut guests),
+            "the pair never reached the tie diff"
+        );
+    }
+    assert!(!a.accepts_writes());
+    assert_eq!(
+        a.write_block(VDISK, 4, b"no verdict, no promise")
+            .unwrap_err(),
+        FsError::Suspended
+    );
+    let parked = a.flush().unwrap();
+
+    pump(&mut a, &mut b, &mut net, &mut guests);
+    assert_eq!(a.state(), ReplState::Synced);
+    assert_eq!(b.state(), ReplState::Synced);
+    assert!(guests.done[0].contains(&parked));
+    assert_identical(&a, &b);
+}
+
+#[test]
+fn a_source_that_dies_mid_stream_cannot_tie_with_the_survivors_next_era() {
+    // A sources at era 2 with A the lower node id, dies mid-pull, and B
+    // survives on a verdict. B's bump must clear the era it was *adopting*
+    // — its own era is still 1 — or it would mint a second era 2, the next
+    // hello would tie, and the tie-break (lower id: the dead node) would
+    // adopt away B's post-verdict acknowledged writes.
+    let (mut a, b, mut net, mut guests) = synced_pair(72);
+    net.partition();
+    a.peer_lost();
+    let b_down = crash_and_restart(b, 1);
+    a.set_peer_fenced().unwrap();
+    a.claim_writer(VDISK).unwrap();
+    a.create_vdisk(VDISK2, CAP2 * BLOCK as u64).unwrap();
+    for index in 0..CAP2 {
+        a.write_block(VDISK2, index, &payload(index, 1)).unwrap();
+    }
+    a.flush().unwrap();
+    pump_one(&mut a, &mut guests, 0);
+    assert_eq!(a.pool().era(), 2);
+
+    // B returns and pulls — and A dies partway through the walk.
+    let mut b = b_down;
+    net.up = true;
+    a.connect();
+    b.connect();
+    assert!(
+        pump_until_sync_data_lands_on(1, &mut a, &mut b, &mut net, &mut guests),
+        "the pull never carried data"
+    );
+    net.partition();
+    b.peer_lost();
+    let a_down = crash_and_restart(a, 0);
+
+    // The cluster fences A; B continues alone. Its era must be 3, not 2.
+    b.set_peer_fenced().unwrap();
+    assert_eq!(
+        b.pool().era(),
+        3,
+        "the bump did not clear the witnessed era"
+    );
+    b.claim_writer(VDISK).unwrap();
+    b.write_block(VDISK, 5, b"the second survivor's promise")
+        .unwrap();
+    let ticket = b.flush().unwrap();
+    pump_one(&mut b, &mut guests, 1);
+    assert!(guests.done[1].contains(&ticket));
+
+    // A returns; the eras order the lineages and B's history wins. A's own
+    // era-2 writes are gone — the cluster fenced the only node that held
+    // them, and the floor makes that loss ordered and visible rather than
+    // a silent tie resolved toward a dead node's disk.
+    let mut a = a_down;
+    net.up = true;
+    a.connect();
+    b.connect();
+    pump(&mut a, &mut b, &mut net, &mut guests);
+    assert_eq!(a.state(), ReplState::Synced);
+    assert_eq!(b.state(), ReplState::Synced);
+    assert_eq!(a.pool().era(), 3);
+    assert_eq!(
+        a.read_block(VDISK, 5).unwrap().unwrap(),
+        b"the second survivor's promise"
+    );
+    assert!(
+        a.pool().vdisk_size(VDISK2).is_err(),
+        "the dead lineage's vdisk survived adoption"
+    );
+    assert_identical(&a, &b);
+}
+
+#[test]
+fn a_collection_on_either_end_cannot_eat_a_resync_in_flight() {
+    // Both ends keep collecting while a pull runs. The source has moved
+    // past its offer — every index rewritten and checkpointed — so without
+    // the pins its collection would sweep the very trees the target is
+    // fetching; the target's fetched fragment is referenced by nothing in
+    // its own manifest at all.
+    let (a_down, mut b, mut net, mut guests) = survivor_with_history(73);
+    let mut a = a_down;
+    net.up = true;
+    a.connect();
+    b.connect();
+    assert!(
+        pump_until_sync_data_lands_on(0, &mut a, &mut b, &mut net, &mut guests),
+        "the pull never carried data"
+    );
+
+    // The offer becomes history on the source...
+    for index in 0..CAP2 {
+        b.write_block(VDISK2, index, &payload(index, 2)).unwrap();
+    }
+    b.flush().unwrap();
+    b.checkpoint().unwrap();
+    // ...and both ends collect, mid-pull.
+    b.collect_garbage().unwrap();
+    a.collect_garbage().unwrap();
+
+    pump(&mut a, &mut b, &mut net, &mut guests);
+    assert_eq!(a.state(), ReplState::Synced);
+    assert_eq!(b.state(), ReplState::Synced);
+    for index in 0..CAP2 {
+        let expected = payload(index, 2);
+        for node in [&a, &b] {
+            assert_eq!(
+                node.read_block(VDISK2, index).unwrap().as_deref(),
+                Some(expected.as_slice()),
+                "block {index} lost the post-offer overwrite"
+            );
+        }
+    }
+    assert_identical(&a, &b);
+    for node in [&a, &b] {
+        let report = node.pool().scrub().unwrap();
+        assert_eq!(report.corrupt, vec![]);
+        assert_eq!(report.missing, vec![]);
     }
 }
 
@@ -630,18 +908,40 @@ fn run_history(seed: u64) {
                 net.up = true;
                 a.connect();
                 b.connect();
-                // Half the time, cut the link once partway through the
-                // walk before healing for real — a resync rarely gets an
-                // uninterrupted network just because it would like one.
+                // Half the time, catch the resync mid-pull. The survivor
+                // is a serving source: a guest write in the middle of the
+                // walk must be accepted and acknowledged on the spot. And
+                // sometimes the link then dies again before healing for
+                // real — a resync rarely gets an uninterrupted network
+                // just because it would like one — in which case that
+                // acknowledged write must ride the next offer instead of
+                // the stream that died.
+                let target = 1 - writer;
                 if rng.chance(50)
-                    && pump_until_sync_data_lands_on_a(&mut a, &mut b, &mut net, &mut guests)
+                    && pump_until_sync_data_lands_on(target, &mut a, &mut b, &mut net, &mut guests)
                 {
-                    net.partition();
-                    a.peer_lost();
-                    b.peer_lost();
-                    net.up = true;
-                    a.connect();
-                    b.connect();
+                    let index = rng.next_below(CAPACITY);
+                    let mut data = vec![0u8; 1 + rng.next_below(BLOCK as u64) as usize];
+                    rng.fill(&mut data);
+                    let node = if writer == 0 { &mut a } else { &mut b };
+                    if node.accepts_writes() {
+                        node.write_block(VDISK, index, &data).unwrap();
+                        let ticket = node.flush().unwrap();
+                        drain_effects(&mut a, &mut b, &mut net, &mut guests);
+                        assert!(
+                            guests.done[writer].contains(&ticket),
+                            "seed {seed} event {event}: a mid-resync flush kept a guest waiting"
+                        );
+                        acked.insert(index, data);
+                    }
+                    if rng.chance(50) {
+                        net.partition();
+                        a.peer_lost();
+                        b.peer_lost();
+                        net.up = true;
+                        a.connect();
+                        b.connect();
+                    }
                 }
                 pump(&mut a, &mut b, &mut net, &mut guests);
                 assert_eq!(a.state(), ReplState::Synced, "seed {seed} event {event}");

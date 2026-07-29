@@ -126,6 +126,10 @@ pub struct Pool<D: Disk> {
     anchor_generation: u64,
     /// The data generation (replication's era) — see format.rs's Anchor.
     era: u64,
+    /// Roots a resync holds live beyond the manifest, as `(hash, depth)` —
+    /// depth as map::walk counts it. Volatile on purpose: a crash ends the
+    /// resync session that needed them, and the next session pins its own.
+    sync_pins: Vec<(BlockHash, u32)>,
 }
 
 /// What a WAL entry says. The encoding is fixed little-endian, one byte of
@@ -286,6 +290,7 @@ impl<D: Disk> Pool<D> {
             leases,
             anchor_generation: anchor.generation,
             era: anchor.era,
+            sync_pins: Vec::new(),
         };
 
         // Replay: apply each entry only while everything it references
@@ -889,6 +894,8 @@ impl<D: Disk> Pool<D> {
                 })?;
             }
         }
+        // A resync in flight holds state neither manifest references yet.
+        self.mark_pinned(&mut live)?;
         self.brick.retain_and_reclaim(&live)
     }
 
@@ -985,9 +992,61 @@ impl<D: Disk> Pool<D> {
     /// This node is continuing without its peer, on a fence verdict the
     /// caller holds: the state that follows belongs to a new generation,
     /// and the fact is anchored before any of that state exists.
-    pub fn bump_era(&mut self) -> Result<()> {
-        self.era += 1;
+    ///
+    /// `witnessed` is the highest era the caller has ever heard a peer
+    /// claim, and the new era must clear it as well as our own. Without
+    /// the floor, a node fenced-verdict-surviving at era 1 while mid-way
+    /// through adopting a peer's era-2 history would mint a *second* era
+    /// 2 — two divergent lineages under one name, and the tie-break at
+    /// the next reconnect would treat them as sharing every acknowledged
+    /// write. Eras order lineages only if every bump clears every era the
+    /// node has witnessed.
+    pub fn bump_era(&mut self, witnessed: u64) -> Result<()> {
+        self.era = self.era.max(witnessed) + 1;
         self.checkpoint()
+    }
+
+    /// Hold these roots live through collections until [`Pool::unpin_sync`],
+    /// as `(root, depth)`. A resync needs this on both ends: the source
+    /// keeps writing past the state it offered, so its next checkpoint
+    /// orphans the offer's trees while the target is still fetching them;
+    /// the target holds a growing top-connected fragment of the offer that
+    /// nothing in its own manifest references yet. Replaces any previous
+    /// pins — one resync session at a time is the protocol's shape.
+    pub fn pin_sync(&mut self, pins: Vec<(BlockHash, u32)>) {
+        self.sync_pins = pins;
+    }
+
+    /// The resync is over — however it ended, the pins come off. What they
+    /// held either got adopted (reachable again) or is garbage (correctly).
+    pub fn unpin_sync(&mut self) {
+        self.sync_pins.clear();
+    }
+
+    /// Mark everything reachable from the sync pins *through blocks the
+    /// store holds*. Skipping an absent subtree is correct on both ends: on
+    /// the source everything pinned is present, and on the target the pull
+    /// arrives strictly top-down — a held block's parents are held — so
+    /// every fetched block sits on a present path from a pinned root.
+    fn mark_pinned(&self, live: &mut HashSet<BlockHash>) -> Result<()> {
+        let mut pending: Vec<(BlockHash, u32)> = self.sync_pins.clone();
+        let mut seen: HashSet<(BlockHash, u32)> = HashSet::new();
+        while let Some((hash, kind)) = pending.pop() {
+            if !seen.insert((hash, kind)) || !self.brick.contains(&hash) {
+                continue;
+            }
+            live.insert(hash);
+            if kind > 0 {
+                let payload = self
+                    .brick
+                    .get(&hash)?
+                    .ok_or(FsError::Corrupt("a pinned map node vanished mid-mark"))?;
+                for child in map::children(&payload) {
+                    pending.push((child, kind - 1));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Store a payload without mapping it anywhere — a replicated block
@@ -1709,12 +1768,83 @@ mod tests {
         pool.claim_lease(1, 0).unwrap();
         assert!(pool.may_write(1, 0));
 
-        pool.bump_era().unwrap();
+        pool.bump_era(0).unwrap();
         assert!(!pool.may_write(1, 0), "a stale lease still bound the pool");
         pool.claim_lease(1, 1).unwrap();
         assert!(pool.may_write(1, 1));
         let pool = reopen(pool);
         assert!(pool.may_write(1, 1));
+    }
+
+    #[test]
+    fn an_era_bump_clears_every_era_the_node_has_witnessed() {
+        // A survivor fenced while mid-way through adopting a peer's era
+        // must not mint a second copy of that era: two divergent lineages
+        // under one number would tie at the next reconnect, and the
+        // tie-break assumes tied nodes share every acknowledged write.
+        let mut pool = pool(35);
+        assert_eq!(pool.era(), 1);
+        pool.bump_era(0).unwrap();
+        assert_eq!(pool.era(), 2, "a bump with nothing witnessed is just +1");
+        pool.bump_era(7).unwrap();
+        assert_eq!(pool.era(), 8, "the bump did not clear the witnessed era");
+        let pool = reopen(pool);
+        assert_eq!(pool.era(), 8, "the era bump was not anchored");
+    }
+
+    #[test]
+    fn sync_pins_hold_the_offered_state_through_a_collection() {
+        // A resync source keeps writing past the checkpoint it offered, so
+        // its own next collection would sweep the offer's trees — unless
+        // the pins hold them exactly as live as the present.
+        let mut pool = pool(36);
+        pool.create_vdisk(1, 40 * BLOCK as u64).unwrap();
+        let old_payloads: Vec<Vec<u8>> = (0..20u64)
+            .map(|index| {
+                let mut data = vec![0u8; 600];
+                data[0..8].copy_from_slice(&index.to_le_bytes());
+                data
+            })
+            .collect();
+        for (index, data) in old_payloads.iter().enumerate() {
+            pool.write_block(1, index as u64, data).unwrap();
+        }
+        pool.checkpoint().unwrap();
+        let (_, vdisks, _) = pool.sync_manifest();
+        let root = vdisks[0].2.expect("a checkpointed vdisk has a root");
+        let depth = map::depth_for(
+            (40 * BLOCK as u64).div_ceil(BLOCK as u64),
+            map::entries_per_node(BLOCK as u32),
+        );
+        pool.pin_sync(vec![(root, depth)]);
+
+        // The offer becomes history: every index rewritten, checkpointed,
+        // collected.
+        for index in 0..20u64 {
+            let mut data = vec![0u8; 600];
+            data[0..8].copy_from_slice(&index.to_le_bytes());
+            data[8] = 0xEE;
+            pool.write_block(1, index, &data).unwrap();
+        }
+        pool.checkpoint().unwrap();
+        pool.collect_garbage().unwrap();
+        for data in &old_payloads {
+            assert!(
+                pool.has_block(&hash_block(data)),
+                "a collection swept a pinned offer's block"
+            );
+        }
+        assert!(pool.has_block(&root), "the pinned root itself was swept");
+
+        // Unpinned, the offer is garbage like any other history.
+        pool.unpin_sync();
+        pool.collect_garbage().unwrap();
+        for data in &old_payloads {
+            assert!(
+                !pool.has_block(&hash_block(data)),
+                "an unpinned offer survived collection"
+            );
+        }
     }
 
     #[test]
