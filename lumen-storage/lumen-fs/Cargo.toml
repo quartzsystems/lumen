@@ -1,0 +1,26 @@
+# lumen-fs — the LumenFS engine core: content-addressed, log-structured
+# block storage, built as a pure deterministic state machine.
+#
+# A library crate like the other domains, and deliberately NOT a workspace
+# member — see the note at the top of lumen-cluster/Cargo.toml.
+#
+# Deliberately dependency-light, and stricter about it than its siblings: the
+# engine is exercised under a deterministic simulation (src/sim.rs) that owns
+# the disk and every source of randomness, so nothing in this crate may reach
+# for tokio, rand, or the wall clock. What the simulation cannot cover —
+# io_uring, sockets, real devices — belongs to the daemon (lumen-fsd, a later
+# stage), never here. See docs/lumenfs.md.
+
+[package]
+name = "lumen-fs"
+version = "0.1.0"
+edition = "2021"
+description = "LumenFS engine core: content-addressed, log-structured block storage"
+license = "MIT"
+
+[dependencies]
+# Content addressing and integrity are one primitive: the BLAKE3 hash of a
+# block is its address and its checksum. The pure-Rust implementation keeps
+# the crate building on every dev box with no C toolchain; the daemon stage
+# can revisit the assembly kernels if hashing ever shows up in a profile.
+blake3 = { version = "1", features = ["pure"] }

@@ -383,8 +383,8 @@ not here; a volume does not know which machines sit on it.
 ## Development
 
 ```sh
-make test    # installer + six domain crates + control plane
-make lint    # shellcheck, rpmlint, fmt/clippy for eight manifests
+make test    # installer + seven domain crates + control plane
+make lint    # shellcheck, rpmlint, fmt/clippy for nine manifests
 ```
 
 `lumen-drbd` links nothing and needs no DRBD anywhere near the tests: the

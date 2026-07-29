@@ -572,8 +572,8 @@ never disagree about what a card says.
 ## Development
 
 ```sh
-make test    # installer + all six domain crates + control plane
-make lint    # shellcheck, rpmlint, fmt/clippy for eight manifests
+make test    # installer + all seven domain crates + control plane
+make lint    # shellcheck, rpmlint, fmt/clippy for nine manifests
 ```
 
 `lumen-cluster` needs no system libraries: state is read through the cluster

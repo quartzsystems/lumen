@@ -37,6 +37,10 @@ SYS_MANIFEST     := lumen-system/lumen-sys/Cargo.toml
 UPDATE_MANIFEST  := lumen-system/lumen-update/Cargo.toml
 NET_MANIFEST     := lumen-networking/lumen-net/Cargo.toml
 ZFS_MANIFEST     := lumen-storage/lumen-zfs/Cargo.toml
+# lumen-fs is the LumenFS engine core (docs/lumenfs.md): no path
+# dependencies at all, tested entirely under its own deterministic
+# simulation, so it can run anywhere in the order — it sits with storage.
+FS_MANIFEST      := lumen-storage/lumen-fs/Cargo.toml
 CLUSTER_MANIFEST := lumen-storage/lumen-cluster/Cargo.toml
 DRBD_MANIFEST    := lumen-storage/lumen-drbd/Cargo.toml
 VIRT_MANIFEST    := lumen-compute/lumen-virt/Cargo.toml
@@ -83,6 +87,8 @@ test:
 		--target-dir build/cargo-target-net
 	cargo test --manifest-path $(ZFS_MANIFEST) \
 		--target-dir build/cargo-target-zfs
+	cargo test --manifest-path $(FS_MANIFEST) \
+		--target-dir build/cargo-target-fs
 	cargo test --manifest-path $(CLUSTER_MANIFEST) \
 		--target-dir build/cargo-target-cluster
 	cargo test --manifest-path $(DRBD_MANIFEST) \
@@ -110,6 +116,9 @@ lint:
 	cargo fmt --manifest-path $(ZFS_MANIFEST) --check
 	cargo clippy --manifest-path $(ZFS_MANIFEST) --all-targets \
 		--target-dir build/cargo-target-zfs -- -D warnings
+	cargo fmt --manifest-path $(FS_MANIFEST) --check
+	cargo clippy --manifest-path $(FS_MANIFEST) --all-targets \
+		--target-dir build/cargo-target-fs -- -D warnings
 	cargo fmt --manifest-path $(CLUSTER_MANIFEST) --check
 	cargo clippy --manifest-path $(CLUSTER_MANIFEST) --all-targets \
 		--target-dir build/cargo-target-cluster -- -D warnings
