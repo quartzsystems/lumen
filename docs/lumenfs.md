@@ -30,7 +30,22 @@ histories under `cargo test`: the brick-level contract (an acknowledged
 block survives intact) and the vdisk-level one (an acknowledged write
 survives; an unacknowledged write lands whole or not at all, never as
 garbage — with trims and collections interleaved through the crashes).
-Still design: snapshots-as-API and the NBD export.
+
+**Phase 1's engine work is complete.** Snapshots, writable clones, and
+rollback landed as checkpoint-grade synchronous operations (a snapshot is
+a retained root, exactly as designed; a clone shares every block with its
+source through dedupe; a vdisk with snapshots refuses to die until they
+do), pinned by their own crash suite. The byte-granular view a block
+device speaks — read-modify-write edges, zero-fill, short tail blocks,
+advisory trim alignment — lives in the library and is model-tested under
+the simulation. And `lumen-fs-nbd`, a std-only smoke tool (deliberately
+not the daemon), formats a pool on a real file with fsync as the barrier
+and serves vdisk 1 over fixed-newstyle NBD, so the engine can take a real
+filesystem from a real kernel: `lumen-fs-nbd format <file> <bytes>
+<vdisk-bytes>`, `serve <file> <addr>`, `scrub <file>`. What remains before
+phase 2 (replication) is burn-in, not construction: real-hardware NBD
+smoke runs on the lumen boxes, then the slice-map and peer-WAL work
+begins.
 
 ## Why not Ceph, revisited
 

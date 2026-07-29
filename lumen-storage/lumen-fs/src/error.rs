@@ -49,6 +49,13 @@ pub enum FsError {
     VdiskExists(u64),
     /// A read or write beyond the vdisk's capacity.
     OutOfRange { index: u64, capacity: u64 },
+    /// A snapshot create named an id the vdisk already carries.
+    SnapshotExists { vdisk: u64, snapshot: u64 },
+    /// An operation named a snapshot the vdisk does not carry.
+    UnknownSnapshot { vdisk: u64, snapshot: u64 },
+    /// A vdisk delete refused because snapshots still pin its history —
+    /// deleting them first is an explicit act, not a cascade.
+    HasSnapshots(u64),
 }
 
 impl fmt::Display for FsError {
@@ -86,6 +93,16 @@ impl fmt::Display for FsError {
             FsError::OutOfRange { index, capacity } => write!(
                 f,
                 "block index {index} is beyond the vdisk's capacity of {capacity} blocks"
+            ),
+            FsError::SnapshotExists { vdisk, snapshot } => {
+                write!(f, "vdisk {vdisk} already carries snapshot {snapshot}")
+            }
+            FsError::UnknownSnapshot { vdisk, snapshot } => {
+                write!(f, "vdisk {vdisk} carries no snapshot {snapshot}")
+            }
+            FsError::HasSnapshots(id) => write!(
+                f,
+                "vdisk {id} still has snapshots; delete them before the vdisk"
             ),
         }
     }

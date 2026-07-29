@@ -234,6 +234,61 @@ fn every_acknowledged_vdisk_write_survives_every_crash_history() {
 }
 
 #[test]
+fn a_snapshot_stays_immutable_through_overwrites_crashes_and_rollback() {
+    for seed in 300..324 {
+        let mut rng = SplitMix64::new(seed);
+        let brick = Brick::format(SimDisk::new(8 * KIB * KIB, seed), params()).unwrap();
+        let mut pool = Pool::create(brick).unwrap();
+        pool.create_vdisk(1, 100 * BLOCK as u64).unwrap();
+
+        // The state the snapshot must preserve, whatever happens after.
+        let mut pinned: Vec<(u64, Vec<u8>)> = Vec::new();
+        for _ in 0..8 {
+            let index = rng.next_below(99);
+            let data = payload(&mut rng);
+            pool.write_block(1, index, &data).unwrap();
+            pinned.retain(|(i, _)| *i != index);
+            pinned.push((index, data));
+        }
+        pool.snapshot_vdisk(1, 42).unwrap();
+
+        for _ in 0..3 {
+            for _ in 0..10 {
+                let index = rng.next_below(99);
+                pool.write_block(1, index, &payload(&mut rng)).unwrap();
+            }
+            if rng.chance(50) {
+                pool.checkpoint().unwrap();
+            }
+            let mut disk = pool.into_brick().into_disk();
+            disk.crash();
+            pool = Pool::open(Brick::open(disk).unwrap()).unwrap();
+            for (index, data) in &pinned {
+                assert_eq!(
+                    pool.read_snapshot_block(1, 42, *index).unwrap().as_ref(),
+                    Some(data),
+                    "seed {seed}: the snapshot drifted at block {index}"
+                );
+            }
+        }
+
+        // Rollback returns the present to the pin — and survives one more
+        // crash on its own durability.
+        pool.rollback_vdisk(1, 42).unwrap();
+        let mut disk = pool.into_brick().into_disk();
+        disk.crash();
+        let pool = Pool::open(Brick::open(disk).unwrap()).unwrap();
+        for (index, data) in &pinned {
+            assert_eq!(
+                pool.read_block(1, *index).unwrap().as_ref(),
+                Some(data),
+                "seed {seed}: rollback lost block {index}"
+            );
+        }
+    }
+}
+
+#[test]
 fn a_crash_during_a_checkpoint_falls_back_to_the_previous_anchor() {
     // Write through a checkpoint, then write more and crash without one:
     // recovery must serve the checkpointed state plus whatever legitimately

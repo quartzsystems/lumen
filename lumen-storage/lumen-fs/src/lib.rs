@@ -18,7 +18,9 @@
 //!   brick.rs    one disk's extent store: format, recover, put, get
 //!   wal.rs      the write-ahead ring: durable before any tree knows
 //!   map.rs      vdisk maps: COW radix trees whose nodes are pool blocks
-//!   pool.rs     vdisks over the brick: write, read, flush, checkpoint
+//!   pool.rs     vdisks over the brick: write, read, flush, checkpoint,
+//!               snapshots, clones, rollback, GC, scrub
+//!   bytes.rs    the byte-granular view a block device speaks
 //! ```
 //!
 //! The durability contract, stated once and tested everywhere: a block is
@@ -29,6 +31,7 @@
 //! may survive or vanish; both are correct.
 
 pub mod brick;
+pub mod bytes;
 pub mod disk;
 pub mod error;
 pub mod format;

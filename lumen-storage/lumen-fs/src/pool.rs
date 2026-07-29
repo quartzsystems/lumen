@@ -58,8 +58,9 @@ pub struct ScrubReport {
 }
 
 const MANIFEST_MAGIC: &[u8; 8] = b"LFSMAN\0\0";
-const MANIFEST_HEADER_LEN: usize = 16; // magic 8 + version 4 + count 4
+const MANIFEST_HEADER_LEN: usize = 20; // magic 8 + version 4 + two counts
 const MANIFEST_ENTRY_LEN: usize = 48; // id 8 + size 8 + root 32
+const MANIFEST_SNAPSHOT_LEN: usize = 56; // vdisk 8 + snapshot 8 + size 8 + root 32
 const MANIFEST_VERSION: u32 = 1;
 
 /// One vdisk's durable identity in the manifest.
@@ -74,10 +75,22 @@ struct VdiskState {
     dirty: BTreeMap<u64, Option<BlockHash>>,
 }
 
+/// One pinned moment of one vdisk: a root the trees will never rewrite and
+/// GC will never sweep. The size rides along so the snapshot keeps its own
+/// shape whatever later happens to the vdisk.
+#[derive(Debug, Clone, Copy)]
+struct SnapshotState {
+    size_bytes: u64,
+    root: Option<BlockHash>,
+}
+
 pub struct Pool<D: Disk> {
     brick: Brick<D>,
     wal: Wal,
     vdisks: HashMap<u64, VdiskState>,
+    /// Keyed `(vdisk, snapshot)`; a BTreeMap so the manifest encodes
+    /// deterministically.
+    snapshots: BTreeMap<(u64, u64), SnapshotState>,
     anchor_generation: u64,
 }
 
@@ -172,13 +185,18 @@ impl<D: Disk> Pool<D> {
             .ok_or(FsError::Corrupt("a formatted brick with no valid anchor"))?;
 
         let mut vdisks = HashMap::new();
+        let mut snapshots = BTreeMap::new();
         if anchor.manifest_hash != [0; 32] {
             let manifest_hash = BlockHash::from_bytes(anchor.manifest_hash);
             let manifest = brick
                 .get(&manifest_hash)?
                 .ok_or(FsError::Corrupt("the anchored manifest block is missing"))?;
-            for (id, state) in decode_manifest(&manifest)? {
+            let decoded = decode_manifest(&manifest)?;
+            for (id, state) in decoded.vdisks {
                 vdisks.insert(id, state);
+            }
+            for (key, state) in decoded.snapshots {
+                snapshots.insert(key, state);
             }
         }
 
@@ -206,6 +224,7 @@ impl<D: Disk> Pool<D> {
             brick,
             wal,
             vdisks,
+            snapshots,
             anchor_generation: anchor.generation,
         };
 
@@ -285,15 +304,32 @@ impl<D: Disk> Pool<D> {
         }
     }
 
+    fn capacity_for(&self, size_bytes: u64) -> u64 {
+        size_bytes.div_ceil(self.brick.block_size() as u64)
+    }
+
+    fn depth_for_size(&self, size_bytes: u64) -> u32 {
+        map::depth_for(
+            self.capacity_for(size_bytes),
+            map::entries_per_node(self.brick.block_size()),
+        )
+    }
+
     fn capacity_of(&self, state: &VdiskState) -> u64 {
-        state.size_bytes.div_ceil(self.brick.block_size() as u64)
+        self.capacity_for(state.size_bytes)
     }
 
     fn depth_of(&self, state: &VdiskState) -> u32 {
-        map::depth_for(
-            self.capacity_of(state),
-            map::entries_per_node(self.brick.block_size()),
-        )
+        self.depth_for_size(state.size_bytes)
+    }
+
+    /// Whether a manifest of these counts still fits its one block — the
+    /// stated v1 ceiling on vdisks and snapshots together.
+    fn manifest_fits(&self, vdisk_count: usize, snapshot_count: usize) -> bool {
+        MANIFEST_HEADER_LEN
+            + vdisk_count * MANIFEST_ENTRY_LEN
+            + snapshot_count * MANIFEST_SNAPSHOT_LEN
+            <= self.brick.block_size() as usize
     }
 
     /// Create a vdisk. Durable at the next flush, like any write.
@@ -304,9 +340,7 @@ impl<D: Disk> Pool<D> {
         if size_bytes == 0 {
             return Err(FsError::BadGeometry("a vdisk must hold at least one block"));
         }
-        if (self.vdisks.len() + 1) * MANIFEST_ENTRY_LEN + MANIFEST_HEADER_LEN
-            > self.brick.block_size() as usize
-        {
+        if !self.manifest_fits(self.vdisks.len() + 1, self.snapshots.len()) {
             return Err(FsError::ManifestFull);
         }
         let entry = WalEntry::CreateVdisk { id, size_bytes };
@@ -370,14 +404,143 @@ impl<D: Disk> Pool<D> {
     /// Forget a vdisk. Its tree becomes unreachable at the checkpoint after
     /// this lands, and its space returns at the collection after that —
     /// deletion is a promise about reachability, reclaim is GC's schedule.
+    /// Refused while snapshots still pin the vdisk's history: deleting
+    /// those is an explicit act, never a cascade.
     pub fn delete_vdisk(&mut self, id: u64) -> Result<()> {
         if !self.vdisks.contains_key(&id) {
             return Err(FsError::UnknownVdisk(id));
+        }
+        if self.snapshots.keys().any(|(vdisk, _)| *vdisk == id) {
+            return Err(FsError::HasSnapshots(id));
         }
         let entry = WalEntry::DeleteVdisk { id };
         self.wal.append(&mut self.brick, &entry.encode())?;
         self.vdisks.remove(&id);
         Ok(())
+    }
+
+    /// Pin the vdisk's current content as a snapshot. Checkpoint-grade and
+    /// synchronous: everything pending settles first, and the pin is
+    /// durable when the call returns — there is no window where a snapshot
+    /// exists in memory but not on disk. The pinned root is exactly what a
+    /// clone starts from and a rollback returns to.
+    pub fn snapshot_vdisk(&mut self, vdisk: u64, snapshot: u64) -> Result<()> {
+        if !self.vdisks.contains_key(&vdisk) {
+            return Err(FsError::UnknownVdisk(vdisk));
+        }
+        if self.snapshots.contains_key(&(vdisk, snapshot)) {
+            return Err(FsError::SnapshotExists { vdisk, snapshot });
+        }
+        if !self.manifest_fits(self.vdisks.len(), self.snapshots.len() + 1) {
+            return Err(FsError::ManifestFull);
+        }
+        // First checkpoint settles the root being pinned; the second makes
+        // the pin durable. A crash between them means the snapshot simply
+        // never happened — the settling was just an ordinary checkpoint.
+        self.checkpoint()?;
+        let state = &self.vdisks[&vdisk];
+        self.snapshots.insert(
+            (vdisk, snapshot),
+            SnapshotState {
+                size_bytes: state.size_bytes,
+                root: state.root,
+            },
+        );
+        self.checkpoint()
+    }
+
+    /// Unpin a snapshot. Durable on return; whatever history only the pin
+    /// kept alive returns to free space at the next collection.
+    pub fn delete_snapshot(&mut self, vdisk: u64, snapshot: u64) -> Result<()> {
+        if self.snapshots.remove(&(vdisk, snapshot)).is_none() {
+            return Err(FsError::UnknownSnapshot { vdisk, snapshot });
+        }
+        self.checkpoint()
+    }
+
+    /// Return a vdisk to a snapshot's content, durably, discarding whatever
+    /// was written since — a rollback is a statement that the present is
+    /// wrong, and half-keeping it would be keeping it.
+    pub fn rollback_vdisk(&mut self, vdisk: u64, snapshot: u64) -> Result<()> {
+        let snap = *self
+            .snapshots
+            .get(&(vdisk, snapshot))
+            .ok_or(FsError::UnknownSnapshot { vdisk, snapshot })?;
+        let state = self
+            .vdisks
+            .get_mut(&vdisk)
+            .ok_or(FsError::UnknownVdisk(vdisk))?;
+        state.dirty.clear();
+        state.root = snap.root;
+        state.size_bytes = snap.size_bytes;
+        self.checkpoint()
+    }
+
+    /// A writable clone: a new vdisk whose starting content is a snapshot.
+    /// It shares every block and map node with its source until writes
+    /// diverge — the copy in copy-on-write, done by dedupe rather than by
+    /// copying anything.
+    pub fn clone_vdisk(&mut self, new_id: u64, vdisk: u64, snapshot: u64) -> Result<()> {
+        if self.vdisks.contains_key(&new_id) {
+            return Err(FsError::VdiskExists(new_id));
+        }
+        let snap = *self
+            .snapshots
+            .get(&(vdisk, snapshot))
+            .ok_or(FsError::UnknownSnapshot { vdisk, snapshot })?;
+        if !self.manifest_fits(self.vdisks.len() + 1, self.snapshots.len()) {
+            return Err(FsError::ManifestFull);
+        }
+        self.vdisks.insert(
+            new_id,
+            VdiskState {
+                size_bytes: snap.size_bytes,
+                root: snap.root,
+                dirty: BTreeMap::new(),
+            },
+        );
+        self.checkpoint()
+    }
+
+    /// Read one block of a snapshot — the vdisk as it was at the pin.
+    pub fn read_snapshot_block(
+        &self,
+        vdisk: u64,
+        snapshot: u64,
+        index: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        let snap = self
+            .snapshots
+            .get(&(vdisk, snapshot))
+            .ok_or(FsError::UnknownSnapshot { vdisk, snapshot })?;
+        let capacity = self.capacity_for(snap.size_bytes);
+        if index >= capacity {
+            return Err(FsError::OutOfRange { index, capacity });
+        }
+        let hash = match &snap.root {
+            Some(root) => map::lookup(
+                &self.brick,
+                root,
+                self.depth_for_size(snap.size_bytes),
+                index,
+            )?,
+            None => None,
+        };
+        match hash {
+            Some(hash) => match self.brick.get(&hash)? {
+                Some(payload) => Ok(Some(payload)),
+                None => Err(FsError::Corrupt("a mapped block is missing from the store")),
+            },
+            None => Ok(None),
+        }
+    }
+
+    /// Every snapshot as `(vdisk, snapshot, size_bytes)`, sorted.
+    pub fn snapshots(&self) -> Vec<(u64, u64, u64)> {
+        self.snapshots
+            .iter()
+            .map(|((vdisk, snapshot), state)| (*vdisk, *snapshot, state.size_bytes))
+            .collect()
     }
 
     /// Read one block. `Ok(None)` is "never written" — zeros, in the
@@ -438,10 +601,10 @@ impl<D: Disk> Pool<D> {
             self.vdisks.get_mut(id).unwrap().root = root;
         }
 
-        let manifest_hash = if self.vdisks.is_empty() {
+        let manifest_hash = if self.vdisks.is_empty() && self.snapshots.is_empty() {
             [0u8; 32]
         } else {
-            let manifest = encode_manifest(&ids, &self.vdisks);
+            let manifest = encode_manifest(&ids, &self.vdisks, &self.snapshots);
             *self.brick.put(&manifest)?.as_bytes()
         };
         self.brick.flush()?;
@@ -474,18 +637,28 @@ impl<D: Disk> Pool<D> {
         let mut ids: Vec<u64> = self.vdisks.keys().copied().collect();
         ids.sort_unstable();
         let mut live: HashSet<BlockHash> = HashSet::new();
-        if !self.vdisks.is_empty() {
+        if !(self.vdisks.is_empty() && self.snapshots.is_empty()) {
             // The same bytes the checkpoint just anchored, so the same hash
             // — recomputed rather than remembered, one source of truth.
-            live.insert(hash_block(&encode_manifest(&ids, &self.vdisks)));
+            live.insert(hash_block(&encode_manifest(
+                &ids,
+                &self.vdisks,
+                &self.snapshots,
+            )));
         }
-        let roots: Vec<(Option<BlockHash>, u32)> = ids
+        let mut roots: Vec<(Option<BlockHash>, u32)> = ids
             .iter()
             .map(|id| {
                 let state = &self.vdisks[id];
                 (state.root, self.depth_of(state))
             })
             .collect();
+        // Pinned history is exactly as live as the present.
+        roots.extend(
+            self.snapshots
+                .values()
+                .map(|snap| (snap.root, self.depth_for_size(snap.size_bytes))),
+        );
         for (root, depth) in roots {
             if let Some(root) = root {
                 map::walk(&self.brick, &root, depth, &mut |item| match item {
@@ -536,12 +709,48 @@ impl<D: Disk> Pool<D> {
                 }
             }
         }
+        // Pinned history answers reads too, so it scrubs like the present;
+        // a hole is reported under the vdisk the snapshot belongs to.
+        for ((vdisk, _), snap) in &self.snapshots {
+            if let Some(root) = &snap.root {
+                let mut tree_refs = Vec::new();
+                map::walk(
+                    &self.brick,
+                    root,
+                    self.depth_for_size(snap.size_bytes),
+                    &mut |item| {
+                        if let map::MapItem::Block { index, hash } = item {
+                            tree_refs.push((index, hash));
+                        }
+                    },
+                )?;
+                for (index, hash) in tree_refs {
+                    if !self.brick.contains(&hash) {
+                        missing.push((*vdisk, index));
+                    }
+                }
+            }
+        }
         missing.sort_unstable();
+        missing.dedup();
         Ok(ScrubReport {
             blocks_verified,
             corrupt,
             missing,
         })
+    }
+
+    /// The pool's block size — the unit bytes.rs translates to.
+    pub fn block_size(&self) -> u32 {
+        self.brick.block_size()
+    }
+
+    /// One vdisk's size in bytes.
+    pub fn vdisk_size(&self, id: u64) -> Result<u64> {
+        self.vdisks
+            .get(&id)
+            .map(|state| state.size_bytes)
+            .ok_or(FsError::UnknownVdisk(id))
     }
 
     /// Every vdisk's `(id, size_bytes)`, sorted — the listing a console
@@ -561,24 +770,57 @@ impl<D: Disk> Pool<D> {
     }
 }
 
-fn encode_manifest(ids: &[u64], vdisks: &HashMap<u64, VdiskState>) -> Vec<u8> {
-    let mut buf = vec![0u8; MANIFEST_HEADER_LEN + ids.len() * MANIFEST_ENTRY_LEN];
+fn root_bytes(root: &Option<BlockHash>) -> [u8; 32] {
+    root.map(|hash| *hash.as_bytes()).unwrap_or([0u8; 32])
+}
+
+fn root_from_bytes(bytes: [u8; 32]) -> Option<BlockHash> {
+    if bytes == [0u8; 32] {
+        None
+    } else {
+        Some(BlockHash::from_bytes(bytes))
+    }
+}
+
+fn encode_manifest(
+    ids: &[u64],
+    vdisks: &HashMap<u64, VdiskState>,
+    snapshots: &BTreeMap<(u64, u64), SnapshotState>,
+) -> Vec<u8> {
+    let mut buf = vec![
+        0u8;
+        MANIFEST_HEADER_LEN
+            + ids.len() * MANIFEST_ENTRY_LEN
+            + snapshots.len() * MANIFEST_SNAPSHOT_LEN
+    ];
     buf[0..8].copy_from_slice(MANIFEST_MAGIC);
     buf[8..12].copy_from_slice(&MANIFEST_VERSION.to_le_bytes());
     buf[12..16].copy_from_slice(&(ids.len() as u32).to_le_bytes());
-    for (n, id) in ids.iter().enumerate() {
+    buf[16..20].copy_from_slice(&(snapshots.len() as u32).to_le_bytes());
+    let mut at = MANIFEST_HEADER_LEN;
+    for id in ids {
         let state = &vdisks[id];
-        let at = MANIFEST_HEADER_LEN + n * MANIFEST_ENTRY_LEN;
         buf[at..at + 8].copy_from_slice(&id.to_le_bytes());
         buf[at + 8..at + 16].copy_from_slice(&state.size_bytes.to_le_bytes());
-        if let Some(root) = &state.root {
-            buf[at + 16..at + 48].copy_from_slice(root.as_bytes());
-        }
+        buf[at + 16..at + 48].copy_from_slice(&root_bytes(&state.root));
+        at += MANIFEST_ENTRY_LEN;
+    }
+    for ((vdisk, snapshot), state) in snapshots {
+        buf[at..at + 8].copy_from_slice(&vdisk.to_le_bytes());
+        buf[at + 8..at + 16].copy_from_slice(&snapshot.to_le_bytes());
+        buf[at + 16..at + 24].copy_from_slice(&state.size_bytes.to_le_bytes());
+        buf[at + 24..at + 56].copy_from_slice(&root_bytes(&state.root));
+        at += MANIFEST_SNAPSHOT_LEN;
     }
     buf
 }
 
-fn decode_manifest(buf: &[u8]) -> Result<Vec<(u64, VdiskState)>> {
+struct DecodedManifest {
+    vdisks: Vec<(u64, VdiskState)>,
+    snapshots: Vec<((u64, u64), SnapshotState)>,
+}
+
+fn decode_manifest(buf: &[u8]) -> Result<DecodedManifest> {
     if buf.len() < MANIFEST_HEADER_LEN || &buf[0..8] != MANIFEST_MAGIC {
         return Err(FsError::Corrupt("the manifest block has the wrong shape"));
     }
@@ -587,24 +829,24 @@ fn decode_manifest(buf: &[u8]) -> Result<Vec<(u64, VdiskState)>> {
             "the manifest block is a version this build does not speak",
         ));
     }
-    let count = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
-    if buf.len() < MANIFEST_HEADER_LEN + count * MANIFEST_ENTRY_LEN {
+    let vdisk_count = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
+    let snapshot_count = u32::from_le_bytes(buf[16..20].try_into().unwrap()) as usize;
+    if buf.len()
+        < MANIFEST_HEADER_LEN
+            + vdisk_count * MANIFEST_ENTRY_LEN
+            + snapshot_count * MANIFEST_SNAPSHOT_LEN
+    {
         return Err(FsError::Corrupt(
-            "the manifest block is shorter than its count",
+            "the manifest block is shorter than its counts",
         ));
     }
-    let mut out = Vec::with_capacity(count);
-    for n in 0..count {
-        let at = MANIFEST_HEADER_LEN + n * MANIFEST_ENTRY_LEN;
+    let mut vdisks = Vec::with_capacity(vdisk_count);
+    let mut at = MANIFEST_HEADER_LEN;
+    for _ in 0..vdisk_count {
         let id = u64::from_le_bytes(buf[at..at + 8].try_into().unwrap());
         let size_bytes = u64::from_le_bytes(buf[at + 8..at + 16].try_into().unwrap());
-        let root_bytes: [u8; 32] = buf[at + 16..at + 48].try_into().unwrap();
-        let root = if root_bytes == [0u8; 32] {
-            None
-        } else {
-            Some(BlockHash::from_bytes(root_bytes))
-        };
-        out.push((
+        let root = root_from_bytes(buf[at + 16..at + 48].try_into().unwrap());
+        vdisks.push((
             id,
             VdiskState {
                 size_bytes,
@@ -612,8 +854,18 @@ fn decode_manifest(buf: &[u8]) -> Result<Vec<(u64, VdiskState)>> {
                 dirty: BTreeMap::new(),
             },
         ));
+        at += MANIFEST_ENTRY_LEN;
     }
-    Ok(out)
+    let mut snapshots = Vec::with_capacity(snapshot_count);
+    for _ in 0..snapshot_count {
+        let vdisk = u64::from_le_bytes(buf[at..at + 8].try_into().unwrap());
+        let snapshot = u64::from_le_bytes(buf[at + 8..at + 16].try_into().unwrap());
+        let size_bytes = u64::from_le_bytes(buf[at + 16..at + 24].try_into().unwrap());
+        let root = root_from_bytes(buf[at + 24..at + 56].try_into().unwrap());
+        snapshots.push(((vdisk, snapshot), SnapshotState { size_bytes, root }));
+        at += MANIFEST_SNAPSHOT_LEN;
+    }
+    Ok(DecodedManifest { vdisks, snapshots })
 }
 
 #[cfg(test)]
@@ -871,6 +1123,117 @@ mod tests {
         assert!(report.blocks_verified > 10, "{report:?}");
         assert_eq!(report.corrupt, vec![]);
         assert_eq!(report.missing, vec![]);
+    }
+
+    #[test]
+    fn a_snapshot_pins_the_past_while_the_present_moves_on() {
+        let mut pool = pool(15);
+        pool.create_vdisk(1, 40 * BLOCK as u64).unwrap();
+        pool.write_block(1, 5, b"the past").unwrap();
+        pool.snapshot_vdisk(1, 100).unwrap();
+        pool.write_block(1, 5, b"the present").unwrap();
+        pool.write_block(1, 6, b"only now").unwrap();
+        pool.checkpoint().unwrap();
+        assert_eq!(pool.read_block(1, 5).unwrap().unwrap(), b"the present");
+        assert_eq!(
+            pool.read_snapshot_block(1, 100, 5).unwrap().unwrap(),
+            b"the past"
+        );
+        assert_eq!(pool.read_snapshot_block(1, 100, 6).unwrap(), None);
+        // Both survive a reopen.
+        let pool = reopen(pool);
+        assert_eq!(pool.read_block(1, 6).unwrap().unwrap(), b"only now");
+        assert_eq!(
+            pool.read_snapshot_block(1, 100, 5).unwrap().unwrap(),
+            b"the past"
+        );
+        assert_eq!(pool.snapshots(), vec![(1, 100, 40 * BLOCK as u64)]);
+    }
+
+    #[test]
+    fn a_rollback_discards_the_present_including_unflushed_writes() {
+        let mut pool = pool(16);
+        pool.create_vdisk(1, 40 * BLOCK as u64).unwrap();
+        pool.write_block(1, 0, b"keep me").unwrap();
+        pool.snapshot_vdisk(1, 1).unwrap();
+        pool.write_block(1, 0, b"checkpointed over").unwrap();
+        pool.checkpoint().unwrap();
+        pool.write_block(1, 0, b"not even flushed").unwrap();
+        pool.write_block(1, 3, b"collateral").unwrap();
+        pool.rollback_vdisk(1, 1).unwrap();
+        assert_eq!(pool.read_block(1, 0).unwrap().unwrap(), b"keep me");
+        assert_eq!(pool.read_block(1, 3).unwrap(), None);
+        // Durable without any further flush: rollback is checkpoint-grade.
+        let pool = reopen(pool);
+        assert_eq!(pool.read_block(1, 0).unwrap().unwrap(), b"keep me");
+    }
+
+    #[test]
+    fn a_clone_diverges_from_its_source_without_disturbing_it() {
+        let mut pool = pool(17);
+        pool.create_vdisk(1, 40 * BLOCK as u64).unwrap();
+        pool.write_block(1, 2, b"shared history").unwrap();
+        pool.snapshot_vdisk(1, 1).unwrap();
+        pool.clone_vdisk(9, 1, 1).unwrap();
+        assert_eq!(pool.read_block(9, 2).unwrap().unwrap(), b"shared history");
+        pool.write_block(9, 2, b"the clone's own").unwrap();
+        pool.write_block(1, 2, b"the source's own").unwrap();
+        pool.checkpoint().unwrap();
+        let pool = reopen(pool);
+        assert_eq!(pool.read_block(9, 2).unwrap().unwrap(), b"the clone's own");
+        assert_eq!(pool.read_block(1, 2).unwrap().unwrap(), b"the source's own");
+        assert_eq!(
+            pool.read_snapshot_block(1, 1, 2).unwrap().unwrap(),
+            b"shared history"
+        );
+        assert_eq!(pool.vdisks().len(), 2);
+    }
+
+    #[test]
+    fn a_vdisk_with_snapshots_refuses_to_die_until_they_do() {
+        let mut pool = pool(18);
+        pool.create_vdisk(1, 10 * BLOCK as u64).unwrap();
+        pool.snapshot_vdisk(1, 7).unwrap();
+        assert_eq!(pool.delete_vdisk(1).unwrap_err(), FsError::HasSnapshots(1));
+        pool.delete_snapshot(1, 7).unwrap();
+        pool.delete_vdisk(1).unwrap();
+        assert_eq!(
+            pool.delete_snapshot(1, 7).unwrap_err(),
+            FsError::UnknownSnapshot {
+                vdisk: 1,
+                snapshot: 7
+            }
+        );
+    }
+
+    #[test]
+    fn gc_spares_what_a_snapshot_pins_and_reclaims_it_when_unpinned() {
+        let mut pool = pool(19);
+        pool.create_vdisk(1, 40 * BLOCK as u64).unwrap();
+        for index in 0..20u64 {
+            let mut payload = vec![0xAB; 3000];
+            payload[0..8].copy_from_slice(&index.to_le_bytes());
+            pool.write_block(1, index, &payload).unwrap();
+        }
+        pool.snapshot_vdisk(1, 1).unwrap();
+        // Overwrite everything: without the pin, the old blocks would all
+        // be garbage now.
+        for index in 0..20u64 {
+            let mut payload = vec![0xCD; 3000];
+            payload[0..8].copy_from_slice(&index.to_le_bytes());
+            pool.write_block(1, index, &payload).unwrap();
+        }
+        pool.collect_garbage().unwrap();
+        let old = pool.read_snapshot_block(1, 1, 12).unwrap().unwrap();
+        assert_eq!(old[8], 0xAB, "the pinned past was swept");
+        // Unpin and collect again: now the history goes.
+        pool.delete_snapshot(1, 1).unwrap();
+        let stats = pool.collect_garbage().unwrap();
+        assert!(
+            stats.blocks_dropped >= 20,
+            "unpinned history lingered: {stats:?}"
+        );
+        assert_eq!(pool.read_block(1, 12).unwrap().unwrap()[8], 0xCD);
     }
 
     #[test]
