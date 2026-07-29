@@ -185,6 +185,23 @@ pub fn print_plan(ops: &[Op]) {
 pub const MANAGEMENT_ID: &str = "management";
 pub const MANAGEMENT_PORT_ID: &str = "management-port";
 
+/// The MTU a port must carry to serve a controller asking for `controller`.
+///
+/// A bond or bridge cannot pass a frame larger than its smallest port will
+/// take, and NetworkManager does not infer this: a port profile with no MTU
+/// of its own is written at the 1500 default, so a 9000 bond over untouched
+/// ports is a link that completes a TCP handshake and then silently drops
+/// every full-sized packet — the resync that never advances past 0.00, the
+/// promotion that times out with no explanation on the wire. The port keeps
+/// its own value when that value is larger; it is never lowered here.
+fn carried_mtu(controller: Option<u32>, port: Option<u32>) -> Option<u32> {
+    match (controller, port) {
+        (Some(controller), Some(port)) => Some(controller.max(port)),
+        (Some(controller), None) => Some(controller),
+        (None, port) => port,
+    }
+}
+
 /// Every connection profile the desired state implies, keyed by interface.
 pub fn specs(desired: &NetworkDesiredState) -> BTreeMap<String, ConnectionSpec> {
     let mut out: BTreeMap<String, ConnectionSpec> = BTreeMap::new();
@@ -240,6 +257,7 @@ pub fn specs(desired: &NetworkDesiredState) -> BTreeMap<String, ConnectionSpec> 
                 spec.port_type = Some(PortType::Bridge);
                 // A port carries no addresses of its own.
                 spec.ip = IpConfig::Disabled;
+                spec.mtu = carried_mtu(bridge.mtu, spec.mtu);
             }
         }
     }
@@ -249,6 +267,7 @@ pub fn specs(desired: &NetworkDesiredState) -> BTreeMap<String, ConnectionSpec> 
                 spec.controller = Some(bond.name.clone());
                 spec.port_type = Some(PortType::Bond);
                 spec.ip = IpConfig::Disabled;
+                spec.mtu = carried_mtu(bond.mtu, spec.mtu);
             }
         }
     }
@@ -597,6 +616,57 @@ mod tests {
             "{:?}",
             names(&ops)
         );
+    }
+
+    /// A controller's MTU reaches the ports that actually carry the frames.
+    ///
+    /// The bug this pins cost a bring-up: a 9000 bond over two ports left at
+    /// the 1500 default connected, authenticated, exchanged a compressed
+    /// bitmap — everything small — and then moved zero bytes of resync,
+    /// while promotion failed as a 30-second state-change timeout with
+    /// nothing on the wire to explain it.
+    #[test]
+    fn a_ports_mtu_rises_to_the_controller_it_serves() {
+        let mut desired = flat();
+        desired.bonds.push(Bond {
+            name: "bond0".into(),
+            ports: vec!["nic1".into()],
+            mtu: Some(9000),
+            ..Bond::default()
+        });
+        let bonded = specs(&desired);
+        assert_eq!(bonded["bond0"].mtu, Some(9000));
+        assert_eq!(
+            bonded["nic1"].mtu,
+            Some(9000),
+            "a port left at the default silently drops every full-sized frame"
+        );
+
+        // A bridge port is the same physics.
+        let mut desired = flat();
+        desired.bridges.push(Bridge {
+            name: "br0".into(),
+            ports: vec!["nic1".into()],
+            mtu: Some(9000),
+            ..Bridge::default()
+        });
+        assert_eq!(specs(&desired)["nic1"].mtu, Some(9000));
+    }
+
+    /// A port that already asks for more keeps it — the controller's value is
+    /// a floor, not an assignment.
+    #[test]
+    fn a_ports_own_larger_mtu_is_never_lowered_to_its_controllers() {
+        let mut desired = flat();
+        desired.nics[1].mtu = Some(9000);
+        desired.bonds.push(Bond {
+            name: "bond0".into(),
+            ports: vec![desired.nics[1].name.clone()],
+            mtu: Some(1500),
+            ..Bond::default()
+        });
+        let name = desired.nics[1].name.clone();
+        assert_eq!(specs(&desired)[&name].mtu, Some(9000));
     }
 
     #[test]
