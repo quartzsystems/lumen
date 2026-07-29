@@ -39,7 +39,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::brick::{Brick, GcStats};
+use crate::brick::{Brick, BrickStats, GcStats};
 use crate::disk::Disk;
 use crate::error::{FsError, Result};
 use crate::format::Anchor;
@@ -762,6 +762,14 @@ impl<D: Disk> Pool<D> {
         self.brick.block_size()
     }
 
+    /// How the brick's space stands. A caller that only ever learns about
+    /// pressure from [`FsError::Full`] learns too late: by then every write
+    /// triggers a collection, and the pool spends its time collecting
+    /// rather than storing. This is how policy sees the cliff coming.
+    pub fn space(&self) -> BrickStats {
+        self.brick.stats()
+    }
+
     // -----------------------------------------------------------------
     // The replication layer's entry points (repl.rs). Everything here is
     // expressible through the public API's semantics; these exist so a
@@ -1306,6 +1314,71 @@ mod tests {
         pool.write_block(1, 0, b"room again").unwrap();
         pool.checkpoint().unwrap();
         assert_eq!(pool.read_block(1, 0).unwrap().unwrap(), b"room again");
+    }
+
+    #[test]
+    fn a_pool_worked_hard_keeps_storing_instead_of_only_collecting() {
+        // The shape of a burn-in that reported twenty passing rounds while
+        // doing nothing for sixteen of them: a caller collects below some
+        // level, a collection stops at that same level, and from then on
+        // every write buys a collection with nothing left to do. Progress
+        // may become gradual near full — a copy-on-write store must move a
+        // byte to place a byte — but it must not stop.
+        let mut pool = pool(21);
+        // A vdisk about half the pool, overwritten far past its size: the
+        // regime where live data alone denies any generous free-space goal.
+        let capacity = 220u64;
+        pool.create_vdisk(1, capacity * BLOCK as u64).unwrap();
+        let quarter = pool.space().segments_total / 4;
+
+        let mut written = 0u64;
+        let mut collections = 0u64;
+        for round in 0..12u8 {
+            for index in 0..capacity {
+                let mut payload = vec![round; 3000];
+                payload[0..8].copy_from_slice(&index.to_le_bytes());
+                // Make room and try again — a full ring wants a checkpoint,
+                // a full brick wants a collection, and neither is a reason
+                // to drop the write.
+                for attempt in 0..3 {
+                    match pool.write_block(1, index, &payload) {
+                        Ok(()) => {
+                            written += 1;
+                            break;
+                        }
+                        Err(FsError::WalFull) => pool.checkpoint().unwrap(),
+                        Err(FsError::Full) => {
+                            pool.collect_garbage().unwrap();
+                            collections += 1;
+                        }
+                        Err(other) => panic!("{other}"),
+                    }
+                    assert!(
+                        attempt < 2,
+                        "block {index} would not go in after making room twice"
+                    );
+                }
+            }
+            // Collect the way a caller should: on the way down, not at the
+            // bottom — and then insist it actually bought headroom.
+            if pool.space().segments_free <= quarter {
+                pool.collect_garbage().unwrap();
+                collections += 1;
+                assert!(
+                    pool.space().segments_free > quarter,
+                    "round {round}: a collection left the caller still asking \
+                     ({} free, asks at {quarter}) — every write from here pays \
+                     for a collection that can do nothing",
+                    pool.space().segments_free,
+                );
+            }
+        }
+
+        assert_eq!(written, 12 * capacity, "writing stalled");
+        assert!(collections > 0, "the pool never came under pressure");
+        for index in 0..capacity {
+            assert_eq!(pool.read_block(1, index).unwrap().unwrap()[8], 11);
+        }
     }
 
     #[test]

@@ -95,8 +95,16 @@ log, no side channel, and no trust in the process it just killed.
 ./burn-in.sh --rounds 20                    # 4 GiB image under /var/tmp
 ./burn-in.sh --device /dev/sdX --rounds 50  # a real disk; ERASES IT
 ./burn-in.sh --forever                      # then pull the power, and
-./burn-in.sh --rounds 1                     # re-run: it verifies first
+./burn-in.sh --verify-only                  # after the reboot, ask it
 ```
+
+**The harness keeps its own books.** A pool that has lost part of what it
+owed cannot be trusted to say how much that was: its watermark shrinks with
+the loss, forgiving the very debt under examination. So the highest
+watermark ever shown is recorded beside the pool, and a resumed pool below
+it fails — whatever it now claims about itself. Without this the burn-in
+graded a pool that had silently reverted from 9,912 acknowledged operations
+to 192 and called it intact.
 
 Operations above the watermark were never acknowledged, so the verifier
 allows each block one alternative value: whatever the in-flight batch
@@ -110,8 +118,65 @@ SIGKILL is not a power cut: the page cache survives it, so a clean
 kill-loop proves the engine's ordering rather than the device's honesty
 about flushes. `--forever` plus a pulled cord tests the rest.
 
-**Two findings from its first run**, both fixed, neither reachable from the
-simulation:
+**The first run on real hardware survived a genuine power cut** — the cord
+pulled mid-workload, 428,304 acknowledged operations, every one intact on
+the far side with a clean scrub. It also found, in twenty kill-and-verify
+rounds, that collection stalls at high utilization:
+
+- **A collection could free nothing when the brick was nearly full**, which
+  is when it matters. Everything was reclaimed at the *end* of the sweep,
+  so every evacuation had to fit in the space that existed *before* any of
+  it was freed — on a full brick, only the reserve. It ran out, no source
+  was ever emptied, and nothing came back. Segments are now released as
+  each evacuation lands, so the space compounds and a collection can work
+  its way out of a brick with almost nothing free.
+- **A fixed "only compact segments under half live" rule made a pool near
+  half utilisation uncollectable**, because no segment anywhere qualified.
+  Candidates are now taken cheapest-first with no threshold, and only a
+  segment that is almost entirely live is skipped — moving that one would
+  cost about what it returns. Expensive evacuation stops once enough room
+  is back; reclaiming a *dead* segment is always done, since it costs a
+  sector.
+- **Space pressure was only ever announced by failure.** `Full` is too late
+  to be policy: by then every write triggers a collection and the pool
+  spends itself collecting. `Pool::space()` now reports the cliff before
+  it arrives, and the tool collects on the way down.
+
+Together those turned sixteen do-nothing rounds into sixteen that made
+progress. The harness had called them all "survived", which is the next
+finding: **a round that acknowledges nothing is not a round that
+survived**, and the script says so instead of reporting green forever once
+the watermark stops moving.
+
+**Then that check cried wolf, and the measurement is the point.** Later
+rounds still went quiet, and the obvious reading — the pool is stuck — was
+wrong. Asked directly at the moment it looked wedged, the pool was doing
+**~3,900 operations a second**: not stuck, just no longer able to finish a
+batch inside a three-second round with a process restart in front of it. A
+batch only counts when it completes, so "slower than the round" and
+"stopped" look identical from outside. The harness now retries a silent
+round with room to breathe and only calls it stuck if that fails too, and
+it points at `info` and `gc` when it does.
+
+Two measured costs came out of chasing it, neither yet addressed:
+
+- **Opening a pool is O(what is stored in it)** — 1.78 s against 1.3 GiB
+  of live data, versus 26 ms fresh — because the recovery scan reads *and
+  rehashes* every record. This is the price of an index rebuilt by
+  scanning, which docs above call a deliberate phase-1 trade; what the
+  burn-in adds is a number, and the observation that it bounds recovery
+  time on a large brick. The persisted index is the answer, and it is
+  already the plan.
+- **Throughput falls as a pool fills**, which is inherent to a
+  copy-on-write store — near full it must move a byte to place a byte —
+  but the shape of the curve here has not been characterised, only
+  survived. Worth measuring properly before phase 3.
+
+`lumen-fs-nbd gc <file>` and `info <file>` exist because guessing at space
+behaviour from the outside is how all of this went unnoticed for so long.
+
+**Two findings from its first local run**, both fixed, neither reachable
+from the simulation:
 
 - Nothing collected garbage under pressure. The tool had a policy for a
   full write-ahead ring and none for a full brick, so a long-running export

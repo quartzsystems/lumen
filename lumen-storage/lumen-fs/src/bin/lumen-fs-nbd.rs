@@ -25,7 +25,7 @@
 //! and `burn-in.sh`.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -42,10 +42,30 @@ struct FileDisk {
     size: u64,
 }
 
+/// Whether this path is a raw block device — a disk, not a file that
+/// stands in for one. The two are formatted differently and only one of
+/// them can be created.
+#[cfg(unix)]
+fn is_block_device(path: &str) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    std::fs::metadata(path)
+        .map(|meta| meta.file_type().is_block_device())
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn is_block_device(_path: &str) -> bool {
+    false
+}
+
 impl FileDisk {
     fn open(path: &str) -> std::io::Result<FileDisk> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
-        let size = file.metadata()?.len();
+        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        // Seeking to the end, rather than asking the metadata: a block
+        // device reports a length of zero in its metadata, and a pool that
+        // believes its disk is zero bytes long refuses every write it is
+        // ever asked to make.
+        let size = file.seek(SeekFrom::End(0))?;
         Ok(FileDisk { file, size })
     }
 
@@ -137,14 +157,19 @@ fn main() -> ExitCode {
         Some("format") if args.len() == 5 => cmd_format(&args[2], &args[3], &args[4]),
         Some("serve") if args.len() == 4 => cmd_serve(&args[2], &args[3]),
         Some("scrub") if args.len() == 3 => cmd_scrub(&args[2]),
+        Some("info") if args.len() == 3 => cmd_info(&args[2]),
+        Some("gc") if args.len() == 3 => cmd_gc(&args[2]),
         Some("workload") if args.len() == 4 => cmd_workload(&args[2], &args[3]),
-        Some("verify") if args.len() == 4 => cmd_verify(&args[2], &args[3]),
+        Some("verify") if args.len() == 4 => cmd_verify(&args[2], &args[3], "0"),
+        Some("verify") if args.len() == 5 => cmd_verify(&args[2], &args[3], &args[4]),
         _ => {
             eprintln!("usage: lumen-fs-nbd format   <file> <disk-bytes> <vdisk-bytes>");
             eprintln!("       lumen-fs-nbd serve    <file> <addr>");
             eprintln!("       lumen-fs-nbd scrub    <file>");
+            eprintln!("       lumen-fs-nbd info     <file>   # is there a pool here?");
+            eprintln!("       lumen-fs-nbd gc       <file>   # one collection, with the numbers");
             eprintln!("       lumen-fs-nbd workload <file> <seed>   # runs until killed");
-            eprintln!("       lumen-fs-nbd verify   <file> <seed>");
+            eprintln!("       lumen-fs-nbd verify   <file> <seed> [min-watermark]");
             return ExitCode::from(2);
         }
     };
@@ -166,16 +191,23 @@ fn cmd_format(path: &str, disk_bytes: &str, vdisk_bytes: &str) -> std::result::R
     let disk_bytes = parse_bytes(disk_bytes)?;
     let vdisk_bytes = parse_bytes(vdisk_bytes)?;
 
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|err| format!("cannot create {path}: {err}"))?;
-    file.set_len(disk_bytes)
-        .map_err(|err| format!("cannot size {path}: {err}"))?;
-    drop(file);
+    // A raw disk already exists and cannot be resized, so it is formatted
+    // in place — the caller is expected to have meant it. Anything else
+    // must not exist yet: `create_new` is what keeps a stray argument from
+    // eating a file somebody wanted.
+    if !is_block_device(path) {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|err| format!("cannot create {path}: {err}"))?;
+        file.set_len(disk_bytes)
+            .map_err(|err| format!("cannot size {path}: {err}"))?;
+        drop(file);
+    }
     let disk = FileDisk::open(path).map_err(|err| err.to_string())?;
+    let disk_bytes = disk.size();
 
     // The engine has no randomness by design; the tool is the impure shell,
     // so identity comes from here — the wall clock and pid, hashed.
@@ -204,6 +236,53 @@ fn cmd_format(path: &str, disk_bytes: &str, vdisk_bytes: &str) -> std::result::R
         .map_err(|err| err.to_string())?;
     pool.checkpoint().map_err(|err| err.to_string())?;
     println!("formatted {path}: {disk_bytes} bytes, vdisk {VDISK} of {vdisk_bytes} bytes");
+    Ok(())
+}
+
+/// Open the pool and say what is in it — and, by succeeding or not, answer
+/// the question a script has to ask before it decides whether formatting
+/// would be creating something or destroying something. Opening is the
+/// cheapest honest probe there is: a scrub reads and hashes every byte,
+/// which is no way to ask "is anything here".
+fn cmd_info(path: &str) -> std::result::Result<(), String> {
+    let pool = open_pool(path)?;
+    println!(
+        "pool on {path}: era {}, block size {}, {} vdisk(s), {} snapshot(s)",
+        pool.era(),
+        pool.block_size(),
+        pool.vdisks().len(),
+        pool.snapshots().len()
+    );
+    for (id, size) in pool.vdisks() {
+        println!("  vdisk {id}: {size} bytes");
+    }
+    Ok(())
+}
+
+/// Run one collection and say what it cost and bought. Space behaviour is
+/// the hardest thing to reason about from the outside, and guessing at it
+/// is how a pool ends up collecting far more often than it stores.
+fn cmd_gc(path: &str) -> std::result::Result<(), String> {
+    let mut pool = open_pool(path)?;
+    let before = pool.space();
+    let started = SystemTime::now();
+    let stats = pool.collect_garbage().map_err(|err| err.to_string())?;
+    let elapsed = started.elapsed().map(|d| d.as_secs_f64()).unwrap_or(0.0);
+    let after = pool.space();
+    println!(
+        "segments: {} total, free {} -> {}; live blocks {} -> {}; \
+         {} payload MiB live",
+        before.segments_total,
+        before.segments_free,
+        after.segments_free,
+        before.blocks,
+        after.blocks,
+        after.payload_bytes / (1 << 20),
+    );
+    println!(
+        "collection: dropped {}, moved {}, compacted {}, freed {} in {elapsed:.1}s",
+        stats.blocks_dropped, stats.blocks_moved, stats.segments_compacted, stats.segments_freed,
+    );
     Ok(())
 }
 
@@ -290,6 +369,9 @@ fn cmd_workload(path: &str, seed: &str) -> std::result::Result<(), String> {
         return Err("the vdisk needs at least two blocks for a burn-in".into());
     }
     let mut done = read_watermark(&pool)?;
+    // The free-segment level at which collecting is still worth asking
+    // for; lowered when a collection turns out not to help.
+    let mut collect_below = u64::MAX;
     println!("workload: seed {seed}, {blocks} blocks, resuming at {done}; kill me any time");
 
     loop {
@@ -309,6 +391,27 @@ fn cmd_workload(path: &str, seed: &str) -> std::result::Result<(), String> {
         // kill between these two flushes is the interesting case, and it
         // is the one the ordering makes safe.
         pool.flush().map_err(|err| err.to_string())?;
+        // Collect on the way down, not at the bottom. Waiting for `Full`
+        // means every subsequent write triggers a collection and the pool
+        // spends itself collecting — which is how a burn-in that looked
+        // like twenty passing rounds was really sixteen wedged ones.
+        //
+        // And when a collection cannot help — a pool genuinely near full —
+        // asking again immediately is the same trap by another road. So a
+        // collection that gained nothing lowers the bar it would next be
+        // asked at: the pool keeps working until things actually get
+        // worse, and `Full` remains the honest end of the line.
+        let space = pool.space();
+        if space.segments_free < (space.segments_total / 4).min(collect_below) {
+            let before = space.segments_free;
+            pool.collect_garbage().map_err(|err| err.to_string())?;
+            let after = pool.space().segments_free;
+            collect_below = if after > before {
+                u64::MAX
+            } else {
+                before.saturating_sub(1)
+            };
+        }
         done += BURN_BATCH;
         with_room(&mut pool, |pool| {
             pool.write_bytes(VDISK, 0, &done.to_le_bytes())
@@ -318,13 +421,27 @@ fn cmd_workload(path: &str, seed: &str) -> std::result::Result<(), String> {
     }
 }
 
-fn cmd_verify(path: &str, seed: &str) -> std::result::Result<(), String> {
+fn cmd_verify(path: &str, seed: &str, min_watermark: &str) -> std::result::Result<(), String> {
     let seed = parse_bytes(seed)?;
+    let min_watermark = parse_bytes(min_watermark)?;
     let pool = open_pool(path)?;
     let block_size = pool.block_size() as u64;
     let size = pool.vdisk_size(VDISK).map_err(|err| err.to_string())?;
     let blocks = size / block_size;
     let watermark = read_watermark(&pool)?;
+
+    // The watermark is the pool's own account of what it owes, so a check
+    // that trusts it can be talked down: a pool that comes back at a far
+    // older state would have its debts forgiven by the very number that
+    // shrank. The caller therefore remembers the highest watermark it was
+    // ever shown, and a pool below it has lost acknowledged history —
+    // whatever it says about itself now.
+    if watermark < min_watermark {
+        return Err(format!(
+            "watermark went backwards: {watermark} now, {min_watermark} already acknowledged \
+             — the pool lost history it had promised"
+        ));
+    }
 
     // Replay the acknowledged history to learn what each block must hold.
     // `None` is trimmed or never written, which reads as zeros.
@@ -381,7 +498,7 @@ fn cmd_verify(path: &str, seed: &str) -> std::result::Result<(), String> {
 
     let report = pool.scrub().map_err(|err| err.to_string())?;
     println!(
-        "verify: watermark {watermark}, {checked} blocks checked, {} wrong, \
+        "verify: watermark={watermark}, {checked} blocks checked, {} wrong, \
          {unacknowledged} carrying unacknowledged writes; \
          scrub {} verified, {} corrupt, {} missing",
         wrong.len(),

@@ -82,6 +82,7 @@ struct OpenSegment {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BrickStats {
     pub blocks: u64,
+    pub segments_total: u64,
     pub segments_live: u64,
     pub segments_free: u64,
     /// Payload bytes the index points at (not the padded on-disk spans).
@@ -519,30 +520,56 @@ impl<D: Disk> Brick<D> {
         self.reserve_open = false;
     }
 
+    /// Which segment an absolute record offset belongs to.
+    fn segment_of(&self, offset: u64) -> u64 {
+        (offset - self.sb.segment_area_start) / self.sb.segment_size
+    }
+
+    /// Retire a segment: zero its header and hand it back to the free list.
+    /// The zeroing is pending, and either fate in a crash is safe — a
+    /// surviving header describes records nothing references, which the
+    /// next collection drops again.
+    fn release_segment(&mut self, segment: u64) -> Result<()> {
+        let zero = vec![0u8; SECTOR_SIZE as usize];
+        self.disk.write_at(self.sb.segment_offset(segment), &zero)?;
+        self.free.push(segment);
+        Ok(())
+    }
+
     /// The sweep half of garbage collection: keep exactly the blocks in
     /// `live`, reclaim what that empties out.
     ///
     /// The caller (the pool) must have made `live` computable from durable
     /// state alone — checkpointed, WAL retired — before calling; that
     /// contract is what lets this run with no persistent bookkeeping at
-    /// all. Three moves, in an order a crash cannot break:
+    /// all. Unreachable index entries are dropped first. Their records stay
+    /// on disk until their segment is reused; if a crash resurrects them
+    /// into a future index, they are unreferenced blocks the next
+    /// collection drops again — noise, not loss.
     ///
-    /// 1. Unreachable index entries are dropped. Their records stay on disk
-    ///    until their segment is reused; if a crash resurrects them into a
-    ///    future index, they are unreferenced blocks the next collection
-    ///    drops again — noise, not loss.
-    /// 2. Sparse segments (live spans at most half the usable space) are
-    ///    evacuated: live records rewritten at the write head. Content
-    ///    addressing makes the move invisible to every map that references
-    ///    the block. The moves are **flushed before** any source becomes
-    ///    reusable — a reused source overwrites history, and history may
-    ///    not die before its replacement is durable.
-    /// 3. Emptied segments get their headers zeroed (pending — either fate
-    ///    in a crash is safe) and join the free list.
+    /// Then segments are reclaimed, **emptiest first, releasing each one as
+    /// it is finished**. Both halves of that are load-bearing, and a real
+    /// workload taught them:
     ///
-    /// An evacuation stopped by a full brick keeps its source segment live
-    /// with whatever remains; the copies already made are merely dead
-    /// weight for the next collection.
+    /// - *Emptiest first, with no fixed threshold.* Refusing to touch
+    ///   anything above some fraction of live data sounds like thrift, but
+    ///   it means a pool sitting near that fraction has no eligible segment
+    ///   anywhere and collection quietly becomes a no-op — busy, and
+    ///   freeing nothing. Cheapest-first always finds the best available
+    ///   work, and only a segment that is almost entirely live is skipped,
+    ///   because moving it would cost about what it returns.
+    /// - *Release as you go.* Reclaiming everything at the end means every
+    ///   evacuation must fit in the space that existed **before** any of it
+    ///   was freed — on a full brick, only the reserve. It runs out, no
+    ///   source is ever emptied, and the collection frees nothing precisely
+    ///   when it is needed most. Freeing each segment as its evacuation
+    ///   lands makes the space compound, so a collection can work its way
+    ///   out of a brick with almost nothing free.
+    ///
+    /// The ordering that keeps a crash honest is unchanged and now applies
+    /// per segment: a source's replacement is **flushed before** the source
+    /// becomes reusable, because a reused segment overwrites history and
+    /// history may not die before its replacement is durable.
     pub fn retain_and_reclaim(&mut self, live: &HashSet<BlockHash>) -> Result<GcStats> {
         let before = self.index.len() as u64;
         self.index.retain(|hash, _| live.contains(hash));
@@ -553,46 +580,115 @@ impl<D: Disk> Brick<D> {
 
         let mut by_segment: HashMap<u64, Vec<BlockHash>> = HashMap::new();
         for (hash, location) in &self.index {
-            let segment = (location.offset - self.sb.segment_area_start) / self.sb.segment_size;
-            by_segment.entry(segment).or_default().push(*hash);
+            by_segment
+                .entry(self.segment_of(location.offset))
+                .or_default()
+                .push(*hash);
         }
 
-        let open_segment = self.open.map(|open| open.index);
-        let already_free: HashSet<u64> = self.free.iter().copied().collect();
-        let mut reclaimed = Vec::new();
-        let mut moved_any = false;
-        for segment in 0..self.sb.segment_count {
-            if Some(segment) == open_segment || already_free.contains(&segment) {
+        // Cheapest work first.
+        let usable = self.sb.segment_size - SECTOR_SIZE;
+        let mut candidates: Vec<(u64, u64)> = (0..self.sb.segment_count)
+            .map(|segment| {
+                let span: u64 = by_segment
+                    .get(&segment)
+                    .map(|hashes| {
+                        hashes
+                            .iter()
+                            .filter_map(|hash| self.index.get(hash))
+                            .map(|location| record_span(location.length))
+                            .sum()
+                    })
+                    .unwrap_or(0);
+                (span, segment)
+            })
+            .collect();
+        candidates.sort_unstable();
+
+        // When to stop, expressed two ways — and it needs both.
+        //
+        // `target_free` is the comfortable level: far enough above
+        // whatever makes a caller ask for a collection that writing can go
+        // a long way before asking again. A collection that stopped at
+        // exactly the level that triggers it would leave the caller still
+        // asking, and every write from then on would pay for a collection
+        // with nothing left to do.
+        //
+        // But a level alone is a goal that can be impossible. Live data
+        // approaching half the brick puts "half of it free" permanently
+        // out of reach, and a collector chasing an unreachable target
+        // evacuates everything it is allowed to, every single time. So the
+        // *work* is bounded too, and that is the bound that actually
+        // holds: each collection moves at most a few segments' worth, does
+        // whatever good that buys, and returns. Progress at high
+        // utilisation becomes gradual — which is honest, since a
+        // copy-on-write store near full genuinely must move a byte to
+        // place a byte — rather than collapsing.
+        let target_free = (self.sb.segment_count / 2).max(self.reserve + 2);
+        let move_budget = self.sb.segment_size.saturating_mul(4);
+        let mut moved_bytes = 0u64;
+
+        for (_, segment) in candidates {
+            // Freshly, not from a snapshot: this loop frees segments as it
+            // goes, and the write head moves into them.
+            if self.open.map(|open| open.index) == Some(segment) || self.free.contains(&segment) {
                 continue;
             }
-            let hashes = match by_segment.get(&segment) {
-                None => {
-                    // Nothing live at all — reclaim without touching data.
-                    reclaimed.push(segment);
-                    continue;
-                }
-                Some(hashes) => {
-                    let mut hashes = hashes.clone();
-                    hashes.sort_unstable();
-                    hashes
-                }
-            };
-            let live_span: u64 = hashes
+            // Blocks may have moved out of this segment earlier in the
+            // loop, so membership is taken from where they live now.
+            let members: Vec<BlockHash> = by_segment
+                .get(&segment)
+                .map(|hashes| {
+                    let mut here: Vec<BlockHash> = hashes
+                        .iter()
+                        .copied()
+                        .filter(|hash| {
+                            self.index
+                                .get(hash)
+                                .map(|location| self.segment_of(location.offset) == segment)
+                                .unwrap_or(false)
+                        })
+                        .collect();
+                    here.sort_unstable();
+                    here
+                })
+                .unwrap_or_default();
+
+            // A segment holding nothing live is always taken back: it is
+            // free space already, and saying so costs one sector.
+            if members.is_empty() {
+                self.release_segment(segment)?;
+                stats.segments_freed += 1;
+                continue;
+            }
+
+            // Past here, reclaiming means *moving* data, which is paid for
+            // in writes. Enough room recovered, or enough moving done,
+            // and there is no reason to keep paying — the rest of the
+            // garbage will still be garbage at the next collection.
+            if self.free.len() as u64 >= target_free || moved_bytes >= move_budget {
+                break;
+            }
+
+            let live_span: u64 = members
                 .iter()
                 .map(|hash| record_span(self.index[hash].length))
                 .sum();
-            if live_span * 2 > self.sb.segment_size - SECTOR_SIZE {
-                continue;
+            // Almost entirely live: moving it would cost about what it
+            // gives back, and the segments after it in this ordering are
+            // no cheaper.
+            if live_span * 10 >= usable * 9 {
+                break;
             }
+
             let mut whole = true;
-            for hash in &hashes {
+            for hash in &members {
                 let location = self.index[hash];
                 let payload = self.read_location(hash, &location)?;
                 match self.append_record(*hash, &payload) {
                     Ok(new_location) => {
                         self.index.insert(*hash, new_location);
                         stats.blocks_moved += 1;
-                        moved_any = true;
                     }
                     Err(FsError::Full) => {
                         whole = false;
@@ -602,19 +698,14 @@ impl<D: Disk> Brick<D> {
                 }
             }
             if whole {
+                // The replacements must be durable before the original can
+                // be handed out to be overwritten.
+                self.disk.flush()?;
+                self.release_segment(segment)?;
                 stats.segments_compacted += 1;
-                reclaimed.push(segment);
+                stats.segments_freed += 1;
+                moved_bytes += live_span;
             }
-        }
-
-        if moved_any {
-            self.disk.flush()?;
-        }
-        let zero = vec![0u8; SECTOR_SIZE as usize];
-        for segment in reclaimed {
-            self.disk.write_at(self.sb.segment_offset(segment), &zero)?;
-            self.free.push(segment);
-            stats.segments_freed += 1;
         }
         Ok(stats)
     }
@@ -651,6 +742,7 @@ impl<D: Disk> Brick<D> {
     pub fn stats(&self) -> BrickStats {
         BrickStats {
             blocks: self.index.len() as u64,
+            segments_total: self.sb.segment_count,
             segments_free: self.free.len() as u64,
             segments_live: self.sb.segment_count
                 - self.free.len() as u64
