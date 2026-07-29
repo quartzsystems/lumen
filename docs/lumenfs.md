@@ -76,6 +76,57 @@ and is mistaken for an answer to it.
 Still ahead: writer leases hardened for live migration, streaming writes
 while a resync runs, and the slice map that takes this past two nodes.
 
+## Burning it in
+
+The simulation decides when a disk loses power. Real hardware decides for
+itself, and lies differently — so `burn-in.sh` runs the same durability
+contract against a device's own fsync, on the machine that will carry it.
+
+The workload records its progress **inside the vdisk**: block 0 holds a
+watermark, the count of operations it has acknowledged. Each round writes a
+batch of data blocks, flushes them, then writes the new watermark and
+flushes again — in that order, so at every instant the disk satisfies one
+rule: *every operation at or below the stored watermark is present and
+exact.* The verifier replays the seed and demands exactly that. It needs no
+log, no side channel, and no trust in the process it just killed.
+
+```sh
+# On a node, with the binary and script copied over:
+./burn-in.sh --rounds 20                    # 4 GiB image under /var/tmp
+./burn-in.sh --device /dev/sdX --rounds 50  # a real disk; ERASES IT
+./burn-in.sh --forever                      # then pull the power, and
+./burn-in.sh --rounds 1                     # re-run: it verifies first
+```
+
+Operations above the watermark were never acknowledged, so the verifier
+allows each block one alternative value: whatever the in-flight batch
+wrote. That window is exactly one batch wide — the workload cannot begin a
+batch until the previous one's watermark is durable, and a resumed run
+rewrites the same window from the same seed — and every block outside it
+must be exact. The report says how many blocks it forgave, because a number
+that stops looking like one batch is itself a finding.
+
+SIGKILL is not a power cut: the page cache survives it, so a clean
+kill-loop proves the engine's ordering rather than the device's honesty
+about flushes. `--forever` plus a pulled cord tests the rest.
+
+**Two findings from its first run**, both fixed, neither reachable from the
+simulation:
+
+- Nothing collected garbage under pressure. The tool had a policy for a
+  full write-ahead ring and none for a full brick, so a long-running export
+  would have failed writes with most of its space reclaimable. Space
+  pressure is now handled where policy belongs — in the caller.
+- Worse, and the reason the reserve exists: **a collection must write
+  before it can free.** Its opening checkpoint folds dirty maps into new
+  tree nodes, and compaction rewrites live records before releasing their
+  segments, so a brick with nothing free could never be collected — the
+  state where reclaiming is the only remedy was the one state where it was
+  impossible. A slice of the brick (a sixteenth, never less than one
+  segment) is now held back from ordinary writes and opened only for a
+  collection. `a_brick_that_has_run_out_can_still_be_collected` keeps it
+  honest.
+
 ## Why not Ceph, revisited
 
 The scale-out document's own costs section is the argument. Ceph brings a

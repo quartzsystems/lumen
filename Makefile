@@ -17,6 +17,7 @@ VERSION := $(shell cat VERSION)
 SCRIPTS := packages/build-rpms.sh iso/build-live-iso.sh \
            lumen-installer/live/build-live.sh \
            lumen-networking/nicnames/lumen-nicnames \
+           lumen-storage/lumen-fs/burn-in.sh \
            branding/console/lumen-console-banner \
            branding/console/50-lumen-banner
 SPECS   := packages/lumen-release.spec packages/lumen-logos.spec \

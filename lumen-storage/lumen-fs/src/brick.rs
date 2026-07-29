@@ -101,6 +101,22 @@ pub struct GcStats {
     pub segments_compacted: u64,
 }
 
+/// Segments held back from ordinary writes so a collection can always run.
+///
+/// A collection must write before it can free — the checkpoint it starts
+/// with folds dirty maps into new tree nodes, and compaction rewrites live
+/// records ahead of releasing their old segments. A brick with nothing free
+/// could therefore never be collected: the state where reclaiming is most
+/// needed would be the one state where it is impossible. Roughly a
+/// sixteenth of the brick, never less than one segment, is kept for that —
+/// and a brick too small to spare one keeps none, because refusing every
+/// write would be worse than the hazard.
+fn reserve_segments(segment_count: u64) -> u64 {
+    (segment_count / 16)
+        .max(1)
+        .min(segment_count.saturating_sub(1))
+}
+
 #[derive(Debug)]
 pub struct Brick<D: Disk> {
     disk: D,
@@ -111,6 +127,11 @@ pub struct Brick<D: Disk> {
     /// Highest incarnation ever observed on this brick.
     max_seq: u64,
     open: Option<OpenSegment>,
+    /// How many free segments ordinary writes must leave alone.
+    reserve: u64,
+    /// Whether the reserve is currently available — true only inside a
+    /// collection.
+    reserve_open: bool,
 }
 
 impl<D: Disk> Brick<D> {
@@ -190,6 +211,8 @@ impl<D: Disk> Brick<D> {
             index: HashMap::new(),
             max_seq: 0,
             open: None,
+            reserve: reserve_segments(segment_count),
+            reserve_open: false,
         })
     }
 
@@ -221,6 +244,7 @@ impl<D: Disk> Brick<D> {
             _ => return Err(FsError::BadGeometry("superblock geometry exceeds the disk")),
         }
 
+        let reserve = reserve_segments(sb.segment_count);
         let mut brick = Brick {
             disk,
             sb,
@@ -228,6 +252,8 @@ impl<D: Disk> Brick<D> {
             free: Vec::new(),
             max_seq: 0,
             open: None,
+            reserve,
+            reserve_open: false,
         };
         for segment in 0..brick.sb.segment_count {
             brick.recover_segment(segment)?;
@@ -355,7 +381,9 @@ impl<D: Disk> Brick<D> {
             // Sealed by being full; it stays live through the index alone.
             self.open = None;
         }
-        let index = if self.free.is_empty() {
+        // Ordinary writes stop at the reserve; a collection may spend it.
+        let floor = if self.reserve_open { 0 } else { self.reserve };
+        let index = if self.free.len() as u64 <= floor {
             return Err(FsError::Full);
         } else {
             let lowest = *self.free.iter().min().unwrap();
@@ -478,6 +506,17 @@ impl<D: Disk> Brick<D> {
         let mut sector = vec![0u8; SECTOR_SIZE as usize];
         sector[..anchor.encode().len()].copy_from_slice(&anchor.encode());
         self.aux_write(Anchor::slot_offset(anchor.generation), &sector)
+    }
+
+    /// Make the reserve available. Only a collection may call this, and
+    /// only for as long as it runs — see [`reserve_segments`].
+    pub fn open_reserve(&mut self) {
+        self.reserve_open = true;
+    }
+
+    /// Put the reserve back out of reach.
+    pub fn close_reserve(&mut self) {
+        self.reserve_open = false;
     }
 
     /// The sweep half of garbage collection: keep exactly the blocks in

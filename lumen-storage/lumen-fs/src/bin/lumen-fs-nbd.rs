@@ -12,10 +12,17 @@
 //! data lives in the library; this file is wire plumbing.
 //!
 //! ```text
-//!   lumen-fs-nbd format <file> <disk-bytes> <vdisk-bytes>
-//!   lumen-fs-nbd serve  <file> <addr>          # e.g. 127.0.0.1:10809
-//!   lumen-fs-nbd scrub  <file>
+//!   lumen-fs-nbd format   <file> <disk-bytes> <vdisk-bytes>
+//!   lumen-fs-nbd serve    <file> <addr>        # e.g. 127.0.0.1:10809
+//!   lumen-fs-nbd scrub    <file>
+//!   lumen-fs-nbd workload <file> <seed>        # burn-in; runs until killed
+//!   lumen-fs-nbd verify   <file> <seed>
 //! ```
+//!
+//! `workload` and `verify` are the real-hardware half of the simulation:
+//! the same durability contract, checked against a device's own fsync
+//! instead of a modelled one. See the burn-in section of docs/lumenfs.md
+//! and `burn-in.sh`.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -23,7 +30,9 @@ use std::net::{TcpListener, TcpStream};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use lumen_fs::{hash_block, Brick, BrickParams, Disk, FsError, Pool, Result, SECTOR_SIZE};
+use lumen_fs::{
+    hash_block, Brick, BrickParams, Disk, FsError, Pool, Result, SplitMix64, SECTOR_SIZE,
+};
 
 // ---------------------------------------------------------------------------
 // A real file as a Disk. Flush is fsync — the honest barrier.
@@ -128,10 +137,14 @@ fn main() -> ExitCode {
         Some("format") if args.len() == 5 => cmd_format(&args[2], &args[3], &args[4]),
         Some("serve") if args.len() == 4 => cmd_serve(&args[2], &args[3]),
         Some("scrub") if args.len() == 3 => cmd_scrub(&args[2]),
+        Some("workload") if args.len() == 4 => cmd_workload(&args[2], &args[3]),
+        Some("verify") if args.len() == 4 => cmd_verify(&args[2], &args[3]),
         _ => {
-            eprintln!("usage: lumen-fs-nbd format <file> <disk-bytes> <vdisk-bytes>");
-            eprintln!("       lumen-fs-nbd serve  <file> <addr>");
-            eprintln!("       lumen-fs-nbd scrub  <file>");
+            eprintln!("usage: lumen-fs-nbd format   <file> <disk-bytes> <vdisk-bytes>");
+            eprintln!("       lumen-fs-nbd serve    <file> <addr>");
+            eprintln!("       lumen-fs-nbd scrub    <file>");
+            eprintln!("       lumen-fs-nbd workload <file> <seed>   # runs until killed");
+            eprintln!("       lumen-fs-nbd verify   <file> <seed>");
             return ExitCode::from(2);
         }
     };
@@ -209,6 +222,185 @@ fn cmd_scrub(path: &str) -> std::result::Result<(), String> {
         Ok(())
     } else {
         Err("the scrub found damage".into())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The burn-in pair: a deterministic workload that can be killed at any
+// instant, and a verifier that proves the durability contract held.
+//
+// The trick that makes this work on real hardware, where nothing can be
+// written down outside the thing under test, is that the vdisk describes
+// its own progress. Block 0 is a **watermark**: the number of operations
+// this workload has acknowledged. Each round writes a batch of data
+// blocks, flushes them, then writes the new watermark and flushes again.
+//
+// So at every instant the on-disk state satisfies one rule: **every
+// operation at or below the stored watermark must be present and exact.**
+// A kill between the two flushes leaves the old watermark and some newer
+// data — allowed, because nothing above the watermark was ever promised.
+// A kill after the second leaves a watermark whose whole history must be
+// there. That is the phase-1 contract, checkable with no side channel, no
+// log, and no trust in the process that died.
+//
+// Operations are derived from `(seed, n)` alone, so the verifier replays
+// exactly what the workload did without being told.
+
+/// How many data operations per flushed round.
+const BURN_BATCH: u64 = 24;
+
+fn op_roll(seed: u64, n: u64) -> u64 {
+    SplitMix64::new(seed ^ n.wrapping_mul(0x9E37_79B9_7F4A_7C15)).next_u64()
+}
+
+fn op_payload(seed: u64, n: u64, len: usize) -> Vec<u8> {
+    let mut rng = SplitMix64::new(seed ^ n ^ 0x5AFE_D00D_5AFE_D00D);
+    let mut payload = vec![0u8; len];
+    rng.fill(&mut payload);
+    payload
+}
+
+/// What operation `n` does: a whole-block write, or a trim one time in ten.
+/// Block 0 is the watermark, so data lives at 1..blocks.
+fn op_target(seed: u64, n: u64, blocks: u64) -> (u64, bool) {
+    let roll = op_roll(seed, n);
+    let index = 1 + roll % (blocks - 1);
+    (index, roll.is_multiple_of(10))
+}
+
+fn open_pool(path: &str) -> std::result::Result<Pool<FileDisk>, String> {
+    let disk = FileDisk::open(path).map_err(|err| err.to_string())?;
+    Pool::open(Brick::open(disk).map_err(|err| err.to_string())?).map_err(|err| err.to_string())
+}
+
+fn read_watermark(pool: &Pool<FileDisk>) -> std::result::Result<u64, String> {
+    let bytes = pool
+        .read_bytes(VDISK, 0, 8)
+        .map_err(|err| err.to_string())?;
+    Ok(u64::from_le_bytes(bytes[..8].try_into().unwrap()))
+}
+
+fn cmd_workload(path: &str, seed: &str) -> std::result::Result<(), String> {
+    let seed = parse_bytes(seed)?;
+    let mut pool = open_pool(path)?;
+    let block_size = pool.block_size() as u64;
+    let size = pool.vdisk_size(VDISK).map_err(|err| err.to_string())?;
+    let blocks = size / block_size;
+    if blocks < 2 {
+        return Err("the vdisk needs at least two blocks for a burn-in".into());
+    }
+    let mut done = read_watermark(&pool)?;
+    println!("workload: seed {seed}, {blocks} blocks, resuming at {done}; kill me any time");
+
+    loop {
+        for n in done + 1..=done + BURN_BATCH {
+            let (index, trim) = op_target(seed, n, blocks);
+            let at = index * block_size;
+            if trim {
+                with_room(&mut pool, |pool| pool.trim_bytes(VDISK, at, block_size))
+                    .map_err(|err| err.to_string())?;
+            } else {
+                let payload = op_payload(seed, n, block_size as usize);
+                with_room(&mut pool, |pool| pool.write_bytes(VDISK, at, &payload))
+                    .map_err(|err| err.to_string())?;
+            }
+        }
+        // The data is durable before the watermark that claims it is. A
+        // kill between these two flushes is the interesting case, and it
+        // is the one the ordering makes safe.
+        pool.flush().map_err(|err| err.to_string())?;
+        done += BURN_BATCH;
+        with_room(&mut pool, |pool| {
+            pool.write_bytes(VDISK, 0, &done.to_le_bytes())
+        })
+        .map_err(|err| err.to_string())?;
+        pool.flush().map_err(|err| err.to_string())?;
+    }
+}
+
+fn cmd_verify(path: &str, seed: &str) -> std::result::Result<(), String> {
+    let seed = parse_bytes(seed)?;
+    let pool = open_pool(path)?;
+    let block_size = pool.block_size() as u64;
+    let size = pool.vdisk_size(VDISK).map_err(|err| err.to_string())?;
+    let blocks = size / block_size;
+    let watermark = read_watermark(&pool)?;
+
+    // Replay the acknowledged history to learn what each block must hold.
+    // `None` is trimmed or never written, which reads as zeros.
+    let mut expected: Vec<Option<u64>> = vec![None; blocks as usize];
+    for n in 1..=watermark {
+        let (index, trim) = op_target(seed, n, blocks);
+        expected[index as usize] = if trim { None } else { Some(n) };
+    }
+
+    // Operations above the watermark were written but never acknowledged,
+    // and the contract lets those land or vanish. A SIGKILL in particular
+    // leaves the page cache intact, so they usually *have* landed. Each
+    // such block therefore has exactly one alternative legal value.
+    //
+    // The window is one batch wide, and that bound is what keeps this
+    // check honest rather than permissive: the workload cannot begin a
+    // batch until it has flushed the watermark for the last one, so it is
+    // never more than `BURN_BATCH` operations ahead of the watermark on
+    // disk. A resumed run rewrites that same window with the same seed, so
+    // nothing older can linger either. Any disagreement outside the window
+    // is a broken promise.
+    //
+    // Outer `None` is "no in-flight operation touched this block"; inner
+    // `None` is an in-flight trim, whose legal value is zeros.
+    let mut in_flight: Vec<Option<Option<u64>>> = vec![None; blocks as usize];
+    for n in watermark + 1..=watermark + BURN_BATCH {
+        let (index, trim) = op_target(seed, n, blocks);
+        in_flight[index as usize] = Some(if trim { None } else { Some(n) });
+    }
+
+    let zeros = vec![0u8; block_size as usize];
+    let payload_of = |op: Option<u64>| match op {
+        Some(n) => op_payload(seed, n, block_size as usize),
+        None => zeros.clone(),
+    };
+
+    let mut checked = 0u64;
+    let mut unacknowledged = 0u64;
+    let mut wrong = Vec::new();
+    for index in 1..blocks {
+        let found = pool
+            .read_bytes(VDISK, index * block_size, block_size)
+            .map_err(|err| err.to_string())?;
+        if found == payload_of(expected[index as usize]) {
+            checked += 1;
+            continue;
+        }
+        match in_flight[index as usize] {
+            Some(op) if found == payload_of(op) => unacknowledged += 1,
+            _ => wrong.push(index),
+        }
+        checked += 1;
+    }
+
+    let report = pool.scrub().map_err(|err| err.to_string())?;
+    println!(
+        "verify: watermark {watermark}, {checked} blocks checked, {} wrong, \
+         {unacknowledged} carrying unacknowledged writes; \
+         scrub {} verified, {} corrupt, {} missing",
+        wrong.len(),
+        report.blocks_verified,
+        report.corrupt.len(),
+        report.missing.len()
+    );
+    if wrong.is_empty() && report.corrupt.is_empty() && report.missing.is_empty() {
+        Ok(())
+    } else {
+        if !wrong.is_empty() {
+            let shown: Vec<String> = wrong.iter().take(8).map(u64::to_string).collect();
+            eprintln!(
+                "acknowledged blocks that did not survive: {}{}",
+                shown.join(", "),
+                if wrong.len() > 8 { ", …" } else { "" }
+            );
+        }
+        Err("the durability contract was broken".into())
     }
 }
 
@@ -369,7 +561,7 @@ fn serve_client(
                 }
                 let mut data = vec![0u8; length as usize];
                 stream.read_exact(&mut data)?;
-                let outcome = with_wal_room(pool, |pool| pool.write_bytes(VDISK, offset, &data));
+                let outcome = with_room(pool, |pool| pool.write_bytes(VDISK, offset, &data));
                 match outcome {
                     Ok(()) => simple_reply(&mut stream, 0, cookie, &[])?,
                     Err(err) => simple_reply(&mut stream, engine_errno(&err), cookie, &[])?,
@@ -380,8 +572,7 @@ fn serve_client(
                 Err(err) => simple_reply(&mut stream, engine_errno(&err), cookie, &[])?,
             },
             CMD_TRIM => {
-                let outcome =
-                    with_wal_room(pool, |pool| pool.trim_bytes(VDISK, offset, length as u64));
+                let outcome = with_room(pool, |pool| pool.trim_bytes(VDISK, offset, length as u64));
                 match outcome {
                     Ok(()) => simple_reply(&mut stream, 0, cookie, &[])?,
                     Err(err) => simple_reply(&mut stream, engine_errno(&err), cookie, &[])?,
@@ -393,18 +584,37 @@ fn serve_client(
     }
 }
 
-/// A full ring is the engine asking for a checkpoint; the tool is the
-/// policy layer, and its policy is: make room and go again.
-fn with_wal_room(
+/// The engine reports pressure and refuses to invent policy: a full ring
+/// wants a checkpoint, a full brick wants a collection, and deciding when
+/// belongs to whoever is running it. This is the tool's answer — make room
+/// and go again.
+///
+/// Each remedy is tried at most once per operation, so a genuinely full
+/// pool surfaces its error instead of spinning. Without the `Full` arm a
+/// long-running export eventually fails writes while most of its space is
+/// garbage nobody asked to reclaim; the burn-in found that on its third
+/// round, which is the kind of thing only a real workload finds.
+fn with_room(
     pool: &mut Pool<FileDisk>,
     mut op: impl FnMut(&mut Pool<FileDisk>) -> Result<()>,
 ) -> Result<()> {
-    match op(pool) {
-        Err(FsError::WalFull) => {
-            pool.checkpoint()?;
-            op(pool)
+    let mut checkpointed = false;
+    let mut collected = false;
+    loop {
+        match op(pool) {
+            Err(FsError::WalFull) if !checkpointed => {
+                checkpointed = true;
+                pool.checkpoint()?;
+            }
+            Err(FsError::Full) if !collected => {
+                collected = true;
+                // A collection checkpoints on the way in, so it cures a
+                // tight ring as well as a tight brick.
+                checkpointed = true;
+                pool.collect_garbage()?;
+            }
+            other => return other,
         }
-        other => other,
     }
 }
 

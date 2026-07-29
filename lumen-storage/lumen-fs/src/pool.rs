@@ -637,6 +637,18 @@ impl<D: Disk> Pool<D> {
     /// entry, and replay after a crash would mistake an acknowledged write
     /// for an invalid tail.
     pub fn collect_garbage(&mut self) -> Result<GcStats> {
+        // A collection writes before it frees — the checkpoint below folds
+        // dirty maps into new tree nodes, and compaction rewrites live
+        // records ahead of releasing their segments. So it spends the
+        // brick's reserve, which exists for exactly this and is closed
+        // again however this ends.
+        self.brick.open_reserve();
+        let outcome = self.collect_within_reserve();
+        self.brick.close_reserve();
+        outcome
+    }
+
+    fn collect_within_reserve(&mut self) -> Result<GcStats> {
         self.checkpoint()?;
 
         let mut ids: Vec<u64> = self.vdisks.keys().copied().collect();
@@ -1251,6 +1263,49 @@ mod tests {
             [8, 8, 8, 8]
         );
         assert_eq!(pool.vdisks().len(), 1);
+    }
+
+    #[test]
+    fn a_brick_that_has_run_out_can_still_be_collected() {
+        // The liveness hazard a real burn-in found on its third round: a
+        // collection has to write before it can free, so a brick with
+        // nothing left would be uncollectable exactly when collecting is
+        // the only thing that helps. The reserve is what breaks that
+        // circle, and this is the shape of the failure it prevents.
+        let mut pool = pool(20);
+        pool.create_vdisk(1, 200 * BLOCK as u64).unwrap();
+        let mut round = 0u8;
+        loop {
+            round = round.wrapping_add(1);
+            let mut hit_full = false;
+            for index in 0..200u64 {
+                let mut payload = vec![round; 3000];
+                payload[0..8].copy_from_slice(&index.to_le_bytes());
+                match pool.write_block(1, index, &payload) {
+                    Ok(()) => {}
+                    Err(FsError::WalFull) => pool.checkpoint().unwrap(),
+                    Err(FsError::Full) => {
+                        hit_full = true;
+                        break;
+                    }
+                    Err(other) => panic!("{other}"),
+                }
+            }
+            if hit_full {
+                break;
+            }
+            assert!(round < 200, "the brick never filled");
+        }
+
+        // Out of room — and a collection must still run and give room back.
+        let stats = pool.collect_garbage().unwrap();
+        assert!(
+            stats.segments_freed > 0,
+            "the collection freed nothing: {stats:?}"
+        );
+        pool.write_block(1, 0, b"room again").unwrap();
+        pool.checkpoint().unwrap();
+        assert_eq!(pool.read_block(1, 0).unwrap().unwrap(), b"room again");
     }
 
     #[test]
