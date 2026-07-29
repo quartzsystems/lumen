@@ -175,6 +175,31 @@ Two measured costs came out of chasing it, neither yet addressed:
 `lumen-fs-nbd gc <file>` and `info <file>` exist because guessing at space
 behaviour from the outside is how all of this went unnoticed for so long.
 
+### Where it stands on real hardware
+
+On lumen1, a 4 GiB pool carrying a 2 GiB vdisk — so a fully-written vdisk
+occupies **half the brick**, the case that used to stall:
+
+- **20 rounds, 396,648 acknowledged operations, every one intact.** No
+  round wrong, corrupt, or missing.
+- **Steady state reached and held.** Per-round progress settles to roughly
+  15,500 operations by round 8 and stays there for the remaining thirteen
+  rounds, with the live-block count oscillating around 140–154k rather
+  than climbing. Collection keeps pace with writing at 50% utilisation,
+  which is the property the earlier collapse denied.
+- **A real power cut, separately: 428,304 operations, all intact.**
+
+That is phase 1's durability contract demonstrated against real hardware
+rather than a modelled disk. Two things it does not yet cover: a raw block
+device (`--device`, exercised only against a loop device so far), and a
+long soak rather than minutes.
+
+One number worth reading carefully: the index holds ~154k blocks where the
+vdisk has 131,071 and its map needs ~257. The remainder is dead records
+the open scan re-indexed, which the next collection drops — harmless by
+design, but it is also what makes opening a worked pool slow, so the two
+findings are one finding.
+
 **Two findings from its first local run**, both fixed, neither reachable
 from the simulation:
 
