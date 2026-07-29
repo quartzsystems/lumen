@@ -14,8 +14,11 @@
 //!   hash.rs     the content address — a BLAKE3-256 that is also the checksum
 //!   disk.rs     the one seam to hardware: read, write, flush-barrier
 //!   sim.rs      the deterministic disk: torn writes, reordering, power loss
-//!   format.rs   the on-disk shapes: superblock, segment header, block record
+//!   format.rs   the on-disk shapes: superblock, anchor, segment, record
 //!   brick.rs    one disk's extent store: format, recover, put, get
+//!   wal.rs      the write-ahead ring: durable before any tree knows
+//!   map.rs      vdisk maps: COW radix trees whose nodes are pool blocks
+//!   pool.rs     vdisks over the brick: write, read, flush, checkpoint
 //! ```
 //!
 //! The durability contract, stated once and tested everywhere: a block is
@@ -30,11 +33,15 @@ pub mod disk;
 pub mod error;
 pub mod format;
 pub mod hash;
+pub mod map;
+pub mod pool;
 pub mod sim;
+pub mod wal;
 
 pub use brick::{Brick, BrickParams, BrickStats};
 pub use disk::Disk;
 pub use error::{FsError, Result};
 pub use format::{SECTOR_SIZE, SUPERBLOCK_SLOTS};
 pub use hash::{hash_block, BlockHash};
+pub use pool::Pool;
 pub use sim::{SimDisk, SplitMix64};

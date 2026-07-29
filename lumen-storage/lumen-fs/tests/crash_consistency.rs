@@ -30,6 +30,7 @@ fn params() -> BrickParams {
         brick_uuid: [0xBB; 16],
         block_size: BLOCK_SIZE,
         segment_size: SEGMENT_SIZE,
+        wal_size: 64 * KIB as u64,
     }
 }
 

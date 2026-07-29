@@ -37,8 +37,8 @@ use std::collections::HashMap;
 use crate::disk::Disk;
 use crate::error::{FsError, Result};
 use crate::format::{
-    record_span, RecordHeader, SegmentHeader, Superblock, RECORD_HEADER_LEN, SECTOR_SIZE,
-    SEGMENT_AREA_START,
+    record_span, Anchor, RecordHeader, SegmentHeader, Superblock, ANCHOR_AREA_START, ANCHOR_SLOTS,
+    RECORD_HEADER_LEN, SECTOR_SIZE, WAL_AREA_START,
 };
 use crate::hash::{hash_block, BlockHash};
 
@@ -53,6 +53,10 @@ pub struct BrickParams {
     /// Bytes per segment; a sector multiple with room for the header and at
     /// least one maximal record.
     pub segment_size: u64,
+    /// Bytes reserved for the write-ahead ring; a sector multiple. The WAL
+    /// itself is the pool's business (wal.rs) — the brick only carves out
+    /// and guards the space.
+    pub wal_size: u64,
 }
 
 /// Where one block lives.
@@ -114,7 +118,13 @@ impl<D: Disk> Brick<D> {
                 "a segment must hold its header and one maximal block",
             ));
         }
-        let area = disk.size().saturating_sub(SEGMENT_AREA_START);
+        if !params.wal_size.is_multiple_of(SECTOR_SIZE) || params.wal_size < 2 * SECTOR_SIZE {
+            return Err(FsError::BadGeometry(
+                "the WAL area must be a sector multiple of at least two sectors",
+            ));
+        }
+        let segment_area_start = WAL_AREA_START + params.wal_size;
+        let area = disk.size().saturating_sub(segment_area_start);
         let segment_count = area / params.segment_size;
         if segment_count == 0 {
             return Err(FsError::BadGeometry("disk too small for one segment"));
@@ -123,9 +133,11 @@ impl<D: Disk> Brick<D> {
         let sb = Superblock {
             block_size: params.block_size,
             segment_size: params.segment_size,
-            segment_area_start: SEGMENT_AREA_START,
+            segment_area_start,
             segment_count,
             generation: 1,
+            wal_start: WAL_AREA_START,
+            wal_size: params.wal_size,
             pool_uuid: params.pool_uuid,
             brick_uuid: params.brick_uuid,
         };
@@ -134,6 +146,24 @@ impl<D: Disk> Brick<D> {
         sector[..encoded.len()].copy_from_slice(&encoded);
         disk.write_at(0, &sector)?;
         disk.write_at(SECTOR_SIZE, &sector)?;
+        // Retire any anchors a previous format left behind (anchors carry
+        // no brick uuid — zeroing the slots is what unlinks history), then
+        // lay down the initial one: an empty pool, replay from the top of
+        // the WAL. The same single flush covers superblocks and anchor, so
+        // a crash mid-format still leaves a brick or no brick.
+        let zero = vec![0u8; SECTOR_SIZE as usize];
+        for slot in 0..ANCHOR_SLOTS {
+            disk.write_at(ANCHOR_AREA_START + slot * SECTOR_SIZE, &zero)?;
+        }
+        let anchor = Anchor {
+            generation: 1,
+            wal_replay_offset: WAL_AREA_START,
+            wal_replay_seq: 1,
+            manifest_hash: [0; 32],
+        };
+        let mut anchor_sector = vec![0u8; SECTOR_SIZE as usize];
+        anchor_sector[..anchor.encode().len()].copy_from_slice(&anchor.encode());
+        disk.write_at(Anchor::slot_offset(anchor.generation), &anchor_sector)?;
         disk.flush()?;
 
         // A fresh brick_uuid is what retires any segment headers left by a
@@ -361,6 +391,66 @@ impl<D: Disk> Brick<D> {
         self.disk.flush()
     }
 
+    /// The WAL area's bounds: `(start, size)`.
+    pub fn wal_bounds(&self) -> (u64, u64) {
+        (self.sb.wal_start, self.sb.wal_size)
+    }
+
+    /// Read within the auxiliary area — anchors and WAL. The brick owns the
+    /// device; the pool's machinery is a guest in this range and nowhere
+    /// else, and the bounds check is what holds that.
+    pub fn aux_read(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        self.check_aux(offset, buf.len())?;
+        self.disk.read_at(offset, buf)
+    }
+
+    /// Write within the auxiliary area — same guest, same fence.
+    pub fn aux_write(&mut self, offset: u64, data: &[u8]) -> Result<()> {
+        self.check_aux(offset, data.len())?;
+        self.disk.write_at(offset, data)
+    }
+
+    fn check_aux(&self, offset: u64, len: usize) -> Result<()> {
+        let end = offset.checked_add(len as u64);
+        match end {
+            Some(end) if offset >= ANCHOR_AREA_START && end <= self.sb.segment_area_start => Ok(()),
+            _ => Err(FsError::OutOfBounds {
+                offset,
+                len: len as u64,
+                disk_size: self.sb.segment_area_start,
+            }),
+        }
+    }
+
+    /// The valid anchor with the highest generation, or `None` for a brick
+    /// that somehow lost both — which open() treats as corruption, since
+    /// format always writes one.
+    pub fn read_best_anchor(&self) -> Result<Option<Anchor>> {
+        let mut best: Option<Anchor> = None;
+        for slot in 0..ANCHOR_SLOTS {
+            let mut buf = vec![0u8; SECTOR_SIZE as usize];
+            self.aux_read(ANCHOR_AREA_START + slot * SECTOR_SIZE, &mut buf)?;
+            if let Some(anchor) = Anchor::decode(&buf) {
+                let newer = best
+                    .as_ref()
+                    .map(|b| anchor.generation > b.generation)
+                    .unwrap_or(true);
+                if newer {
+                    best = Some(anchor);
+                }
+            }
+        }
+        Ok(best)
+    }
+
+    /// Write an anchor into its generation's slot. Not durable until the
+    /// next flush — the checkpoint sequence owns the ordering.
+    pub fn write_anchor(&mut self, anchor: &Anchor) -> Result<()> {
+        let mut sector = vec![0u8; SECTOR_SIZE as usize];
+        sector[..anchor.encode().len()].copy_from_slice(&anchor.encode());
+        self.aux_write(Anchor::slot_offset(anchor.generation), &sector)
+    }
+
     pub fn contains(&self, hash: &BlockHash) -> bool {
         self.index.contains_key(hash)
     }
@@ -400,6 +490,7 @@ mod tests {
             brick_uuid: [0xBB; 16],
             block_size: 16 * KIB as u32,
             segment_size: 256 * KIB,
+            wal_size: 64 * KIB,
         }
     }
 
@@ -500,8 +591,9 @@ mod tests {
         brick.flush().unwrap();
         let mut disk = brick.into_disk();
         // Flip one payload byte of the first record: segment 0 starts after
-        // the two superblock sectors, its first record after its header.
-        let payload_at = 2 * 4096 + 4096 + RECORD_HEADER_LEN as u64 + 100;
+        // the superblock and anchor sectors and the WAL area, its first
+        // record after its header.
+        let payload_at = 4 * 4096 + 64 * KIB + 4096 + RECORD_HEADER_LEN as u64 + 100;
         let mut byte = [0u8; 1];
         disk.read_at(payload_at, &mut byte).unwrap();
         disk.write_at(payload_at, &[byte[0] ^ 0x40]).unwrap();

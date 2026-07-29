@@ -36,6 +36,19 @@ pub enum FsError {
     /// No free segment can take the next block. GC arrives later in phase 1;
     /// until then a full brick refuses further puts rather than wedging.
     Full,
+    /// The write-ahead ring would lap its live history. The pool's cue to
+    /// checkpoint and retry — never silently dropped work.
+    WalFull,
+    /// The vdisk manifest block cannot take another entry. A stated v1
+    /// ceiling, like DRBD's twelve volumes — chaining arrives if a real
+    /// deployment ever nears it.
+    ManifestFull,
+    /// An operation named a vdisk the pool does not have.
+    UnknownVdisk(u64),
+    /// A create named a vdisk the pool already has.
+    VdiskExists(u64),
+    /// A read or write beyond the vdisk's capacity.
+    OutOfRange { index: u64, capacity: u64 },
 }
 
 impl fmt::Display for FsError {
@@ -61,6 +74,19 @@ impl fmt::Display for FsError {
             ),
             FsError::EmptyPayload => write!(f, "a block must carry at least one byte"),
             FsError::Full => write!(f, "no free segment remains on this brick"),
+            FsError::WalFull => {
+                write!(
+                    f,
+                    "the write-ahead ring is full; a checkpoint must retire it"
+                )
+            }
+            FsError::ManifestFull => write!(f, "the vdisk manifest cannot take another entry"),
+            FsError::UnknownVdisk(id) => write!(f, "no vdisk {id} exists in this pool"),
+            FsError::VdiskExists(id) => write!(f, "vdisk {id} already exists in this pool"),
+            FsError::OutOfRange { index, capacity } => write!(
+                f,
+                "block index {index} is beyond the vdisk's capacity of {capacity} blocks"
+            ),
         }
     }
 }

@@ -14,13 +14,18 @@ docs/storage.md (DRBD replicated volumes) remains what exists in production
 and keeps carrying machines until LumenFS has earned them.
 
 **Status: phase 1 has begun.** The `lumen-fs` crate exists with the
-simulation harness and the first layer of the engine — the deterministic
-disk with crash and torn-write injection, the v1 on-disk format (superblock,
-segment incarnations, self-validating block records), and the single-brick
-extent store with scan-based recovery, held by a crash-consistency suite
-that replays seeded power-loss histories under `cargo test`. Everything
-below the WAL heading — vdisk maps, dedupe refcounts, GC, scrub, NBD —
-remains design.
+simulation harness and the write path — the deterministic disk with crash
+and torn-write injection, the v1 on-disk format (superblock, dual anchor
+slots, WAL area, segment incarnations, self-validating block records), the
+single-brick extent store with scan-based recovery, the write-ahead ring,
+the COW map trees whose nodes are ordinary pool blocks, and the pool layer
+that ties them into vdisks: write, read, flush-to-acknowledge, and the
+two-flush checkpoint that folds dirty maps into trees and retires WAL
+history. Two crash suites replay seeded power-loss histories under
+`cargo test`: the brick-level contract (an acknowledged block survives
+intact) and the vdisk-level one (an acknowledged write survives; an
+unacknowledged write lands whole or not at all, never as garbage). Still
+design: dedupe refcounts and GC, scrub, snapshots-as-API, NBD export.
 
 ## Why not Ceph, revisited
 

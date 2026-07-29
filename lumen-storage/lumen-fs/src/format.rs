@@ -3,9 +3,11 @@
 //! Layout of a brick:
 //!
 //! ```text
-//!   sector 0        superblock, slot A ─┐ two slots, alternate generations;
-//!   sector 1        superblock, slot B ─┘ the valid one with the highest
-//!                                          generation wins
+//!   sector 0        superblock, slot A ─┐ two slots; the valid one with
+//!   sector 1        superblock, slot B ─┘ the highest generation wins
+//!   sector 2        anchor, slot A ─┐ the durable root of everything above
+//!   sector 3        anchor, slot B ─┘ the extent store; alternating slots
+//!   WAL area        the write-ahead ring (size chosen at format)
 //!   segment area    fixed-size segments, back to back to the end of disk
 //! ```
 //!
@@ -51,16 +53,25 @@ pub const SUPERBLOCK_SLOTS: u64 = 2;
 
 pub const FORMAT_VERSION: u32 = 1;
 
+/// Two anchor copies right behind them, same reasoning.
+pub const ANCHOR_SLOTS: u64 = 2;
+
 const SUPERBLOCK_MAGIC: &[u8; 8] = b"LUMENFS\0";
+const ANCHOR_MAGIC: &[u8; 8] = b"LFSANC\0\0";
 const SEGMENT_MAGIC: &[u8; 8] = b"LFSSEG\0\0";
 const RECORD_MAGIC: &[u8; 8] = b"LFSBLK\0\0";
 
-/// Where the segment area begins: right after the superblock slots.
-pub const SEGMENT_AREA_START: u64 = SECTOR_SIZE * SUPERBLOCK_SLOTS;
+/// Where the anchor slots begin: right after the superblock slots.
+pub const ANCHOR_AREA_START: u64 = SECTOR_SIZE * SUPERBLOCK_SLOTS;
+
+/// Where the WAL area begins: right after the anchor slots. It ends where
+/// the superblock says the segment area starts.
+pub const WAL_AREA_START: u64 = ANCHOR_AREA_START + SECTOR_SIZE * ANCHOR_SLOTS;
 
 /// Encoded sizes. The structs occupy the front of their sector; the rest is
 /// zeros.
-const SUPERBLOCK_LEN: usize = 112;
+const SUPERBLOCK_LEN: usize = 128;
+const ANCHOR_LEN: usize = 96;
 const SEGMENT_HEADER_LEN: usize = 72;
 pub const RECORD_HEADER_LEN: usize = 64;
 
@@ -98,9 +109,11 @@ fn get_u64(buf: &[u8], at: usize) -> u64 {
 ///   24..32  segment_area_start     u64
 ///   32..40  segment_count          u64
 ///   40..48  generation             u64   highest valid generation wins
-///   48..64  pool_uuid              16 bytes
-///   64..80  brick_uuid             16 bytes
-///   80..112 checksum               BLAKE3 of bytes 0..80
+///   48..56  wal_start              u64
+///   56..64  wal_size               u64
+///   64..80  pool_uuid              16 bytes
+///   80..96  brick_uuid             16 bytes
+///   96..128 checksum               BLAKE3 of bytes 0..96
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Superblock {
@@ -109,6 +122,8 @@ pub struct Superblock {
     pub segment_area_start: u64,
     pub segment_count: u64,
     pub generation: u64,
+    pub wal_start: u64,
+    pub wal_size: u64,
     pub pool_uuid: [u8; 16],
     pub brick_uuid: [u8; 16],
 }
@@ -123,10 +138,12 @@ impl Superblock {
         put_u64(&mut buf, 24, self.segment_area_start);
         put_u64(&mut buf, 32, self.segment_count);
         put_u64(&mut buf, 40, self.generation);
-        buf[48..64].copy_from_slice(&self.pool_uuid);
-        buf[64..80].copy_from_slice(&self.brick_uuid);
-        let check = full_check(&buf[0..80]);
-        buf[80..112].copy_from_slice(&check);
+        put_u64(&mut buf, 48, self.wal_start);
+        put_u64(&mut buf, 56, self.wal_size);
+        buf[64..80].copy_from_slice(&self.pool_uuid);
+        buf[80..96].copy_from_slice(&self.brick_uuid);
+        let check = full_check(&buf[0..96]);
+        buf[96..128].copy_from_slice(&check);
         buf
     }
 
@@ -138,7 +155,7 @@ impl Superblock {
         if buf.len() < SUPERBLOCK_LEN || &buf[0..8] != SUPERBLOCK_MAGIC {
             return Ok(None);
         }
-        if full_check(&buf[0..80]) != buf[80..112] {
+        if full_check(&buf[0..96]) != buf[96..128] {
             return Ok(None);
         }
         let version = get_u32(buf, 8);
@@ -146,15 +163,17 @@ impl Superblock {
             return Err(FsError::UnsupportedVersion(version));
         }
         let mut pool_uuid = [0u8; 16];
-        pool_uuid.copy_from_slice(&buf[48..64]);
+        pool_uuid.copy_from_slice(&buf[64..80]);
         let mut brick_uuid = [0u8; 16];
-        brick_uuid.copy_from_slice(&buf[64..80]);
+        brick_uuid.copy_from_slice(&buf[80..96]);
         Ok(Some(Superblock {
             block_size: get_u32(buf, 12),
             segment_size: get_u64(buf, 16),
             segment_area_start: get_u64(buf, 24),
             segment_count: get_u64(buf, 32),
             generation: get_u64(buf, 40),
+            wal_start: get_u64(buf, 48),
+            wal_size: get_u64(buf, 56),
             pool_uuid,
             brick_uuid,
         }))
@@ -163,6 +182,71 @@ impl Superblock {
     /// Byte offset of a segment's first sector.
     pub fn segment_offset(&self, index: u64) -> u64 {
         self.segment_area_start + index * self.segment_size
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Anchor
+
+/// The durable root of everything above the extent store: which manifest
+/// block describes the vdisks, and where WAL replay begins. Written by a
+/// checkpoint (alternating slots, rising generation) and at format; read at
+/// open. The superblock is who the brick *is*; the anchor is where its
+/// state *starts*.
+///
+/// Layout (little-endian):
+/// ```text
+///   0..8    magic "LFSANC\0\0"
+///   8..16   generation          u64   highest valid generation wins
+///   16..24  wal_replay_offset   u64   absolute; where replay begins
+///   24..32  wal_replay_seq      u64   the seq expected there
+///   32..64  manifest_hash       the vdisk manifest block; all-zeros = none
+///   64..96  checksum            BLAKE3 of bytes 0..64
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Anchor {
+    pub generation: u64,
+    pub wal_replay_offset: u64,
+    pub wal_replay_seq: u64,
+    pub manifest_hash: [u8; 32],
+}
+
+impl Anchor {
+    pub fn encode(&self) -> [u8; ANCHOR_LEN] {
+        let mut buf = [0u8; ANCHOR_LEN];
+        buf[0..8].copy_from_slice(ANCHOR_MAGIC);
+        put_u64(&mut buf, 8, self.generation);
+        put_u64(&mut buf, 16, self.wal_replay_offset);
+        put_u64(&mut buf, 24, self.wal_replay_seq);
+        buf[32..64].copy_from_slice(&self.manifest_hash);
+        let check = full_check(&buf[0..64]);
+        buf[64..96].copy_from_slice(&check);
+        buf
+    }
+
+    /// `None` for a slot that holds no valid anchor — a torn checkpoint
+    /// write reads this way, and its twin carries the previous state.
+    pub fn decode(buf: &[u8]) -> Option<Anchor> {
+        if buf.len() < ANCHOR_LEN || &buf[0..8] != ANCHOR_MAGIC {
+            return None;
+        }
+        if full_check(&buf[0..64]) != buf[64..96] {
+            return None;
+        }
+        let mut manifest_hash = [0u8; 32];
+        manifest_hash.copy_from_slice(&buf[32..64]);
+        Some(Anchor {
+            generation: get_u64(buf, 8),
+            wal_replay_offset: get_u64(buf, 16),
+            wal_replay_seq: get_u64(buf, 24),
+            manifest_hash,
+        })
+    }
+
+    /// The slot a generation lands in: alternating, so a torn write can
+    /// only ever hurt the generation being written, never the survivor.
+    pub fn slot_offset(generation: u64) -> u64 {
+        ANCHOR_AREA_START + (generation % ANCHOR_SLOTS) * SECTOR_SIZE
     }
 }
 
@@ -300,9 +384,11 @@ mod tests {
         Superblock {
             block_size: 16384,
             segment_size: 1 << 20,
-            segment_area_start: SEGMENT_AREA_START,
+            segment_area_start: WAL_AREA_START + (64 << 10),
             segment_count: 7,
             generation: 3,
+            wal_start: WAL_AREA_START,
+            wal_size: 64 << 10,
             pool_uuid: [1; 16],
             brick_uuid: [2; 16],
         }
@@ -318,7 +404,7 @@ mod tests {
     #[test]
     fn a_single_flipped_superblock_bit_reads_as_no_superblock() {
         let mut buf = sample_superblock().encode();
-        for bit_of in [0usize, 9, 17, 50, 79, 100] {
+        for bit_of in [0usize, 9, 17, 50, 60, 90, 110] {
             buf[bit_of] ^= 0x01;
             assert_eq!(Superblock::decode(&buf).unwrap(), None, "byte {bit_of}");
             buf[bit_of] ^= 0x01;
@@ -329,12 +415,36 @@ mod tests {
     fn a_valid_superblock_from_the_future_is_an_error_not_a_blank() {
         let mut buf = sample_superblock().encode();
         put_u32(&mut buf, 8, FORMAT_VERSION + 1);
-        let check = full_check(&buf[0..80]);
-        buf[80..112].copy_from_slice(&check);
+        let check = full_check(&buf[0..96]);
+        buf[96..128].copy_from_slice(&check);
         assert_eq!(
             Superblock::decode(&buf).unwrap_err(),
             FsError::UnsupportedVersion(FORMAT_VERSION + 1)
         );
+    }
+
+    #[test]
+    fn an_anchor_round_trips_and_a_flipped_bit_reads_as_no_anchor() {
+        let anchor = Anchor {
+            generation: 12,
+            wal_replay_offset: WAL_AREA_START + 4096,
+            wal_replay_seq: 88,
+            manifest_hash: [9; 32],
+        };
+        let mut buf = anchor.encode();
+        assert_eq!(Anchor::decode(&buf), Some(anchor));
+        for bit_of in [0usize, 10, 20, 40, 70] {
+            buf[bit_of] ^= 0x01;
+            assert_eq!(Anchor::decode(&buf), None, "byte {bit_of}");
+            buf[bit_of] ^= 0x01;
+        }
+    }
+
+    #[test]
+    fn anchor_generations_alternate_between_the_two_slots() {
+        assert_eq!(Anchor::slot_offset(2), ANCHOR_AREA_START);
+        assert_eq!(Anchor::slot_offset(3), ANCHOR_AREA_START + SECTOR_SIZE);
+        assert_ne!(Anchor::slot_offset(7), Anchor::slot_offset(8));
     }
 
     #[test]
