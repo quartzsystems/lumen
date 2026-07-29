@@ -76,15 +76,26 @@ pub fn resource_file(
     out.push_str("    }\n");
 
     if policy.fence_peer_through_pacemaker {
-        // The two-node regime: on a lost peer, suspend I/O and outdate the
-        // peer through Pacemaker before resuming. This is what stands in
-        // for quorum where there is no majority to have.
+        // The two-node regime: on a lost peer, suspend I/O and fence that
+        // peer before resuming. This is what stands in for quorum where
+        // there is no majority to have.
+        //
+        // The handler fences the peer *node* through Pacemaker's STONITH —
+        // the one `fence_ipmilan` device per member the cluster already
+        // builds and live-tests — and answers 7, "peer node has been
+        // fenced", which is a code DRBD acts on. The CIB-constraint handler
+        // (`crm-fence-peer.9.sh`) is the wrong one for this appliance: it
+        // looks for a promotable DRBD resource to constrain, and by design
+        // there is none — auto-promote is the only promotion here. It exits
+        // with a code DRBD reads as "helper broken" and then refuses the
+        // promote, which strands a healthy survivor holding a machine it
+        // cannot start. No `after-resync-target` to match: fencing the node
+        // leaves no CIB constraint behind to unfence.
         out.push_str("    disk {\n");
         out.push_str("        fencing resource-and-stonith;\n");
         out.push_str("    }\n");
         out.push_str("    handlers {\n");
-        out.push_str("        fence-peer \"/usr/lib/drbd/crm-fence-peer.9.sh\";\n");
-        out.push_str("        after-resync-target \"/usr/lib/drbd/crm-unfence-peer.9.sh\";\n");
+        out.push_str("        fence-peer \"/usr/lib/drbd/stonith_admin-fence-peer.sh\";\n");
         out.push_str("    }\n");
     }
 
@@ -172,8 +183,14 @@ mod tests {
         assert!(res.contains("protocol C;"));
         assert!(res.contains("auto-promote yes;"));
         assert!(res.contains("fencing resource-and-stonith;"));
-        assert!(res.contains("crm-fence-peer.9.sh"));
-        assert!(res.contains("crm-unfence-peer.9.sh"));
+        // The node-level handler, not the CIB-constraint one: there is no
+        // promotable DRBD resource for crm-fence-peer to find, and its
+        // failure code reads to DRBD as a broken helper and blocks the
+        // promote — a survivor that cannot start the machine it saved.
+        assert!(res.contains("fence-peer \"/usr/lib/drbd/stonith_admin-fence-peer.sh\";"));
+        assert!(!res.contains("crm-fence-peer"), "{res}");
+        // Nothing places a CIB constraint, so nothing has to clear one.
+        assert!(!res.contains("after-resync-target"), "{res}");
         assert!(!res.contains("quorum majority"), "no majority of two");
         assert!(res.contains("shared-secret \"s3cret\";"));
 
@@ -207,7 +224,7 @@ mod tests {
         assert!(res.contains("quorum majority;"));
         assert!(res.contains("on-no-quorum suspend-io;"));
         assert!(!res.contains("fencing resource-and-stonith"));
-        assert!(!res.contains("crm-fence-peer"));
+        assert!(!res.contains("fence-peer"));
     }
 
     #[test]

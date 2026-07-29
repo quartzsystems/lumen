@@ -125,7 +125,7 @@ carrying its own `if n == 2`.
 | corosync quorum | `two_node: 1`, `wait_for_all: 1` | plain majority |
 | fence race | asymmetric `pcmk_delay_base` | none — quorum decides |
 | Pacemaker | (defaults) | `no-quorum-policy=stop` |
-| DRBD | `fencing resource-and-stonith` + handlers | volume quorum, suspend on loss |
+| DRBD | `fencing resource-and-stonith` + `stonith_admin-fence-peer.sh` | volume quorum, suspend on loss |
 
 Two nodes are a real regime, not a degenerate three: there is no majority to
 have, so `two_node` keeps the survivor quorate after fencing succeeds,
@@ -178,6 +178,14 @@ it prominent enough to find at 3 a.m.: a red **Confirm dead** button appears
 on the node's own row the moment the node is unfenced-unreachable, and
 nowhere else, because offering it anywhere else would be offering a way to
 corrupt data with one request.
+
+This one path carries more than Pacemaker's own recovery. A two-node
+volume's DRBD `fence-peer` handler is `stonith_admin-fence-peer.sh`, which
+fences the peer node through these same devices before the survivor is
+allowed to promote — so an untested fence device is not only a recovery
+that may not happen, it is a machine that may not start. That is the
+strongest argument for the live fence test being part of the create wizard
+rather than an afterwards.
 
 Two things follow from having exactly one fence path. There is **no
 supported configuration with fencing disabled** — no API field, no UI

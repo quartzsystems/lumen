@@ -49,6 +49,13 @@ const IPADDR2_AGENT: &str = "ocf:heartbeat:IPaddr2";
 const PCS: &str = "/usr/sbin/pcs";
 const CIBADMIN: &str = "/usr/sbin/cibadmin";
 
+const FIREWALL_CMD: &str = "/usr/bin/firewall-cmd";
+/// corosync on both rings — bound on Core and Management.
+const CLUSTER_SERVICE: &str = "lumen-cluster";
+/// DRBD, the hypervisor's peer connection, and the migration stream — Core
+/// only, because replication never rides anything else.
+const REPLICATION_SERVICE: &str = "lumen-replication";
+
 pub struct CliBackend {
     crm_mon: String,
     quorumtool: String,
@@ -120,6 +127,64 @@ impl CliBackend {
             )));
         }
         Ok(())
+    }
+
+    /// The firewalld zone an interface is in, or the default zone when it is
+    /// in none. Reading it is what keeps this from moving interfaces between
+    /// zones: whatever else is already open on that interface stays open.
+    async fn zone_of(&self, interface: &str) -> Result<String> {
+        let outcome = self
+            .exec
+            .run(
+                ExecRequest::new("read an interface's firewall zone", FIREWALL_CMD)
+                    .args([&format!("--get-zone-of-interface={interface}")]),
+            )
+            .await
+            .map_err(ClusterError::Backend)?;
+        let zone = outcome.stdout.trim();
+        // An interface in no zone answers "no zone" and exits non-zero;
+        // the default zone is where it is really being filtered.
+        if outcome.ok() && !zone.is_empty() && zone != "no zone" {
+            return Ok(zone.to_string());
+        }
+        let outcome = self
+            .exec
+            .run(
+                ExecRequest::new("read the default firewall zone", FIREWALL_CMD)
+                    .args(["--get-default-zone"]),
+            )
+            .await
+            .map_err(ClusterError::Backend)?;
+        if !outcome.ok() {
+            return Err(ClusterError::Conflict(format!(
+                "could not read the host firewall's default zone: {}",
+                outcome.failure()
+            )));
+        }
+        Ok(outcome.stdout.trim().to_string())
+    }
+
+    /// Add or remove one service in one zone, permanently. firewalld treats
+    /// "already enabled" and "not enabled" as warnings rather than failures,
+    /// which is what makes preparing a node twice harmless.
+    async fn zone_service(&self, zone: &str, service: &str, open: bool) -> Result<()> {
+        let verb = if open {
+            format!("--add-service={service}")
+        } else {
+            format!("--remove-service={service}")
+        };
+        self.run_privileged(
+            format!(
+                "{service} could not be {} on the {zone} zone",
+                if open { "opened" } else { "closed" }
+            ),
+            ExecRequest::new("bind a cluster service to a firewall zone", FIREWALL_CMD).args([
+                "--permanent",
+                &format!("--zone={zone}"),
+                &verb,
+            ]),
+        )
+        .await
     }
 }
 
@@ -207,6 +272,37 @@ impl ClusterBackend for CliBackend {
             ExecRequest::new("write the cluster authentication key", INSTALL)
                 .args(["-m", "0600", "/dev/stdin", COROSYNC_AUTHKEY])
                 .stdin(authkey),
+        )
+        .await
+    }
+
+    async fn set_cluster_ports(
+        &self,
+        core: &str,
+        management: Option<&str>,
+        open: bool,
+    ) -> Result<()> {
+        let core_zone = self.zone_of(core).await?;
+        self.zone_service(&core_zone, REPLICATION_SERVICE, open)
+            .await?;
+        self.zone_service(&core_zone, CLUSTER_SERVICE, open).await?;
+
+        // The second ring. Skipped when Management shares the Core
+        // interface: one zone, already carrying both services.
+        if let Some(management) = management.filter(|m| *m != core) {
+            let management_zone = self.zone_of(management).await?;
+            if management_zone != core_zone {
+                self.zone_service(&management_zone, CLUSTER_SERVICE, open)
+                    .await?;
+            }
+        }
+
+        // Permanent rules are a file until this; without the reload the
+        // ports are open only after the next boot, which is the kind of
+        // "works tomorrow" a cluster create must not leave behind.
+        self.run_privileged(
+            "the host firewall would not reload".into(),
+            ExecRequest::new("reload the host firewall", FIREWALL_CMD).args(["--reload"]),
         )
         .await
     }
@@ -1060,6 +1156,150 @@ Not synchronised\n";
         assert!(
             exec.ran_with(RM, &["-rf", COROSYNC_CONF, COROSYNC_AUTHKEY, PACEMAKER_CIB])
                 .await
+        );
+    }
+
+    /// Replication rides Core alone; corosync rides both rings. Each service
+    /// is added to the zone its interface is already in — the console's own
+    /// port is bound to the default zone at install, and an interface moved
+    /// into a zone of ours would take that with it.
+    #[tokio::test]
+    async fn the_clusters_ports_open_on_the_interfaces_that_carry_them() {
+        let exec = lumen_sys::exec::MockExec::working();
+        exec.answer_next("public\n").await; // the Core interface's zone
+        exec.answer_next("").await; // add replication
+        exec.answer_next("").await; // add cluster
+        exec.answer_next("internal\n").await; // the Management interface's
+        let backend = CliBackend::new(exec.clone());
+
+        backend
+            .set_cluster_ports("nic1", Some("nic0"), true)
+            .await
+            .unwrap();
+
+        assert!(
+            exec.ran_with(
+                FIREWALL_CMD,
+                &[
+                    "--permanent",
+                    "--zone=public",
+                    "--add-service=lumen-replication"
+                ]
+            )
+            .await
+        );
+        assert!(
+            exec.ran_with(
+                FIREWALL_CMD,
+                &[
+                    "--permanent",
+                    "--zone=public",
+                    "--add-service=lumen-cluster"
+                ]
+            )
+            .await
+        );
+        // The second ring, on its own interface's zone — and replication is
+        // not opened there.
+        assert!(
+            exec.ran_with(
+                FIREWALL_CMD,
+                &[
+                    "--permanent",
+                    "--zone=internal",
+                    "--add-service=lumen-cluster"
+                ]
+            )
+            .await
+        );
+        assert!(
+            !exec
+                .ran_with(
+                    FIREWALL_CMD,
+                    &[
+                        "--permanent",
+                        "--zone=internal",
+                        "--add-service=lumen-replication"
+                    ]
+                )
+                .await
+        );
+        // Permanent rules are a file until the reload.
+        assert!(exec.ran_with(FIREWALL_CMD, &["--reload"]).await);
+        // Nothing moved between zones.
+        let ran = exec.ran().await;
+        assert!(
+            !ran.iter().any(|r| r
+                .args
+                .iter()
+                .any(|a| a.contains("--change-interface") || a.contains("--add-interface"))),
+            "{ran:?}"
+        );
+    }
+
+    /// One interface carrying both rings is one zone, asked once — a second
+    /// identical add would be harmless, but the log line it writes is a
+    /// question an operator should not have to answer.
+    #[tokio::test]
+    async fn a_shared_interface_is_not_asked_for_twice() {
+        let exec = lumen_sys::exec::MockExec::working();
+        exec.answer_next("public\n").await;
+        let backend = CliBackend::new(exec.clone());
+        backend
+            .set_cluster_ports("nic0", Some("nic0"), true)
+            .await
+            .unwrap();
+        let adds = exec
+            .ran()
+            .await
+            .into_iter()
+            .filter(|r| r.args.iter().any(|a| a == "--add-service=lumen-cluster"))
+            .count();
+        assert_eq!(adds, 1);
+    }
+
+    /// A teardown removes exactly what the prepare added.
+    #[tokio::test]
+    async fn closing_the_ports_removes_the_same_services() {
+        let exec = lumen_sys::exec::MockExec::working();
+        exec.answer_next("public\n").await;
+        let backend = CliBackend::new(exec.clone());
+        backend
+            .set_cluster_ports("nic0", None, false)
+            .await
+            .unwrap();
+        assert!(
+            exec.ran_with(
+                FIREWALL_CMD,
+                &[
+                    "--permanent",
+                    "--zone=public",
+                    "--remove-service=lumen-replication"
+                ]
+            )
+            .await
+        );
+    }
+
+    /// An interface in no zone is still being filtered — by the default one.
+    #[tokio::test]
+    async fn an_interface_in_no_zone_falls_back_to_the_default_zone() {
+        let exec = lumen_sys::exec::MockExec::working();
+        exec.fail_next(2, "no zone").await;
+        exec.answer_next("public\n").await;
+        let backend = CliBackend::new(exec.clone());
+        backend.set_cluster_ports("nic0", None, true).await.unwrap();
+        assert!(exec.ran_with(FIREWALL_CMD, &["--get-default-zone"]).await);
+        assert!(
+            exec.ran_with(
+                FIREWALL_CMD,
+                &[
+                    "--permanent",
+                    "--zone=public",
+                    "--add-service=lumen-replication"
+                ]
+            )
+            .await
         );
     }
 

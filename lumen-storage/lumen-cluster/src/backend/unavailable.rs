@@ -44,6 +44,15 @@ impl ClusterBackend for UnavailableBackend {
         self.error()
     }
 
+    async fn set_cluster_ports(
+        &self,
+        _core: &str,
+        _management: Option<&str>,
+        _open: bool,
+    ) -> Result<()> {
+        self.error()
+    }
+
     async fn enable_stack(&self) -> Result<()> {
         self.error()
     }

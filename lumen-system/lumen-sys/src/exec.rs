@@ -420,6 +420,16 @@ impl MockExec {
         });
     }
 
+    /// Make the next command succeed and say this — for the commands a
+    /// caller runs to *read* something rather than to change it.
+    pub async fn answer_next(&self, stdout: &str) {
+        self.answers.lock().await.push(Outcome {
+            status: 0,
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+        });
+    }
+
     /// Everything that has been run, in order.
     pub async fn ran(&self) -> Vec<Request> {
         self.ran.lock().await.clone()

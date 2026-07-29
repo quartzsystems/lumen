@@ -72,12 +72,53 @@ resource, no promotion constraint, no agent — a VM volume's writer is
 decided by who opened it, which is exactly the fact libvirt already owns.
 What makes that safe is the topology regime's policy, rendered into the
 resource file by the engine that owns the regimes: two-node volumes carry
-`fencing resource-and-stonith` with the crm-fence-peer handlers (a lost peer
-suspends I/O until it is outdated through Pacemaker), and three-replica
-volumes in the quorum regime carry `quorum majority` + `on-no-quorum
-suspend-io`. Two-replica volumes in a quorum cluster carry neither — the
+`fencing resource-and-stonith` with `stonith_admin-fence-peer.sh` (a lost
+peer suspends I/O until that peer has been fenced through Pacemaker), and
+three-replica volumes in the quorum regime carry `quorum majority` +
+`on-no-quorum suspend-io`.
+
+The handler is the node-level one, and the reason is this section's own
+first paragraph. `crm-fence-peer.9.sh` — the handler DRBD's documentation
+reaches for first — works by placing a location constraint on a *promotable
+DRBD resource in the CIB*, and there is deliberately no such resource here.
+Given none to find, it exits with a code DRBD reads as "fence-peer helper
+broken", and DRBD then refuses the promotion: `Refusing to be Primary while
+peer is not outdated`. The failure is worst exactly when it matters — a
+degraded two-node volume, which is to say a peer that just died — and it
+presents as the survivor being unable to start the machine it saved, with
+QEMU reporting `Could not open '/dev/drbdN': Read-only file system`.
+`stonith_admin-fence-peer.sh` fences the peer *node* instead, through the
+one `fence_ipmilan` device per member the cluster already builds and live
+tests, and answers 7 — "peer node has been fenced" — which is a code DRBD
+acts on. It places no CIB constraint, so there is no `after-resync-target`
+unfence handler to match. Two-replica volumes in a quorum cluster carry neither — the
 cluster's own quorum and fencing protect them. Integrity over availability,
 always, and `render.rs` is tested for all three shapes.
+
+### The ports are opened where the traffic is
+
+`lumen-storage` installs two firewalld *service definitions* —
+`lumen-cluster` (corosync, UDP 5405–5406) and `lumen-replication` (DRBD
+7788–7799, the hypervisor's peer connection, the migration stream). A
+definition in `/usr/lib/firewalld/services` only names ports: nothing is
+open until it is bound to a zone, and that binding is `peer_prepare`'s
+first step, before the configuration is written. Replication and migration
+are bound on the Core interface alone; corosync is bound on Core and
+Management, because it rides both rings. A teardown removes exactly what
+the prepare added.
+
+Each service is added to the zone its interface is **already** in, rather
+than the interface being moved into a zone of Lumen's own. The console's
+port is bound to the default zone by the installer, and a node that
+reassigned its own management interface would come back answering on
+nothing — an appliance must not be able to lock its operator out by
+joining a cluster.
+
+Shipping a definition is not opening a port, and the gap between the two is
+not theoretical: it is what let a cluster form, gossip its record, create a
+volume on both members, and then leave DRBD in `Connecting` forever, with
+one replica `UpToDate`, the other `Inconsistent`, and the first machine to
+want its disk unable to start.
 
 ### The initial sync is skipped, deliberately
 
@@ -111,8 +152,9 @@ The same finishes-or-never-happened rule as a cluster create, pinned by
 ### Twelve volumes per cluster, and the number is honest
 
 Replication rides TCP ports 7788–7799 on the Core network — the exact range
-the firewalld service opens there — allocated per cluster, first free port
-wins. Twelve ports is twelve volumes per cluster: a v1 ceiling that matches
+the `lumen-replication` firewalld service names, bound to the Core
+interface's zone when the node is prepared (see "The ports are opened where
+the traffic is", below) — allocated per cluster, first free port wins. Twelve ports is twelve volumes per cluster: a v1 ceiling that matches
 the appliance's scale (a handful of VMs per cluster, one or two disks each),
 stated here rather than discovered in production. Resource names are
 prefixed with the cluster (`<cluster>-<volume>`), so two clusters sharing a

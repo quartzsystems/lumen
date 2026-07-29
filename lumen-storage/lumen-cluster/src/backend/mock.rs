@@ -27,6 +27,8 @@ struct Inner {
     fail_standby: Option<String>,
     // What the node was asked to do, for assertions.
     written_configs: Vec<(String, String)>,
+    /// Every firewall adjustment, in order: (core, management, open).
+    cluster_ports: Vec<(String, Option<String>, bool)>,
     stack_enabled: bool,
     config_removed: bool,
     properties: Vec<(String, String)>,
@@ -222,6 +224,11 @@ impl MockBackend {
 
     pub fn written_configs(&self) -> Vec<(String, String)> {
         self.inner.lock().unwrap().written_configs.clone()
+    }
+
+    /// Every firewall adjustment, in order: (core, management, open).
+    pub fn cluster_ports(&self) -> Vec<(String, Option<String>, bool)> {
+        self.inner.lock().unwrap().cluster_ports.clone()
     }
 
     pub fn stack_enabled(&self) -> bool {
@@ -442,6 +449,23 @@ impl ClusterBackend for MockBackend {
             .written_configs
             .push((conf.to_string(), authkey.to_string()));
         inner.preflight.already_clustered = true;
+        Ok(())
+    }
+
+    async fn set_cluster_ports(
+        &self,
+        core: &str,
+        management: Option<&str>,
+        open: bool,
+    ) -> Result<()> {
+        if let Some(err) = self.take_failure() {
+            return Err(err);
+        }
+        self.inner.lock().unwrap().cluster_ports.push((
+            core.to_string(),
+            management.map(str::to_string),
+            open,
+        ));
         Ok(())
     }
 

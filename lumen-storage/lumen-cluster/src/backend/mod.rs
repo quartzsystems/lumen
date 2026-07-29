@@ -57,6 +57,26 @@ pub trait ClusterBackend: Send + Sync {
     /// privileged, because the sandbox keeps `/etc` read-only.
     async fn write_cluster_config(&self, conf: &str, authkey: &str) -> Result<()>;
 
+    /// Let the cluster's own traffic through the host firewall on the
+    /// interfaces that carry it, and take it away again on teardown.
+    ///
+    /// `lumen-storage` installs two firewalld *service definitions*
+    /// (`lumen-cluster`, `lumen-replication`), but a definition in
+    /// `/usr/lib/firewalld/services` only names ports — nothing is open
+    /// until a definition is bound to a zone, and that is what this does.
+    /// Replication and live migration ride the Core interface alone;
+    /// corosync rides both rings, so its service is bound on Management
+    /// too. Each service is added to the zone the interface is *already*
+    /// in rather than moving the interface to a zone of ours: the console
+    /// port is bound to the default zone at install, and a node that
+    /// reassigned its own management interface would answer on nothing.
+    async fn set_cluster_ports(
+        &self,
+        core: &str,
+        management: Option<&str>,
+        open: bool,
+    ) -> Result<()>;
+
     /// `systemctl enable --now corosync pacemaker`. Enabled here and only
     /// here: the packages ship presets that keep both off, because a node
     /// that is not in a cluster must not start half of one at boot.

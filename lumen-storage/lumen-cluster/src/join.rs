@@ -125,6 +125,19 @@ pub fn judge_preflight(
     }
 }
 
+/// One member's Management interface, for the ports the second corosync ring
+/// needs open. `None` where the networks carry no seat for that node — the
+/// validation refuses such a definition long before here, so this is a
+/// belt-and-braces `None` rather than a case the caller has to handle.
+fn management_interface(networks: &ClusterNetworks, node: &str) -> Option<String> {
+    networks
+        .management
+        .members
+        .iter()
+        .find(|m| m.node == node)
+        .map(|m| m.interface.clone())
+}
+
 /// The Core-network seat a member is given during prepare: the one piece of
 /// addressing the workflow creates rather than adopts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,6 +161,17 @@ pub struct PreparePayload {
     /// an encoding step.
     pub authkey: String,
     pub core: CoreAssignment,
+    /// The Management interface, for the second corosync ring's ports. Not
+    /// a [`CoreAssignment`]: the Management seat is adopted, never created,
+    /// so the interface's name is the whole of what the prepare needs.
+    ///
+    /// Defaulted rather than required because this payload crosses versions
+    /// during a rolling update — a member still running the older control
+    /// plane sends none, and a node that opens the Core ports and not the
+    /// second ring's is strictly better off than one that refuses the
+    /// prepare outright.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub management_interface: Option<String>,
 }
 
 /// What teardown needs to know to put a node back exactly as it was.
@@ -157,6 +181,10 @@ pub struct TeardownPayload {
     /// The Core interface whose address the prepare assigned, to be released
     /// again. `None` tears down configuration only.
     pub core_interface: Option<String>,
+    /// The Management interface, so the second ring's ports close with the
+    /// rest. Same cross-version default as [`PreparePayload`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub management_interface: Option<String>,
 }
 
 /// A regenerated configuration for a member already in the cluster — the
@@ -468,6 +496,7 @@ pub async fn run_create(
                         .iter()
                         .find(|m| m.node == node.name)
                         .map(|m| m.interface.clone()),
+                    management_interface: management_interface(&networks, &node.name),
                 };
                 match peers.teardown(node, &payload).await {
                     Ok(()) => progress.set_step("unwind", Some(&node.name), StepState::Done, None),
@@ -643,6 +672,7 @@ async fn drive(
             corosync_conf: conf.clone(),
             authkey: authkey.clone(),
             core,
+            management_interface: management_interface(networks, &node.name),
         };
         touched += 1;
         if let Err(err) = peers.prepare(node, &payload).await {

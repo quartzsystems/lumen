@@ -1520,6 +1520,17 @@ impl ClusterService {
             )
             .await?;
         }
+        // Before the configuration, because a node whose stack starts into a
+        // closed firewall is a cluster that forms on paper and replicates
+        // nowhere: the ports the corosync rings and DRBD need are declared
+        // by the package and bound here, on the interfaces that carry them.
+        self.backend
+            .set_cluster_ports(
+                &core.interface,
+                payload.management_interface.as_deref(),
+                true,
+            )
+            .await?;
         self.backend
             .write_cluster_config(&payload.corosync_conf, &payload.authkey)
             .await
@@ -1545,6 +1556,14 @@ impl ClusterService {
         note(self.backend.disable_stack().await);
         note(self.backend.remove_cluster_config().await);
         if let Some(interface) = &payload.core_interface {
+            // The ports close before the address goes: both are things this
+            // node opened for a cluster it is leaving, and neither should
+            // outlive it.
+            note(
+                self.backend
+                    .set_cluster_ports(interface, payload.management_interface.as_deref(), false)
+                    .await,
+            );
             // The seat is released, not the link: a bond the operator built
             // before the create outlives the cluster that borrowed it.
             note(
@@ -1717,6 +1736,13 @@ impl ClusterService {
                 core_interface: record
                     .networks
                     .core
+                    .members
+                    .iter()
+                    .find(|m| m.node == node.name)
+                    .map(|m| m.interface.clone()),
+                management_interface: record
+                    .networks
+                    .management
                     .members
                     .iter()
                     .find(|m| m.node == node.name)
@@ -1959,6 +1985,13 @@ impl ClusterService {
             corosync_conf: conf.clone(),
             authkey: authkey.clone(),
             core: plan.core.clone(),
+            management_interface: plan
+                .networks
+                .management
+                .members
+                .iter()
+                .find(|m| m.node == plan.newcomer.name)
+                .map(|m| m.interface.clone()),
         };
         if let Err(err) = self.peers.prepare(&plan.newcomer, &payload).await {
             self.progress.set_step(
@@ -2163,6 +2196,13 @@ impl ClusterService {
         let payload = crate::join::TeardownPayload {
             cluster: plan.cluster.clone(),
             core_interface: Some(plan.core.interface.clone()),
+            management_interface: plan
+                .networks
+                .management
+                .members
+                .iter()
+                .find(|m| m.node == plan.newcomer.name)
+                .map(|m| m.interface.clone()),
         };
         if let Err(err) = self.peers.teardown(&plan.newcomer, &payload).await {
             tracing::error!(node = %plan.newcomer.name, "the newcomer did not unwind: {err}");
@@ -3186,6 +3226,108 @@ mod tests {
             .iter()
             .filter(|s| s.step == "fence")
             .all(|s| s.state == crate::join::StepState::Done));
+    }
+
+    /// A prepare opens the ports the cluster's own traffic needs, on the
+    /// interfaces that carry it, and a teardown closes them again.
+    ///
+    /// This is the step whose absence let a cluster form and replicate
+    /// nowhere: the package ships the two firewalld service definitions, but
+    /// a definition names ports and binds nothing, so DRBD sat in Connecting
+    /// and the first machine to want its disk could not be started.
+    #[tokio::test]
+    async fn a_prepare_opens_the_clusters_ports_and_a_teardown_closes_them() {
+        let backend = Arc::new(MockBackend::appliance());
+        let service = Arc::new(
+            ClusterService::new(
+                backend.clone() as Arc<dyn ClusterBackend>,
+                Arc::new(MockPeers::new()),
+                network(),
+                &test_dir("ports"),
+                "0.3.0",
+            )
+            .with_node("alpha-1"),
+        );
+
+        let payload = crate::join::PreparePayload {
+            cluster: "alpha".into(),
+            corosync_conf: "totem {}\n".into(),
+            authkey: "k".into(),
+            core: crate::join::CoreAssignment {
+                interface: "nic1".into(),
+                address: "10.10.0.1".parse().unwrap(),
+                prefix: 24,
+                mtu: 9000,
+            },
+            management_interface: Some("nic0".into()),
+        };
+        service.peer_prepare(&payload).await.unwrap();
+        assert_eq!(
+            backend.cluster_ports(),
+            vec![("nic1".to_string(), Some("nic0".to_string()), true)]
+        );
+        // The configuration still landed — opening the ports is a step
+        // before it, not instead of it.
+        assert_eq!(backend.written_configs().len(), 1);
+
+        service
+            .peer_teardown(&crate::join::TeardownPayload {
+                cluster: "alpha".into(),
+                core_interface: Some("nic1".into()),
+                management_interface: Some("nic0".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.cluster_ports().last().unwrap(),
+            &("nic1".to_string(), Some("nic0".to_string()), false)
+        );
+    }
+
+    /// The prepare payload carries the Management interface, so the node
+    /// receiving it can open the second corosync ring's ports too.
+    #[tokio::test]
+    async fn a_prepared_member_is_told_both_of_its_cluster_interfaces() {
+        let membership = membership_of(&[("alpha-1", None), ("alpha-2", None)]);
+        let backend = Arc::new(MockBackend::appliance());
+        let peers = Arc::new(
+            MockPeers::new()
+                .with_backend(backend.clone())
+                .with_healthy_node("alpha-1", "0.3.0", &["nic0", "nic1"])
+                .with_healthy_node("alpha-2", "0.3.0", &["nic0", "nic1"]),
+        );
+        let service = Arc::new(
+            ClusterService::new(
+                backend.clone() as Arc<dyn ClusterBackend>,
+                peers.clone(),
+                network(),
+                &test_dir("prepare-interfaces"),
+                "0.3.0",
+            )
+            .with_node("alpha-1")
+            .with_form_poll(Duration::from_millis(5))
+            .with_environment(&membership),
+        );
+
+        service
+            .create_cluster(create_request(&["alpha-1", "alpha-2"]))
+            .await
+            .unwrap();
+        finished(&service).await;
+
+        let prepared = peers.prepared();
+        assert_eq!(prepared.len(), 2, "{prepared:?}");
+        for (node, payload) in &prepared {
+            assert!(
+                payload.management_interface.is_some(),
+                "{node} was told no Management interface: {payload:?}"
+            );
+            assert_ne!(
+                payload.management_interface.as_deref(),
+                Some(payload.core.interface.as_str()),
+                "{node}: the two rings must not be read as one interface"
+            );
+        }
     }
 
     /// The acceptance criterion: a create failed mid-way unwinds completely —

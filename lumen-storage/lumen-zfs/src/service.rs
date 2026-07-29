@@ -1302,7 +1302,10 @@ mod tests {
         );
         let explained = with_remedy(refusal).to_string();
         // zpool's own words survive; the sentence after them is ours.
-        assert!(explained.contains("corrupt primary EFI label"), "{explained}");
+        assert!(
+            explained.contains("corrupt primary EFI label"),
+            "{explained}"
+        );
         assert!(explained.contains("Disks page"), "{explained}");
 
         // Everything else is left exactly as the tool said it.
