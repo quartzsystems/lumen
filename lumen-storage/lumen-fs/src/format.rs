@@ -77,7 +77,7 @@ pub const WAL_AREA_START: u64 = ANCHOR_AREA_START + SECTOR_SIZE * ANCHOR_SLOTS;
 /// Encoded sizes. The structs occupy the front of their sector; the rest is
 /// zeros.
 const SUPERBLOCK_LEN: usize = 128;
-const ANCHOR_LEN: usize = 104;
+const ANCHOR_LEN: usize = 112;
 const SEGMENT_HEADER_LEN: usize = 72;
 pub const RECORD_HEADER_LEN: usize = 64;
 
@@ -207,15 +207,22 @@ impl Superblock {
 ///   16..24  wal_replay_offset   u64   absolute; where replay begins
 ///   24..32  wal_replay_seq      u64   the seq expected there
 ///   32..40  wal_epoch           u64   the epoch floor for replay
-///   40..72  manifest_hash       the vdisk manifest block; all-zeros = none
-///   72..104 checksum            BLAKE3 of bytes 0..72
+///   40..48  era                 u64   the data generation (replication)
+///   48..80  manifest_hash       the vdisk manifest block; all-zeros = none
+///   80..112 checksum            BLAKE3 of bytes 0..80
 /// ```
+///
+/// The era is the replication layer's generation counter — bumped when a
+/// survivor continues alone under a fence verdict, adopted by a peer that
+/// resyncs. It lives in the anchor because "I went on without my peer" is
+/// a fact a crashed survivor must still know at its next open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Anchor {
     pub generation: u64,
     pub wal_replay_offset: u64,
     pub wal_replay_seq: u64,
     pub wal_epoch: u64,
+    pub era: u64,
     pub manifest_hash: [u8; 32],
 }
 
@@ -227,9 +234,10 @@ impl Anchor {
         put_u64(&mut buf, 16, self.wal_replay_offset);
         put_u64(&mut buf, 24, self.wal_replay_seq);
         put_u64(&mut buf, 32, self.wal_epoch);
-        buf[40..72].copy_from_slice(&self.manifest_hash);
-        let check = full_check(&buf[0..72]);
-        buf[72..104].copy_from_slice(&check);
+        put_u64(&mut buf, 40, self.era);
+        buf[48..80].copy_from_slice(&self.manifest_hash);
+        let check = full_check(&buf[0..80]);
+        buf[80..112].copy_from_slice(&check);
         buf
     }
 
@@ -239,16 +247,17 @@ impl Anchor {
         if buf.len() < ANCHOR_LEN || &buf[0..8] != ANCHOR_MAGIC {
             return None;
         }
-        if full_check(&buf[0..72]) != buf[72..104] {
+        if full_check(&buf[0..80]) != buf[80..112] {
             return None;
         }
         let mut manifest_hash = [0u8; 32];
-        manifest_hash.copy_from_slice(&buf[40..72]);
+        manifest_hash.copy_from_slice(&buf[48..80]);
         Some(Anchor {
             generation: get_u64(buf, 8),
             wal_replay_offset: get_u64(buf, 16),
             wal_replay_seq: get_u64(buf, 24),
             wal_epoch: get_u64(buf, 32),
+            era: get_u64(buf, 40),
             manifest_hash,
         })
     }
@@ -440,11 +449,12 @@ mod tests {
             wal_replay_offset: WAL_AREA_START + 4096,
             wal_replay_seq: 88,
             wal_epoch: 4,
+            era: 3,
             manifest_hash: [9; 32],
         };
         let mut buf = anchor.encode();
         assert_eq!(Anchor::decode(&buf), Some(anchor));
-        for bit_of in [0usize, 10, 20, 36, 50, 90] {
+        for bit_of in [0usize, 10, 20, 36, 44, 60, 100] {
             buf[bit_of] ^= 0x01;
             assert_eq!(Anchor::decode(&buf), None, "byte {bit_of}");
             buf[bit_of] ^= 0x01;

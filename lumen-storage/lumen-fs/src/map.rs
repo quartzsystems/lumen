@@ -156,6 +156,22 @@ fn fold_level<D: Disk>(
     }
 }
 
+/// The non-zero child hashes of a raw node payload — what a peer resyncing
+/// by tree diff needs, without knowing anything else about the node. The
+/// caller tracks levels; a level-0 node's children are data blocks.
+pub fn children(node: &[u8]) -> Vec<BlockHash> {
+    node.chunks_exact(ENTRY_LEN)
+        .filter_map(|chunk| {
+            let bytes: [u8; ENTRY_LEN] = chunk.try_into().unwrap();
+            if bytes == ZERO_ENTRY {
+                None
+            } else {
+                Some(BlockHash::from_bytes(bytes))
+            }
+        })
+        .collect()
+}
+
 /// What [`walk`] visits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MapItem {

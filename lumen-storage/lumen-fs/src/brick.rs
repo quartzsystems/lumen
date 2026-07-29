@@ -173,6 +173,7 @@ impl<D: Disk> Brick<D> {
             wal_replay_offset: WAL_AREA_START,
             wal_replay_seq: 1,
             wal_epoch: 1,
+            era: 1,
             manifest_hash: [0; 32],
         };
         let mut anchor_sector = vec![0u8; SECTOR_SIZE as usize];

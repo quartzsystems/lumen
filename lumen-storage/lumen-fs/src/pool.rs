@@ -45,6 +45,7 @@ use crate::error::{FsError, Result};
 use crate::format::Anchor;
 use crate::hash::{hash_block, BlockHash};
 use crate::map;
+use crate::repl::{SnapshotOffer, VdiskOffer};
 use crate::wal::Wal;
 
 /// What a scrub found. Empty vectors are the healthy answer.
@@ -92,6 +93,8 @@ pub struct Pool<D: Disk> {
     /// deterministically.
     snapshots: BTreeMap<(u64, u64), SnapshotState>,
     anchor_generation: u64,
+    /// The data generation (replication's era) — see format.rs's Anchor.
+    era: u64,
 }
 
 /// What a WAL entry says. The encoding is fixed little-endian, one byte of
@@ -226,6 +229,7 @@ impl<D: Disk> Pool<D> {
             vdisks,
             snapshots,
             anchor_generation: anchor.generation,
+            era: anchor.era,
         };
 
         // Replay: apply each entry only while everything it references
@@ -617,6 +621,7 @@ impl<D: Disk> Pool<D> {
             wal_replay_offset,
             wal_replay_seq,
             wal_epoch: self.wal.epoch(),
+            era: self.era,
             manifest_hash,
         })?;
         self.brick.flush()
@@ -743,6 +748,143 @@ impl<D: Disk> Pool<D> {
     /// The pool's block size — the unit bytes.rs translates to.
     pub fn block_size(&self) -> u32 {
         self.brick.block_size()
+    }
+
+    // -----------------------------------------------------------------
+    // The replication layer's entry points (repl.rs). Everything here is
+    // expressible through the public API's semantics; these exist so a
+    // peer's stream can move blocks by address instead of re-shipping
+    // payload logic through the guest-facing calls.
+
+    /// The data generation this pool's state belongs to.
+    pub fn era(&self) -> u64 {
+        self.era
+    }
+
+    /// This node is continuing without its peer, on a fence verdict the
+    /// caller holds: the state that follows belongs to a new generation,
+    /// and the fact is anchored before any of that state exists.
+    pub fn bump_era(&mut self) -> Result<()> {
+        self.era += 1;
+        self.checkpoint()
+    }
+
+    /// Store a payload without mapping it anywhere — a replicated block
+    /// arriving ahead of the operation that references it.
+    pub fn put_block(&mut self, payload: &[u8]) -> Result<BlockHash> {
+        self.brick.put(payload)
+    }
+
+    /// Whether the store holds a block, by address.
+    pub fn has_block(&self, hash: &BlockHash) -> bool {
+        self.brick.contains(hash)
+    }
+
+    /// A stored block's payload, by address — what a resync source serves.
+    pub fn block_payload(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>> {
+        self.brick.get(hash)
+    }
+
+    /// A map write whose payload is already in the store — the replicated
+    /// form of [`Pool::write_block`]. Refusing an absent block is what
+    /// keeps a reordered or truncated stream from mapping a promise the
+    /// store cannot keep.
+    pub fn write_block_prehashed(&mut self, vdisk: u64, index: u64, hash: BlockHash) -> Result<()> {
+        let state = self
+            .vdisks
+            .get(&vdisk)
+            .ok_or(FsError::UnknownVdisk(vdisk))?;
+        let capacity = self.capacity_of(state);
+        if index >= capacity {
+            return Err(FsError::OutOfRange { index, capacity });
+        }
+        if !self.brick.contains(&hash) {
+            return Err(FsError::Corrupt(
+                "a replicated write names a block the store does not hold",
+            ));
+        }
+        let entry = WalEntry::MapWrite { vdisk, index, hash };
+        self.wal.append(&mut self.brick, &entry.encode())?;
+        self.vdisks
+            .get_mut(&vdisk)
+            .unwrap()
+            .dirty
+            .insert(index, Some(hash));
+        Ok(())
+    }
+
+    /// The settled state a resync source offers: era, vdisks, snapshots,
+    /// roots. Meaningful only immediately after a checkpoint — the caller
+    /// owns that ordering.
+    pub fn sync_manifest(&self) -> (u64, Vec<VdiskOffer>, Vec<SnapshotOffer>) {
+        let mut vdisks: Vec<VdiskOffer> = self
+            .vdisks
+            .iter()
+            .map(|(id, state)| (*id, state.size_bytes, state.root))
+            .collect();
+        vdisks.sort_unstable_by_key(|(id, _, _)| *id);
+        let snapshots = self
+            .snapshots
+            .iter()
+            .map(|((vdisk, snapshot), state)| (*vdisk, *snapshot, state.size_bytes, state.root))
+            .collect();
+        (self.era, vdisks, snapshots)
+    }
+
+    /// Become the offered state: replace every vdisk and snapshot with the
+    /// source's, adopt its era, and anchor it all. The blocks under every
+    /// root must already be in the store — the resync's tree walk is what
+    /// put them there — and whatever this node held before becomes garbage
+    /// for the next collection. This is how a stale node stops being
+    /// stale, and the discard of its divergent unacknowledged history is
+    /// the point, not a side effect.
+    pub fn adopt_sync(
+        &mut self,
+        era: u64,
+        vdisks: &[VdiskOffer],
+        snapshots: &[SnapshotOffer],
+    ) -> Result<()> {
+        for (_, _, root) in vdisks {
+            if let Some(root) = root {
+                if !self.brick.contains(root) {
+                    return Err(FsError::Corrupt("adopting a root the store does not hold"));
+                }
+            }
+        }
+        for (_, _, _, root) in snapshots {
+            if let Some(root) = root {
+                if !self.brick.contains(root) {
+                    return Err(FsError::Corrupt("adopting a root the store does not hold"));
+                }
+            }
+        }
+        self.vdisks = vdisks
+            .iter()
+            .map(|(id, size_bytes, root)| {
+                (
+                    *id,
+                    VdiskState {
+                        size_bytes: *size_bytes,
+                        root: *root,
+                        dirty: BTreeMap::new(),
+                    },
+                )
+            })
+            .collect();
+        self.snapshots = snapshots
+            .iter()
+            .map(|(vdisk, snapshot, size_bytes, root)| {
+                (
+                    (*vdisk, *snapshot),
+                    SnapshotState {
+                        size_bytes: *size_bytes,
+                        root: *root,
+                    },
+                )
+            })
+            .collect();
+        self.era = era;
+        self.checkpoint()
     }
 
     /// One vdisk's size in bytes.

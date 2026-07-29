@@ -21,6 +21,7 @@
 //!   pool.rs     vdisks over the brick: write, read, flush, checkpoint,
 //!               snapshots, clones, rollback, GC, scrub
 //!   bytes.rs    the byte-granular view a block device speaks
+//!   repl.rs     two-node synchronous replication, sans-IO
 //! ```
 //!
 //! The durability contract, stated once and tested everywhere: a block is
@@ -38,6 +39,7 @@ pub mod format;
 pub mod hash;
 pub mod map;
 pub mod pool;
+pub mod repl;
 pub mod sim;
 pub mod wal;
 
@@ -47,4 +49,5 @@ pub use error::{FsError, Result};
 pub use format::{SECTOR_SIZE, SUPERBLOCK_SLOTS};
 pub use hash::{hash_block, BlockHash};
 pub use pool::{Pool, ScrubReport};
+pub use repl::{Effect, NodeId, PeerMessage, ReplNode, ReplOp, ReplState, SyncOffer};
 pub use sim::{SimDisk, SplitMix64};

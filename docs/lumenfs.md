@@ -44,8 +44,37 @@ and serves vdisk 1 over fixed-newstyle NBD, so the engine can take a real
 filesystem from a real kernel: `lumen-fs-nbd format <file> <bytes>
 <vdisk-bytes>`, `serve <file> <addr>`, `scrub <file>`. What remains before
 phase 2 (replication) is burn-in, not construction: real-hardware NBD
-smoke runs on the lumen boxes, then the slice-map and peer-WAL work
-begins.
+smoke runs on the lumen boxes.
+
+**Phase 2's two-node core is in.** `repl.rs` is a sans-IO `ReplNode` — no
+socket, no clock — that the simulation drives through failovers,
+partitions, and crashes. Only the operation stream and its payloads cross
+the wire: because map trees are canonical, shipping ops makes the nodes
+converge by construction, and each node keeps its own WAL, checkpoints,
+anchor, and collection uncoordinated. A guest flush completes only when
+both nodes hold the writes or a fence verdict says there is one node left
+— DRBD protocol C's guarantee, restated. **The engine never decides
+death**: `set_peer_fenced` is the cluster's verdict arriving from above
+(docs/cluster.md), and without it a partitioned node suspends forever,
+refusing writes and parking flushes. The verdict is made durable by the
+anchor's **era**, bumped before the survivor writes anything new, so a
+returning node knows which side is stale.
+
+Resync needs no dirty bitmap: it is a Merkle diff. The source checkpoints
+and offers its roots; the target walks down, transferring only subtrees
+whose hashes it lacks, then adopts the offer whole — which is also how its
+own divergent unacknowledged history is discarded. One subtlety is worth
+recording because the suite caught it: a target may *hold* an interior
+node whose children never arrived, if an earlier walk was cut short, so
+the walk descends into subtrees it already has rather than assuming a
+matching hash means a complete subtree. Skipping the *transfer* is the
+Merkle win; skipping the *verification* would be adopting a root over a
+hole. A second lesson from the same test: messages queued for a link that
+dies are dropped with it, or a stale reply arrives inside a fresh session
+and is mistaken for an answer to it.
+
+Still ahead: writer leases hardened for live migration, streaming writes
+while a resync runs, and the slice map that takes this past two nodes.
 
 ## Why not Ceph, revisited
 

@@ -56,6 +56,11 @@ pub enum FsError {
     /// A vdisk delete refused because snapshots still pin its history —
     /// deleting them first is an explicit act, not a cascade.
     HasSnapshots(u64),
+    /// A write on a node that does not hold the vdisk's writer role.
+    NotWriter(u64),
+    /// Replication cannot acknowledge: the peer is unreachable and no
+    /// verdict says it is dead. Integrity over availability, always.
+    Suspended,
 }
 
 impl fmt::Display for FsError {
@@ -103,6 +108,13 @@ impl fmt::Display for FsError {
             FsError::HasSnapshots(id) => write!(
                 f,
                 "vdisk {id} still has snapshots; delete them before the vdisk"
+            ),
+            FsError::NotWriter(id) => {
+                write!(f, "this node does not hold the writer role for vdisk {id}")
+            }
+            FsError::Suspended => write!(
+                f,
+                "i/o is suspended: the peer is unreachable and not known dead"
             ),
         }
     }
