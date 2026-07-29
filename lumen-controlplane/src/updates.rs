@@ -37,37 +37,62 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use lumen_cluster::join::WorkflowPhase;
 use lumen_update::{ApplyRequest, RebootState};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
 use crate::AppState;
 
+/// Which of the two decisions a transaction was.
+///
+/// An enum rather than the `&'static str` this used to be, because a
+/// cluster-wide update reads a peer's transaction back off the wire and a
+/// borrowed string cannot be deserialized. The JSON is identical —
+/// `"ordinary"` and `"platform"`, the same two words the console already
+/// switches on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransactionKind {
+    Ordinary,
+    Platform,
+}
+
+impl TransactionKind {
+    fn of(request: &ApplyRequest) -> Self {
+        if request.platform {
+            TransactionKind::Platform
+        } else {
+            TransactionKind::Ordinary
+        }
+    }
+}
+
 /// The whole of an update, as the console polls it.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateProgress {
     pub node: String,
     /// `ordinary` or `platform` — which of the two decisions this was, so a
     /// console that reloaded mid-transaction still knows what it is watching.
-    pub kind: &'static str,
+    pub kind: TransactionKind,
     pub phase: WorkflowPhase,
     /// Unix seconds. The console shows elapsed time against the node's clock
     /// rather than counting locally, exactly as the power page does.
     pub started_at: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<u64>,
     /// Who asked, as the `user@realm` principal.
     pub by: String,
     /// What the package manager reported changing. Empty until it has
     /// finished.
+    #[serde(default)]
     pub changed: Vec<String>,
     /// The tail of its output. The whole of it is in the journal.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Read after the transaction: whether this node is now running a kernel
     /// it no longer has. `None` while it is still running.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reboot: Option<RebootState>,
 }
 
@@ -180,11 +205,7 @@ pub async fn begin(
 
     let progress = UpdateProgress {
         node: state.updates.node().to_string(),
-        kind: if request.platform {
-            "platform"
-        } else {
-            "ordinary"
-        },
+        kind: TransactionKind::of(&request),
         phase: WorkflowPhase::Running,
         started_at: now(),
         finished_at: None,

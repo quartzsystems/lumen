@@ -96,3 +96,72 @@ pub async fn progress(
 ) -> Json<Option<UpdateProgress>> {
     Json(state.update_job.get())
 }
+
+// --- the environment ---------------------------------------------------------
+//
+// The same four questions asked of every member. A separate set of routes
+// rather than a widening of the four above, for the reason `inventory` gives:
+// `/api/system/...` means *this appliance*, and every write already on that
+// prefix is written against that meaning.
+
+/// GET /api/environment/updates — what every member has waiting.
+///
+/// Never asks any member's repositories, so opening the console costs one
+/// round trip per member and no traffic beyond the cluster. A member that
+/// could not be asked comes back carrying the reason rather than being dropped
+/// from the list — during a walk, an unreachable member is usually the one
+/// restarting its control plane, which is the update working.
+pub async fn cluster_updates(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+) -> Json<crate::cluster_updates::ClusterUpdateView> {
+    Json(crate::cluster_updates::environment(&state).await)
+}
+
+/// POST /api/environment/updates/check — every member asks its repositories
+/// now, concurrently.
+pub async fn cluster_check(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+) -> Json<crate::cluster_updates::ClusterUpdateView> {
+    Json(crate::cluster_updates::check(&state).await)
+}
+
+/// POST /api/environment/updates/apply — update every member, one at a time.
+///
+/// `{}` installs the ordinary updates in place. `{"rolling": true,
+/// "i_understand_each_node_restarts": true}` takes each member that needs a
+/// restart through maintenance, its kernel, and a reboot before the next one
+/// is touched.
+///
+/// **202 Accepted** with the walk's first progress: the members are named and
+/// the first one is starting, and the walk runs on from there for as long as
+/// the transactions take. Watched through [`cluster_progress`].
+pub async fn cluster_apply(
+    session: Session,
+    State(state): State<Arc<AppState>>,
+    raw: Body,
+) -> Result<axum::response::Response, ApiError> {
+    let request: crate::cluster_updates::RollRequest = body(raw)?;
+    let progress = crate::cluster_updates::begin(
+        &state,
+        &format!("{}@{}", session.0.sub, session.0.realm),
+        request,
+    )
+    .await?;
+    Ok((axum::http::StatusCode::ACCEPTED, Json(progress)).into_response())
+}
+
+/// GET /api/environment/updates/progress — the walk, running or finished.
+///
+/// `null` when this node is not running one — which is also what it answers
+/// once the walk has updated *this* node, because installing Lumen restarts
+/// the control plane and takes the record with it. That is not a gap the
+/// console has to paper over: `GET /api/environment/updates` reads what every
+/// member actually ended up with, which is the better answer anyway.
+pub async fn cluster_progress(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+) -> Json<Option<crate::cluster_updates::RollProgress>> {
+    Json(state.roll.get())
+}

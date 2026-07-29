@@ -182,6 +182,7 @@ async fn harness(tag: &str, signed_in_as: &str) -> Harness {
         )),
         drain: Default::default(),
         update_job: Default::default(),
+        roll: Default::default(),
     }));
 
     let response = router

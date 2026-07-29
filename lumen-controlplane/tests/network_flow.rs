@@ -131,6 +131,7 @@ async fn harness(tag: &str) -> Harness {
         )),
         drain: Default::default(),
         update_job: Default::default(),
+        roll: Default::default(),
     }));
 
     // Sign in once; every networking route requires the session.

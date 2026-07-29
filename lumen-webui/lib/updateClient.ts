@@ -112,6 +112,146 @@ export const installPlatform = (acknowledged: boolean): Promise<UpdateProgress> 
 export const fetchUpdateProgress = (): Promise<UpdateProgress | null> =>
   apiFetch<UpdateProgress | null>("/system/updates/progress");
 
+// --- the environment ---------------------------------------------------------
+
+/// One member's answer, from one round trip: what it has waiting, and what it
+/// is installing.
+export interface NodeUpdates {
+  view: UpdateView;
+  progress?: UpdateProgress | null;
+}
+
+/// One member as the cluster table carries it.
+///
+/// `reachable: false` with an `error` is a member that is in the environment
+/// and could not be asked — a different thing from a member with nothing
+/// waiting, and during an environment-wide update it is the *expected* state
+/// of whichever member is restarting its control plane.
+export interface MemberUpdates {
+  node: string;
+  local: boolean;
+  reachable: boolean;
+  error?: string | null;
+  updates?: NodeUpdates | null;
+}
+
+export interface ClusterCounts {
+  members: number;
+  reachable: number;
+  members_with_updates: number;
+  members_with_platform: number;
+  updates: number;
+  security: number;
+  platform: number;
+  restarts_required: number;
+  platform_blocked: number;
+}
+
+export interface ClusterUpdateView {
+  members: MemberUpdates[];
+  counts: ClusterCounts;
+}
+
+export type StepState = "pending" | "running" | "done" | "failed" | "unwound";
+
+/// Where one member is in its leg. An ordinary update only ever reaches
+/// `installing`; a rolling one goes through all of them.
+export type MemberStage =
+  | "waiting"
+  | "checking"
+  | "draining"
+  | "installing"
+  | "restarting"
+  | "rejoining"
+  | "returning"
+  | "finished";
+
+/// A machine that would not move off a node being drained.
+export interface Stranded {
+  vmid: number;
+  name: string;
+  reason: string;
+}
+
+/// One member's leg of an environment-wide update.
+export interface MemberStep {
+  node: string;
+  state: StepState;
+  stage: MemberStage;
+  detail?: string | null;
+  changed: string[];
+  restart_required: boolean;
+  /// Machines that would not move off during the drain. Non-empty is why a
+  /// rolling update stopped rather than restarting the node under them.
+  stranded: Stranded[];
+}
+
+/// `ordinary` installs in place; `rolling` restarts each node as it goes.
+export type RollKind = "ordinary" | "rolling";
+
+export interface RollProgress {
+  kind: RollKind;
+  phase: UpdatePhase;
+  by: string;
+  started_at: number;
+  finished_at?: number;
+  error?: string;
+  /// One per member, in the order they are visited — every peer, then the
+  /// node coordinating. Named in full before anything is installed.
+  steps: MemberStep[];
+  /// What the update deliberately did not do. Set when a rolling update
+  /// finishes with the coordinating node still needing a restart — a node
+  /// cannot drive a rolling update through its own reboot.
+  left_to_you?: string | null;
+}
+
+/// What every member has waiting. Never asks any member's repositories, so
+/// this is safe on every page load.
+export const fetchClusterUpdates = (): Promise<ClusterUpdateView> =>
+  apiFetch<ClusterUpdateView>("/environment/updates");
+
+/// Every member asks its repositories now, concurrently.
+export const checkClusterUpdates = (): Promise<ClusterUpdateView> =>
+  post<ClusterUpdateView>("/environment/updates/check");
+
+/// Install the ordinary updates on every member, one at a time. Nothing is
+/// drained and nothing restarts; the kernel is not moved by this.
+export const installClusterUpdates = (): Promise<RollProgress> =>
+  post<RollProgress>("/environment/updates/apply", {});
+
+/// Take every member that needs a restart through maintenance, its kernel, and
+/// a reboot — one at a time, waiting for each to rejoin before the next.
+///
+/// The acknowledgement is required by the backend and is not defaulted here on
+/// purpose: the caller has to have shown the operator what they are agreeing
+/// to.
+export const rollClusterUpdates = (acknowledged: boolean): Promise<RollProgress> =>
+  post<RollProgress>("/environment/updates/apply", {
+    rolling: true,
+    i_understand_each_node_restarts: acknowledged,
+  });
+
+/// What one member's stage reads as in the table, while a walk is running.
+export const STAGE_LABEL: Record<MemberStage, string> = {
+  waiting: "waiting",
+  checking: "checking",
+  draining: "moving machines off",
+  installing: "installing",
+  restarting: "restarting",
+  rejoining: "coming back",
+  returning: "back into service",
+  finished: "finished",
+};
+
+/// The walk, running or finished.
+///
+/// `null` once it has updated the coordinating node, because installing Lumen
+/// restarts the control plane holding this record. That is not a gap to paper
+/// over: `fetchClusterUpdates` reads what every member actually ended up with,
+/// which is the better answer anyway.
+export const fetchRollProgress = (): Promise<RollProgress | null> =>
+  apiFetch<RollProgress | null>("/environment/updates/progress");
+
 // --- display helpers ---------------------------------------------------------
 
 export const KIND_LABEL: Record<UpdateKind, string> = {

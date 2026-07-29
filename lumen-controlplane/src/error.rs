@@ -76,6 +76,26 @@ pub enum ApiError {
     Internal(anyhow::Error),
 }
 
+/// The sentence a client would be shown, without the status that carries it.
+///
+/// Here for the callers that surface a refusal somewhere other than a
+/// response: the environment-wide update puts one member's refusal into that
+/// member's step, where an HTTP status has nowhere to go. `Internal` yields
+/// the same generic line it gives a client — an error worth hiding from a
+/// browser is worth hiding from a progress feed the browser then renders.
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApiError::Unauthorized => f.write_str("Invalid username or password."),
+            ApiError::BadRequest(message)
+            | ApiError::NotFound(message)
+            | ApiError::Conflict(message) => f.write_str(message),
+            ApiError::Validation(rejection) => f.write_str(&rejection.message),
+            ApiError::Internal(_) => f.write_str("Internal server error."),
+        }
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         // Validation answers carry an extra `errors` array alongside the

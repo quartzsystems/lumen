@@ -127,6 +127,193 @@ pub async fn wipe_disk(
     ))
 }
 
+// --- updates -----------------------------------------------------------------
+
+/// POST /api/peer/system/updates — what this node has waiting, and what it is
+/// installing.
+///
+/// Never asks the repositories, exactly as the operator-facing read does not:
+/// an environment-wide page load must not turn into one network request per
+/// member over links this node knows nothing about.
+///
+/// Both halves in one answer for the reason `inventory` returns three: they
+/// are read here at the same moment, and splitting them would only let the two
+/// halves of one row disagree about whether this node is installing something.
+pub async fn updates(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<crate::cluster_updates::NodeUpdates>, ApiError> {
+    Ok(Json(crate::cluster_updates::NodeUpdates {
+        view: state.updates.view().await?,
+        progress: state.update_job.get(),
+    }))
+}
+
+/// POST /api/peer/system/updates/check — ask this node's repositories now, on
+/// behalf of an operator working from another member's console.
+///
+/// A failed check is not an error here. The service records the reason and the
+/// view carries it, and a member whose mirror is unreachable still has a
+/// reboot state and a previous answer worth putting in the table — the same
+/// judgement `GET /api/system/updates` makes about its own page.
+pub async fn check_updates(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<crate::cluster_updates::NodeUpdates>, ApiError> {
+    if let Err(err) = state.updates.check().await {
+        tracing::warn!("a peer asked for a check and the repositories could not be reached: {err}");
+    }
+    Ok(Json(crate::cluster_updates::NodeUpdates {
+        view: state.updates.view().await?,
+        progress: state.update_job.get(),
+    }))
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerApplyRequest {
+    #[serde(default)]
+    pub platform: bool,
+    /// Who asked, as the coordinator knows them.
+    ///
+    /// Taken from the wire, unlike the acknowledgement below it, and the
+    /// difference is the point: this is a label for the journal, not a
+    /// permission. The peer ticket is what authorizes the call at all; what
+    /// this buys is that an operator reading node-b's transaction sees the
+    /// person who pressed the button rather than only the node that relayed
+    /// it. Absent, or from a caller that sends nothing, it falls back to the
+    /// calling node's name.
+    #[serde(default)]
+    pub by: Option<String>,
+}
+
+/// POST /api/peer/system/updates/apply — start installing here, on behalf of
+/// an operator working from another member's console.
+///
+/// The acknowledgement is not taken from the wire, for the same reason
+/// `create_pool` and `wipe_disk` do not take theirs: consent was given to the
+/// console the operator is looking at, and a peer route that accepted "yes,
+/// move the kernel" from a body would be a second, quieter way to replace a
+/// node's kernel.
+///
+/// Every guard that matters is still this node's. Whether the platform set
+/// resolves *here* is a question only this node's package manager can answer,
+/// and it is asked here, against this node's repositories — the coordinator's
+/// belief about it carries no weight.
+pub async fn apply_updates(
+    peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<PeerApplyRequest>,
+) -> Result<Json<crate::updates::UpdateProgress>, ApiError> {
+    let by = match request.by.as_deref() {
+        Some(principal) => format!("{principal} via {}", peer.0),
+        None => peer.0.clone(),
+    };
+    Ok(Json(
+        crate::updates::begin(
+            &state,
+            &by,
+            lumen_update::ApplyRequest {
+                platform: request.platform,
+                i_understand_the_kernel_moves: request.platform,
+            },
+        )
+        .await?,
+    ))
+}
+
+// --- maintenance and power, for a rolling update -----------------------------
+//
+// These four exist for one caller: the rolling update in
+// `src/cluster_updates.rs`, which takes each member through maintenance,
+// installs its kernel, restarts it, and waits for it to rejoin.
+//
+// They are deliberately *not* a peer copy of the operator-facing maintenance
+// routes, which refuse to act on any node but their own ("its machines can
+// only be moved by the node running them"). That rule is unchanged and is why
+// these exist: the work still happens here, on the node it is about, through
+// the same `crate::maintenance` entry points the local console calls. What
+// crosses the wire is only the instruction to begin.
+
+/// POST /api/peer/system/maintenance — take this node out of service and
+/// drain it, on behalf of a rolling update running elsewhere.
+///
+/// Answers as soon as the node is flagged and the drain is published; the
+/// machines are still moving. The caller polls [`drain_progress`].
+///
+/// Every guard is this node's. Whether the cluster can spare it, whether its
+/// machines have anywhere to go, and which member each one may move to are all
+/// decided here, because this is the only node that can see them.
+pub async fn enter_maintenance(
+    peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<PeerMaintenanceRequest>,
+) -> Result<Json<crate::maintenance::MaintenanceProgress>, ApiError> {
+    let by = match request.by.as_deref() {
+        Some(principal) => format!("{principal} via {}", peer.0),
+        None => peer.0.clone(),
+    };
+    Ok(Json(crate::maintenance::begin(&state, &by, true).await?))
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerMaintenanceRequest {
+    /// Who asked. A label for this node's own record, as on the apply route.
+    #[serde(default)]
+    pub by: Option<String>,
+}
+
+/// POST /api/peer/system/maintenance/progress — the drain, while there is one.
+pub async fn drain_progress(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+) -> Json<Option<crate::maintenance::MaintenanceProgress>> {
+    Json(state.drain.get())
+}
+
+/// POST /api/peer/system/maintenance/exit — put this node back into service.
+///
+/// Machines that were evacuated stay where they went. Failback is an
+/// operator's decision here exactly as it is after an HA restart, and a
+/// rolling update that moved work twice per node would take twice as long and
+/// twice the risk to end up where it started.
+pub async fn exit_maintenance(
+    peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<PeerMaintenanceRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let by = match request.by.as_deref() {
+        Some(principal) => format!("{principal} via {}", peer.0),
+        None => peer.0.clone(),
+    };
+    crate::maintenance::end(&state, &by).await?;
+    Ok(Json(serde_json::json!({ "in_service": true })))
+}
+
+/// POST /api/peer/system/restart — restart this node now.
+///
+/// The quorum guard is the same one the operator-facing power route uses, and
+/// it is called here rather than trusted to the caller. A rolling update
+/// reaches this having already put the node into maintenance, which is one of
+/// the three ways past that guard — so the guard passing is evidence the
+/// sequence was followed, not a formality skipped.
+///
+/// There is no acknowledgement to override it with. An operator who wants to
+/// take down a node their cluster cannot spare can still do it, on that node's
+/// own power page, where they are the ones being told what it costs.
+pub async fn restart(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    crate::api::system::guard_cluster_power(&state, false).await?;
+    state
+        .sys
+        .power_now(lumen_sys::model::PowerAction::Reboot)
+        .await?;
+    Ok(Json(serde_json::json!({ "restarting": true })))
+}
+
 /// POST /api/peer/cluster/prepare — realize this node's Core seat and write
 /// the cluster configuration.
 pub async fn prepare(

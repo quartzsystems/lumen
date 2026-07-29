@@ -102,6 +102,7 @@ fn test_app() -> axum::Router {
         )),
         drain: Default::default(),
         update_job: Default::default(),
+        roll: Default::default(),
     };
     app(Arc::new(state))
 }

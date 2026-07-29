@@ -162,6 +162,7 @@ fn harness_with_storage(
         )),
         drain: Default::default(),
         update_job: Default::default(),
+        roll: Default::default(),
     };
     Harness {
         router: app(Arc::new(state)),
@@ -964,6 +965,7 @@ async fn a_cluster_create_reports_per_node_per_step_progress_and_completes() {
         )),
         drain: Default::default(),
         update_job: Default::default(),
+        roll: Default::default(),
     }));
 
     let cookie = sign_in(&router).await;
@@ -2082,10 +2084,7 @@ async fn clearing_the_cluster_address_removes_it() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{answer}");
     assert!(
-        answer["error"]
-            .as_str()
-            .unwrap()
-            .contains("no cluster VIP"),
+        answer["error"].as_str().unwrap().contains("no cluster VIP"),
         "{answer}"
     );
 }

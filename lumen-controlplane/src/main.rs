@@ -291,6 +291,7 @@ async fn main() -> Result<()> {
         tasks: lumen_controlplane::tasks::TaskLog::open(state_dir.join("vm-tasks.jsonl")),
         drain: Default::default(),
         update_job: Default::default(),
+        roll: Default::default(),
     });
 
     // Ask the repositories what is waiting, on a slow loop. Nothing is ever

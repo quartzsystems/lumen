@@ -146,6 +146,7 @@ async fn harness(tag: &str, mock: MockUpdates) -> Harness {
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
         drain: Default::default(),
         update_job: Default::default(),
+        roll: Default::default(),
     }));
 
     let response = router

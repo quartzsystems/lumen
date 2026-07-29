@@ -157,6 +157,7 @@ async fn harness(tag: &str) -> Harness {
         )),
         drain: Default::default(),
         update_job: Default::default(),
+        roll: Default::default(),
     }));
 
     // Sign in once; every machine and storage route requires the session.

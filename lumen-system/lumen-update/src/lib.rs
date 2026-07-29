@@ -74,4 +74,4 @@ pub use model::{
     is_platform, ApplyPlan, ApplyReport, KernelState, PlatformPlan, RebootState, Resolution,
     Update, UpdateKind, PLATFORM_PREFIXES,
 };
-pub use service::{ApplyRequest, UpdateService, UpdateView};
+pub use service::{ApplyRequest, Counts, UpdateService, UpdateView};

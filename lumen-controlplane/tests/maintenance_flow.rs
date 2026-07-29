@@ -260,6 +260,7 @@ fn build(
         )),
         drain: Default::default(),
         update_job: Default::default(),
+        roll: Default::default(),
     });
     Harness {
         router: app(state.clone()),

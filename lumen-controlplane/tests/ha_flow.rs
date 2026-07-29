@@ -195,6 +195,7 @@ fn harness(tag: &str, cluster_backend: ClusterMockBackend) -> Harness {
         )),
         drain: Default::default(),
         update_job: Default::default(),
+        roll: Default::default(),
     });
     Harness {
         state,

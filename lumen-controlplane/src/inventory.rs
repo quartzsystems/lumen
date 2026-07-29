@@ -72,6 +72,65 @@ pub trait InventoryPeers: Send + Sync {
         node: &EnvironmentNode,
         disk: &str,
     ) -> Result<BlockDevice, ClusterError>;
+
+    /// What one member has waiting, and what it is installing.
+    ///
+    /// The read, which never asks that member's repositories — so an
+    /// environment-wide page load costs one round trip per member and no
+    /// network beyond the cluster, exactly as the node-local read does.
+    async fn updates(
+        &self,
+        node: &EnvironmentNode,
+    ) -> Result<crate::cluster_updates::NodeUpdates, ClusterError>;
+
+    /// The same, but that member asks its repositories first.
+    async fn check_updates(
+        &self,
+        node: &EnvironmentNode,
+    ) -> Result<crate::cluster_updates::NodeUpdates, ClusterError>;
+
+    /// Start installing on one member, and answer as soon as it is under way.
+    ///
+    /// Returns that member's own transaction record, whose `started_at` is how
+    /// the walk tells the transaction it started from one that was already
+    /// running there.
+    ///
+    /// `by` is the operator's principal, carried so that member's own record
+    /// names the person rather than only the node that relayed the request.
+    async fn apply_updates(
+        &self,
+        node: &EnvironmentNode,
+        platform: bool,
+        by: &str,
+    ) -> Result<crate::updates::UpdateProgress, ClusterError>;
+
+    /// Take one member out of service and drain it.
+    ///
+    /// Answers once the drain is published, not once it has finished — the
+    /// machines are still moving. [`Self::drain_progress`] is how it is
+    /// watched, and an empty `stranded` list at the end is what means the node
+    /// is safe to restart.
+    async fn enter_maintenance(
+        &self,
+        node: &EnvironmentNode,
+        by: &str,
+    ) -> Result<crate::maintenance::MaintenanceProgress, ClusterError>;
+
+    /// One member's drain, while it has one to report.
+    async fn drain_progress(
+        &self,
+        node: &EnvironmentNode,
+    ) -> Result<Option<crate::maintenance::MaintenanceProgress>, ClusterError>;
+
+    /// Put one member back into service.
+    async fn exit_maintenance(&self, node: &EnvironmentNode, by: &str) -> Result<(), ClusterError>;
+
+    /// Restart one member now.
+    ///
+    /// The member applies the quorum guard itself before it goes, so a call
+    /// that succeeds is one the member agreed was safe — the coordinator's
+    /// belief about the cluster carries no weight over the member's own.
+    async fn restart(&self, node: &EnvironmentNode) -> Result<(), ClusterError>;
 }
 
 /// A control plane with no peer channel behind it: it can answer for itself
@@ -112,6 +171,70 @@ impl InventoryPeers for NoPeers {
             node.name
         )))
     }
+
+    async fn updates(
+        &self,
+        node: &EnvironmentNode,
+    ) -> Result<crate::cluster_updates::NodeUpdates, ClusterError> {
+        Err(ClusterError::Conflict(format!(
+            "This control plane has no peer channel, so \"{}\" could not be asked what it has \
+             waiting.",
+            node.name
+        )))
+    }
+
+    async fn check_updates(
+        &self,
+        node: &EnvironmentNode,
+    ) -> Result<crate::cluster_updates::NodeUpdates, ClusterError> {
+        self.updates(node).await
+    }
+
+    async fn apply_updates(
+        &self,
+        node: &EnvironmentNode,
+        _platform: bool,
+        _by: &str,
+    ) -> Result<crate::updates::UpdateProgress, ClusterError> {
+        Err(ClusterError::Conflict(format!(
+            "This control plane has no peer channel, so nothing could be installed on \"{}\".",
+            node.name
+        )))
+    }
+
+    async fn enter_maintenance(
+        &self,
+        node: &EnvironmentNode,
+        _by: &str,
+    ) -> Result<crate::maintenance::MaintenanceProgress, ClusterError> {
+        Err(no_channel(node, "taken out of service"))
+    }
+
+    async fn drain_progress(
+        &self,
+        node: &EnvironmentNode,
+    ) -> Result<Option<crate::maintenance::MaintenanceProgress>, ClusterError> {
+        Err(no_channel(node, "asked about its drain"))
+    }
+
+    async fn exit_maintenance(
+        &self,
+        node: &EnvironmentNode,
+        _by: &str,
+    ) -> Result<(), ClusterError> {
+        Err(no_channel(node, "put back into service"))
+    }
+
+    async fn restart(&self, node: &EnvironmentNode) -> Result<(), ClusterError> {
+        Err(no_channel(node, "restarted"))
+    }
+}
+
+fn no_channel(node: &EnvironmentNode, what: &str) -> ClusterError {
+    ClusterError::Conflict(format!(
+        "This control plane has no peer channel, so \"{}\" could not be {what}.",
+        node.name
+    ))
 }
 
 /// One node's answer: what it is, what it is plugged into, and what it can

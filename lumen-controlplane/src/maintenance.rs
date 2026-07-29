@@ -42,7 +42,7 @@ use std::sync::{Arc, Mutex};
 use lumen_cluster::join::{StepProgress, StepState, WorkflowPhase};
 use lumen_drbd::VmVolumes;
 use lumen_virt::DomainState;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::AppState;
 
@@ -51,7 +51,7 @@ const OUT_OF_SERVICE: &str = "out-of-service";
 
 /// A machine that is still running on the node after the drain, and the
 /// sentence explaining why it did not move.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Stranded {
     pub vmid: u32,
     pub name: String,
@@ -61,16 +61,21 @@ pub struct Stranded {
 /// The whole of a drain, as the console polls it — the same shape a cluster
 /// create publishes, because it is the same kind of thing: a multi-step job
 /// with one step per unit of work.
-#[derive(Debug, Clone, Serialize)]
+///
+/// Read back as well as written: a rolling update drains a member from another
+/// member's console and has to know whether the drain finished and whether it
+/// left anything behind.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MaintenanceProgress {
     pub node: String,
     pub cluster: String,
     pub phase: WorkflowPhase,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub steps: Vec<StepProgress>,
     /// Machines still running here when the drain finished. Empty is the
     /// answer that means "this node is safe to reboot".
+    #[serde(default)]
     pub stranded: Vec<Stranded>,
 }
 

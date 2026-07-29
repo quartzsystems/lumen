@@ -276,7 +276,7 @@ pub trait PeerChannel: Send + Sync {
 
 // --- create progress --------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StepState {
     Pending,
@@ -287,19 +287,23 @@ pub enum StepState {
     Unwound,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepProgress {
     /// A short verb the console renders: `preflight`, `prepare`, `start`,
     /// `form`, `properties`, `record`, `unwind`.
     pub step: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
     pub state: StepState,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// These three are read back as well as written: a cluster-wide update reads
+/// the phase of a transaction running on *another* member off the wire, which
+/// a serialize-only type cannot express. Nothing else about them changed —
+/// the JSON is what it always was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowPhase {
     Running,

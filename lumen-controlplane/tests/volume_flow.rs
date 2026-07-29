@@ -177,6 +177,7 @@ fn harness(tag: &str, membership: &EnvironmentMembership) -> Harness {
         )),
         drain: Default::default(),
         update_job: Default::default(),
+        roll: Default::default(),
     }));
     Harness {
         router,

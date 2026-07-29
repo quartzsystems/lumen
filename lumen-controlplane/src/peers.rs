@@ -384,6 +384,124 @@ impl crate::inventory::InventoryPeers for HttpPeerChannel {
         )
         .await
     }
+
+    async fn updates(
+        &self,
+        node: &EnvironmentNode,
+    ) -> Result<crate::cluster_updates::NodeUpdates, ClusterError> {
+        self.call(
+            &node.address,
+            "/api/peer/system/updates",
+            &serde_json::json!({}),
+            self.ca_client_config()?,
+            Some(self.peer_ticket()?),
+            CALL_DEADLINE,
+        )
+        .await
+    }
+
+    async fn check_updates(
+        &self,
+        node: &EnvironmentNode,
+    ) -> Result<crate::cluster_updates::NodeUpdates, ClusterError> {
+        self.call(
+            &node.address,
+            "/api/peer/system/updates/check",
+            &serde_json::json!({}),
+            self.ca_client_config()?,
+            Some(self.peer_ticket()?),
+            // Refreshing repository metadata reaches out to the internet from
+            // that member, over a link this node knows nothing about.
+            SLOW_CALL_DEADLINE,
+        )
+        .await
+    }
+
+    async fn apply_updates(
+        &self,
+        node: &EnvironmentNode,
+        platform: bool,
+        by: &str,
+    ) -> Result<crate::updates::UpdateProgress, ClusterError> {
+        self.call(
+            &node.address,
+            "/api/peer/system/updates/apply",
+            &serde_json::json!({ "platform": platform, "by": by }),
+            self.ca_client_config()?,
+            Some(self.peer_ticket()?),
+            // The call returns as soon as the transaction is under way, not
+            // when it finishes — but it validates against a fresh check
+            // first, which is a repository refresh.
+            SLOW_CALL_DEADLINE,
+        )
+        .await
+    }
+
+    async fn enter_maintenance(
+        &self,
+        node: &EnvironmentNode,
+        by: &str,
+    ) -> Result<crate::maintenance::MaintenanceProgress, ClusterError> {
+        self.call(
+            &node.address,
+            "/api/peer/system/maintenance",
+            &serde_json::json!({ "by": by }),
+            self.ca_client_config()?,
+            Some(self.peer_ticket()?),
+            // Answers once the node is flagged and Pacemaker is in standby,
+            // which moves the resources Pacemaker owns before it returns.
+            SLOW_CALL_DEADLINE,
+        )
+        .await
+    }
+
+    async fn drain_progress(
+        &self,
+        node: &EnvironmentNode,
+    ) -> Result<Option<crate::maintenance::MaintenanceProgress>, ClusterError> {
+        self.call(
+            &node.address,
+            "/api/peer/system/maintenance/progress",
+            &serde_json::json!({}),
+            self.ca_client_config()?,
+            Some(self.peer_ticket()?),
+            CALL_DEADLINE,
+        )
+        .await
+    }
+
+    async fn exit_maintenance(&self, node: &EnvironmentNode, by: &str) -> Result<(), ClusterError> {
+        let _: serde_json::Value = self
+            .call(
+                &node.address,
+                "/api/peer/system/maintenance/exit",
+                &serde_json::json!({ "by": by }),
+                self.ca_client_config()?,
+                Some(self.peer_ticket()?),
+                SLOW_CALL_DEADLINE,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn restart(&self, node: &EnvironmentNode) -> Result<(), ClusterError> {
+        // The member answers before it goes: `systemctl reboot` returns and
+        // the machine follows a moment later, which is long enough for the
+        // response to be flushed. A call that does *not* answer is reported as
+        // a failure rather than assumed to be a restart in progress — the two
+        // look identical from here, and only one of them is safe to build on.
+        let _: serde_json::Value = self
+            .call(
+                &node.address,
+                "/api/peer/system/restart",
+                &serde_json::json!({}),
+                self.ca_client_config()?,
+                Some(self.peer_ticket()?),
+                CALL_DEADLINE,
+            )
+            .await?;
+        Ok(())
+    }
 }
 
 #[async_trait]

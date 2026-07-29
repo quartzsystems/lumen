@@ -123,6 +123,23 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/environment/nodes/{node}/disks/{disk}/wipe",
             post(cluster::wipe_node_disk),
         )
+        // Updates across every member: the same four questions the node-local
+        // routes answer, asked of the whole environment. Installing walks the
+        // members one at a time, this node last; see src/cluster_updates.rs
+        // and docs/updates.md.
+        .route("/api/environment/updates", get(updates::cluster_updates))
+        .route(
+            "/api/environment/updates/check",
+            post(updates::cluster_check),
+        )
+        .route(
+            "/api/environment/updates/apply",
+            post(updates::cluster_apply),
+        )
+        .route(
+            "/api/environment/updates/progress",
+            get(updates::cluster_progress),
+        )
         .route("/api/environment/tokens", post(cluster::mint_token))
         .route("/api/environment/join", post(cluster::join))
         .route("/api/environment/preflight", post(cluster::preflight))
@@ -215,6 +232,25 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/peer/network/bond", post(peer::create_bond))
         .route("/api/peer/network/bridge", post(peer::create_bridge))
         .route("/api/peer/node/inventory", post(peer::inventory))
+        .route("/api/peer/system/updates", post(peer::updates))
+        .route("/api/peer/system/updates/check", post(peer::check_updates))
+        .route("/api/peer/system/updates/apply", post(peer::apply_updates))
+        // Maintenance and power, reached across the wire for one caller: the
+        // rolling update. The work still happens on the node it is about; see
+        // src/api/peer.rs.
+        .route(
+            "/api/peer/system/maintenance",
+            post(peer::enter_maintenance),
+        )
+        .route(
+            "/api/peer/system/maintenance/progress",
+            post(peer::drain_progress),
+        )
+        .route(
+            "/api/peer/system/maintenance/exit",
+            post(peer::exit_maintenance),
+        )
+        .route("/api/peer/system/restart", post(peer::restart))
         .route("/api/peer/storage/pool", post(peer::create_pool))
         .route("/api/peer/storage/wipe", post(peer::wipe_disk))
         .route("/api/peer/cluster/teardown", post(peer::teardown))

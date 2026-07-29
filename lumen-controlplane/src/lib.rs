@@ -1,4 +1,5 @@
 pub mod api;
+pub mod cluster_updates;
 pub mod config;
 pub mod error;
 pub mod ha;
@@ -77,6 +78,13 @@ pub struct AppState {
     /// reason the drain is, and one at a time because the package manager
     /// takes a lock of its own.
     pub update_job: updates::UpdateHandle,
+    /// The environment-wide update, while this node is driving one. Unlike the
+    /// two above it, this one is about every member — but it still lives on
+    /// one node, because the node that started the walk is the node running
+    /// it. It does not survive that node updating itself; see
+    /// [`cluster_updates`] for why that is the honest design rather than a
+    /// gap.
+    pub roll: cluster_updates::RollHandle,
 }
 
 /// The full application router: /api plus the static web UI fallback.

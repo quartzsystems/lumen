@@ -172,7 +172,10 @@ pub async fn set_power(
 /// explicit acknowledgement is always allowed, because an appliance that
 /// cannot be powered off by its owner is a worse appliance. What is not
 /// allowed is doing it by accident.
-async fn guard_cluster_power(state: &Arc<AppState>, acknowledged: bool) -> Result<(), ApiError> {
+pub(crate) async fn guard_cluster_power(
+    state: &Arc<AppState>,
+    acknowledged: bool,
+) -> Result<(), ApiError> {
     if acknowledged {
         return Ok(());
     }

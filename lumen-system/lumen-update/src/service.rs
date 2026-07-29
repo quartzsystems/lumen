@@ -8,7 +8,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::backend::UpdateBackend;
 use crate::error::{Result, UpdateError};
@@ -16,7 +16,7 @@ use crate::model::{ApplyPlan, ApplyReport, PlatformPlan, RebootState, Update, Up
 
 /// How many of each kind are waiting — the numbers the console puts on a badge
 /// without reading the table.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Counts {
     /// Lumen's own packages.
     pub lumen: usize,
@@ -29,12 +29,16 @@ pub struct Counts {
 }
 
 /// Everything the Updates page renders.
-#[derive(Debug, Clone, Serialize)]
+///
+/// Read back as well as written: a cluster-wide read asks every member this
+/// question and assembles the answers side by side, so the coordinator has to
+/// be able to parse a peer's view off the wire. The JSON is unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateView {
     pub node: String,
     /// When the repositories were last asked, in unix seconds. `None` before
     /// the first check of this daemon's life.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checked_at: Option<u64>,
     /// The ordinary updates: everything that is not the platform set. These
     /// are what the plain button installs.
@@ -47,7 +51,7 @@ pub struct UpdateView {
     /// an error so the page still renders the reboot state and the previous
     /// answer — a node that cannot reach its repositories is a node whose
     /// operator especially wants to see the rest of the page.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
