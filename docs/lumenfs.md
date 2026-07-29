@@ -73,8 +73,30 @@ hole. A second lesson from the same test: messages queued for a link that
 dies are dropped with it, or a stale reply arrives inside a fresh session
 and is mistaken for an answer to it.
 
-Still ahead: writer leases hardened for live migration, streaming writes
-while a resync runs, and the slice map that takes this past two nodes.
+**Phase 3 has begun: the writer lease is durable, and migration has a
+window.** Who may write a vdisk used to be a map in one node's memory,
+rebuilt from whatever a peer remembered at the next resync — which is a
+thin place to keep the one property that stops two nodes writing the same
+disk. It now lives in the pool: a WAL entry like any other, folded into
+the manifest at each checkpoint, so a node that restarts knows whether it
+may write before anyone tells it.
+
+A lease names the era it was granted in, and that is what lets a failover
+happen at all: a survivor that has been handed a fence verdict bumps the
+era, and leases from the era it survived stop binding. Otherwise a lease
+would outlive its holder and leave the vdisk unwritable at precisely the
+moment somebody needed to rescue it.
+
+Live migration gets the window DRBD spends `--allow-two-primaries` on,
+without ever having two writers. `begin_handover` marks the lease as
+passing to the destination — both nodes may hold the disk open, **the
+source keeps writing**, the destination may not — and `accept_handover`
+moves it in one durable step, so there is no instant in between when both
+could write. Every path out closes the window, `abort_handover` included,
+because a window left open is how two writers eventually happen.
+
+Still ahead: streaming writes while a resync runs, and the slice map that
+takes this past two nodes.
 
 ## Burning it in
 

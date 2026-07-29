@@ -48,6 +48,6 @@ pub use disk::Disk;
 pub use error::{FsError, Result};
 pub use format::{SECTOR_SIZE, SUPERBLOCK_SLOTS};
 pub use hash::{hash_block, BlockHash};
-pub use pool::{Pool, ScrubReport};
+pub use pool::{Lease, Pool, ScrubReport};
 pub use repl::{Effect, NodeId, PeerMessage, ReplNode, ReplOp, ReplState, SyncOffer};
 pub use sim::{SimDisk, SplitMix64};

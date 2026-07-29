@@ -58,7 +58,7 @@ use crate::disk::Disk;
 use crate::error::{FsError, Result};
 use crate::hash::BlockHash;
 use crate::map;
-use crate::pool::Pool;
+use crate::pool::{Lease, Pool};
 
 pub type NodeId = u8;
 
@@ -74,7 +74,7 @@ pub struct SyncOffer {
     pub era: u64,
     pub vdisks: Vec<VdiskOffer>,
     pub snapshots: Vec<SnapshotOffer>,
-    pub writers: Vec<(u64, NodeId)>,
+    pub leases: Vec<(u64, Lease)>,
 }
 
 /// How many blocks a resync target asks for per round trip.
@@ -118,9 +118,12 @@ pub enum ReplOp {
         vdisk: u64,
         snapshot: u64,
     },
-    ClaimWriter {
+    /// The whole lease, not a request for one: the peer applies what the
+    /// holder decided rather than deciding again. Every lease change —
+    /// claim, window open, handover, abort — travels as one of these.
+    SetLease {
         vdisk: u64,
-        node: NodeId,
+        lease: Lease,
     },
 }
 
@@ -207,7 +210,6 @@ pub struct ReplNode<D: Disk> {
     /// Which node holds each vdisk's writer role. Exchanged at resync;
     /// claimed at failover. The lease hardening (handover under a live
     /// peer) is phase 3's work.
-    writers: HashMap<u64, NodeId>,
     effects: VecDeque<Effect>,
     /// Numbering for ops sent (writer side).
     next_rseq: u64,
@@ -227,7 +229,6 @@ impl<D: Disk> ReplNode<D> {
             pool,
             node,
             state: ReplState::Suspended,
-            writers: HashMap::new(),
             effects: VecDeque::new(),
             next_rseq: 1,
             durable_rseq: 0,
@@ -320,21 +321,51 @@ impl<D: Disk> ReplNode<D> {
     /// an explicit claim. (The migration-window handover under a live
     /// guest is phase 3.)
     pub fn claim_writer(&mut self, vdisk: u64) -> Result<()> {
+        self.lease_change(vdisk, |pool, node| pool.claim_lease(vdisk, node))
+    }
+
+    /// Open the migration window. The guest keeps running — and keeps
+    /// writing — here; the destination may open the disk alongside.
+    pub fn begin_handover(&mut self, vdisk: u64, to: NodeId) -> Result<()> {
+        self.lease_change(vdisk, |pool, node| pool.begin_handover(vdisk, node, to))
+    }
+
+    /// Take a lease that was handed to this node: the instant the guest
+    /// becomes ours. One durable step, so there is no moment in which both
+    /// nodes could write.
+    pub fn accept_handover(&mut self, vdisk: u64) -> Result<()> {
+        self.lease_change(vdisk, |pool, node| pool.accept_handover(vdisk, node))
+    }
+
+    /// The migration failed. The window closes and the disk stays where it
+    /// was — every path out of a migration closes it.
+    pub fn abort_handover(&mut self, vdisk: u64) -> Result<()> {
+        self.lease_change(vdisk, |pool, node| pool.abort_handover(vdisk, node))
+    }
+
+    /// Apply a lease change locally and replicate whatever it settled on.
+    /// The peer is sent the resulting lease rather than the request, so the
+    /// two sides cannot reach different conclusions from the same words.
+    fn lease_change(
+        &mut self,
+        vdisk: u64,
+        change: impl FnOnce(&mut Pool<D>, NodeId) -> Result<()>,
+    ) -> Result<()> {
         match self.state {
-            ReplState::Degraded => {
-                self.writers.insert(vdisk, self.node);
-                Ok(())
-            }
-            ReplState::Synced => {
-                self.writers.insert(vdisk, self.node);
-                self.send_ops(vec![ReplOp::ClaimWriter {
-                    vdisk,
-                    node: self.node,
-                }]);
-                Ok(())
-            }
-            _ => Err(FsError::Suspended),
+            ReplState::Synced | ReplState::Degraded => {}
+            _ => return Err(FsError::Suspended),
         }
+        let node = self.node;
+        change(&mut self.pool, node)?;
+        if let Some(lease) = self.pool.lease(vdisk) {
+            self.send_ops(vec![ReplOp::SetLease { vdisk, lease }]);
+        }
+        Ok(())
+    }
+
+    /// What the durable lease says about this vdisk.
+    pub fn lease(&self, vdisk: u64) -> Option<Lease> {
+        self.pool.lease(vdisk)
     }
 
     // -----------------------------------------------------------------
@@ -345,9 +376,10 @@ impl<D: Disk> ReplNode<D> {
             ReplState::Synced | ReplState::Degraded => {}
             _ => return Err(FsError::Suspended),
         }
-        match self.writers.get(&vdisk) {
-            Some(holder) if *holder == self.node => Ok(()),
-            _ => Err(FsError::NotWriter(vdisk)),
+        if self.pool.may_write(vdisk, self.node) {
+            Ok(())
+        } else {
+            Err(FsError::NotWriter(vdisk))
         }
     }
 
@@ -377,13 +409,14 @@ impl<D: Disk> ReplNode<D> {
             _ => return Err(FsError::Suspended),
         }
         self.with_wal_room(|pool| pool.create_vdisk(id, size_bytes))?;
-        self.writers.insert(id, self.node);
+        // Whoever made it holds it, and that has to be durable before
+        // anything is written to it.
+        let node = self.node;
+        self.pool.claim_lease(id, node)?;
+        let lease = self.pool.lease(id).expect("just claimed");
         self.send_ops(vec![
             ReplOp::CreateVdisk { id, size_bytes },
-            ReplOp::ClaimWriter {
-                vdisk: id,
-                node: self.node,
-            },
+            ReplOp::SetLease { vdisk: id, lease },
         ]);
         Ok(())
     }
@@ -409,7 +442,6 @@ impl<D: Disk> ReplNode<D> {
     pub fn delete_vdisk(&mut self, id: u64) -> Result<()> {
         self.writable(id)?;
         self.with_wal_room(|pool| pool.delete_vdisk(id))?;
-        self.writers.remove(&id);
         self.send_ops(vec![ReplOp::DeleteVdisk { id }]);
         Ok(())
     }
@@ -438,16 +470,18 @@ impl<D: Disk> ReplNode<D> {
     pub fn clone_vdisk(&mut self, new_id: u64, vdisk: u64, snapshot: u64) -> Result<()> {
         self.writable(vdisk)?;
         self.pool.clone_vdisk(new_id, vdisk, snapshot)?;
-        self.writers.insert(new_id, self.node);
+        let node = self.node;
+        self.pool.claim_lease(new_id, node)?;
+        let lease = self.pool.lease(new_id).expect("just claimed");
         self.send_ops(vec![
             ReplOp::Clone {
                 new_id,
                 vdisk,
                 snapshot,
             },
-            ReplOp::ClaimWriter {
+            ReplOp::SetLease {
                 vdisk: new_id,
-                node: self.node,
+                lease,
             },
         ]);
         Ok(())
@@ -598,17 +632,12 @@ impl<D: Disk> ReplNode<D> {
         // Settle everything, then offer it.
         self.pool.checkpoint()?;
         let (era, vdisks, snapshots) = self.pool.sync_manifest();
-        let mut writers: Vec<(u64, NodeId)> = self
-            .writers
-            .iter()
-            .map(|(vdisk, node)| (*vdisk, *node))
-            .collect();
-        writers.sort_unstable();
+        let leases = self.pool.leases();
         self.emit(Effect::Send(PeerMessage::SyncManifest(SyncOffer {
             era,
             vdisks,
             snapshots,
-            writers,
+            leases,
         })));
         Ok(())
     }
@@ -731,8 +760,11 @@ impl<D: Disk> ReplNode<D> {
             "finishing a pull that never had a manifest",
         ))?;
         let era = offer.era;
-        self.pool.adopt_sync(era, &offer.vdisks, &offer.snapshots)?;
-        self.writers = offer.writers.into_iter().collect();
+        self.pool
+            .adopt_sync(era, &offer.vdisks, &offer.snapshots, &offer.leases)?;
+        // The leases came over inside the adoption: the source's view of
+        // who may write is part of the state being adopted, not a separate
+        // negotiation.
         self.reset_stream();
         self.state = ReplState::Synced;
         // Anything this node's guests had in flight before it went stale
@@ -768,10 +800,7 @@ impl<D: Disk> ReplNode<D> {
             ReplOp::Trim { vdisk, index } => {
                 self.with_wal_room(|pool| pool.trim_block(vdisk, index))
             }
-            ReplOp::DeleteVdisk { id } => {
-                self.writers.remove(&id);
-                self.with_wal_room(|pool| pool.delete_vdisk(id))
-            }
+            ReplOp::DeleteVdisk { id } => self.with_wal_room(|pool| pool.delete_vdisk(id)),
             ReplOp::Snapshot { vdisk, snapshot } => self.pool.snapshot_vdisk(vdisk, snapshot),
             ReplOp::DeleteSnapshot { vdisk, snapshot } => {
                 self.pool.delete_snapshot(vdisk, snapshot)
@@ -782,10 +811,10 @@ impl<D: Disk> ReplNode<D> {
                 vdisk,
                 snapshot,
             } => self.pool.clone_vdisk(new_id, vdisk, snapshot),
-            ReplOp::ClaimWriter { vdisk, node } => {
-                self.writers.insert(vdisk, node);
-                Ok(())
-            }
+            // Applied as decided, not re-decided: the holder already
+            // resolved who may write, and a peer that argued would be the
+            // second opinion this design exists to prevent.
+            ReplOp::SetLease { vdisk, lease } => self.pool.set_lease(vdisk, lease),
         }
     }
 }

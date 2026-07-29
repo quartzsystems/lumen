@@ -56,8 +56,14 @@ pub enum FsError {
     /// A vdisk delete refused because snapshots still pin its history —
     /// deleting them first is an explicit act, not a cascade.
     HasSnapshots(u64),
-    /// A write on a node that does not hold the vdisk's writer role.
+    /// A write on a node that does not hold the vdisk's writer lease.
     NotWriter(u64),
+    /// A claim on a lease another node holds under the current era. Taking
+    /// it needs a handover or a fence verdict, never impatience.
+    LeaseHeld { vdisk: u64, holder: u8 },
+    /// A handover step for a vdisk whose lease is not in that state — no
+    /// window open, or open toward a different node.
+    NoSuchHandover(u64),
     /// Replication cannot acknowledge: the peer is unreachable and no
     /// verdict says it is dead. Integrity over availability, always.
     Suspended,
@@ -110,7 +116,14 @@ impl fmt::Display for FsError {
                 "vdisk {id} still has snapshots; delete them before the vdisk"
             ),
             FsError::NotWriter(id) => {
-                write!(f, "this node does not hold the writer role for vdisk {id}")
+                write!(f, "this node does not hold the writer lease for vdisk {id}")
+            }
+            FsError::LeaseHeld { vdisk, holder } => write!(
+                f,
+                "node {holder} holds the writer lease for vdisk {vdisk} in this era"
+            ),
+            FsError::NoSuchHandover(id) => {
+                write!(f, "vdisk {id} has no handover open in that direction")
             }
             FsError::Suspended => write!(
                 f,

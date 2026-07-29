@@ -45,7 +45,7 @@ use crate::error::{FsError, Result};
 use crate::format::Anchor;
 use crate::hash::{hash_block, BlockHash};
 use crate::map;
-use crate::repl::{SnapshotOffer, VdiskOffer};
+use crate::repl::{NodeId, SnapshotOffer, VdiskOffer};
 use crate::wal::Wal;
 
 /// What a scrub found. Empty vectors are the healthy answer.
@@ -59,10 +59,38 @@ pub struct ScrubReport {
 }
 
 const MANIFEST_MAGIC: &[u8; 8] = b"LFSMAN\0\0";
-const MANIFEST_HEADER_LEN: usize = 20; // magic 8 + version 4 + two counts
+const MANIFEST_HEADER_LEN: usize = 24; // magic 8 + version 4 + three counts
 const MANIFEST_ENTRY_LEN: usize = 48; // id 8 + size 8 + root 32
 const MANIFEST_SNAPSHOT_LEN: usize = 56; // vdisk 8 + snapshot 8 + size 8 + root 32
-const MANIFEST_VERSION: u32 = 1;
+const MANIFEST_LEASE_LEN: usize = 24; // vdisk 8 + holder 1 + handing 1 + pad 6 + era 8
+/// Version 2 added the writer leases. There is no upgrade path and none is
+/// owed: nothing carrying real data has ever run version 1, and a pool that
+/// says 1 is refused by name rather than misread.
+const MANIFEST_VERSION: u32 = 2;
+
+/// Nobody — the encoded stand-in for "no node", since every real
+/// [`NodeId`] is a valid `u8`.
+const NO_NODE: u8 = 0xFF;
+
+/// Who may write to a vdisk, and whether that is being handed on.
+///
+/// Single-writer is a data-integrity property, not a scheduling
+/// convenience: two nodes writing one vdisk is the corruption every layer
+/// below this has been built to make impossible, and it would arrive
+/// through this door. So the lease is durable — it survives a restart
+/// rather than being rebuilt from whatever a peer happens to remember —
+/// and it names the era it was granted in, because a survivor that has
+/// moved on is not bound by the promises of the era it survived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Lease {
+    pub holder: NodeId,
+    /// Set while a migration window is open: the guest is running on
+    /// `holder` and starting on this node, both have the disk open, and
+    /// exactly one of them may write.
+    pub handing_to: Option<NodeId>,
+    /// The era this lease was granted in.
+    pub era: u64,
+}
 
 /// One vdisk's durable identity in the manifest.
 #[derive(Debug, Clone)]
@@ -92,6 +120,9 @@ pub struct Pool<D: Disk> {
     /// Keyed `(vdisk, snapshot)`; a BTreeMap so the manifest encodes
     /// deterministically.
     snapshots: BTreeMap<(u64, u64), SnapshotState>,
+    /// Who may write each vdisk. BTreeMap so the manifest encodes
+    /// deterministically.
+    leases: BTreeMap<u64, Lease>,
     anchor_generation: u64,
     /// The data generation (replication's era) — see format.rs's Anchor.
     era: u64,
@@ -117,6 +148,10 @@ enum WalEntry {
     },
     DeleteVdisk {
         id: u64,
+    },
+    SetLease {
+        vdisk: u64,
+        lease: Lease,
     },
 }
 
@@ -147,6 +182,14 @@ impl WalEntry {
                 buf.extend_from_slice(&id.to_le_bytes());
                 buf
             }
+            WalEntry::SetLease { vdisk, lease } => {
+                let mut buf = vec![5u8];
+                buf.extend_from_slice(&vdisk.to_le_bytes());
+                buf.push(lease.holder);
+                buf.push(lease.handing_to.unwrap_or(NO_NODE));
+                buf.extend_from_slice(&lease.era.to_le_bytes());
+                buf
+            }
         }
     }
 
@@ -167,6 +210,14 @@ impl WalEntry {
             }),
             4 if buf.len() == 9 => Some(WalEntry::DeleteVdisk {
                 id: u64::from_le_bytes(buf[1..9].try_into().unwrap()),
+            }),
+            5 if buf.len() == 19 => Some(WalEntry::SetLease {
+                vdisk: u64::from_le_bytes(buf[1..9].try_into().unwrap()),
+                lease: Lease {
+                    holder: buf[9],
+                    handing_to: (buf[10] != NO_NODE).then_some(buf[10]),
+                    era: u64::from_le_bytes(buf[11..19].try_into().unwrap()),
+                },
             }),
             _ => None,
         }
@@ -189,6 +240,7 @@ impl<D: Disk> Pool<D> {
 
         let mut vdisks = HashMap::new();
         let mut snapshots = BTreeMap::new();
+        let mut leases = BTreeMap::new();
         if anchor.manifest_hash != [0; 32] {
             let manifest_hash = BlockHash::from_bytes(anchor.manifest_hash);
             let manifest = brick
@@ -200,6 +252,9 @@ impl<D: Disk> Pool<D> {
             }
             for (key, state) in decoded.snapshots {
                 snapshots.insert(key, state);
+            }
+            for (vdisk, lease) in decoded.leases {
+                leases.insert(vdisk, lease);
             }
         }
 
@@ -228,6 +283,7 @@ impl<D: Disk> Pool<D> {
             wal,
             vdisks,
             snapshots,
+            leases,
             anchor_generation: anchor.generation,
             era: anchor.era,
         };
@@ -304,7 +360,147 @@ impl<D: Disk> Pool<D> {
                     .insert(*index, None);
                 true
             }
-            WalEntry::DeleteVdisk { id } => self.vdisks.remove(id).is_some(),
+            WalEntry::DeleteVdisk { id } => {
+                self.leases.remove(id);
+                self.vdisks.remove(id).is_some()
+            }
+            WalEntry::SetLease { vdisk, lease } => {
+                if !self.vdisks.contains_key(vdisk) {
+                    return false;
+                }
+                self.leases.insert(*vdisk, *lease);
+                true
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Writer leases.
+
+    /// Who may write this vdisk, if anyone yet has.
+    pub fn lease(&self, vdisk: u64) -> Option<Lease> {
+        self.leases.get(&vdisk).copied()
+    }
+
+    /// Every lease, sorted — the view a console would render.
+    pub fn leases(&self) -> Vec<(u64, Lease)> {
+        self.leases.iter().map(|(id, l)| (*id, *l)).collect()
+    }
+
+    /// Whether `node` may write `vdisk` right now.
+    ///
+    /// A lease granted in an older era does not bind: it was made in a
+    /// world that has since been resolved by a fence verdict, and the
+    /// survivor that bumped the era is not answerable to it. During a
+    /// handover the holder keeps writing — the window is for the
+    /// destination to *open* the disk, not to write it — so there is
+    /// never an instant with two writers.
+    pub fn may_write(&self, vdisk: u64, node: NodeId) -> bool {
+        match self.leases.get(&vdisk) {
+            Some(lease) if lease.era >= self.era => lease.holder == node,
+            // Stale or absent: whoever claims it next may have it.
+            _ => false,
+        }
+    }
+
+    /// Record a lease. Durable at the next flush, replayed like any write
+    /// — that is the whole point of it living here rather than in a peer's
+    /// memory.
+    pub fn set_lease(&mut self, vdisk: u64, lease: Lease) -> Result<()> {
+        if !self.vdisks.contains_key(&vdisk) {
+            return Err(FsError::UnknownVdisk(vdisk));
+        }
+        let entry = WalEntry::SetLease { vdisk, lease };
+        self.wal.append(&mut self.brick, &entry.encode())?;
+        self.leases.insert(vdisk, lease);
+        Ok(())
+    }
+
+    /// Take the lease for `node`. Legal when the vdisk has no binding
+    /// lease — never held, or held under an era this node has moved past
+    /// — and refused outright while a peer holds it in the current era,
+    /// because that is the case a handover or a fence verdict exists to
+    /// resolve.
+    pub fn claim_lease(&mut self, vdisk: u64, node: NodeId) -> Result<()> {
+        if let Some(lease) = self.leases.get(&vdisk) {
+            if lease.era >= self.era && lease.holder != node {
+                return Err(FsError::LeaseHeld {
+                    vdisk,
+                    holder: lease.holder,
+                });
+            }
+        }
+        let era = self.era;
+        self.set_lease(
+            vdisk,
+            Lease {
+                holder: node,
+                handing_to: None,
+                era,
+            },
+        )
+    }
+
+    /// Open the migration window: the guest is still running here, and
+    /// starting over there. Both may hold the disk open; only the holder
+    /// writes.
+    pub fn begin_handover(&mut self, vdisk: u64, from: NodeId, to: NodeId) -> Result<()> {
+        let lease = self.leases.get(&vdisk).copied();
+        match lease {
+            Some(lease) if lease.holder == from && lease.era >= self.era => {
+                let era = self.era;
+                self.set_lease(
+                    vdisk,
+                    Lease {
+                        holder: from,
+                        handing_to: Some(to),
+                        era,
+                    },
+                )
+            }
+            _ => Err(FsError::NotWriter(vdisk)),
+        }
+    }
+
+    /// The migration completed: the lease moves, in one durable step. From
+    /// here the old holder cannot write and the new one can, with no
+    /// instant in between where both could.
+    pub fn accept_handover(&mut self, vdisk: u64, to: NodeId) -> Result<()> {
+        let lease = self.leases.get(&vdisk).copied();
+        match lease {
+            Some(lease) if lease.handing_to == Some(to) && lease.era >= self.era => {
+                let era = self.era;
+                self.set_lease(
+                    vdisk,
+                    Lease {
+                        holder: to,
+                        handing_to: None,
+                        era,
+                    },
+                )
+            }
+            _ => Err(FsError::NoSuchHandover(vdisk)),
+        }
+    }
+
+    /// The migration failed: the window closes and the disk stays exactly
+    /// where it was. Every path out of a migration closes the window —
+    /// leaving one open is how two writers eventually happen.
+    pub fn abort_handover(&mut self, vdisk: u64, from: NodeId) -> Result<()> {
+        let lease = self.leases.get(&vdisk).copied();
+        match lease {
+            Some(lease) if lease.holder == from && lease.handing_to.is_some() => {
+                let era = lease.era;
+                self.set_lease(
+                    vdisk,
+                    Lease {
+                        holder: from,
+                        handing_to: None,
+                        era,
+                    },
+                )
+            }
+            _ => Err(FsError::NoSuchHandover(vdisk)),
         }
     }
 
@@ -330,8 +526,11 @@ impl<D: Disk> Pool<D> {
     /// Whether a manifest of these counts still fits its one block — the
     /// stated v1 ceiling on vdisks and snapshots together.
     fn manifest_fits(&self, vdisk_count: usize, snapshot_count: usize) -> bool {
+        // Every vdisk may carry a lease, so the ceiling counts one each
+        // whether or not they exist yet — discovering the manifest is full
+        // at the moment a migration needs a lease would be a poor time.
         MANIFEST_HEADER_LEN
-            + vdisk_count * MANIFEST_ENTRY_LEN
+            + vdisk_count * (MANIFEST_ENTRY_LEN + MANIFEST_LEASE_LEN)
             + snapshot_count * MANIFEST_SNAPSHOT_LEN
             <= self.brick.block_size() as usize
     }
@@ -420,6 +619,7 @@ impl<D: Disk> Pool<D> {
         let entry = WalEntry::DeleteVdisk { id };
         self.wal.append(&mut self.brick, &entry.encode())?;
         self.vdisks.remove(&id);
+        self.leases.remove(&id);
         Ok(())
     }
 
@@ -608,7 +808,7 @@ impl<D: Disk> Pool<D> {
         let manifest_hash = if self.vdisks.is_empty() && self.snapshots.is_empty() {
             [0u8; 32]
         } else {
-            let manifest = encode_manifest(&ids, &self.vdisks, &self.snapshots);
+            let manifest = encode_manifest(&ids, &self.vdisks, &self.snapshots, &self.leases);
             *self.brick.put(&manifest)?.as_bytes()
         };
         self.brick.flush()?;
@@ -661,6 +861,7 @@ impl<D: Disk> Pool<D> {
                 &ids,
                 &self.vdisks,
                 &self.snapshots,
+                &self.leases,
             )));
         }
         let mut roots: Vec<(Option<BlockHash>, u32)> = ids
@@ -863,6 +1064,7 @@ impl<D: Disk> Pool<D> {
         era: u64,
         vdisks: &[VdiskOffer],
         snapshots: &[SnapshotOffer],
+        leases: &[(u64, Lease)],
     ) -> Result<()> {
         for (_, _, root) in vdisks {
             if let Some(root) = root {
@@ -903,6 +1105,10 @@ impl<D: Disk> Pool<D> {
                 )
             })
             .collect();
+        // Who may write is part of the state being adopted, not a separate
+        // negotiation: a node that has just taken someone else's history
+        // has no standing to keep its own opinion about who holds the pen.
+        self.leases = leases.iter().copied().collect();
         self.era = era;
         self.checkpoint()
     }
@@ -948,17 +1154,20 @@ fn encode_manifest(
     ids: &[u64],
     vdisks: &HashMap<u64, VdiskState>,
     snapshots: &BTreeMap<(u64, u64), SnapshotState>,
+    leases: &BTreeMap<u64, Lease>,
 ) -> Vec<u8> {
     let mut buf = vec![
         0u8;
         MANIFEST_HEADER_LEN
             + ids.len() * MANIFEST_ENTRY_LEN
             + snapshots.len() * MANIFEST_SNAPSHOT_LEN
+            + leases.len() * MANIFEST_LEASE_LEN
     ];
     buf[0..8].copy_from_slice(MANIFEST_MAGIC);
     buf[8..12].copy_from_slice(&MANIFEST_VERSION.to_le_bytes());
     buf[12..16].copy_from_slice(&(ids.len() as u32).to_le_bytes());
     buf[16..20].copy_from_slice(&(snapshots.len() as u32).to_le_bytes());
+    buf[20..24].copy_from_slice(&(leases.len() as u32).to_le_bytes());
     let mut at = MANIFEST_HEADER_LEN;
     for id in ids {
         let state = &vdisks[id];
@@ -974,12 +1183,20 @@ fn encode_manifest(
         buf[at + 24..at + 56].copy_from_slice(&root_bytes(&state.root));
         at += MANIFEST_SNAPSHOT_LEN;
     }
+    for (vdisk, lease) in leases {
+        buf[at..at + 8].copy_from_slice(&vdisk.to_le_bytes());
+        buf[at + 8] = lease.holder;
+        buf[at + 9] = lease.handing_to.unwrap_or(NO_NODE);
+        buf[at + 16..at + 24].copy_from_slice(&lease.era.to_le_bytes());
+        at += MANIFEST_LEASE_LEN;
+    }
     buf
 }
 
 struct DecodedManifest {
     vdisks: Vec<(u64, VdiskState)>,
     snapshots: Vec<((u64, u64), SnapshotState)>,
+    leases: Vec<(u64, Lease)>,
 }
 
 fn decode_manifest(buf: &[u8]) -> Result<DecodedManifest> {
@@ -993,10 +1210,12 @@ fn decode_manifest(buf: &[u8]) -> Result<DecodedManifest> {
     }
     let vdisk_count = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
     let snapshot_count = u32::from_le_bytes(buf[16..20].try_into().unwrap()) as usize;
+    let lease_count = u32::from_le_bytes(buf[20..24].try_into().unwrap()) as usize;
     if buf.len()
         < MANIFEST_HEADER_LEN
             + vdisk_count * MANIFEST_ENTRY_LEN
             + snapshot_count * MANIFEST_SNAPSHOT_LEN
+            + lease_count * MANIFEST_LEASE_LEN
     {
         return Err(FsError::Corrupt(
             "the manifest block is shorter than its counts",
@@ -1027,7 +1246,25 @@ fn decode_manifest(buf: &[u8]) -> Result<DecodedManifest> {
         snapshots.push(((vdisk, snapshot), SnapshotState { size_bytes, root }));
         at += MANIFEST_SNAPSHOT_LEN;
     }
-    Ok(DecodedManifest { vdisks, snapshots })
+    let mut leases = Vec::with_capacity(lease_count);
+    for _ in 0..lease_count {
+        let vdisk = u64::from_le_bytes(buf[at..at + 8].try_into().unwrap());
+        let handing = buf[at + 9];
+        leases.push((
+            vdisk,
+            Lease {
+                holder: buf[at + 8],
+                handing_to: (handing != NO_NODE).then_some(handing),
+                era: u64::from_le_bytes(buf[at + 16..at + 24].try_into().unwrap()),
+            },
+        ));
+        at += MANIFEST_LEASE_LEN;
+    }
+    Ok(DecodedManifest {
+        vdisks,
+        snapshots,
+        leases,
+    })
 }
 
 #[cfg(test)]
@@ -1379,6 +1616,105 @@ mod tests {
         for index in 0..capacity {
             assert_eq!(pool.read_block(1, index).unwrap().unwrap()[8], 11);
         }
+    }
+
+    #[test]
+    fn a_lease_survives_a_restart() {
+        // The whole reason it lives in the pool: a node that restarts must
+        // know whether it may write before anyone tells it.
+        let mut pool = pool(30);
+        pool.create_vdisk(1, 40 * BLOCK as u64).unwrap();
+        pool.claim_lease(1, 7).unwrap();
+        assert!(pool.may_write(1, 7));
+        assert!(!pool.may_write(1, 8));
+        pool.flush().unwrap();
+        // Through the WAL...
+        let mut pool = reopen(pool);
+        assert!(pool.may_write(1, 7));
+        pool.checkpoint().unwrap();
+        // ...and through the manifest.
+        let pool = reopen(pool);
+        assert!(pool.may_write(1, 7));
+        assert_eq!(pool.lease(1).unwrap().holder, 7);
+    }
+
+    #[test]
+    fn a_handover_moves_the_pen_exactly_once() {
+        let mut pool = pool(31);
+        pool.create_vdisk(1, 40 * BLOCK as u64).unwrap();
+        pool.claim_lease(1, 0).unwrap();
+
+        // The window: the guest still runs on 0, so 0 still writes and 1
+        // still may not. This is the invariant a two-primaries window is
+        // always one mistake away from breaking.
+        pool.begin_handover(1, 0, 1).unwrap();
+        assert!(pool.may_write(1, 0), "the source stopped writing too early");
+        assert!(
+            !pool.may_write(1, 1),
+            "the destination wrote during the window"
+        );
+
+        // The instant of handover.
+        pool.accept_handover(1, 1).unwrap();
+        assert!(!pool.may_write(1, 0));
+        assert!(pool.may_write(1, 1));
+        assert_eq!(pool.lease(1).unwrap().handing_to, None);
+    }
+
+    #[test]
+    fn an_abandoned_migration_leaves_the_disk_where_it_was() {
+        let mut pool = pool(32);
+        pool.create_vdisk(1, 40 * BLOCK as u64).unwrap();
+        pool.claim_lease(1, 0).unwrap();
+        pool.begin_handover(1, 0, 1).unwrap();
+        pool.abort_handover(1, 0).unwrap();
+        assert!(pool.may_write(1, 0));
+        assert!(!pool.may_write(1, 1));
+        // And with the window closed, the destination cannot take it.
+        assert_eq!(
+            pool.accept_handover(1, 1).unwrap_err(),
+            FsError::NoSuchHandover(1)
+        );
+    }
+
+    #[test]
+    fn a_held_lease_is_refused_to_everyone_but_its_holder() {
+        let mut pool = pool(33);
+        pool.create_vdisk(1, 40 * BLOCK as u64).unwrap();
+        pool.claim_lease(1, 0).unwrap();
+        assert_eq!(
+            pool.claim_lease(1, 1).unwrap_err(),
+            FsError::LeaseHeld {
+                vdisk: 1,
+                holder: 0
+            }
+        );
+        // The holder may re-claim its own without ceremony.
+        pool.claim_lease(1, 0).unwrap();
+        // And nobody may hand over what they do not hold.
+        assert_eq!(
+            pool.begin_handover(1, 1, 0).unwrap_err(),
+            FsError::NotWriter(1)
+        );
+    }
+
+    #[test]
+    fn a_new_era_retires_the_leases_of_the_one_it_replaced() {
+        // A survivor that has been told its peer is dead is not bound by
+        // the arrangement it had with the peer — otherwise a failover
+        // could never take the pen, and the vdisk would be unwritable
+        // exactly when someone needed to save it.
+        let mut pool = pool(34);
+        pool.create_vdisk(1, 40 * BLOCK as u64).unwrap();
+        pool.claim_lease(1, 0).unwrap();
+        assert!(pool.may_write(1, 0));
+
+        pool.bump_era().unwrap();
+        assert!(!pool.may_write(1, 0), "a stale lease still bound the pool");
+        pool.claim_lease(1, 1).unwrap();
+        assert!(pool.may_write(1, 1));
+        let pool = reopen(pool);
+        assert!(pool.may_write(1, 1));
     }
 
     #[test]

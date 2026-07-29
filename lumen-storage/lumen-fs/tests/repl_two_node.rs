@@ -359,6 +359,127 @@ fn an_unacknowledged_write_dies_with_its_fenced_writer() {
 }
 
 #[test]
+fn a_live_migration_hands_the_pen_over_without_ever_dropping_it() {
+    // The two-primaries window, which is the one moment in a machine's
+    // life when both nodes legitimately hold its disk open. Exactly one of
+    // them may write at every instant of it.
+    let (mut a, mut b, mut net, mut guests) = synced_pair(60);
+    a.write_block(VDISK, 1, b"written before the move").unwrap();
+    a.flush().unwrap();
+    pump(&mut a, &mut b, &mut net, &mut guests);
+
+    // A opens the window toward B: the guest is still on A.
+    a.begin_handover(VDISK, 1).unwrap();
+    pump(&mut a, &mut b, &mut net, &mut guests);
+    assert_eq!(a.lease(VDISK).unwrap().handing_to, Some(1));
+    assert_eq!(
+        b.lease(VDISK).unwrap().handing_to,
+        Some(1),
+        "the peer did not learn the window was open"
+    );
+    // Still A's disk: it writes, B does not.
+    a.write_block(VDISK, 2, b"written during the window")
+        .unwrap();
+    a.flush().unwrap();
+    pump(&mut a, &mut b, &mut net, &mut guests);
+    assert_eq!(
+        b.write_block(VDISK, 3, b"not yours yet").unwrap_err(),
+        FsError::NotWriter(VDISK)
+    );
+
+    // The instant of handover.
+    b.accept_handover(VDISK).unwrap();
+    pump(&mut a, &mut b, &mut net, &mut guests);
+    assert_eq!(
+        a.write_block(VDISK, 3, b"not yours any more").unwrap_err(),
+        FsError::NotWriter(VDISK)
+    );
+    b.write_block(VDISK, 3, b"written after the move").unwrap();
+    let ticket = b.flush().unwrap();
+    pump(&mut a, &mut b, &mut net, &mut guests);
+    assert!(guests.done[1].contains(&ticket));
+
+    // Everything written on either side of the move is on both nodes, and
+    // the move itself survives a crash of the node that now holds it.
+    assert_identical(&a, &b);
+    let b = crash_and_restart(b, 1);
+    assert_eq!(b.lease(VDISK).unwrap().holder, 1, "the lease was forgotten");
+    assert_eq!(
+        b.read_block(VDISK, 2).unwrap().unwrap(),
+        b"written during the window"
+    );
+}
+
+#[test]
+fn an_abandoned_migration_leaves_the_writer_where_it_started() {
+    let (mut a, mut b, mut net, mut guests) = synced_pair(61);
+    a.begin_handover(VDISK, 1).unwrap();
+    pump(&mut a, &mut b, &mut net, &mut guests);
+    a.abort_handover(VDISK).unwrap();
+    pump(&mut a, &mut b, &mut net, &mut guests);
+
+    assert_eq!(b.lease(VDISK).unwrap().handing_to, None);
+    assert_eq!(
+        b.accept_handover(VDISK).unwrap_err(),
+        FsError::NoSuchHandover(VDISK)
+    );
+    // A is still the writer, and still works.
+    a.write_block(VDISK, 4, b"still mine").unwrap();
+    a.flush().unwrap();
+    pump(&mut a, &mut b, &mut net, &mut guests);
+    assert_eq!(b.read_block(VDISK, 4).unwrap().unwrap(), b"still mine");
+}
+
+#[test]
+fn a_failover_takes_a_lease_the_dead_node_still_held() {
+    // The lease says A may write. A dies. B must be able to take it — a
+    // lease that outlived its holder would make the vdisk unwritable at
+    // exactly the moment somebody needs to rescue it.
+    let (mut a, mut b, mut net, mut guests) = synced_pair(62);
+    a.write_block(VDISK, 0, b"before the failure").unwrap();
+    a.flush().unwrap();
+    pump(&mut a, &mut b, &mut net, &mut guests);
+    assert_eq!(b.lease(VDISK).unwrap().holder, 0);
+    assert_eq!(
+        b.write_block(VDISK, 1, b"not yet").unwrap_err(),
+        FsError::NotWriter(VDISK)
+    );
+
+    net.partition();
+    b.peer_lost();
+    let a_disk = {
+        let mut disk = a.into_pool().into_brick().into_disk();
+        disk.crash();
+        disk
+    };
+    b.set_peer_fenced().unwrap();
+    b.claim_writer(VDISK).unwrap();
+    b.write_block(VDISK, 1, b"rescued").unwrap();
+    let ticket = b.flush().unwrap();
+    pump_one(&mut b, &mut guests, 1);
+    assert!(guests.done[1].contains(&ticket));
+
+    // A comes back holding a lease from the era it died in, and must not
+    // act on it: it adopts B's state, leases included.
+    let mut a = ReplNode::new(Pool::open(Brick::open(a_disk).unwrap()).unwrap(), 0);
+    net.up = true;
+    a.connect();
+    b.connect();
+    pump(&mut a, &mut b, &mut net, &mut guests);
+    assert_eq!(
+        a.lease(VDISK).unwrap().holder,
+        1,
+        "the revenant kept the pen"
+    );
+    assert_eq!(
+        a.write_block(VDISK, 2, b"i am still in charge")
+            .unwrap_err(),
+        FsError::NotWriter(VDISK)
+    );
+    assert_identical(&a, &b);
+}
+
+#[test]
 fn a_resync_interrupted_partway_resumes_without_adopting_a_hole() {
     // The hazard content addressing tempts you into: a target that already
     // holds an interior node looks like a target that holds its whole
