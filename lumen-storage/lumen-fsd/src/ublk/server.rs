@@ -45,6 +45,13 @@ fn os_err(what: &str, err: io::Error) -> String {
     format!("{what}: {err}")
 }
 
+/// Say what is coming down, before the sequence that can block on a kernel.
+/// An operator watching a teardown that stalls wants to know which vdisk and
+/// which device it stalled on.
+fn tracing_note(vdisk: u64, dev_id: u32) {
+    eprintln!("ublk: taking down {} (vdisk {vdisk})", block_path(dev_id));
+}
+
 /// Negative errno from a control completion into a readable error.
 fn ctrl_err(what: &str, res: i32) -> String {
     format!("{what}: {}", io::Error::from_raw_os_error(-res))
@@ -211,6 +218,7 @@ impl ExportControl for Export {
     ///    control surface stuck behind it, since this runs on the thread
     ///    answering the operator.
     fn stop(self: Box<Self>) -> Result<(), String> {
+        tracing_note(self.vdisk, self.dev_id);
         let mut ctrl = Ctrl::open()?;
         self.guest.cancel();
         let stopped = ctrl.stop_dev(self.dev_id);
@@ -386,12 +394,12 @@ fn queue_loop(guest: GuestHandle, vdisk: u64, dev_id: u32) -> Result<(), String>
         unsafe { std::mem::transmute(cmd) }
     };
 
-    for tag in 0..depth {
+    for (tag, buffer) in buffers.iter().enumerate() {
         ring.push_cmd(
             char_dev.as_raw_fd(),
             IO_FETCH_REQ,
             tag as u64,
-            &io_cmd(tag, -1, buffers[tag].as_ptr() as u64),
+            &io_cmd(tag, -1, buffer.as_ptr() as u64),
         )
         .map_err(|err| os_err("prime fetch", err))?;
     }

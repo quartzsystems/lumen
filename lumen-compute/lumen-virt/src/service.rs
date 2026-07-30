@@ -3334,7 +3334,6 @@ mod tests {
                 vm.vmid,
                 Acknowledgements {
                     may_lose_data: true,
-                    ..Acknowledgements::default()
                 },
             )
             .await
