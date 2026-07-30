@@ -55,6 +55,11 @@ const CLUSTER_SERVICE: &str = "lumen-cluster";
 /// DRBD, the hypervisor's peer connection, and the migration stream — Core
 /// only, because replication never rides anything else.
 const REPLICATION_SERVICE: &str = "lumen-replication";
+/// The LumenFS peer link, one port per pool — Core only, for the same reason
+/// replication is. Bound whether or not this node has a pool yet: prepare is
+/// the only moment that knows which interface Core is, and a pool created
+/// later must not need the firewall opened by hand.
+const POOL_SERVICE: &str = "lumen-pool";
 
 pub struct CliBackend {
     crm_mon: String,
@@ -285,6 +290,7 @@ impl ClusterBackend for CliBackend {
         let core_zone = self.zone_of(core).await?;
         self.zone_service(&core_zone, REPLICATION_SERVICE, open)
             .await?;
+        self.zone_service(&core_zone, POOL_SERVICE, open).await?;
         self.zone_service(&core_zone, CLUSTER_SERVICE, open).await?;
 
         // The second ring. Skipped when Management shares the Core
@@ -1159,15 +1165,16 @@ Not synchronised\n";
         );
     }
 
-    /// Replication rides Core alone; corosync rides both rings. Each service
-    /// is added to the zone its interface is already in — the console's own
-    /// port is bound to the default zone at install, and an interface moved
-    /// into a zone of ours would take that with it.
+    /// Replication and the pool link ride Core alone; corosync rides both
+    /// rings. Each service is added to the zone its interface is already in —
+    /// the console's own port is bound to the default zone at install, and an
+    /// interface moved into a zone of ours would take that with it.
     #[tokio::test]
     async fn the_clusters_ports_open_on_the_interfaces_that_carry_them() {
         let exec = lumen_sys::exec::MockExec::working();
         exec.answer_next("public\n").await; // the Core interface's zone
         exec.answer_next("").await; // add replication
+        exec.answer_next("").await; // add pool
         exec.answer_next("").await; // add cluster
         exec.answer_next("internal\n").await; // the Management interface's
         let backend = CliBackend::new(exec.clone());
@@ -1191,6 +1198,13 @@ Not synchronised\n";
         assert!(
             exec.ran_with(
                 FIREWALL_CMD,
+                &["--permanent", "--zone=public", "--add-service=lumen-pool"]
+            )
+            .await
+        );
+        assert!(
+            exec.ran_with(
+                FIREWALL_CMD,
                 &[
                     "--permanent",
                     "--zone=public",
@@ -1199,8 +1213,8 @@ Not synchronised\n";
             )
             .await
         );
-        // The second ring, on its own interface's zone — and replication is
-        // not opened there.
+        // The second ring, on its own interface's zone — and neither
+        // replication nor the pool link is opened there.
         assert!(
             exec.ran_with(
                 FIREWALL_CMD,
@@ -1221,6 +1235,14 @@ Not synchronised\n";
                         "--zone=internal",
                         "--add-service=lumen-replication"
                     ]
+                )
+                .await
+        );
+        assert!(
+            !exec
+                .ran_with(
+                    FIREWALL_CMD,
+                    &["--permanent", "--zone=internal", "--add-service=lumen-pool"]
                 )
                 .await
         );
@@ -1275,6 +1297,17 @@ Not synchronised\n";
                     "--permanent",
                     "--zone=public",
                     "--remove-service=lumen-replication"
+                ]
+            )
+            .await
+        );
+        assert!(
+            exec.ran_with(
+                FIREWALL_CMD,
+                &[
+                    "--permanent",
+                    "--zone=public",
+                    "--remove-service=lumen-pool"
                 ]
             )
             .await

@@ -229,10 +229,11 @@ byte-identical, twenty-plus rounds. Three things the kernel taught that
 the header file does not say:
 
 - **EL10 ships io_uring disabled** (`kernel.io_uring_disabled=2`), so the
-  export dies at setup with EPERM until a sysctl opens it. The appliance
-  needs a `sysctl.d` drop-in in the storage package — recorded as a
-  packaging follow-on, and the kind of default that would have cost a
-  support call in the field.
+  export dies at setup with EPERM until a sysctl opens it. The storage
+  package now ships the `sysctl.d` drop-in that raises it to 1 —
+  privileged callers only, never 0 — and the two-host run is what proved
+  the drop-in has to be *shipped* rather than set: the value had been
+  raised by hand on lumen1 and lumen2 was still at EL10's 2.
 - ADD_DEV with an explicit device id demands the no-queue sentinel
   (`queue_id = 0xFFFF`) in the control command, or answers EINVAL.
 - The driver requires 128-byte SQEs on both rings — including the data
@@ -433,6 +434,22 @@ whole sequence is validated on lumen1 against real ublk devices: the
 destination refused before the handover, the source's `relinquish`
 answered, the destination's `accept` then confirming, the source refused
 afterward, and the filesystem mounted from the destination byte-identical.
+
+**And then across two machines, which is the run that matters.** The same
+sequence between lumen1 and lumen2, peered on TCP 7800 over the Core bond
+rather than loopback: a vdisk created on one member and arriving on the
+other by replication alone, exported as `/dev/ublkb6` there and
+`/dev/ublkb7` here, both reading identically mid-window while the
+destination's writes were refused and the source's were not, the pen moving
+once, and the payload byte-identical mounted from the far machine — six
+rounds, every scrub clean. Two details only a real pair could have taught.
+The port is the proof the firewall service is load-bearing: 7800 falls
+outside `lumen-replication`'s 7788–7799, so nothing but `lumen-pool` bound
+to the Core interface's zone opens it. And `kernel.io_uring_disabled` had
+been raised by hand on lumen1 and never persisted, so lumen2 still sat at
+EL10's 2 and could not have exported at all — the sysctl drop-in is not
+packaging tidiness, it is the difference between one node working and a
+pool working.
 
 **And the seam's window verb has changed shape to match.**
 `set_two_primaries(device, allow)` was symmetric because DRBD's window is;
@@ -916,8 +933,10 @@ snapshots. The console's snapshot dialog gets simpler because the truth did.
 
 Membership, quorum, and fencing from `lumen-cluster` and its topology
 regimes. The Core network and its MTU handling for replication and the
-firewalld service pattern for its ports (a new `lumen-pool` service
-definition, bound at prepare exactly as `lumen-replication` is). The peer
+firewalld service pattern for its ports — the `lumen-pool` service
+definition, bound at prepare on the Core interface's existing zone exactly
+as `lumen-replication` is, and never by moving the interface into a zone of
+ours. The peer
 channel for orchestration verbs. The membership record for the slice map
 and pool definitions — written last, workflows transactional with unwind,
 same as every create in the appliance. The HA manager's sweep and rules.
