@@ -15,7 +15,8 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use lumen_fsd::{format_brick, nbd::VDISK, Config, Daemon};
+use lumen_fs::FsError;
+use lumen_fsd::{daemon::Attach, format_brick, nbd::VDISK, Config, Daemon};
 
 const DISK_BYTES: u64 = 64 << 20;
 const VDISK_BYTES: u64 = 8 << 20;
@@ -199,6 +200,207 @@ fn a_verdict_with_the_link_still_up_forces_it_down_first() {
     assert_eq!(b.guest().read(VDISK, 0, 16).unwrap(), b"alone but moving");
 
     b.shutdown();
+    a.shutdown();
+}
+
+/// The vdisk id the lifecycle tests create beyond the formatted one.
+const SECOND: u64 = 2;
+
+#[test]
+fn a_vdisks_life_replicates_from_either_end() {
+    let (a, b, _ba, _bb) = synced_pair("lifecycle");
+    a.guest().create_vdisk(SECOND, 4 << 20).unwrap();
+
+    // Creation is a replicated operation: the peer knows the vdisk exists
+    // without being asked, and knows who holds its pen.
+    wait_until("the peer to learn the new vdisk", || {
+        b.guest().vdisk_size(SECOND).is_ok()
+    });
+    assert_eq!(b.guest().lease(SECOND).unwrap().holder, 0);
+
+    // And it is a real disk on both: written here, readable there after
+    // the two-node barrier.
+    let guest = a.guest();
+    guest.write(SECOND, 0, b"a second disk").unwrap();
+    guest.flush().unwrap();
+    assert_eq!(b.guest().read(SECOND, 0, 13).unwrap(), b"a second disk");
+
+    // Deletion replicates the same way.
+    guest.delete_vdisk(SECOND).unwrap();
+    wait_until("the peer to lose the vdisk", || {
+        b.guest().vdisk_size(SECOND).is_err()
+    });
+    assert!(a.guest().vdisk_size(SECOND).is_err());
+
+    b.shutdown();
+    a.shutdown();
+}
+
+#[test]
+fn a_live_migration_moves_the_pen_and_never_lends_it_twice() {
+    // The shape the compute seam drives: the destination opens the disk
+    // while the source is still writing it, and exactly one of them may
+    // write at every instant.
+    let (a, b, _ba, _bb) = synced_pair("migration");
+    let source = a.guest();
+    let destination = b.guest();
+    source.create_vdisk(SECOND, 4 << 20).unwrap();
+    wait_until("the peer to learn the vdisk", || {
+        destination.vdisk_size(SECOND).is_ok()
+    });
+
+    // An ordinary attach takes the pen.
+    assert_eq!(source.attach(SECOND).unwrap(), Attach::Writer);
+    source.write(SECOND, 0, b"written before the move").unwrap();
+    source.flush().unwrap();
+
+    // Before the window, the destination cannot even open it: this is
+    // somebody else's disk.
+    assert!(
+        destination.attach(SECOND).is_err(),
+        "the disk opened on a node with no claim to it"
+    );
+
+    // The window opens. Now the destination may hold it open — penless.
+    source.begin_handover(SECOND, 1).unwrap();
+    wait_until("the window to reach the destination", || {
+        destination
+            .lease(SECOND)
+            .is_some_and(|lease| lease.handing_to == Some(1))
+    });
+    assert_eq!(destination.attach(SECOND).unwrap(), Attach::Penless);
+
+    // Mid-window: the source still writes, the destination still cannot.
+    source
+        .write(SECOND, 4096, b"written during the window")
+        .unwrap();
+    source.flush().unwrap();
+    assert_eq!(
+        destination
+            .write(SECOND, 8192, b"not yours yet")
+            .unwrap_err(),
+        FsError::NotWriter(SECOND)
+    );
+
+    // The instant of handover, and it is exactly an instant: after it the
+    // source is the one refused.
+    destination.accept_handover(SECOND).unwrap();
+    destination
+        .write(SECOND, 8192, b"written after the move")
+        .unwrap();
+    destination.flush().unwrap();
+    assert_eq!(
+        source
+            .write(SECOND, 12288, b"not mine any more")
+            .unwrap_err(),
+        FsError::NotWriter(SECOND)
+    );
+
+    // Everything from both sides of the move is on both nodes.
+    for (node, name) in [(&a, "source"), (&b, "destination")] {
+        let guest = node.guest();
+        assert_eq!(
+            guest.read(SECOND, 0, 23).unwrap(),
+            b"written before the move",
+            "{name} lost the pre-move write"
+        );
+        assert_eq!(
+            guest.read(SECOND, 4096, 25).unwrap(),
+            b"written during the window",
+            "{name} lost the in-window write"
+        );
+        assert_eq!(
+            guest.read(SECOND, 8192, 22).unwrap(),
+            b"written after the move",
+            "{name} lost the post-move write"
+        );
+    }
+
+    b.shutdown();
+    a.shutdown();
+}
+
+#[test]
+fn an_aborted_migration_leaves_the_disk_where_it_started() {
+    let (a, b, _ba, _bb) = synced_pair("abort");
+    let source = a.guest();
+    let destination = b.guest();
+    source.create_vdisk(SECOND, 4 << 20).unwrap();
+    wait_until("the peer to learn the vdisk", || {
+        destination.vdisk_size(SECOND).is_ok()
+    });
+    source.attach(SECOND).unwrap();
+    source.begin_handover(SECOND, 1).unwrap();
+    wait_until("the window to reach the destination", || {
+        destination
+            .lease(SECOND)
+            .is_some_and(|lease| lease.handing_to == Some(1))
+    });
+    assert_eq!(destination.attach(SECOND).unwrap(), Attach::Penless);
+
+    // The migration fails, so the window closes from the side that never
+    // stopped being the writer.
+    source.abort_handover(SECOND).unwrap();
+    wait_until("the closed window to reach the destination", || {
+        destination
+            .lease(SECOND)
+            .is_some_and(|lease| lease.handing_to.is_none())
+    });
+
+    // The destination can no longer accept, and can no longer even open
+    // the disk: the offer is withdrawn.
+    assert_eq!(
+        destination.accept_handover(SECOND).unwrap_err(),
+        FsError::NoSuchHandover(SECOND)
+    );
+    assert!(destination.attach(SECOND).is_err());
+
+    // And the source is still the writer, and still works.
+    source.write(SECOND, 0, b"still mine").unwrap();
+    source.flush().unwrap();
+    assert_eq!(destination.read(SECOND, 0, 10).unwrap(), b"still mine");
+
+    b.shutdown();
+    a.shutdown();
+}
+
+#[test]
+fn a_cancelled_handle_releases_parked_io_without_a_verdict() {
+    // Suspended I/O waits for a verdict, and a verdict may never come.
+    // So taking an export down cannot mean waiting for its parked
+    // requests: `unexport` on a node whose peer died unfenced would hang,
+    // and hang the control surface with it. Cancelling is the release.
+    let (a, b, _ba, _bb) = synced_pair("cancel");
+    let guest = a.guest();
+    guest.claim_writer(VDISK).unwrap();
+    b.shutdown();
+    wait_until("the survivor to notice", || {
+        a.status().state == lumen_fs::ReplState::Suspended
+    });
+
+    let (tx, rx) = mpsc::channel();
+    let parked = guest.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(parked.write(VDISK, 0, b"never acknowledged"));
+    });
+    assert_eq!(
+        rx.recv_timeout(Duration::from_millis(400)),
+        Err(mpsc::RecvTimeoutError::Timeout),
+        "the write did not park, so this test proves nothing"
+    );
+
+    // The switch a teardown throws — and it reaches the clone servicing
+    // the export, which is the whole point.
+    guest.cancel();
+    let outcome = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("cancelling did not release the parked write");
+    assert_eq!(
+        outcome.unwrap_err(),
+        FsError::Suspended,
+        "a released write must fail, never silently succeed"
+    );
+
     a.shutdown();
 }
 

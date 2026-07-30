@@ -283,13 +283,89 @@ The mapping:
   method grows a destination parameter (or a sibling method), decided
   when the implementation lands.
 
-Two consequences the export must absorb first: the daemon needs vdisk
-lifecycle verbs on its control surface (today it serves exactly vdisk 1
-via a boot flag), and the ublk attach must stop claiming the writer
-lease unconditionally — a migration destination opens the device
-*without* the pen, and writes refuse until the handover's accept. The
-claim moves to "first attach outside a window", which the lease state
-already distinguishes.
+**Both prerequisites are in.** The daemon now has the vdisk lifecycle and
+the export registry on its control surface — `vdisk-create`,
+`vdisk-delete`, `vdisks`, `export <vdisk> <dev>`, `unexport`, `exports`,
+`lease`, and the three migration acts (`handover <vdisk> <to>` on the
+source, `accept` on the destination, `abort` on the source) — so an
+orchestrator drives storage without restarting anything. Exports are
+owned by the daemon rather than by whoever started them, which is what
+makes stopping possible at all: a block device that outlives the process
+serving it is a device whose next reader hangs, so shutdown tears every
+export down *before* the engine stops answering.
+
+And the attach no longer grabs the pen unconditionally. `GuestHandle::attach`
+returns `Writer` or `Penless`: ordinarily it claims the lease — that is
+the single-writer door — but an attach that finds a window aimed at this
+node opens **penless**, and an attach where the peer holds the lease with
+no window naming us is somebody else's disk and is refused outright. A
+window from a retired era binds nothing, so a survivor that moved on is
+not offered a door it should not walk through. This is what lets a
+migration destination hold the disk open while the source is still
+writing it, which is the whole shape of the thing.
+
+The suite now covers that shape end to end on real sockets: a vdisk's
+creation and deletion replicating from either end; an ordinary attach
+taking the pen and a pre-window attach being refused; a penless attach
+inside the window where the source keeps writing and the destination is
+refused; the accept as a single instant, after which the *source* is the
+one refused; and an aborted window leaving the disk exactly where it
+started, with the destination unable to accept or even reopen. Each of
+those fails if the penless branch is removed — checked by removing it.
+
+**And it holds on real block devices.** On lumen1: a vdisk created
+through the control surface and replicated; exported from A, given an
+ext4 and 64 MiB of payload with flushes engaging; a window opened, and
+the *same vdisk* opened on B as its own `/dev/ublkb` — both devices
+reading identically, a `dd` to the destination refused by the kernel with
+an I/O error, and the source still writing through its own window; the
+accept, after which the destination writes and the **source** is the one
+refused; the filesystem mounted from the destination with the payload
+byte-identical; and the export torn down leaving no device behind. Two
+writers never existed at any point a shell could observe.
+
+Getting there cost two teardown deadlocks, both of the kind only a real
+kernel tells you about, and together they fix the order of an export's
+last four steps — each one unblocking the next:
+
+1. **Release parked I/O.** STOP_DEV freezes the block queue and waits for
+   in-flight requests to complete. A request parked *inside the engine* on
+   a suspension no verdict will ever resolve never completes — so a peer
+   dying unfenced left STOP_DEV waiting in `blk_mq_freeze_queue_wait`
+   while the guest's `dd` waited in `submit_bio_wait`, forever, with the
+   control surface stuck behind it (a teardown runs on the thread
+   answering the operator). A guest handle can now be **cancelled**:
+   parked operations give up and become errors, which is the honest answer
+   for a device that is going away — nothing was acknowledged, so nothing
+   is being taken back. Suspended I/O still waits for a verdict in every
+   case except the one where its device is being removed.
+2. **STOP_DEV**, which aborts the queue's parked fetches — the only thing
+   that ends the servicing loop, so it must precede the join.
+3. **Join**, which is what drops the descriptor mapping.
+4. **DEL_DEV**, last. The first deadlock was here: `unexport` never
+   returned, with a kernel thread in `ublk_ctrl_del_dev` and the queue
+   thread long since exited, because **an mmap outlives the descriptor it
+   came from**. The request-descriptor region was mapped and never
+   unmapped, so it kept its own reference to the char device and the
+   kernel's delete waited forever for a device nobody was using. The
+   mapping is an RAII guard now, and the delete waits only on what the
+   join has already released.
+
+Both were diagnosed the same way — thread wait-channels on the live box,
+which named the exact kernel function each side was parked in — and
+neither was reachable from the simulation or from a test that never tore
+an export down while its node was suspended. The first is confirmed on
+hardware; the second is proven by a test that fails without the fix, with
+its hardware run still owed (see below).
+
+**An operational rule the second one taught, worth stating for anyone who
+ever debugs this daemon: never `kill -9` a ublk server while a guest
+request is in flight.** Nothing is left to complete that request, so the
+device's queue can never freeze, the server's threads can never leave the
+kernel, and SIGKILL is ignored because they are in uninterruptible sleep
+— the minor is then unrecoverable until the machine reboots. A recoverable
+hang becomes a permanent one. Ask the daemon to `unexport` (bounded), and
+escalate no further than SIGTERM while a device still exists.
 
 Still ahead in phase 3 beyond that: the console pages (pool and vdisk
 views with the snapshot dialog); then the slice map that takes this past

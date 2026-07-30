@@ -7,10 +7,11 @@
 //! docs/lumenfs.md says it is — bootstrap and debugging, never the VM path;
 //! ublk takes that seat next.
 //!
-//! Attach claims: the first thing a client connection does is take the
-//! vdisk's writer lease, and a lease the peer holds refuses the client.
-//! That is the single-writer guarantee arriving at the door instead of at
-//! the first write.
+//! Attach decides the pen: a client connection ordinarily takes the
+//! vdisk's writer lease, and a lease the peer holds refuses the client —
+//! the single-writer guarantee arriving at the door instead of at the
+//! first write. Inside a migration window aimed at this node the disk
+//! opens penless instead, and writes refuse until the handover's accept.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -19,7 +20,8 @@ use lumen_fs::FsError;
 
 use crate::daemon::GuestHandle;
 
-/// The one exported vdisk, same as the smoke tool's.
+/// The vdisk a freshly formatted brick carries, and the default the CLI
+/// exports when no id is named — the smoke tool's convention, kept.
 pub const VDISK: u64 = 1;
 
 const OPTS_MAGIC: u64 = 0x4948_4156_454F_5054; // "IHAVEOPT"
@@ -58,7 +60,7 @@ const MAX_REQUEST: u32 = 32 << 20;
 
 /// Serve the export until the listener dies. One client at a time — the
 /// bootstrap posture; concurrency arrives with ublk.
-pub fn serve(listener: TcpListener, guest: GuestHandle) {
+pub fn serve(listener: TcpListener, guest: GuestHandle, vdisk: u64) {
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(stream) => stream,
@@ -72,24 +74,26 @@ pub fn serve(listener: TcpListener, guest: GuestHandle) {
             .map(|a| a.to_string())
             .unwrap_or_else(|_| "?".into());
         println!("nbd client {peer} connected");
-        match serve_client(stream, &guest) {
+        match serve_client(stream, &guest, vdisk) {
             Ok(()) => println!("nbd client {peer} disconnected"),
             Err(err) => eprintln!("nbd client {peer} dropped: {err}"),
         }
     }
 }
 
-fn serve_client(mut stream: TcpStream, guest: &GuestHandle) -> std::io::Result<()> {
+fn serve_client(mut stream: TcpStream, guest: &GuestHandle, vdisk: u64) -> std::io::Result<()> {
     stream.set_nodelay(true).ok();
 
-    // The attach: hold the pen before promising a disk. A lease the peer
-    // holds under the current era refuses the client here, at the door.
-    if let Err(err) = guest.claim_writer(VDISK) {
+    // The attach decides the pen: ordinarily it is taken here, at the
+    // door, and a lease the peer holds refuses the client outright. Inside
+    // a migration window aimed at this node the disk opens penless, and
+    // writes refuse until the handover's accept.
+    if let Err(err) = guest.attach(vdisk) {
         eprintln!("nbd attach refused: {err}");
         return Err(std::io::ErrorKind::PermissionDenied.into());
     }
     let size = guest
-        .vdisk_size(VDISK)
+        .vdisk_size(vdisk)
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::NotFound))?;
 
     // Handshake.
@@ -161,7 +165,7 @@ fn serve_client(mut stream: TcpStream, guest: &GuestHandle) -> std::io::Result<(
                     simple_reply(&mut stream, EINVAL, cookie, &[])?;
                     continue;
                 }
-                match guest.read(VDISK, offset, length as u64) {
+                match guest.read(vdisk, offset, length as u64) {
                     Ok(data) => simple_reply(&mut stream, 0, cookie, &data)?,
                     Err(err) => simple_reply(&mut stream, engine_errno(&err), cookie, &[])?,
                 }
@@ -172,7 +176,7 @@ fn serve_client(mut stream: TcpStream, guest: &GuestHandle) -> std::io::Result<(
                 }
                 let mut data = vec![0u8; length as usize];
                 stream.read_exact(&mut data)?;
-                match guest.write(VDISK, offset, &data) {
+                match guest.write(vdisk, offset, &data) {
                     Ok(()) => simple_reply(&mut stream, 0, cookie, &[])?,
                     Err(err) => simple_reply(&mut stream, engine_errno(&err), cookie, &[])?,
                 }
@@ -181,7 +185,7 @@ fn serve_client(mut stream: TcpStream, guest: &GuestHandle) -> std::io::Result<(
                 Ok(()) => simple_reply(&mut stream, 0, cookie, &[])?,
                 Err(err) => simple_reply(&mut stream, engine_errno(&err), cookie, &[])?,
             },
-            CMD_TRIM => match guest.trim(VDISK, offset, length as u64) {
+            CMD_TRIM => match guest.trim(vdisk, offset, length as u64) {
                 Ok(()) => simple_reply(&mut stream, 0, cookie, &[])?,
                 Err(err) => simple_reply(&mut stream, engine_errno(&err), cookie, &[])?,
             },

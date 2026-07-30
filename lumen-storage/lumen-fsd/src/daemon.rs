@@ -84,6 +84,26 @@ pub struct Status {
     pub stream: (u64, u64, u64),
 }
 
+/// What an attach got: the pen, or a seat beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attach {
+    /// This node holds the writer lease; the guest may write.
+    Writer,
+    /// Opened inside a migration window aimed here. Reads serve, writes
+    /// refuse, and the pen arrives with the handover's accept.
+    Penless,
+}
+
+/// A live guest export, held by the daemon so it can be taken down —
+/// abstract because the only implementation is Linux-only, and the
+/// daemon's own bookkeeping should not be.
+pub trait ExportControl: Send {
+    /// For the status line: what and where.
+    fn describe(&self) -> String;
+    /// Tear the export down and wait for its servicing to end.
+    fn stop(self: Box<Self>) -> Result<(), String>;
+}
+
 struct Outbound {
     queue: VecDeque<PeerMessage>,
     /// The session generation. Bumped at every session start, every
@@ -268,6 +288,10 @@ fn with_room<T>(
 #[derive(Clone)]
 pub struct GuestHandle {
     shared: Arc<Shared>,
+    /// Set when whatever this handle serves is going away. Clones share
+    /// it, so cancelling the handle an export was built from releases the
+    /// threads servicing that export — see [`GuestHandle::cancel`].
+    cancelled: Arc<AtomicBool>,
 }
 
 impl GuestHandle {
@@ -277,9 +301,26 @@ impl GuestHandle {
             .with_engine(|engine| engine.read_bytes(vdisk, offset, len))
     }
 
+    /// Stop parking I/O on this handle and every clone of it: the export
+    /// it serves is being taken down.
+    ///
+    /// Suspended I/O waits for a verdict, and a verdict may never come —
+    /// that is the whole point of it. So a teardown that waits for parked
+    /// requests to finish waits forever: `unexport` on a node whose peer
+    /// died unfenced would hang, and hang the control surface with it,
+    /// since the teardown runs on the thread answering the operator.
+    /// Cancelling turns those requests into errors, which is the honest
+    /// answer for a device that is going away — nothing was acknowledged,
+    /// so nothing is being taken back.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        self.shared.notify_all();
+    }
+
     /// A mutation, blocking through suspension: a suspended node holds the
     /// request (DRBD's suspended I/O) rather than erroring the guest, and
-    /// completes it when a verdict or a reconciliation says how.
+    /// completes it when a verdict or a reconciliation says how — or when
+    /// the export it belongs to is cancelled out from under it.
     fn blocking<T>(
         &self,
         mut f: impl FnMut(&mut ReplNode<FileDisk>) -> Result<T, FsError>,
@@ -288,7 +329,7 @@ impl GuestHandle {
             let outcome = self.shared.with_engine(|engine| with_room(engine, &mut f));
             match outcome {
                 Err(FsError::Suspended) => {
-                    if !self.shared.wait_change() {
+                    if self.cancelled.load(Ordering::SeqCst) || !self.shared.wait_change() {
                         return Err(FsError::Suspended);
                     }
                 }
@@ -321,7 +362,8 @@ impl GuestHandle {
                     Err(FsError::Corrupt("a flush's writes did not survive"))
                 };
             }
-            if self.shared.shutdown.load(Ordering::SeqCst) {
+            if self.shared.shutdown.load(Ordering::SeqCst) || self.cancelled.load(Ordering::SeqCst)
+            {
                 return Err(FsError::Suspended);
             }
             flushes = self
@@ -333,10 +375,80 @@ impl GuestHandle {
         }
     }
 
-    /// Take the writer lease — the attach step. Blocks through suspension;
-    /// refuses (`LeaseHeld`) if the peer holds the vdisk in this era.
+    /// Take the writer lease. Blocks through suspension; refuses
+    /// (`LeaseHeld`) if the peer holds the vdisk in this era.
     pub fn claim_writer(&self, vdisk: u64) -> Result<(), FsError> {
         self.blocking(|engine| engine.claim_writer(vdisk))
+    }
+
+    /// Open a vdisk for a guest, and say whether this node may write it.
+    ///
+    /// The distinction is live migration's whole shape. An ordinary attach
+    /// takes the pen — that is what makes a running machine's disk
+    /// single-writer. But a migration *destination* must open the disk
+    /// while the source is still writing it, so an attach that found a
+    /// window open toward this node opens **penless**: reads work, writes
+    /// refuse with `NotWriter`, and the pen arrives at
+    /// [`GuestHandle::accept_handover`] — one durable step, no instant
+    /// with two writers. An attach where the peer holds the lease and no
+    /// window names us is somebody else's disk, and is refused.
+    pub fn attach(&self, vdisk: u64) -> Result<Attach, FsError> {
+        // Existence first: a claim on a vdisk that is not here should say
+        // so, not report a lease problem.
+        self.vdisk_size(vdisk)?;
+        self.blocking(|engine| {
+            let node = engine.node();
+            let era = engine.pool().era();
+            match engine.lease(vdisk) {
+                // A window from the era we are actually in. A window from
+                // a retired era binds nothing — the survivor moved on.
+                Some(lease) if lease.era >= era && lease.handing_to == Some(node) => {
+                    Ok(Attach::Penless)
+                }
+                _ => {
+                    engine.claim_writer(vdisk)?;
+                    Ok(Attach::Writer)
+                }
+            }
+        })
+    }
+
+    /// Open the migration window toward `to`. The guest keeps running and
+    /// keeps writing here; the destination may open the disk alongside.
+    pub fn begin_handover(&self, vdisk: u64, to: u8) -> Result<(), FsError> {
+        self.blocking(|engine| engine.begin_handover(vdisk, to))
+    }
+
+    /// Take a lease handed to this node: the instant the guest becomes
+    /// ours. Runs on the destination, when the guest starts writing there.
+    pub fn accept_handover(&self, vdisk: u64) -> Result<(), FsError> {
+        self.blocking(|engine| engine.accept_handover(vdisk))
+    }
+
+    /// The migration failed; the window closes and the disk stays put.
+    /// Runs on the source, which never stopped being the writer.
+    pub fn abort_handover(&self, vdisk: u64) -> Result<(), FsError> {
+        self.blocking(|engine| engine.abort_handover(vdisk))
+    }
+
+    pub fn lease(&self, vdisk: u64) -> Option<Lease> {
+        self.shared.with_engine(|engine| engine.lease(vdisk))
+    }
+
+    /// Create a vdisk. Replicated like any other operation, so it exists
+    /// on both members or the call refuses.
+    pub fn create_vdisk(&self, vdisk: u64, size_bytes: u64) -> Result<(), FsError> {
+        self.blocking(|engine| engine.create_vdisk(vdisk, size_bytes))
+    }
+
+    /// Destroy a vdisk. Refused while snapshots pin its history — the
+    /// engine's rule, surfaced rather than worked around.
+    pub fn delete_vdisk(&self, vdisk: u64) -> Result<(), FsError> {
+        self.blocking(|engine| engine.delete_vdisk(vdisk))
+    }
+
+    pub fn vdisks(&self) -> Vec<(u64, u64)> {
+        self.shared.with_engine(|engine| engine.pool().vdisks())
     }
 
     pub fn vdisk_size(&self, vdisk: u64) -> Result<u64, FsError> {
@@ -480,6 +592,10 @@ pub struct Daemon {
     threads: Vec<JoinHandle<()>>,
     /// Where the peer listener actually bound, for `listen` on port 0.
     peer_addr: Option<SocketAddr>,
+    /// Live guest exports by vdisk. The daemon owns these so that stopping
+    /// is possible at all: a block device that outlives the process
+    /// serving it is a device whose next reader hangs.
+    exports: Mutex<HashMap<u64, Box<dyn ExportControl>>>,
 }
 
 impl Daemon {
@@ -618,7 +734,68 @@ impl Daemon {
             shared,
             threads,
             peer_addr,
+            exports: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Serve `vdisk` as a guest block device. One export per vdisk: a
+    /// second would be a second writer wearing a different device name,
+    /// which is the thing every layer under this exists to prevent.
+    pub fn export(&self, vdisk: u64, dev_id: u32) -> Result<String, String> {
+        let mut exports = self.exports.lock().unwrap();
+        if exports.contains_key(&vdisk) {
+            return Err(format!("vdisk {vdisk} is already exported"));
+        }
+        let export = self.start_export(vdisk, dev_id)?;
+        let describe = export.describe();
+        exports.insert(vdisk, export);
+        Ok(describe)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn start_export(&self, vdisk: u64, dev_id: u32) -> Result<Box<dyn ExportControl>, String> {
+        crate::ublk::start(self.guest(), vdisk, dev_id)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn start_export(&self, _vdisk: u64, _dev_id: u32) -> Result<Box<dyn ExportControl>, String> {
+        Err("the ublk export needs a Linux kernel".into())
+    }
+
+    /// Take an export down. The lease is deliberately *not* released: who
+    /// may write outlives who is currently serving, which is what lets a
+    /// node be re-exported after a daemon restart without a negotiation.
+    pub fn unexport(&self, vdisk: u64) -> Result<(), String> {
+        let export = self
+            .exports
+            .lock()
+            .unwrap()
+            .remove(&vdisk)
+            .ok_or_else(|| format!("vdisk {vdisk} is not exported"))?;
+        export.stop()
+    }
+
+    /// Every live export, `(vdisk, description)`, sorted.
+    pub fn exports(&self) -> Vec<(u64, String)> {
+        let exports = self.exports.lock().unwrap();
+        let mut all: Vec<(u64, String)> = exports
+            .iter()
+            .map(|(vdisk, export)| (*vdisk, export.describe()))
+            .collect();
+        all.sort_by_key(|(vdisk, _)| *vdisk);
+        all
+    }
+
+    /// Stop every export. Runs before the threads join at shutdown, and
+    /// on its own when an operator wants the guests off this node.
+    fn stop_all_exports(&self) {
+        let taken: Vec<(u64, Box<dyn ExportControl>)> =
+            self.exports.lock().unwrap().drain().collect();
+        for (vdisk, export) in taken {
+            if let Err(err) = export.stop() {
+                eprintln!("stopping the export of vdisk {vdisk} failed: {err}");
+            }
+        }
     }
 
     /// Where the peer listener bound — what the other node dials.
@@ -626,9 +803,12 @@ impl Daemon {
         self.peer_addr
     }
 
+    /// A fresh guest handle, with its own cancellation switch — so
+    /// cancelling one export's handle never releases another's parked I/O.
     pub fn guest(&self) -> GuestHandle {
         GuestHandle {
             shared: Arc::clone(&self.shared),
+            cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -662,8 +842,12 @@ impl Daemon {
         self.shared.with_engine(|engine| engine.pool().scrub())
     }
 
-    /// Stop everything, settle the pool, release the brick.
+    /// Stop everything, settle the pool, release the brick. Exports go
+    /// first and while the engine is still answering: a guest device
+    /// whose server has already stopped is a device that hangs its
+    /// reader, and tearing it down needs the very I/O path being closed.
     pub fn shutdown(self) {
+        self.stop_all_exports();
         self.shared.shutdown.store(true, Ordering::SeqCst);
         self.shared.kill_link();
         self.shared.notify_all();

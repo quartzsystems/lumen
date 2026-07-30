@@ -185,20 +185,15 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
             TcpListener::bind(addr).map_err(|err| format!("cannot bind nbd {addr}: {err}"))?;
         println!("nbd export on {addr}");
         let guest = daemon.guest();
-        threads.push(std::thread::spawn(move || nbd::serve(listener, guest)));
-    }
-    #[cfg(target_os = "linux")]
-    if let Some(dev_id) = ublk_dev {
-        let guest = daemon.guest();
         threads.push(std::thread::spawn(move || {
-            if let Err(err) = lumen_fsd::ublk::serve(guest, dev_id) {
-                eprintln!("ublk export failed: {err}");
-            }
+            nbd::serve(listener, guest, nbd::VDISK)
         }));
     }
-    #[cfg(not(target_os = "linux"))]
-    if ublk_dev.is_some() {
-        return Err("the ublk export needs a Linux kernel".into());
+    if let Some(dev_id) = ublk_dev {
+        // The boot flag is a convenience for the default vdisk; the
+        // control surface is where exports are managed for real.
+        let device = daemon.export(nbd::VDISK, dev_id)?;
+        println!("ublk export: {device}");
     }
     if let Some(addr) = control_addr {
         let listener =
@@ -244,7 +239,116 @@ fn serve_control(listener: TcpListener, daemon: &Daemon) {
     }
 }
 
-fn control_command(daemon: &Daemon, command: &str) -> String {
+/// The verbs, dispatched on words so arguments are ordinary rather than
+/// a special case. Every reply is one line beginning `ok` or `error`.
+fn control_command(daemon: &Daemon, line: &str) -> String {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let number = |index: usize| -> Result<u64, String> {
+        words
+            .get(index)
+            .ok_or_else(|| "error: missing argument".to_string())?
+            .parse::<u64>()
+            .map_err(|_| format!("error: not a number: {}", words[index]))
+    };
+    match words.first().copied().unwrap_or("") {
+        "vdisks" => {
+            let listed: Vec<String> = daemon
+                .guest()
+                .vdisks()
+                .iter()
+                .map(|(id, size)| format!("{id}:{size}"))
+                .collect();
+            format!("ok: [{}]", listed.join(","))
+        }
+        "vdisk-create" => match (number(1), number(2)) {
+            (Ok(vdisk), Ok(size)) => match daemon.guest().create_vdisk(vdisk, size) {
+                Ok(()) => format!("ok: vdisk {vdisk} of {size} bytes"),
+                Err(err) => format!("error: {err}"),
+            },
+            (Err(err), _) | (_, Err(err)) => err,
+        },
+        "vdisk-delete" => match number(1) {
+            Ok(vdisk) => match daemon.guest().delete_vdisk(vdisk) {
+                Ok(()) => format!("ok: vdisk {vdisk} gone"),
+                Err(err) => format!("error: {err}"),
+            },
+            Err(err) => err,
+        },
+        "export" => match (number(1), number(2)) {
+            (Ok(vdisk), Ok(dev_id)) => match daemon.export(vdisk, dev_id as u32) {
+                Ok(device) => format!("ok: {device}"),
+                Err(err) => format!("error: {err}"),
+            },
+            (Err(err), _) | (_, Err(err)) => err,
+        },
+        "unexport" => match number(1) {
+            Ok(vdisk) => match daemon.unexport(vdisk) {
+                Ok(()) => format!("ok: vdisk {vdisk} unexported"),
+                Err(err) => format!("error: {err}"),
+            },
+            Err(err) => err,
+        },
+        "exports" => {
+            let listed: Vec<String> = daemon
+                .exports()
+                .iter()
+                .map(|(vdisk, device)| format!("{vdisk}={device}"))
+                .collect();
+            format!("ok: [{}]", listed.join(","))
+        }
+        "lease" => match number(1) {
+            Ok(vdisk) => match daemon.guest().lease(vdisk) {
+                Some(lease) => format!(
+                    "ok: holder {} era {}{}",
+                    lease.holder,
+                    lease.era,
+                    match lease.handing_to {
+                        Some(to) => format!(" handing to {to}"),
+                        None => String::new(),
+                    }
+                ),
+                None => "ok: unheld".into(),
+            },
+            Err(err) => err,
+        },
+        // The migration window, as three explicit acts. `handover` runs on
+        // the source and opens it; `accept` runs on the *destination* and
+        // is the instant the pen moves; `abort` runs on the source and
+        // closes a window the migration never used.
+        "handover" => match (number(1), number(2)) {
+            (Ok(vdisk), Ok(to)) => match daemon.guest().begin_handover(vdisk, to as u8) {
+                Ok(()) => format!("ok: window open on vdisk {vdisk} toward node {to}"),
+                Err(err) => format!("error: {err}"),
+            },
+            (Err(err), _) | (_, Err(err)) => err,
+        },
+        "accept" => match number(1) {
+            Ok(vdisk) => match daemon.guest().accept_handover(vdisk) {
+                Ok(()) => format!("ok: vdisk {vdisk} is ours"),
+                Err(err) => format!("error: {err}"),
+            },
+            Err(err) => err,
+        },
+        "abort" => match number(1) {
+            Ok(vdisk) => match daemon.guest().abort_handover(vdisk) {
+                Ok(()) => format!("ok: window on vdisk {vdisk} closed"),
+                Err(err) => format!("error: {err}"),
+            },
+            Err(err) => err,
+        },
+        "hash" => match number(1) {
+            Ok(vdisk) => match vdisk_content_hash(daemon, vdisk) {
+                Ok(hash) => format!("ok: {hash}"),
+                Err(err) => format!("error: {err}"),
+            },
+            Err(err) => err,
+        },
+        _ => legacy_command(daemon, line),
+    }
+}
+
+/// The node-wide verbs, unchanged.
+fn legacy_command(daemon: &Daemon, command: &str) -> String {
     match command {
         "status" => {
             let s = daemon.status();
@@ -302,19 +406,11 @@ fn control_command(daemon: &Daemon, command: &str) -> String {
             ),
             Err(err) => format!("error: {err}"),
         },
-        _ => {
-            if let Some(vdisk) = command.strip_prefix("hash ") {
-                return match vdisk.parse::<u64>() {
-                    Ok(vdisk) => match vdisk_content_hash(daemon, vdisk) {
-                        Ok(hash) => format!("ok: {hash}"),
-                        Err(err) => format!("error: {err}"),
-                    },
-                    Err(_) => format!("error: not a vdisk id: {vdisk}"),
-                };
-            }
-            "error: unknown command (status, fence-peer, checkpoint, gc, scrub, hash <vdisk>)"
-                .into()
-        }
+        _ => "error: unknown command. node: status, fence-peer, checkpoint, gc, scrub. \
+              vdisks: vdisks, vdisk-create <id> <bytes>, vdisk-delete <id>, hash <id>. \
+              exports: export <id> <dev>, unexport <id>, exports. \
+              migration: lease <id>, handover <id> <to-node>, accept <id>, abort <id>"
+            .into(),
     }
 }
 

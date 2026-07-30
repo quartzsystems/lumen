@@ -14,4 +14,4 @@ mod server;
 mod uring;
 
 #[cfg(target_os = "linux")]
-pub use server::{delete_device, serve};
+pub use server::{delete_device, start, Export};

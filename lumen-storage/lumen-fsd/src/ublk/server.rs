@@ -23,13 +23,13 @@
 
 use std::fs::OpenOptions;
 use std::io;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use lumen_fs::FsError;
 
-use crate::daemon::GuestHandle;
-use crate::nbd::VDISK;
+use crate::daemon::{Attach, ExportControl, GuestHandle};
 
 use super::uapi::*;
 use super::uring::Uring;
@@ -174,13 +174,67 @@ impl Ctrl {
     }
 }
 
-/// Serve the vdisk as `/dev/ublkb<dev_id>` until the device is stopped.
-/// Claims the writer lease first — the single-writer door, same as NBD's.
-pub fn serve(guest: GuestHandle, dev_id: u32) -> Result<(), String> {
-    guest
-        .claim_writer(VDISK)
+/// A live export: the device, the thread servicing its queue, and the
+/// handle whose cancellation releases that thread if it is parked.
+pub struct Export {
+    vdisk: u64,
+    dev_id: u32,
+    guest: GuestHandle,
+    queue: JoinHandle<Result<(), String>>,
+}
+
+impl ExportControl for Export {
+    fn describe(&self) -> String {
+        format!("{} (vdisk {})", block_path(self.dev_id), self.vdisk)
+    }
+
+    /// Release, stop, join, delete — a sequence in which every step
+    /// unblocks the next, and every ordering here was learned by
+    /// deadlocking against a real kernel.
+    ///
+    /// 1. **Cancel first.** STOP_DEV freezes the block queue and waits for
+    ///    in-flight requests to complete. A request parked inside the
+    ///    engine on a suspension no verdict will ever resolve never
+    ///    completes, so STOP_DEV waits forever in
+    ///    `blk_mq_freeze_queue_wait` while the guest's bio waits in
+    ///    `submit_bio_wait`. Releasing parked I/O first turns those into
+    ///    errors, which is the honest answer for a device going away.
+    /// 2. **Then STOP_DEV**, which aborts the queue's parked fetches —
+    ///    the only thing that ends the servicing loop, so it must precede
+    ///    the join.
+    /// 3. **Then join**, which is what drops the descriptor mapping.
+    /// 4. **DEL_DEV last**: the kernel's delete waits until every
+    ///    reference to the char device is gone, mappings included, so
+    ///    deleting earlier hangs in `ublk_ctrl_del_dev` — with the
+    ///    control surface stuck behind it, since this runs on the thread
+    ///    answering the operator.
+    fn stop(self: Box<Self>) -> Result<(), String> {
+        let mut ctrl = Ctrl::open()?;
+        self.guest.cancel();
+        let stopped = ctrl.stop_dev(self.dev_id);
+        let joined = self
+            .queue
+            .join()
+            .map_err(|_| "the queue thread panicked".to_string())?;
+        let deleted = ctrl.del_dev(self.dev_id);
+        stopped.and(joined).and(deleted)
+    }
+}
+
+/// Serve `vdisk` as `/dev/ublkb<dev_id>`, returning once the device is
+/// live. The attach decides the pen: an ordinary attach takes the writer
+/// lease, and an attach inside a migration window aimed here opens
+/// penless — the destination holds the disk open while the source is
+/// still writing it, and writes refuse until the handover's accept.
+pub fn start(
+    guest: GuestHandle,
+    vdisk: u64,
+    dev_id: u32,
+) -> Result<Box<dyn ExportControl>, String> {
+    let attach = guest
+        .attach(vdisk)
         .map_err(|err| format!("ublk attach refused: {err}"))?;
-    let size_bytes = guest.vdisk_size(VDISK).map_err(|err| err.to_string())?;
+    let size_bytes = guest.vdisk_size(vdisk).map_err(|err| err.to_string())?;
     let block_size = guest.block_size();
 
     let mut ctrl = Ctrl::open()?;
@@ -191,22 +245,34 @@ pub fn serve(guest: GuestHandle, dev_id: u32) -> Result<(), String> {
         ctrl.set_params(dev_id, size_bytes, block_size)?;
         let queue = {
             let guest = guest.clone();
-            std::thread::spawn(move || queue_loop(guest, dev_id))
+            std::thread::spawn(move || queue_loop(guest, vdisk, dev_id))
         };
         ctrl.start_dev(dev_id)?;
-        println!(
-            "ublk: vdisk {VDISK} ({size_bytes} bytes) live at {}",
-            block_path(dev_id)
-        );
-        queue
-            .join()
-            .map_err(|_| "the queue thread panicked".to_string())?
+        Ok(queue)
     })();
-    if outcome.is_err() {
-        let _ = ctrl.stop_dev(dev_id);
-        let _ = ctrl.del_dev(dev_id);
+    match outcome {
+        Ok(queue) => {
+            println!(
+                "ublk: vdisk {vdisk} ({size_bytes} bytes, {}) live at {}",
+                match attach {
+                    Attach::Writer => "writer",
+                    Attach::Penless => "penless, awaiting handover",
+                },
+                block_path(dev_id)
+            );
+            Ok(Box::new(Export {
+                vdisk,
+                dev_id,
+                guest,
+                queue,
+            }))
+        }
+        Err(err) => {
+            let _ = ctrl.stop_dev(dev_id);
+            let _ = ctrl.del_dev(dev_id);
+            Err(err)
+        }
     }
-    outcome
 }
 
 /// Stop and delete a device — the cleanup verb for a daemon that died
@@ -216,6 +282,58 @@ pub fn delete_device(dev_id: u32) -> Result<(), String> {
     let stop = ctrl.stop_dev(dev_id);
     let del = ctrl.del_dev(dev_id);
     stop.and(del)
+}
+
+/// The driver-written request descriptors, mapped read-only — and
+/// unmapped when the queue ends, which is load-bearing rather than tidy.
+/// A mapping outlives the fd it came from and keeps its own reference to
+/// the char device, so a leaked one makes the kernel's DEL_DEV wait
+/// forever for a device nobody is using. Found exactly that way: an
+/// `unexport` that never returned, with a kernel thread parked in
+/// `ublk_ctrl_del_dev` and the queue thread long since exited.
+struct Descriptors {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl Descriptors {
+    fn map(fd: RawFd, len: usize) -> Result<Descriptors, String> {
+        // SAFETY: a fresh read-only shared mapping of the char device's
+        // descriptor region at its defined offset; failure is checked.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_SHARED | libc::MAP_POPULATE,
+                fd,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(os_err("mmap descriptors", io::Error::last_os_error()));
+        }
+        Ok(Descriptors {
+            ptr: ptr.cast(),
+            len,
+        })
+    }
+
+    fn at(&self, tag: usize) -> IoDesc {
+        // SAFETY: callers pass tag < queue depth, inside the mapping; the
+        // driver guarantees a descriptor is stable from the fetch
+        // completion that announced it until its commit.
+        unsafe { *self.ptr.cast::<IoDesc>().add(tag) }
+    }
+}
+
+impl Drop for Descriptors {
+    fn drop(&mut self) {
+        // SAFETY: unmapping exactly what map() mapped.
+        unsafe {
+            libc::munmap(self.ptr.cast(), self.len);
+        }
+    }
 }
 
 /// Wait for udev to surface the char device ADD_DEV created.
@@ -235,7 +353,7 @@ fn open_char_dev(dev_id: u32) -> Result<std::fs::File, String> {
     }
 }
 
-fn queue_loop(guest: GuestHandle, dev_id: u32) -> Result<(), String> {
+fn queue_loop(guest: GuestHandle, vdisk: u64, dev_id: u32) -> Result<(), String> {
     let depth = QUEUE_DEPTH as usize;
     let char_dev = open_char_dev(dev_id)?;
 
@@ -243,25 +361,8 @@ fn queue_loop(guest: GuestHandle, dev_id: u32) -> Result<(), String> {
     // fetch completion. Queue 0 sits at offset 0.
     let desc_len = depth * std::mem::size_of::<IoDesc>();
     let desc_len = desc_len.div_ceil(4096) * 4096;
-    // SAFETY: mapping the driver-defined descriptor region read-only.
-    let descs = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            desc_len,
-            libc::PROT_READ,
-            libc::MAP_SHARED | libc::MAP_POPULATE,
-            char_dev.as_raw_fd(),
-            0,
-        )
-    };
-    if descs == libc::MAP_FAILED {
-        return Err(os_err("mmap descriptors", io::Error::last_os_error()));
-    }
-    let desc_at = |tag: usize| -> IoDesc {
-        // SAFETY: tag < depth, within the mapping; the driver guarantees
-        // the descriptor is stable between fetch completion and commit.
-        unsafe { *descs.cast::<IoDesc>().add(tag) }
-    };
+    let descs = Descriptors::map(char_dev.as_raw_fd(), desc_len)?;
+    let desc_at = |tag: usize| -> IoDesc { descs.at(tag) };
 
     // One kernel-copy buffer per tag, address registered in every fetch.
     let mut buffers: Vec<Vec<u8>> = (0..depth)
@@ -305,7 +406,7 @@ fn queue_loop(guest: GuestHandle, dev_id: u32) -> Result<(), String> {
                 return Ok(());
             }
             let desc = desc_at(tag);
-            let result = service(&guest, &desc, &mut buffers[tag]);
+            let result = service(&guest, vdisk, &desc, &mut buffers[tag]);
             ring.push_cmd(
                 char_dev.as_raw_fd(),
                 IO_COMMIT_AND_FETCH_REQ,
@@ -319,21 +420,21 @@ fn queue_loop(guest: GuestHandle, dev_id: u32) -> Result<(), String> {
 
 /// One request against the replicated guest path. Returns the ublk
 /// result: bytes transferred, or a negative errno.
-fn service(guest: &GuestHandle, desc: &IoDesc, buffer: &mut [u8]) -> i32 {
+fn service(guest: &GuestHandle, vdisk: u64, desc: &IoDesc, buffer: &mut [u8]) -> i32 {
     let offset = desc.start_sector * SECTOR;
     let len = desc.nr_sectors as u64 * SECTOR;
     if len as usize > buffer.len() {
         return -libc::EINVAL;
     }
     match desc.op() {
-        IO_OP_READ => match guest.read(VDISK, offset, len) {
+        IO_OP_READ => match guest.read(vdisk, offset, len) {
             Ok(data) => {
                 buffer[..data.len()].copy_from_slice(&data);
                 data.len() as i32
             }
             Err(err) => errno(&err),
         },
-        IO_OP_WRITE => match guest.write(VDISK, offset, &buffer[..len as usize]) {
+        IO_OP_WRITE => match guest.write(vdisk, offset, &buffer[..len as usize]) {
             Ok(()) => len as i32,
             Err(err) => errno(&err),
         },
@@ -341,7 +442,7 @@ fn service(guest: &GuestHandle, desc: &IoDesc, buffer: &mut [u8]) -> i32 {
             Ok(()) => 0,
             Err(err) => errno(&err),
         },
-        IO_OP_DISCARD => match guest.trim(VDISK, offset, len) {
+        IO_OP_DISCARD => match guest.trim(vdisk, offset, len) {
             Ok(()) => 0,
             Err(err) => errno(&err),
         },
@@ -350,7 +451,7 @@ fn service(guest: &GuestHandle, desc: &IoDesc, buffer: &mut [u8]) -> i32 {
         // literal answer cheap: every zero block is one stored block.
         IO_OP_WRITE_ZEROES => {
             buffer[..len as usize].fill(0);
-            match guest.write(VDISK, offset, &buffer[..len as usize]) {
+            match guest.write(vdisk, offset, &buffer[..len as usize]) {
                 Ok(()) => 0,
                 Err(err) => errno(&err),
             }
