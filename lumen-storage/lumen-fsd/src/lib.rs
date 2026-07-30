@@ -14,6 +14,8 @@
 //!   daemon.rs   the harness: engine under a lock, ordered effect drain,
 //!               session incarnations, suspension made real, maintenance
 //!   nbd.rs      the bootstrap guest export over the daemon's guest path
+//!   ublk/       the real guest export: a vdisk as /dev/ublkb<id>
+//!   control.rs  the operator/orchestrator surface, and its typed client
 //! ```
 //!
 //! The library shape exists for the tests: two whole daemons can run
@@ -22,9 +24,11 @@
 //! `cargo test` — the same contract the simulation pins, one layer closer
 //! to the metal.
 
+pub mod control;
 pub mod daemon;
 pub mod nbd;
 pub mod ublk;
 pub mod wire;
 
+pub use control::Client;
 pub use daemon::{format_brick, Config, Daemon, GuestHandle, Status};

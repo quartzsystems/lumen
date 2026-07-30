@@ -184,8 +184,10 @@ pub struct Export {
 }
 
 impl ExportControl for Export {
+    /// The guest device path, and nothing else: callers key this by vdisk
+    /// already, and a machine-readable answer beats a prettier one.
     fn describe(&self) -> String {
-        format!("{} (vdisk {})", block_path(self.dev_id), self.vdisk)
+        block_path(self.dev_id)
     }
 
     /// Release, stop, join, delete — a sequence in which every step

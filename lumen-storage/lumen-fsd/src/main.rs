@@ -18,14 +18,13 @@
 //! as `pcs stonith confirm` — saying it about a peer that is not dead is
 //! how two writers happen.
 
-use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use lumen_fs::hash_block;
-use lumen_fsd::{format_brick, nbd, Config, Daemon};
+use lumen_fsd::{control, format_brick, nbd, Config, Daemon};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -199,7 +198,7 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
         let listener =
             TcpListener::bind(addr).map_err(|err| format!("cannot bind control {addr}: {err}"))?;
         println!("control on {addr}");
-        serve_control(listener, &daemon);
+        control::serve(listener, &daemon);
     } else {
         // No control surface: serve until killed.
         for thread in threads {
@@ -210,231 +209,4 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-/// One line in, one line out. Trust model: this binds where the operator
-/// says and nowhere by default; real authentication arrives with
-/// lumen-pool's peer channel, and this surface is the interim break-glass.
-fn serve_control(listener: TcpListener, daemon: &Daemon) {
-    for stream in listener.incoming() {
-        let Ok(stream) = stream else { continue };
-        let mut reader = BufReader::new(match stream.try_clone() {
-            Ok(clone) => clone,
-            Err(_) => continue,
-        });
-        let mut stream = stream;
-        let mut line = String::new();
-        while {
-            line.clear();
-            matches!(reader.read_line(&mut line), Ok(n) if n > 0)
-        } {
-            let reply = control_command(daemon, line.trim());
-            if stream.write_all(reply.as_bytes()).is_err()
-                || stream.write_all(b"\n").is_err()
-                || stream.flush().is_err()
-            {
-                break;
-            }
-        }
-    }
-}
-
-/// The verbs, dispatched on words so arguments are ordinary rather than
-/// a special case. Every reply is one line beginning `ok` or `error`.
-fn control_command(daemon: &Daemon, line: &str) -> String {
-    let words: Vec<&str> = line.split_whitespace().collect();
-    let number = |index: usize| -> Result<u64, String> {
-        words
-            .get(index)
-            .ok_or_else(|| "error: missing argument".to_string())?
-            .parse::<u64>()
-            .map_err(|_| format!("error: not a number: {}", words[index]))
-    };
-    match words.first().copied().unwrap_or("") {
-        "vdisks" => {
-            let listed: Vec<String> = daemon
-                .guest()
-                .vdisks()
-                .iter()
-                .map(|(id, size)| format!("{id}:{size}"))
-                .collect();
-            format!("ok: [{}]", listed.join(","))
-        }
-        "vdisk-create" => match (number(1), number(2)) {
-            (Ok(vdisk), Ok(size)) => match daemon.guest().create_vdisk(vdisk, size) {
-                Ok(()) => format!("ok: vdisk {vdisk} of {size} bytes"),
-                Err(err) => format!("error: {err}"),
-            },
-            (Err(err), _) | (_, Err(err)) => err,
-        },
-        "vdisk-delete" => match number(1) {
-            Ok(vdisk) => match daemon.guest().delete_vdisk(vdisk) {
-                Ok(()) => format!("ok: vdisk {vdisk} gone"),
-                Err(err) => format!("error: {err}"),
-            },
-            Err(err) => err,
-        },
-        "export" => match (number(1), number(2)) {
-            (Ok(vdisk), Ok(dev_id)) => match daemon.export(vdisk, dev_id as u32) {
-                Ok(device) => format!("ok: {device}"),
-                Err(err) => format!("error: {err}"),
-            },
-            (Err(err), _) | (_, Err(err)) => err,
-        },
-        "unexport" => match number(1) {
-            Ok(vdisk) => match daemon.unexport(vdisk) {
-                Ok(()) => format!("ok: vdisk {vdisk} unexported"),
-                Err(err) => format!("error: {err}"),
-            },
-            Err(err) => err,
-        },
-        "exports" => {
-            let listed: Vec<String> = daemon
-                .exports()
-                .iter()
-                .map(|(vdisk, device)| format!("{vdisk}={device}"))
-                .collect();
-            format!("ok: [{}]", listed.join(","))
-        }
-        "lease" => match number(1) {
-            Ok(vdisk) => match daemon.guest().lease(vdisk) {
-                Some(lease) => format!(
-                    "ok: holder {} era {}{}",
-                    lease.holder,
-                    lease.era,
-                    match lease.handing_to {
-                        Some(to) => format!(" handing to {to}"),
-                        None => String::new(),
-                    }
-                ),
-                None => "ok: unheld".into(),
-            },
-            Err(err) => err,
-        },
-        // The migration window, as three explicit acts. `handover` runs on
-        // the source and opens it; `accept` runs on the *destination* and
-        // is the instant the pen moves; `abort` runs on the source and
-        // closes a window the migration never used.
-        "handover" => match (number(1), number(2)) {
-            (Ok(vdisk), Ok(to)) => match daemon.guest().begin_handover(vdisk, to as u8) {
-                Ok(()) => format!("ok: window open on vdisk {vdisk} toward node {to}"),
-                Err(err) => format!("error: {err}"),
-            },
-            (Err(err), _) | (_, Err(err)) => err,
-        },
-        "accept" => match number(1) {
-            Ok(vdisk) => match daemon.guest().accept_handover(vdisk) {
-                Ok(()) => format!("ok: vdisk {vdisk} is ours"),
-                Err(err) => format!("error: {err}"),
-            },
-            Err(err) => err,
-        },
-        "abort" => match number(1) {
-            Ok(vdisk) => match daemon.guest().abort_handover(vdisk) {
-                Ok(()) => format!("ok: window on vdisk {vdisk} closed"),
-                Err(err) => format!("error: {err}"),
-            },
-            Err(err) => err,
-        },
-        "hash" => match number(1) {
-            Ok(vdisk) => match vdisk_content_hash(daemon, vdisk) {
-                Ok(hash) => format!("ok: {hash}"),
-                Err(err) => format!("error: {err}"),
-            },
-            Err(err) => err,
-        },
-        _ => legacy_command(daemon, line),
-    }
-}
-
-/// The node-wide verbs, unchanged.
-fn legacy_command(daemon: &Daemon, command: &str) -> String {
-    match command {
-        "status" => {
-            let s = daemon.status();
-            let leases: Vec<String> = s
-                .leases
-                .iter()
-                .map(|(vdisk, lease)| {
-                    format!(
-                        "{vdisk}:{}@{}{}",
-                        lease.holder,
-                        lease.era,
-                        match lease.handing_to {
-                            Some(to) => format!("->{to}"),
-                            None => String::new(),
-                        }
-                    )
-                })
-                .collect();
-            format!(
-                "node {} state {:?} era {} writes {} vdisks {:?} leases [{}] free {}/{} stream sent={} durable={} applied={}",
-                s.node,
-                s.state,
-                s.era,
-                if s.accepts_writes { "open" } else { "held" },
-                s.vdisks,
-                leases.join(","),
-                s.space.segments_free,
-                s.space.segments_total,
-                s.stream.0,
-                s.stream.1,
-                s.stream.2,
-            )
-        }
-        "fence-peer" => match daemon.fence_peer() {
-            Ok(()) => "ok: continuing alone under the verdict".into(),
-            Err(err) => format!("error: {err}"),
-        },
-        "checkpoint" => match daemon.checkpoint() {
-            Ok(()) => "ok".into(),
-            Err(err) => format!("error: {err}"),
-        },
-        "gc" => match daemon.collect_garbage() {
-            Ok(stats) => format!(
-                "ok: dropped {} moved {} freed {}",
-                stats.blocks_dropped, stats.blocks_moved, stats.segments_freed
-            ),
-            Err(err) => format!("error: {err}"),
-        },
-        "scrub" => match daemon.scrub() {
-            Ok(report) => format!(
-                "ok: {} verified, {} corrupt, {} missing",
-                report.blocks_verified,
-                report.corrupt.len(),
-                report.missing.len()
-            ),
-            Err(err) => format!("error: {err}"),
-        },
-        _ => "error: unknown command. node: status, fence-peer, checkpoint, gc, scrub. \
-              vdisks: vdisks, vdisk-create <id> <bytes>, vdisk-delete <id>, hash <id>. \
-              exports: export <id> <dev>, unexport <id>, exports. \
-              migration: lease <id>, handover <id> <to-node>, accept <id>, abort <id>"
-            .into(),
-    }
-}
-
-/// A deterministic content hash of a whole vdisk (hash of per-chunk
-/// hashes), for comparing two nodes' answers from the outside — the
-/// diagnostic that localizes "who lost it" when a byte goes missing.
-fn vdisk_content_hash(daemon: &Daemon, vdisk: u64) -> Result<String, String> {
-    const CHUNK: u64 = 16 << 20;
-    let guest = daemon.guest();
-    let size = guest.vdisk_size(vdisk).map_err(|err| err.to_string())?;
-    let mut digests = Vec::new();
-    let mut offset = 0;
-    while offset < size {
-        let len = CHUNK.min(size - offset);
-        let chunk = guest
-            .read(vdisk, offset, len)
-            .map_err(|err| err.to_string())?;
-        digests.extend_from_slice(hash_block(&chunk).as_bytes());
-        offset += len;
-    }
-    let combined = hash_block(&digests);
-    Ok(combined
-        .as_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect())
 }

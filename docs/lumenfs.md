@@ -379,9 +379,134 @@ kernel, and SIGKILL is ignored because they are in uninterruptible sleep
 hang becomes a permanent one. Ask the daemon to `unexport` (bounded), and
 escalate no further than SIGTERM while a device still exists.
 
+**The control surface is now the library's, with a typed client**, because
+it has two callers of equal standing: an operator typing verbs at a
+socket, and the orchestration layer issuing the same ones from Rust. A
+protocol with two consumers should have one definition, and the tests
+should drive the real dispatcher rather than a stand-in. Replies a program
+reads are `key=value` — `lease 2` answers `ok: holder=0 era=1 handing=1`,
+as readable at a shell as it is from `Client::lease`. Two things the tests
+found immediately, both fixed: an empty listing answers a bare `ok` and a
+client that treated that as a parse failure would have reported a healthy
+pool as broken; and `lease` on a vdisk that does not exist used to answer
+`unheld`, which conflates "nobody holds it" with "there is no such
+vdisk" — a distinction the seam's `disk_of` predicate depends on.
+
+**One honesty note about the handover, surfaced by driving it through the
+protocol.** `accept` moves the pen on the destination in one durable step,
+and the source learns by replication — so for the width of that
+propagation there is an interval in which the source still believes it may
+write. In a real migration nothing writes there, because the guest is
+paused on the source before it is resumed on the destination: the lease is
+a durable record of who *should* be writing, and the ordering is supplied
+by the migration protocol above it. But that means the lease is a backstop
+against mistakes rather than a mutual-exclusion primitive across the
+propagation delay.
+
+**That gap is to be closed, by making the source relinquish** (Cody,
+2026-07-29). The source hands the pen — it sets `holder = destination` in
+one durable step, replicated like any other lease change — and the
+destination waits to see the lease name it. Because only one node ever
+changes the record, there is no interval in which two nodes both believe
+they may write, and the backstop becomes as strong as the record. `accept`
+survives as a *verification* rather than a seizure: it succeeds when the
+lease already names this node and refuses otherwise, so no path remains by
+which a destination can take a pen the source has not handed over. The
+unplanned case needs nothing new — a source that is simply gone is a
+failover, which the era bump and a fresh claim already handle.
+
+**And the seam's window verb changes shape to match** (same decision).
+`set_two_primaries(device, allow)` is symmetric because DRBD's window is;
+a lease handover names its destination and distinguishes success from
+failure. It becomes one method over an enum:
+
+```rust
+async fn migration_window(&self, device: &str, window: MigrationWindow) -> Result<()>;
+
+enum MigrationWindow { Open { destination: String }, Accepted, Aborted }
+```
+
+DRBD's implementation collapses `Accepted` and `Aborted` into
+`allow=no` and loses nothing; the LumenFS implementation uses all three.
+It also lets `VirtService::migrate` say out loud whether its close is a
+success or a failure — something it already knows and currently discards.
+
 Still ahead in phase 3 beyond that: the console pages (pool and vdisk
-views with the snapshot dialog); then the slice map that takes this past
-two nodes.
+views with the snapshot dialog).
+
+**Phase 5 has begun with placement, which is pure arithmetic and so goes
+first.** `slice.rs` is the whole of "which members hold a block": hash →
+slice → an ordered pair of members, 256 slices per tier, a slice being one
+byte of the digest. Nothing consults a directory and no block's location
+is written down anywhere, which is the same sentence that makes dedupe and
+placement one mechanism instead of two.
+
+A member set of `n` gets the `n` ring pairs dealt round-robin across
+slices, so at three the pattern is `(A,B), (B,C), (C,A)` exactly as this
+document already named it, and at two it degenerates to both members
+everywhere — every read local, the appliance's center of gravity
+preserved by construction rather than by a special case.
+
+One number deserves stating because it surprises people: at three members
+with RF=2, **each member holds about two thirds of the unique data**, not
+one third. There are `2 × 256` seats however many members exist, so three
+split 512 seats about 171 each across 256 slices. That is also the cost of
+adding the third member — it must be filled to two thirds before the pool
+is balanced — and it is what buys capacity beyond any single node, which
+is the only reason a vdisk larger than a node is possible.
+
+A consequence worth noticing early: because placement follows the hash,
+every vdisk's blocks spread evenly over every slice, so **every member
+holds about two thirds of *every* vdisk**. No member is a better host for
+a given machine than any other, which means HA eligibility needs no
+locality hint — the seam's answer really can be "any member that can reach
+a quorate pool".
+
+Reassignment is one call for what look like three operations. Growing to a
+third member, shrinking back to two, and re-protecting after a death are
+all `reassigned(version, members)`; there is no separate re-protection
+algorithm to keep honest. It keeps a slice's existing homes wherever the
+balance allows and **never takes both homes of a slice in one step**, so
+every slice always retains a member that already holds its blocks: a
+source for the copy, and a reader for anyone asking while it runs. The one
+case arithmetic cannot rescue — both homes of a slice gone at once, RF=2
+exhausted — is reported by name rather than papered over with a fresh
+assignment pointing at members that hold nothing.
+
+Eleven tests pin it, including the invariants that matter for running it
+against a live pool: no slice stranded on growth, every move sourced from
+a member that really holds the slice, a single death among three never
+orphaning anything, a no-op reassignment copying nothing, and the same
+inputs always producing the same map on every node regardless of the order
+members are listed in.
+
+What remains for phase 5 is the protocol, and its three open questions are
+now decided (Cody, 2026-07-29) — recorded here so the code that follows
+does not relitigate them:
+
+- **Metadata is replicated to every member; only data blocks slice.** Map
+  trees and manifests go everywhere, so garbage collection, scrub, and
+  pool-open stay local operations over durable local state — the property
+  every invariant this engine has earned depends on. The cost is roughly
+  three copies of about 0.2% of stored bytes. The alternative, slicing
+  metadata too, would have made collection a distributed protocol to save
+  a rounding error of disk.
+- **A write acknowledges on its two data homes**, as docs/storage.md
+  already specifies. A slow third member adds no latency; it applies the
+  op stream behind and catches up by Merkle resync. Its metadata may lag,
+  which matters only when it starts a vdisk — and that resyncs first
+  anyway.
+- **A non-home node fetches on demand and keeps nothing.** About a third
+  of reads cross the Core network at three members, and that is the
+  honest price. A cached block would be a third copy that collection must
+  account for and scrub must verify — a second liveness problem beside
+  the one already solved. Measure before adding it; nothing in the format
+  precludes it later.
+
+Sequencing is engine-first: the placement and replication core lands in
+`lumen-fs` under the simulation, leaving the cluster record, the
+workflows, and the console untouched, so nothing destabilizes while DRBD
+carries production and each piece stays abandonable.
 
 ## Burning it in
 

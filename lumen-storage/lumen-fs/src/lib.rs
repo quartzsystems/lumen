@@ -22,6 +22,7 @@
 //!               snapshots, clones, rollback, GC, scrub
 //!   bytes.rs    the byte-granular view a block device speaks
 //!   repl.rs     two-node synchronous replication, sans-IO
+//!   slice.rs    placement: hash → slice → members, and what moves
 //!   file_disk.rs  a real file or device as a Disk — the shells' shared edge
 //! ```
 //!
@@ -43,6 +44,7 @@ pub mod map;
 pub mod pool;
 pub mod repl;
 pub mod sim;
+pub mod slice;
 pub mod wal;
 
 pub use brick::{Brick, BrickParams, BrickStats, GcStats};
@@ -54,3 +56,4 @@ pub use hash::{hash_block, BlockHash};
 pub use pool::{Lease, Pool, ScrubReport};
 pub use repl::{Effect, NodeId, PeerMessage, ReplNode, ReplOp, ReplState, SyncOffer};
 pub use sim::{SimDisk, SplitMix64};
+pub use slice::{slice_of, Homes, Reassignment, SliceMap, SliceMove, SLICES};

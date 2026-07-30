@@ -67,6 +67,10 @@ pub enum FsError {
     /// Replication cannot acknowledge: the peer is unreachable and no
     /// verdict says it is dead. Integrity over availability, always.
     Suspended,
+    /// A slice map is not well-formed, or a change to one is not orderable
+    /// against the map it replaces. Placement is arithmetic — every one of
+    /// these is a caller's mistake, never a runtime condition.
+    Placement(&'static str),
 }
 
 impl fmt::Display for FsError {
@@ -129,6 +133,7 @@ impl fmt::Display for FsError {
                 f,
                 "i/o is suspended: the peer is unreachable and not known dead"
             ),
+            FsError::Placement(why) => write!(f, "placement is not well-formed: {why}"),
         }
     }
 }

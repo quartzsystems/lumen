@@ -16,7 +16,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use lumen_fs::FsError;
-use lumen_fsd::{daemon::Attach, format_brick, nbd::VDISK, Config, Daemon};
+use lumen_fsd::{control, daemon::Attach, format_brick, nbd::VDISK, Config, Daemon};
 
 const DISK_BYTES: u64 = 64 << 20;
 const VDISK_BYTES: u64 = 8 << 20;
@@ -359,6 +359,105 @@ fn an_aborted_migration_leaves_the_disk_where_it_started() {
     source.write(SECOND, 0, b"still mine").unwrap();
     source.flush().unwrap();
     assert_eq!(destination.read(SECOND, 0, 10).unwrap(), b"still mine");
+
+    b.shutdown();
+    a.shutdown();
+}
+
+#[test]
+fn an_orchestrator_drives_a_whole_migration_over_the_control_protocol() {
+    // Every step the compute seam will take, taken through the surface it
+    // will use — the library's real dispatcher, against two real daemons.
+    let (a, b, _ba, _bb) = synced_pair("control");
+    let source = |verb: &str| control::command(&a, verb);
+    let destination = |verb: &str| control::command(&b, verb);
+
+    assert_eq!(
+        source(&format!("vdisk-create {SECOND} 4194304")),
+        format!("ok: vdisk {SECOND} of 4194304 bytes")
+    );
+    wait_until("the peer to learn the vdisk", || {
+        destination("vdisks").contains(&format!("{SECOND}=4194304"))
+    });
+
+    // Created means claimed, and the peer can see whose it is.
+    assert_eq!(
+        destination(&format!("lease {SECOND}")),
+        "ok: holder=0 era=1"
+    );
+
+    // The window, as three acts across two members.
+    assert!(source(&format!("handover {SECOND} 1")).starts_with("ok"));
+    wait_until("the window to reach the destination", || {
+        destination(&format!("lease {SECOND}")) == "ok: holder=0 era=1 handing=1"
+    });
+    // Accepting is the destination's act, and refused on the source.
+    assert!(
+        source(&format!("accept {SECOND}")).starts_with("error"),
+        "the source accepted its own handover"
+    );
+    assert!(destination(&format!("accept {SECOND}")).starts_with("ok"));
+    // The destination holds the pen the instant it accepts; the source
+    // learns by replication, so its view catches up rather than changing
+    // with it. That gap is real and is discussed in docs/lumenfs.md — the
+    // guest being paused on the source is what keeps it from mattering.
+    assert_eq!(
+        destination(&format!("lease {SECOND}")),
+        "ok: holder=1 era=1",
+        "the destination did not take the pen on accepting"
+    );
+    wait_until("the source to learn the pen moved", || {
+        source(&format!("lease {SECOND}")) == "ok: holder=1 era=1"
+    });
+
+    // Errors carry reasons, and unknown verbs do not panic.
+    let complaint = source("lease 404");
+    assert!(
+        complaint.starts_with("error") && complaint.contains("404"),
+        "an unknown vdisk should be named: {complaint}"
+    );
+    assert!(source("nonsense").starts_with("error"));
+    assert!(source("vdisk-create").starts_with("error"));
+    assert!(source("vdisk-create x 1").starts_with("error"));
+
+    // And the node-wide verbs answer, including the cross-member
+    // diagnostic that says whether the two really agree.
+    assert!(source("status").contains("state Synced"));
+    assert_eq!(source("checkpoint"), "ok");
+    assert!(source("scrub").contains("corrupt=0"));
+    assert_eq!(
+        source(&format!("hash {SECOND}")),
+        destination(&format!("hash {SECOND}")),
+        "the two members disagree about the vdisk's contents"
+    );
+
+    b.shutdown();
+    a.shutdown();
+}
+
+#[test]
+fn an_aborted_window_is_visible_to_both_members_over_the_protocol() {
+    let (a, b, _ba, _bb) = synced_pair("control-abort");
+    let source = |verb: &str| control::command(&a, verb);
+    let destination = |verb: &str| control::command(&b, verb);
+
+    source(&format!("vdisk-create {SECOND} 4194304"));
+    wait_until("the peer to learn the vdisk", || {
+        destination(&format!("lease {SECOND}")).starts_with("ok: holder")
+    });
+    source(&format!("handover {SECOND} 1"));
+    wait_until("the window to reach the destination", || {
+        destination(&format!("lease {SECOND}")).contains("handing=1")
+    });
+
+    assert!(source(&format!("abort {SECOND}")).starts_with("ok"));
+    wait_until("the closed window to reach the destination", || {
+        destination(&format!("lease {SECOND}")) == "ok: holder=0 era=1"
+    });
+    assert!(
+        destination(&format!("accept {SECOND}")).starts_with("error"),
+        "the destination accepted a withdrawn offer"
+    );
 
     b.shutdown();
     a.shutdown();
