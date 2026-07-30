@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<service>
+  <short>Lumen Pool</short>
+  <description>Pooled storage replication between cluster members on the Core network: the LumenFS peer link on TCP 7800 to 7809, one port per pool. Bind this service to Core interfaces only — replication never rides Management or an External network. The pool daemon's control surface is deliberately not here: it listens on the loopback address, because it is the local orchestration seam rather than a cluster protocol, and a fence verdict arriving from off-box is not something this appliance accepts.</description>
+  <port protocol="tcp" port="7800-7809"/>
+</service>

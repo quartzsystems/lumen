@@ -20,6 +20,8 @@ Source0:        50-lumen-storage.preset
 Source1:        50-lumen-cluster.preset
 Source2:        lumen-cluster.xml
 Source3:        lumen-replication.xml
+Source4:        lumen-pool.xml
+Source5:        50-lumen-pool.conf
 
 Requires:       systemd
 # The pool tooling the management daemon reads through, and which the
@@ -80,12 +82,22 @@ install -D -p -m 0644 %{SOURCE2} \
     %{buildroot}%{_prefix}/lib/firewalld/services/lumen-cluster.xml
 install -D -p -m 0644 %{SOURCE3} \
     %{buildroot}%{_prefix}/lib/firewalld/services/lumen-replication.xml
+install -D -p -m 0644 %{SOURCE4} \
+    %{buildroot}%{_prefix}/lib/firewalld/services/lumen-pool.xml
+# The pool daemon serves vdisks through ublk, whose interface is io_uring —
+# refused outright by EL10's default. Vendor sysctl.d, not %%{_sysconfdir},
+# for the same reason as the presets: an operator's override is a
+# higher-sorting file they add, so this never becomes a modified config file.
+install -D -p -m 0644 %{SOURCE5} \
+    %{buildroot}%{_prefix}/lib/sysctl.d/50-lumen-pool.conf
 
 %files
 %{_prefix}/lib/systemd/system-preset/50-lumen-storage.preset
 %{_prefix}/lib/systemd/system-preset/50-lumen-cluster.preset
 %{_prefix}/lib/firewalld/services/lumen-cluster.xml
 %{_prefix}/lib/firewalld/services/lumen-replication.xml
+%{_prefix}/lib/firewalld/services/lumen-pool.xml
+%{_prefix}/lib/sysctl.d/50-lumen-pool.conf
 
 # A preset file is only advice until something acts on it, and nothing on an
 # installed node ever runs `systemctl preset-all` again. This is that something:

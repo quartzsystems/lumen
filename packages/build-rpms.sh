@@ -138,6 +138,8 @@ cp "$REPO_ROOT/lumen-compute/system/systemd/50-lumen-compute.preset" \
    "$REPO_ROOT/lumen-storage/system/systemd/50-lumen-cluster.preset" \
    "$REPO_ROOT/lumen-storage/system/firewalld/lumen-cluster.xml" \
    "$REPO_ROOT/lumen-storage/system/firewalld/lumen-replication.xml" \
+   "$REPO_ROOT/lumen-storage/system/firewalld/lumen-pool.xml" \
+   "$REPO_ROOT/lumen-storage/system/sysctl/50-lumen-pool.conf" \
    "$TOPDIR/SOURCES/"
 
 # --- repository configuration (only when the signing key is in the tree) ------
