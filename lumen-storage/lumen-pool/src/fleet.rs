@@ -1,0 +1,341 @@
+//! The pool's members, as something the service can call.
+//!
+//! One trait, one verb per thing the seam needs, each addressed to a
+//! member by name. The real implementation is a [`lumen_fsd::Client`] per
+//! member over the Core network; the mock here is an in-memory pool that
+//! models the parts of the engine's behaviour the service depends on —
+//! notably that **creating and deleting a vdisk replicates by itself**
+//! while **exports are per-member**, which is the asymmetry the whole
+//! service is shaped around.
+//!
+//! The mock is not a stub returning `Ok`. It refuses what the daemon
+//! refuses: exporting a vdisk that does not exist, exporting one whose pen
+//! another member holds outside a migration window, and handing over a
+//! window nobody opened. A mock that says yes to everything would let the
+//! service's tests pass while the real thing failed at the first refusal.
+
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+
+use async_trait::async_trait;
+
+use crate::error::{PoolError, Result};
+
+/// What a member's daemon can be asked. Names are cluster node names; the
+/// `u8` ids are the node ids the engine's leases speak.
+#[async_trait]
+pub trait PoolFleet: Send + Sync {
+    /// The pool's members, this node first. Empty means there is no pool
+    /// on this node — the standalone appliance.
+    async fn members(&self) -> Result<Vec<String>>;
+
+    /// The engine's node id for a member, which is what a lease names.
+    async fn node_id(&self, member: &str) -> Result<u8>;
+
+    /// Every vdisk the pool holds, as `(id, size_bytes)`. Replicated
+    /// state, so any member answers the same.
+    async fn vdisks(&self, member: &str) -> Result<Vec<(u64, u64)>>;
+
+    /// Create a vdisk. Replicated: one member is enough.
+    async fn create_vdisk(&self, member: &str, vdisk: u64, size_bytes: u64) -> Result<()>;
+
+    /// Delete a vdisk. Replicated: one member is enough.
+    async fn delete_vdisk(&self, member: &str, vdisk: u64) -> Result<()>;
+
+    /// Serve a vdisk as a guest device on this member, returning the path.
+    /// Per-member: the path is the same string everywhere, but the device
+    /// exists only where it has been exported.
+    async fn export(&self, member: &str, vdisk: u64) -> Result<String>;
+
+    /// Stop serving it here. The lease is untouched.
+    async fn unexport(&self, member: &str, vdisk: u64) -> Result<()>;
+
+    /// What this member is serving, as `(vdisk, device)`.
+    async fn exports(&self, member: &str) -> Result<Vec<(u64, String)>>;
+
+    /// Who holds a vdisk's pen as this member sees it, and whether a window
+    /// is open: `(holder, handing_to)`. `None` means nobody has claimed it.
+    /// The open window is the record of its own destination, which is how a
+    /// handover knows where it was aimed without being told twice.
+    async fn lease(&self, member: &str, vdisk: u64) -> Result<Option<(u8, Option<u8>)>>;
+
+    /// Open the migration window toward `to`. Runs on the holder.
+    async fn handover(&self, member: &str, vdisk: u64, to: u8) -> Result<()>;
+
+    /// Hand the pen over. Runs on the holder; the destination then sees it.
+    async fn relinquish(&self, member: &str, vdisk: u64, to: u8) -> Result<()>;
+
+    /// Close a window the migration did not use. Runs on the holder.
+    async fn abort(&self, member: &str, vdisk: u64) -> Result<()>;
+
+    /// Ask whether the pen has arrived and settled. Runs on the
+    /// destination, and takes nothing.
+    async fn accept(&self, member: &str, vdisk: u64) -> Result<()>;
+}
+
+// ---------------------------------------------------------------------------
+// The mock: an in-memory pool that refuses what the real one refuses.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Lease {
+    holder: u8,
+    handing_to: Option<u8>,
+}
+
+#[derive(Default)]
+struct MockInner {
+    /// `None` is the standalone appliance: no pool here.
+    members: Option<Vec<String>>,
+    vdisks: BTreeMap<u64, u64>,
+    leases: BTreeMap<u64, Lease>,
+    /// Per member, the vdisks it is serving — the asymmetry that matters.
+    exports: BTreeMap<String, Vec<u64>>,
+    fail_next_export: bool,
+}
+
+pub struct MockFleet {
+    inner: Mutex<MockInner>,
+}
+
+impl MockFleet {
+    /// No pool on this node: every call explains itself.
+    pub fn standalone() -> MockFleet {
+        MockFleet {
+            inner: Mutex::new(MockInner::default()),
+        }
+    }
+
+    /// A pool whose members are `members`, this node first. Node ids are
+    /// assigned by position, matching how a two-node pool is formatted.
+    pub fn pooled(members: &[&str]) -> MockFleet {
+        MockFleet {
+            inner: Mutex::new(MockInner {
+                members: Some(members.iter().map(|m| (*m).to_string()).collect()),
+                ..MockInner::default()
+            }),
+        }
+    }
+
+    /// Make the next export fail once — the moment a create must unwind.
+    pub fn fail_next_export(&self) {
+        self.inner.lock().unwrap().fail_next_export = true;
+    }
+
+    /// Which vdisks a member is serving right now.
+    pub fn exported_on(&self, member: &str) -> Vec<u64> {
+        self.inner
+            .lock()
+            .unwrap()
+            .exports
+            .get(member)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Every vdisk that exists, sorted — replicated state.
+    pub fn existing(&self) -> Vec<u64> {
+        self.inner.lock().unwrap().vdisks.keys().copied().collect()
+    }
+
+    /// Who holds a vdisk's pen, and whether a window is open.
+    pub fn lease(&self, vdisk: u64) -> Option<(u8, Option<u8>)> {
+        self.inner
+            .lock()
+            .unwrap()
+            .leases
+            .get(&vdisk)
+            .map(|l| (l.holder, l.handing_to))
+    }
+
+    fn id_of(inner: &MockInner, member: &str) -> Result<u8> {
+        let members = inner
+            .members
+            .as_ref()
+            .ok_or_else(|| PoolError::Unavailable("this node carries no pool".into()))?;
+        members
+            .iter()
+            .position(|m| m == member)
+            .map(|at| at as u8)
+            .ok_or_else(|| PoolError::NotFound(format!("{member} is not a member of this pool")))
+    }
+}
+
+#[async_trait]
+impl PoolFleet for MockFleet {
+    async fn members(&self) -> Result<Vec<String>> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .members
+            .clone()
+            .unwrap_or_default())
+    }
+
+    async fn node_id(&self, member: &str) -> Result<u8> {
+        let inner = self.inner.lock().unwrap();
+        MockFleet::id_of(&inner, member)
+    }
+
+    async fn vdisks(&self, member: &str) -> Result<Vec<(u64, u64)>> {
+        let inner = self.inner.lock().unwrap();
+        MockFleet::id_of(&inner, member)?;
+        Ok(inner.vdisks.iter().map(|(id, size)| (*id, *size)).collect())
+    }
+
+    async fn create_vdisk(&self, member: &str, vdisk: u64, size_bytes: u64) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let id = MockFleet::id_of(&inner, member)?;
+        if inner.vdisks.contains_key(&vdisk) {
+            return Err(PoolError::Conflict(format!("vdisk {vdisk} already exists")));
+        }
+        // Replicated, and whoever made it holds the pen.
+        inner.vdisks.insert(vdisk, size_bytes);
+        inner.leases.insert(
+            vdisk,
+            Lease {
+                holder: id,
+                handing_to: None,
+            },
+        );
+        Ok(())
+    }
+
+    async fn delete_vdisk(&self, member: &str, vdisk: u64) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        MockFleet::id_of(&inner, member)?;
+        if inner.vdisks.remove(&vdisk).is_none() {
+            return Err(PoolError::NotFound(format!("no vdisk {vdisk}")));
+        }
+        inner.leases.remove(&vdisk);
+        Ok(())
+    }
+
+    async fn export(&self, member: &str, vdisk: u64) -> Result<String> {
+        let mut inner = self.inner.lock().unwrap();
+        let id = MockFleet::id_of(&inner, member)?;
+        if inner.fail_next_export {
+            inner.fail_next_export = false;
+            return Err(PoolError::Backend("the export did not come up".into()));
+        }
+        if !inner.vdisks.contains_key(&vdisk) {
+            return Err(PoolError::NotFound(format!("no vdisk {vdisk}")));
+        }
+        // The attach, modelled: ours, or penless inside a window aimed
+        // here, or somebody else's disk.
+        match inner.leases.get(&vdisk).copied() {
+            Some(lease) if lease.holder == id => {}
+            Some(lease) if lease.handing_to == Some(id) => {}
+            Some(lease) => {
+                return Err(PoolError::Conflict(format!(
+                    "node {} holds the writer lease for vdisk {vdisk}",
+                    lease.holder
+                )))
+            }
+            None => {
+                inner.leases.insert(
+                    vdisk,
+                    Lease {
+                        holder: id,
+                        handing_to: None,
+                    },
+                );
+            }
+        }
+        let serving = inner.exports.entry(member.to_string()).or_default();
+        if !serving.contains(&vdisk) {
+            serving.push(vdisk);
+        }
+        Ok(crate::model::device_path(vdisk))
+    }
+
+    async fn unexport(&self, member: &str, vdisk: u64) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        MockFleet::id_of(&inner, member)?;
+        match inner.exports.get_mut(member) {
+            Some(serving) if serving.contains(&vdisk) => {
+                serving.retain(|v| *v != vdisk);
+                Ok(())
+            }
+            _ => Err(PoolError::NotFound(format!(
+                "vdisk {vdisk} is not exported on {member}"
+            ))),
+        }
+    }
+
+    async fn exports(&self, member: &str) -> Result<Vec<(u64, String)>> {
+        let inner = self.inner.lock().unwrap();
+        MockFleet::id_of(&inner, member)?;
+        Ok(inner
+            .exports
+            .get(member)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|vdisk| (vdisk, crate::model::device_path(vdisk)))
+            .collect())
+    }
+
+    async fn lease(&self, member: &str, vdisk: u64) -> Result<Option<(u8, Option<u8>)>> {
+        let inner = self.inner.lock().unwrap();
+        MockFleet::id_of(&inner, member)?;
+        Ok(inner
+            .leases
+            .get(&vdisk)
+            .map(|lease| (lease.holder, lease.handing_to)))
+    }
+
+    async fn handover(&self, member: &str, vdisk: u64, to: u8) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let id = MockFleet::id_of(&inner, member)?;
+        match inner.leases.get_mut(&vdisk) {
+            Some(lease) if lease.holder == id => {
+                lease.handing_to = Some(to);
+                Ok(())
+            }
+            _ => Err(PoolError::Conflict(format!(
+                "{member} does not hold the writer lease for vdisk {vdisk}"
+            ))),
+        }
+    }
+
+    async fn relinquish(&self, member: &str, vdisk: u64, to: u8) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let id = MockFleet::id_of(&inner, member)?;
+        match inner.leases.get_mut(&vdisk) {
+            Some(lease) if lease.holder == id && lease.handing_to == Some(to) => {
+                lease.holder = to;
+                lease.handing_to = None;
+                Ok(())
+            }
+            _ => Err(PoolError::Conflict(format!(
+                "vdisk {vdisk} has no handover open toward node {to}"
+            ))),
+        }
+    }
+
+    async fn abort(&self, member: &str, vdisk: u64) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let id = MockFleet::id_of(&inner, member)?;
+        match inner.leases.get_mut(&vdisk) {
+            Some(lease) if lease.holder == id && lease.handing_to.is_some() => {
+                lease.handing_to = None;
+                Ok(())
+            }
+            _ => Err(PoolError::Conflict(format!(
+                "vdisk {vdisk} has no window open"
+            ))),
+        }
+    }
+
+    async fn accept(&self, member: &str, vdisk: u64) -> Result<()> {
+        let inner = self.inner.lock().unwrap();
+        let id = MockFleet::id_of(&inner, member)?;
+        match inner.leases.get(&vdisk) {
+            Some(lease) if lease.holder == id && lease.handing_to.is_none() => Ok(()),
+            _ => Err(PoolError::Conflict(format!(
+                "the pen for vdisk {vdisk} has not arrived at {member}"
+            ))),
+        }
+    }
+}

@@ -1,0 +1,37 @@
+# lumen-pool — the orchestration domain over LumenFS: the compute seam,
+# implemented a second time.
+#
+# Deliberately NOT a workspace member, like its siblings — see the note at
+# the top of lumen-cluster/Cargo.toml.
+#
+# This crate holds no data and can corrupt none: the engine (lumen-fs) owns
+# every byte, the daemon (lumen-fsd) owns the sockets, and everything here
+# is naming, fan-out, and the five verbs the compute domain speaks. It is
+# the house-style layer of docs/lumenfs.md's crate list, minus the render
+# and state modules until the console pages need them.
+
+[package]
+name = "lumen-pool"
+version = "0.1.0"
+edition = "2021"
+description = "LumenFS orchestration: the compute seam over vdisks and leases"
+license = "MIT"
+
+[dependencies]
+# The seam itself lives here — trait, ReplicatedDisk, VmDiskRequest,
+# MigrationWindow, and the error type the compute domain already matches
+# on. That it is named for the other engine is a wart this second
+# implementation exposes; moving the seam to neutral ground is a later,
+# larger refactor and is recorded rather than done.
+lumen-drbd = { path = "../lumen-drbd" }
+# The daemon's typed control client is this crate's backend.
+lumen-fsd = { path = "../lumen-fsd" }
+anyhow = "1"
+async-trait = "0.1"
+# `spawn_blocking`: the control client is blocking by design, and blocking
+# a reactor thread is how an async service quietly stops answering.
+tokio = { version = "1", features = ["rt", "sync", "macros", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

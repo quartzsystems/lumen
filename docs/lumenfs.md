@@ -459,6 +459,63 @@ two call sites in `lumen-virt::migrate`. Nothing about DRBD's behavior
 changed — 38 storage tests, 96 compute tests, and the controlplane's suites
 all pass untouched.
 
+**The seam is implemented: `lumen-pool` exists.** The same `VmVolumes` the
+DRBD path implements, over vdisks and writer leases — and a test asserts it
+coerces to `Arc<dyn VmVolumes>` beside the DRBD one, because if that stops
+compiling the integration is broken however well the logic passes.
+
+Two facts about LumenFS shape the whole service, and neither was true of
+DRBD. **Creating and deleting a vdisk replicates by itself**, so one member
+is told and both have it — nothing to fan out, nothing to unwind halfway.
+**Exports do not**: `/dev/ublkb<id>` is the same string on every member,
+which is what keeps one domain document valid everywhere, but the device
+exists only where the daemon exported it. So the device is materialized
+where the machine is — here at create, and on the destination when a
+migration window opens, where the export is penless by construction.
+
+**Recorded deviation: there is no vdisk record.** The survey expected a
+sibling record type on `ClusterRecord` mapping vdisks to names, the shape
+`VolumeRecord` has. DRBD needs that because `/dev/drbd<minor>` says nothing
+about which machine owns it — minors come from a pool, so the association
+has to be written down. Here identity is *derived* and the mapping is
+invertible:
+
+```text
+  vm-7-disk-3  →  vdisk 1795  →  /dev/ublkb1795  →  vm-7-disk-3
+```
+
+The vdisk id is the machine id shifted up a byte with the disk index in the
+low byte, and the ublk device id is the same number. That removes a second
+source of truth that could disagree with the engine about what exists: the
+engine already knows its vdisks, and a derived name cannot go stale. The
+cost is a stated ceiling — 256 disks per machine, machine ids below 2^24 so
+the device id fits the `u32` the driver takes — and a name outside the
+convention is refused rather than reshaped. The pool, brick, and slice-map
+records phases 4 and 5 need are unaffected; those describe things no id can
+encode.
+
+A pleasant consequence: a freshly formatted brick's own vdisk 1 decodes to
+machine 0, which is no machine, so `disk_of` correctly answers "not a
+pooled machine disk" for it with no special case.
+
+`common_members` returns the pool's members, and that is the whole of
+pooled HA eligibility — placement is by content hash, so no member holds a
+better share of any one disk than another, and `ha.rs` needs no change at
+all.
+
+**Two things this slice deliberately leaves open.** The fleet — the trait
+the service calls — has a mock that refuses what the daemon refuses (an
+export whose pen another member holds, a handover nobody opened, a device
+that is not there), but its implementation over real sockets is not written
+yet: a `lumen_fsd::Client` per member behind `spawn_blocking`, which is
+mechanical. And **an HA restart does not pass through `migration_window`**,
+so nothing exports the device on the survivor. Two ways to close that,
+neither chosen: let the export happen at attach time on any member — which
+means relaxing the daemon's "somebody else's disk" refusal into a penless
+open — or give the seam a verb for "make this device exist here". Until
+then pooled disks migrate but do not fail over, and saying so is better
+than shipping a sweep that half-works.
+
 Still ahead in phase 3 beyond that: the console pages (pool and vdisk
 views with the snapshot dialog).
 
