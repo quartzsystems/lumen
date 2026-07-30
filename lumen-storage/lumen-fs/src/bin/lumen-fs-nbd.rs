@@ -124,7 +124,7 @@ fn cmd_format(path: &str, disk_bytes: &str, vdisk_bytes: &str) -> std::result::R
     };
     let brick = Brick::format(disk, params).map_err(|err| err.to_string())?;
     let mut pool = Pool::create(brick).map_err(|err| err.to_string())?;
-    pool.create_vdisk(VDISK, vdisk_bytes)
+    pool.create_vdisk(VDISK, vdisk_bytes, 0)
         .map_err(|err| err.to_string())?;
     pool.checkpoint().map_err(|err| err.to_string())?;
     println!("formatted {path}: {disk_bytes} bytes, vdisk {VDISK} of {vdisk_bytes} bytes");

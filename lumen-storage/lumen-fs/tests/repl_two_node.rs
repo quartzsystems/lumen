@@ -158,7 +158,7 @@ fn synced_pair(seed: u64) -> (ReplNode<SimDisk>, ReplNode<SimDisk>, Net, Guests)
     pump(&mut a, &mut b, &mut net, &mut guests);
     assert_eq!(a.state(), ReplState::Synced);
     assert_eq!(b.state(), ReplState::Synced);
-    a.create_vdisk(VDISK, CAPACITY * BLOCK as u64).unwrap();
+    a.create_vdisk(VDISK, CAPACITY * BLOCK as u64, 0).unwrap();
     pump(&mut a, &mut b, &mut net, &mut guests);
     (a, b, net, guests)
 }
@@ -615,7 +615,7 @@ fn survivor_with_history(seed: u64) -> (ReplNode<SimDisk>, ReplNode<SimDisk>, Ne
     let a_down = crash_and_restart(a, 0);
     b.set_peer_fenced().unwrap();
     b.claim_writer(VDISK).unwrap();
-    b.create_vdisk(VDISK2, CAP2 * BLOCK as u64).unwrap();
+    b.create_vdisk(VDISK2, CAP2 * BLOCK as u64, 0).unwrap();
     for index in 0..CAP2 {
         b.write_block(VDISK2, index, &payload(index, 1)).unwrap();
     }
@@ -760,7 +760,7 @@ fn a_source_that_dies_mid_stream_cannot_tie_with_the_survivors_next_era() {
     let b_down = crash_and_restart(b, 1);
     a.set_peer_fenced().unwrap();
     a.claim_writer(VDISK).unwrap();
-    a.create_vdisk(VDISK2, CAP2 * BLOCK as u64).unwrap();
+    a.create_vdisk(VDISK2, CAP2 * BLOCK as u64, 0).unwrap();
     for index in 0..CAP2 {
         a.write_block(VDISK2, index, &payload(index, 1)).unwrap();
     }

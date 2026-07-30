@@ -34,6 +34,7 @@
 //! may survive or vanish; both are correct.
 
 pub mod brick;
+pub mod brick_set;
 pub mod bytes;
 pub mod disk;
 pub mod error;
@@ -47,7 +48,8 @@ pub mod sim;
 pub mod slice;
 pub mod wal;
 
-pub use brick::{Brick, BrickParams, BrickStats, GcStats};
+pub use brick::{BlockRead, BlockWrite, Brick, BrickParams, BrickStats, GcStats};
+pub use brick_set::BrickSet;
 pub use bytes::ByteView;
 pub use disk::Disk;
 pub use error::{FsError, Result};

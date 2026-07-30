@@ -1,5 +1,13 @@
-//! The pool: vdisks over one brick, held together by the WAL, the map
-//! trees, and the anchor.
+//! The pool: vdisks over one node's bricks, held together by the WAL, the
+//! map trees, and the anchor.
+//!
+//! Since phase 4 the store under a pool is a [`BrickSet`] — one brick per
+//! disk, per tier. The pool's job barely changes: data blocks go to the
+//! **vdisk's tier**, map nodes and the manifest go to **tier 0** (the map
+//! working set lives on the fastest class, docs/lumenfs.md "Tiers"), and
+//! the WAL and anchors live on the one brick the set designates. A
+//! single-brick pool is the degenerate set and behaves byte-identically to
+//! phase 1–3.
 //!
 //! This is the engine's write path from docs/lumenfs.md, single-node form:
 //!
@@ -40,6 +48,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::brick::{Brick, BrickStats, GcStats};
+use crate::brick_set::BrickSet;
 use crate::disk::Disk;
 use crate::error::{FsError, Result};
 use crate::format::Anchor;
@@ -60,13 +69,14 @@ pub struct ScrubReport {
 
 const MANIFEST_MAGIC: &[u8; 8] = b"LFSMAN\0\0";
 const MANIFEST_HEADER_LEN: usize = 24; // magic 8 + version 4 + three counts
-const MANIFEST_ENTRY_LEN: usize = 48; // id 8 + size 8 + root 32
+const MANIFEST_ENTRY_LEN: usize = 56; // id 8 + size 8 + tier 1 + pad 7 + root 32
 const MANIFEST_SNAPSHOT_LEN: usize = 56; // vdisk 8 + snapshot 8 + size 8 + root 32
 const MANIFEST_LEASE_LEN: usize = 24; // vdisk 8 + holder 1 + handing 1 + pad 6 + era 8
-/// Version 2 added the writer leases. There is no upgrade path and none is
-/// owed: nothing carrying real data has ever run version 1, and a pool that
-/// says 1 is refused by name rather than misread.
-const MANIFEST_VERSION: u32 = 2;
+/// Version 2 added the writer leases; version 3 the per-vdisk tier. There
+/// is no upgrade path and none is owed: nothing carrying real data has
+/// ever run an earlier version, and a pool that says one is refused by
+/// name rather than misread — the same posture the superblock takes.
+const MANIFEST_VERSION: u32 = 3;
 
 /// Nobody — the encoded stand-in for "no node", since every real
 /// [`NodeId`] is a valid `u8`.
@@ -96,6 +106,10 @@ pub struct Lease {
 #[derive(Debug, Clone)]
 struct VdiskState {
     size_bytes: u64,
+    /// The device class this vdisk's data lives on, named at creation.
+    /// Map nodes stay on tier 0 whatever this says — the working set
+    /// belongs on the fastest class.
+    tier: u8,
     /// The checkpointed tree, if any writes have ever been checkpointed.
     root: Option<BlockHash>,
     /// Mutations since the last checkpoint — replayable from the WAL, so
@@ -114,7 +128,7 @@ struct SnapshotState {
 }
 
 pub struct Pool<D: Disk> {
-    brick: Brick<D>,
+    store: BrickSet<D>,
     wal: Wal,
     vdisks: HashMap<u64, VdiskState>,
     /// Keyed `(vdisk, snapshot)`; a BTreeMap so the manifest encodes
@@ -126,10 +140,12 @@ pub struct Pool<D: Disk> {
     anchor_generation: u64,
     /// The data generation (replication's era) — see format.rs's Anchor.
     era: u64,
-    /// Roots a resync holds live beyond the manifest, as `(hash, depth)` —
-    /// depth as map::walk counts it. Volatile on purpose: a crash ends the
-    /// resync session that needed them, and the next session pins its own.
-    sync_pins: Vec<(BlockHash, u32)>,
+    /// Roots a resync holds live beyond the manifest, as `(hash, depth,
+    /// data_tier)` — depth as map::walk counts it, and the tier the tree's
+    /// *data* blocks live on (its nodes are tier 0 like every map node).
+    /// Volatile on purpose: a crash ends the resync session that needed
+    /// them, and the next session pins its own.
+    sync_pins: Vec<(BlockHash, u32, u8)>,
 }
 
 /// What a WAL entry says. The encoding is fixed little-endian, one byte of
@@ -140,6 +156,7 @@ enum WalEntry {
     CreateVdisk {
         id: u64,
         size_bytes: u64,
+        tier: u8,
     },
     MapWrite {
         vdisk: u64,
@@ -162,10 +179,15 @@ enum WalEntry {
 impl WalEntry {
     fn encode(&self) -> Vec<u8> {
         match self {
-            WalEntry::CreateVdisk { id, size_bytes } => {
+            WalEntry::CreateVdisk {
+                id,
+                size_bytes,
+                tier,
+            } => {
                 let mut buf = vec![1u8];
                 buf.extend_from_slice(&id.to_le_bytes());
                 buf.extend_from_slice(&size_bytes.to_le_bytes());
+                buf.push(*tier);
                 buf
             }
             WalEntry::MapWrite { vdisk, index, hash } => {
@@ -199,9 +221,10 @@ impl WalEntry {
 
     fn decode(buf: &[u8]) -> Option<WalEntry> {
         match buf.first()? {
-            1 if buf.len() == 17 => Some(WalEntry::CreateVdisk {
+            1 if buf.len() == 18 => Some(WalEntry::CreateVdisk {
                 id: u64::from_le_bytes(buf[1..9].try_into().unwrap()),
                 size_bytes: u64::from_le_bytes(buf[9..17].try_into().unwrap()),
+                tier: buf[17],
             }),
             2 if buf.len() == 49 => Some(WalEntry::MapWrite {
                 vdisk: u64::from_le_bytes(buf[1..9].try_into().unwrap()),
@@ -235,10 +258,23 @@ impl<D: Disk> Pool<D> {
         Self::open(brick)
     }
 
-    /// Open a pool: the brick has already recovered its extent store; the
-    /// anchor names the manifest and where WAL replay begins.
+    /// Open a single-brick pool — the degenerate set, and the shape every
+    /// pool before phase 4 had.
     pub fn open(brick: Brick<D>) -> Result<Pool<D>> {
-        let anchor = brick
+        Self::open_set(BrickSet::single(brick)?)
+    }
+
+    /// A freshly formatted set is a pool with no vdisks, same as one brick.
+    pub fn create_set(store: BrickSet<D>) -> Result<Pool<D>> {
+        Self::open_set(store)
+    }
+
+    /// Open a pool over its brick set: every brick has already recovered
+    /// its extent store; the holder's anchor names the manifest and where
+    /// WAL replay begins.
+    pub fn open_set(store: BrickSet<D>) -> Result<Pool<D>> {
+        let anchor = store
+            .wal_brick()
             .read_best_anchor()?
             .ok_or(FsError::Corrupt("a formatted brick with no valid anchor"))?;
 
@@ -247,8 +283,8 @@ impl<D: Disk> Pool<D> {
         let mut leases = BTreeMap::new();
         if anchor.manifest_hash != [0; 32] {
             let manifest_hash = BlockHash::from_bytes(anchor.manifest_hash);
-            let manifest = brick
-                .get(&manifest_hash)?
+            let manifest = store
+                .get(0, &manifest_hash)?
                 .ok_or(FsError::Corrupt("the anchored manifest block is missing"))?;
             let decoded = decode_manifest(&manifest)?;
             for (id, state) in decoded.vdisks {
@@ -262,9 +298,9 @@ impl<D: Disk> Pool<D> {
             }
         }
 
-        let (wal_start, wal_size) = brick.wal_bounds();
+        let (wal_start, wal_size) = store.wal_brick().wal_bounds();
         let frames = Wal::recover(
-            &brick,
+            store.wal_brick(),
             anchor.wal_replay_offset,
             anchor.wal_replay_seq,
             anchor.wal_epoch,
@@ -283,7 +319,7 @@ impl<D: Disk> Pool<D> {
         );
 
         let mut pool = Pool {
-            brick,
+            store,
             wal,
             vdisks,
             snapshots,
@@ -318,14 +354,19 @@ impl<D: Disk> Pool<D> {
     /// Apply one replayed entry if its references hold. `false` ends replay.
     fn apply_replayed(&mut self, entry: &WalEntry) -> bool {
         match entry {
-            WalEntry::CreateVdisk { id, size_bytes } => {
-                if self.vdisks.contains_key(id) || *size_bytes == 0 {
+            WalEntry::CreateVdisk {
+                id,
+                size_bytes,
+                tier,
+            } => {
+                if self.vdisks.contains_key(id) || *size_bytes == 0 || !self.store.has_tier(*tier) {
                     return false;
                 }
                 self.vdisks.insert(
                     *id,
                     VdiskState {
                         size_bytes: *size_bytes,
+                        tier: *tier,
                         root: None,
                         dirty: BTreeMap::new(),
                     },
@@ -333,14 +374,11 @@ impl<D: Disk> Pool<D> {
                 true
             }
             WalEntry::MapWrite { vdisk, index, hash } => {
-                if !self.brick.contains(hash) {
-                    return false;
-                }
-                let capacity = match self.vdisks.get(vdisk) {
-                    Some(state) => self.capacity_of(state),
+                let (capacity, tier) = match self.vdisks.get(vdisk) {
+                    Some(state) => (self.capacity_of(state), state.tier),
                     None => return false,
                 };
-                if *index >= capacity {
+                if *index >= capacity || !self.store.contains(tier, hash) {
                     return false;
                 }
                 self.vdisks
@@ -416,7 +454,8 @@ impl<D: Disk> Pool<D> {
             return Err(FsError::UnknownVdisk(vdisk));
         }
         let entry = WalEntry::SetLease { vdisk, lease };
-        self.wal.append(&mut self.brick, &entry.encode())?;
+        self.wal
+            .append(self.store.wal_brick_mut(), &entry.encode())?;
         self.leases.insert(vdisk, lease);
         Ok(())
     }
@@ -524,13 +563,13 @@ impl<D: Disk> Pool<D> {
     }
 
     fn capacity_for(&self, size_bytes: u64) -> u64 {
-        size_bytes.div_ceil(self.brick.block_size() as u64)
+        size_bytes.div_ceil(self.store.block_size() as u64)
     }
 
     fn depth_for_size(&self, size_bytes: u64) -> u32 {
         map::depth_for(
             self.capacity_for(size_bytes),
-            map::entries_per_node(self.brick.block_size()),
+            map::entries_per_node(self.store.block_size()),
         )
     }
 
@@ -551,26 +590,38 @@ impl<D: Disk> Pool<D> {
         MANIFEST_HEADER_LEN
             + vdisk_count * (MANIFEST_ENTRY_LEN + MANIFEST_LEASE_LEN)
             + snapshot_count * MANIFEST_SNAPSHOT_LEN
-            <= self.brick.block_size() as usize
+            <= self.store.block_size() as usize
     }
 
-    /// Create a vdisk. Durable at the next flush, like any write.
-    pub fn create_vdisk(&mut self, id: u64, size_bytes: u64) -> Result<()> {
+    /// Create a vdisk on a tier. Durable at the next flush, like any
+    /// write. A tier this node's set does not carry is refused — there is
+    /// no spill, because a capacity figure that lied about where bytes
+    /// land would be worse than a refusal.
+    pub fn create_vdisk(&mut self, id: u64, size_bytes: u64, tier: u8) -> Result<()> {
         if self.vdisks.contains_key(&id) {
             return Err(FsError::VdiskExists(id));
         }
         if size_bytes == 0 {
             return Err(FsError::BadGeometry("a vdisk must hold at least one block"));
         }
+        if !self.store.has_tier(tier) {
+            return Err(FsError::NoSuchTier(tier));
+        }
         if !self.manifest_fits(self.vdisks.len() + 1, self.snapshots.len()) {
             return Err(FsError::ManifestFull);
         }
-        let entry = WalEntry::CreateVdisk { id, size_bytes };
-        self.wal.append(&mut self.brick, &entry.encode())?;
+        let entry = WalEntry::CreateVdisk {
+            id,
+            size_bytes,
+            tier,
+        };
+        self.wal
+            .append(self.store.wal_brick_mut(), &entry.encode())?;
         self.vdisks.insert(
             id,
             VdiskState {
                 size_bytes,
+                tier,
                 root: None,
                 dirty: BTreeMap::new(),
             },
@@ -587,12 +638,14 @@ impl<D: Disk> Pool<D> {
             .get(&vdisk)
             .ok_or(FsError::UnknownVdisk(vdisk))?;
         let capacity = self.capacity_of(state);
+        let tier = state.tier;
         if index >= capacity {
             return Err(FsError::OutOfRange { index, capacity });
         }
-        let hash = self.brick.put(payload)?;
+        let hash = self.store.put(tier, payload)?;
         let entry = WalEntry::MapWrite { vdisk, index, hash };
-        self.wal.append(&mut self.brick, &entry.encode())?;
+        self.wal
+            .append(self.store.wal_brick_mut(), &entry.encode())?;
         self.vdisks
             .get_mut(&vdisk)
             .unwrap()
@@ -614,7 +667,8 @@ impl<D: Disk> Pool<D> {
             return Err(FsError::OutOfRange { index, capacity });
         }
         let entry = WalEntry::TrimBlock { vdisk, index };
-        self.wal.append(&mut self.brick, &entry.encode())?;
+        self.wal
+            .append(self.store.wal_brick_mut(), &entry.encode())?;
         self.vdisks
             .get_mut(&vdisk)
             .unwrap()
@@ -636,7 +690,8 @@ impl<D: Disk> Pool<D> {
             return Err(FsError::HasSnapshots(id));
         }
         let entry = WalEntry::DeleteVdisk { id };
-        self.wal.append(&mut self.brick, &entry.encode())?;
+        self.wal
+            .append(self.store.wal_brick_mut(), &entry.encode())?;
         self.vdisks.remove(&id);
         self.leases.remove(&id);
         Ok(())
@@ -714,10 +769,19 @@ impl<D: Disk> Pool<D> {
         if !self.manifest_fits(self.vdisks.len() + 1, self.snapshots.len()) {
             return Err(FsError::ManifestFull);
         }
+        // The clone shares every block with its source, and a block's tier
+        // is part of its home — so the clone lives on the source's tier by
+        // construction, not by choice.
+        let tier = self
+            .vdisks
+            .get(&vdisk)
+            .ok_or(FsError::UnknownVdisk(vdisk))?
+            .tier;
         self.vdisks.insert(
             new_id,
             VdiskState {
                 size_bytes: snap.size_bytes,
+                tier,
                 root: snap.root,
                 dirty: BTreeMap::new(),
             },
@@ -736,13 +800,20 @@ impl<D: Disk> Pool<D> {
             .snapshots
             .get(&(vdisk, snapshot))
             .ok_or(FsError::UnknownSnapshot { vdisk, snapshot })?;
+        // The snapshot's data lives on its vdisk's tier; the vdisk always
+        // exists, because deleting one with snapshots is refused.
+        let tier = self
+            .vdisks
+            .get(&vdisk)
+            .ok_or(FsError::Corrupt("a snapshot outlives its vdisk"))?
+            .tier;
         let capacity = self.capacity_for(snap.size_bytes);
         if index >= capacity {
             return Err(FsError::OutOfRange { index, capacity });
         }
         let hash = match &snap.root {
             Some(root) => map::lookup(
-                &self.brick,
+                &self.store.tier_ref(0),
                 root,
                 self.depth_for_size(snap.size_bytes),
                 index,
@@ -750,7 +821,7 @@ impl<D: Disk> Pool<D> {
             None => None,
         };
         match hash {
-            Some(hash) => match self.brick.get(&hash)? {
+            Some(hash) => match self.store.get(tier, &hash)? {
                 Some(payload) => Ok(Some(payload)),
                 None => Err(FsError::Corrupt("a mapped block is missing from the store")),
             },
@@ -783,12 +854,14 @@ impl<D: Disk> Pool<D> {
             // tree still says underneath.
             Some(None) => None,
             None => match &state.root {
-                Some(root) => map::lookup(&self.brick, root, self.depth_of(state), index)?,
+                Some(root) => {
+                    map::lookup(&self.store.tier_ref(0), root, self.depth_of(state), index)?
+                }
                 None => None,
             },
         };
         match hash {
-            Some(hash) => match self.brick.get(&hash)? {
+            Some(hash) => match self.store.get(state.tier, &hash)? {
                 Some(payload) => Ok(Some(payload)),
                 // The map promised a block the store cannot produce: that
                 // is corruption to repair, never a quiet zero-fill.
@@ -799,14 +872,15 @@ impl<D: Disk> Pool<D> {
     }
 
     /// The acknowledgement barrier: every write and create before this call
-    /// is durable when it returns.
+    /// is durable when it returns, on every brick it touched.
     pub fn flush(&mut self) -> Result<()> {
-        self.brick.flush()
+        self.store.flush()
     }
 
     /// Fold every dirty map into its tree, anchor the result, and retire
     /// the WAL's history. Two flushes; see the module header for why the
-    /// order cannot lie.
+    /// order cannot lie — the first now spans every dirty brick, and
+    /// nothing is anchored until all of them have answered.
     pub fn checkpoint(&mut self) -> Result<()> {
         let mut ids: Vec<u64> = self.vdisks.keys().copied().collect();
         ids.sort_unstable();
@@ -820,7 +894,14 @@ impl<D: Disk> Pool<D> {
             let state = self.vdisks.get_mut(id).unwrap();
             let dirty = std::mem::take(&mut state.dirty);
             let previous = state.root;
-            let root = map::fold(&mut self.brick, previous.as_ref(), depth, &dirty)?;
+            // Tree nodes are tier-0 blocks whatever tier the data went to:
+            // the map working set belongs on the fastest class.
+            let root = map::fold(
+                &mut self.store.tier_mut(0),
+                previous.as_ref(),
+                depth,
+                &dirty,
+            )?;
             self.vdisks.get_mut(id).unwrap().root = root;
         }
 
@@ -828,23 +909,24 @@ impl<D: Disk> Pool<D> {
             [0u8; 32]
         } else {
             let manifest = encode_manifest(&ids, &self.vdisks, &self.snapshots, &self.leases);
-            *self.brick.put(&manifest)?.as_bytes()
+            *self.store.put(0, &manifest)?.as_bytes()
         };
-        self.brick.flush()?;
+        self.store.flush()?;
 
         self.wal.retire_to_cursor();
         let (wal_replay_offset, wal_replay_seq) = self.wal.position();
         self.anchor_generation += 1;
-        self.brick.write_anchor(&Anchor {
+        let roster = self.store.roster();
+        self.store.wal_brick_mut().write_anchor(&Anchor {
             generation: self.anchor_generation,
             wal_replay_offset,
             wal_replay_seq,
             wal_epoch: self.wal.epoch(),
             era: self.era,
             manifest_hash,
-            roster: vec![self.brick.roster_entry()],
+            roster,
         })?;
-        self.brick.flush()
+        self.store.flush()
     }
 
     /// Collect garbage: checkpoint, mark everything reachable from the
@@ -859,12 +941,12 @@ impl<D: Disk> Pool<D> {
     pub fn collect_garbage(&mut self) -> Result<GcStats> {
         // A collection writes before it frees — the checkpoint below folds
         // dirty maps into new tree nodes, and compaction rewrites live
-        // records ahead of releasing their segments. So it spends the
+        // records ahead of releasing their segments. So it spends every
         // brick's reserve, which exists for exactly this and is closed
         // again however this ends.
-        self.brick.open_reserve();
+        self.store.open_reserve();
         let outcome = self.collect_within_reserve();
-        self.brick.close_reserve();
+        self.store.close_reserve();
         outcome
     }
 
@@ -873,45 +955,58 @@ impl<D: Disk> Pool<D> {
 
         let mut ids: Vec<u64> = self.vdisks.keys().copied().collect();
         ids.sort_unstable();
-        let mut live: HashSet<BlockHash> = HashSet::new();
+        // Liveness is per tier — the same hash on two tiers is two blocks,
+        // and marking one must not keep the other.
+        let mut live: HashSet<(u8, BlockHash)> = HashSet::new();
         if !(self.vdisks.is_empty() && self.snapshots.is_empty()) {
             // The same bytes the checkpoint just anchored, so the same hash
             // — recomputed rather than remembered, one source of truth.
-            live.insert(hash_block(&encode_manifest(
-                &ids,
-                &self.vdisks,
-                &self.snapshots,
-                &self.leases,
-            )));
+            live.insert((
+                0,
+                hash_block(&encode_manifest(
+                    &ids,
+                    &self.vdisks,
+                    &self.snapshots,
+                    &self.leases,
+                )),
+            ));
         }
-        let mut roots: Vec<(Option<BlockHash>, u32)> = ids
+        let mut roots: Vec<(Option<BlockHash>, u32, u8)> = ids
             .iter()
             .map(|id| {
                 let state = &self.vdisks[id];
-                (state.root, self.depth_of(state))
+                (state.root, self.depth_of(state), state.tier)
             })
             .collect();
-        // Pinned history is exactly as live as the present.
-        roots.extend(
-            self.snapshots
-                .values()
-                .map(|snap| (snap.root, self.depth_for_size(snap.size_bytes))),
-        );
-        for (root, depth) in roots {
+        // Pinned history is exactly as live as the present, on the tier of
+        // the vdisk it pins.
+        roots.extend(self.snapshots.iter().map(|((vdisk, _), snap)| {
+            (
+                snap.root,
+                self.depth_for_size(snap.size_bytes),
+                self.vdisks[vdisk].tier,
+            )
+        }));
+        for (root, depth, data_tier) in roots {
             if let Some(root) = root {
-                map::walk(&self.brick, &root, depth, &mut |item| match item {
-                    map::MapItem::Node(hash) => {
-                        live.insert(hash);
-                    }
-                    map::MapItem::Block { hash, .. } => {
-                        live.insert(hash);
-                    }
-                })?;
+                map::walk(
+                    &self.store.tier_ref(0),
+                    &root,
+                    depth,
+                    &mut |item| match item {
+                        map::MapItem::Node(hash) => {
+                            live.insert((0, hash));
+                        }
+                        map::MapItem::Block { hash, .. } => {
+                            live.insert((data_tier, hash));
+                        }
+                    },
+                )?;
             }
         }
         // A resync in flight holds state neither manifest references yet.
         self.mark_pinned(&mut live)?;
-        self.brick.retain_and_reclaim(&live)
+        self.store.retain_and_reclaim(&live)
     }
 
     /// Verify everything: every stored block against its content address,
@@ -920,7 +1015,7 @@ impl<D: Disk> Pool<D> {
     /// an error rather than a report line — with the tree's shape gone,
     /// there is no honest way to say which blocks are missing.
     pub fn scrub(&self) -> Result<ScrubReport> {
-        let (blocks_verified, corrupt) = self.brick.scrub()?;
+        let (blocks_verified, corrupt) = self.store.scrub()?;
         let mut missing = Vec::new();
         let mut ids: Vec<u64> = self.vdisks.keys().copied().collect();
         ids.sort_unstable();
@@ -928,22 +1023,28 @@ impl<D: Disk> Pool<D> {
             let state = &self.vdisks[&id];
             for (index, value) in &state.dirty {
                 if let Some(hash) = value {
-                    if !self.brick.contains(hash) {
+                    if !self.store.contains(state.tier, hash) {
                         missing.push((id, *index));
                     }
                 }
             }
             if let Some(root) = &state.root {
                 let mut tree_refs = Vec::new();
-                map::walk(&self.brick, root, self.depth_of(state), &mut |item| {
-                    if let map::MapItem::Block { index, hash } = item {
-                        tree_refs.push((index, hash));
-                    }
-                })?;
+                map::walk(
+                    &self.store.tier_ref(0),
+                    root,
+                    self.depth_of(state),
+                    &mut |item| {
+                        if let map::MapItem::Block { index, hash } = item {
+                            tree_refs.push((index, hash));
+                        }
+                    },
+                )?;
                 for (index, hash) in tree_refs {
                     // A dirty entry supersedes the tree at this index; only
                     // the reference a read would actually follow counts.
-                    if !state.dirty.contains_key(&index) && !self.brick.contains(&hash) {
+                    if !state.dirty.contains_key(&index) && !self.store.contains(state.tier, &hash)
+                    {
                         missing.push((id, index));
                     }
                 }
@@ -952,10 +1053,11 @@ impl<D: Disk> Pool<D> {
         // Pinned history answers reads too, so it scrubs like the present;
         // a hole is reported under the vdisk the snapshot belongs to.
         for ((vdisk, _), snap) in &self.snapshots {
+            let tier = self.vdisks[vdisk].tier;
             if let Some(root) = &snap.root {
                 let mut tree_refs = Vec::new();
                 map::walk(
-                    &self.brick,
+                    &self.store.tier_ref(0),
                     root,
                     self.depth_for_size(snap.size_bytes),
                     &mut |item| {
@@ -965,7 +1067,7 @@ impl<D: Disk> Pool<D> {
                     },
                 )?;
                 for (index, hash) in tree_refs {
-                    if !self.brick.contains(&hash) {
+                    if !self.store.contains(tier, &hash) {
                         missing.push((*vdisk, index));
                     }
                 }
@@ -982,20 +1084,26 @@ impl<D: Disk> Pool<D> {
 
     /// The pool's block size — the unit bytes.rs translates to.
     pub fn block_size(&self) -> u32 {
-        self.brick.block_size()
+        self.store.block_size()
     }
 
-    /// The pool identity this brick was formatted into.
+    /// The pool identity these bricks were formatted into.
     pub fn pool_uuid(&self) -> [u8; 16] {
-        self.brick.pool_uuid()
+        self.store.pool_uuid()
     }
 
-    /// How the brick's space stands. A caller that only ever learns about
-    /// pressure from [`FsError::Full`] learns too late: by then every write
-    /// triggers a collection, and the pool spends its time collecting
-    /// rather than storing. This is how policy sees the cliff coming.
+    /// The tiers this node's set carries, ascending.
+    pub fn tiers(&self) -> Vec<u8> {
+        self.store.tiers()
+    }
+
+    /// How the store's space stands, summed across bricks. A caller that
+    /// only ever learns about pressure from [`FsError::Full`] learns too
+    /// late: by then every write triggers a collection, and the pool
+    /// spends its time collecting rather than storing. This is how policy
+    /// sees the cliff coming.
     pub fn space(&self) -> BrickStats {
-        self.brick.stats()
+        self.store.stats()
     }
 
     // -----------------------------------------------------------------
@@ -1027,13 +1135,14 @@ impl<D: Disk> Pool<D> {
     }
 
     /// Hold these roots live through collections until [`Pool::unpin_sync`],
-    /// as `(root, depth)`. A resync needs this on both ends: the source
-    /// keeps writing past the state it offered, so its next checkpoint
-    /// orphans the offer's trees while the target is still fetching them;
-    /// the target holds a growing top-connected fragment of the offer that
-    /// nothing in its own manifest references yet. Replaces any previous
-    /// pins — one resync session at a time is the protocol's shape.
-    pub fn pin_sync(&mut self, pins: Vec<(BlockHash, u32)>) {
+    /// as `(root, depth, data_tier)`. A resync needs this on both ends:
+    /// the source keeps writing past the state it offered, so its next
+    /// checkpoint orphans the offer's trees while the target is still
+    /// fetching them; the target holds a growing top-connected fragment of
+    /// the offer that nothing in its own manifest references yet. Replaces
+    /// any previous pins — one resync session at a time is the protocol's
+    /// shape.
+    pub fn pin_sync(&mut self, pins: Vec<(BlockHash, u32, u8)>) {
         self.sync_pins = pins;
     }
 
@@ -1048,41 +1157,45 @@ impl<D: Disk> Pool<D> {
     /// the source everything pinned is present, and on the target the pull
     /// arrives strictly top-down — a held block's parents are held — so
     /// every fetched block sits on a present path from a pinned root.
-    fn mark_pinned(&self, live: &mut HashSet<BlockHash>) -> Result<()> {
-        let mut pending: Vec<(BlockHash, u32)> = self.sync_pins.clone();
-        let mut seen: HashSet<(BlockHash, u32)> = HashSet::new();
-        while let Some((hash, kind)) = pending.pop() {
-            if !seen.insert((hash, kind)) || !self.brick.contains(&hash) {
+    fn mark_pinned(&self, live: &mut HashSet<(u8, BlockHash)>) -> Result<()> {
+        let mut pending: Vec<(BlockHash, u32, u8)> = self.sync_pins.clone();
+        let mut seen: HashSet<(BlockHash, u32, u8)> = HashSet::new();
+        while let Some((hash, kind, data_tier)) = pending.pop() {
+            // A node lives on tier 0; a kind-0 entry is data on its tier.
+            let store_tier = if kind > 0 { 0 } else { data_tier };
+            if !seen.insert((hash, kind, data_tier)) || !self.store.contains(store_tier, &hash) {
                 continue;
             }
-            live.insert(hash);
+            live.insert((store_tier, hash));
             if kind > 0 {
                 let payload = self
-                    .brick
-                    .get(&hash)?
+                    .store
+                    .get(0, &hash)?
                     .ok_or(FsError::Corrupt("a pinned map node vanished mid-mark"))?;
                 for child in map::children(&payload) {
-                    pending.push((child, kind - 1));
+                    pending.push((child, kind - 1, data_tier));
                 }
             }
         }
         Ok(())
     }
 
-    /// Store a payload without mapping it anywhere — a replicated block
-    /// arriving ahead of the operation that references it.
-    pub fn put_block(&mut self, payload: &[u8]) -> Result<BlockHash> {
-        self.brick.put(payload)
+    /// Store a payload at a tier without mapping it anywhere — a
+    /// replicated block arriving ahead of the operation that references
+    /// it, on the tier that operation will reference it at.
+    pub fn put_block(&mut self, tier: u8, payload: &[u8]) -> Result<BlockHash> {
+        self.store.put(tier, payload)
     }
 
-    /// Whether the store holds a block, by address.
-    pub fn has_block(&self, hash: &BlockHash) -> bool {
-        self.brick.contains(hash)
+    /// Whether the store holds a block, by tier and address.
+    pub fn has_block(&self, tier: u8, hash: &BlockHash) -> bool {
+        self.store.contains(tier, hash)
     }
 
-    /// A stored block's payload, by address — what a resync source serves.
-    pub fn block_payload(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>> {
-        self.brick.get(hash)
+    /// A stored block's payload, by tier and address — what a resync
+    /// source serves.
+    pub fn block_payload(&self, tier: u8, hash: &BlockHash) -> Result<Option<Vec<u8>>> {
+        self.store.get(tier, hash)
     }
 
     /// A map write whose payload is already in the store — the replicated
@@ -1095,16 +1208,18 @@ impl<D: Disk> Pool<D> {
             .get(&vdisk)
             .ok_or(FsError::UnknownVdisk(vdisk))?;
         let capacity = self.capacity_of(state);
+        let tier = state.tier;
         if index >= capacity {
             return Err(FsError::OutOfRange { index, capacity });
         }
-        if !self.brick.contains(&hash) {
+        if !self.store.contains(tier, &hash) {
             return Err(FsError::Corrupt(
                 "a replicated write names a block the store does not hold",
             ));
         }
         let entry = WalEntry::MapWrite { vdisk, index, hash };
-        self.wal.append(&mut self.brick, &entry.encode())?;
+        self.wal
+            .append(self.store.wal_brick_mut(), &entry.encode())?;
         self.vdisks
             .get_mut(&vdisk)
             .unwrap()
@@ -1120,9 +1235,9 @@ impl<D: Disk> Pool<D> {
         let mut vdisks: Vec<VdiskOffer> = self
             .vdisks
             .iter()
-            .map(|(id, state)| (*id, state.size_bytes, state.root))
+            .map(|(id, state)| (*id, state.size_bytes, state.tier, state.root))
             .collect();
-        vdisks.sort_unstable_by_key(|(id, _, _)| *id);
+        vdisks.sort_unstable_by_key(|(id, _, _, _)| *id);
         let snapshots = self
             .snapshots
             .iter()
@@ -1145,27 +1260,34 @@ impl<D: Disk> Pool<D> {
         snapshots: &[SnapshotOffer],
         leases: &[(u64, Lease)],
     ) -> Result<()> {
-        for (_, _, root) in vdisks {
+        for (_, _, tier, root) in vdisks {
+            // A vdisk on a tier this set lacks has nowhere for its data —
+            // the asymmetric-brick-set deployment error, refused by name
+            // before any state is replaced.
+            if !self.store.has_tier(*tier) {
+                return Err(FsError::NoSuchTier(*tier));
+            }
             if let Some(root) = root {
-                if !self.brick.contains(root) {
+                if !self.store.contains(0, root) {
                     return Err(FsError::Corrupt("adopting a root the store does not hold"));
                 }
             }
         }
         for (_, _, _, root) in snapshots {
             if let Some(root) = root {
-                if !self.brick.contains(root) {
+                if !self.store.contains(0, root) {
                     return Err(FsError::Corrupt("adopting a root the store does not hold"));
                 }
             }
         }
         self.vdisks = vdisks
             .iter()
-            .map(|(id, size_bytes, root)| {
+            .map(|(id, size_bytes, tier, root)| {
                 (
                     *id,
                     VdiskState {
                         size_bytes: *size_bytes,
+                        tier: *tier,
                         root: *root,
                         dirty: BTreeMap::new(),
                     },
@@ -1200,6 +1322,14 @@ impl<D: Disk> Pool<D> {
             .ok_or(FsError::UnknownVdisk(id))
     }
 
+    /// The tier one vdisk's data lives on.
+    pub fn vdisk_tier(&self, id: u64) -> Result<u8> {
+        self.vdisks
+            .get(&id)
+            .map(|state| state.tier)
+            .ok_or(FsError::UnknownVdisk(id))
+    }
+
     /// Every vdisk's `(id, size_bytes)`, sorted — the listing a console
     /// will eventually render.
     pub fn vdisks(&self) -> Vec<(u64, u64)> {
@@ -1212,8 +1342,17 @@ impl<D: Disk> Pool<D> {
         all
     }
 
+    /// Take a single-brick pool apart — the crash-simulation reopen path.
+    /// Panics on a multi-brick set; those go through [`Pool::into_bricks`].
     pub fn into_brick(self) -> Brick<D> {
-        self.brick
+        let mut bricks = self.store.into_bricks();
+        assert_eq!(bricks.len(), 1, "into_brick on a multi-brick pool");
+        bricks.pop().unwrap()
+    }
+
+    /// Take the whole set apart.
+    pub fn into_bricks(self) -> Vec<Brick<D>> {
+        self.store.into_bricks()
     }
 }
 
@@ -1252,7 +1391,9 @@ fn encode_manifest(
         let state = &vdisks[id];
         buf[at..at + 8].copy_from_slice(&id.to_le_bytes());
         buf[at + 8..at + 16].copy_from_slice(&state.size_bytes.to_le_bytes());
-        buf[at + 16..at + 48].copy_from_slice(&root_bytes(&state.root));
+        buf[at + 16] = state.tier;
+        // bytes 17..24 stay zero — padding to keep the root aligned
+        buf[at + 24..at + 56].copy_from_slice(&root_bytes(&state.root));
         at += MANIFEST_ENTRY_LEN;
     }
     for ((vdisk, snapshot), state) in snapshots {
@@ -1305,11 +1446,13 @@ fn decode_manifest(buf: &[u8]) -> Result<DecodedManifest> {
     for _ in 0..vdisk_count {
         let id = u64::from_le_bytes(buf[at..at + 8].try_into().unwrap());
         let size_bytes = u64::from_le_bytes(buf[at + 8..at + 16].try_into().unwrap());
-        let root = root_from_bytes(buf[at + 16..at + 48].try_into().unwrap());
+        let tier = buf[at + 16];
+        let root = root_from_bytes(buf[at + 24..at + 56].try_into().unwrap());
         vdisks.push((
             id,
             VdiskState {
                 size_bytes,
+                tier,
                 root,
                 dirty: BTreeMap::new(),
             },
@@ -1378,7 +1521,7 @@ mod tests {
     #[test]
     fn a_write_survives_reopen_through_the_wal_alone() {
         let mut pool = pool(1);
-        pool.create_vdisk(7, 40 * BLOCK as u64).unwrap();
+        pool.create_vdisk(7, 40 * BLOCK as u64, 0).unwrap();
         pool.write_block(7, 3, b"through the wal").unwrap();
         pool.flush().unwrap();
         // No checkpoint: reopen leans entirely on anchor + replay.
@@ -1391,7 +1534,7 @@ mod tests {
     #[test]
     fn a_write_survives_reopen_through_the_tree_alone() {
         let mut pool = pool(2);
-        pool.create_vdisk(1, 40 * BLOCK as u64).unwrap();
+        pool.create_vdisk(1, 40 * BLOCK as u64, 0).unwrap();
         pool.write_block(1, 9, b"through the tree").unwrap();
         pool.checkpoint().unwrap();
         // The checkpoint retired the WAL: reopen leans on the manifest.
@@ -1402,7 +1545,7 @@ mod tests {
     #[test]
     fn an_overwrite_reads_back_newest_before_and_after_checkpoint() {
         let mut pool = pool(3);
-        pool.create_vdisk(1, 40 * BLOCK as u64).unwrap();
+        pool.create_vdisk(1, 40 * BLOCK as u64, 0).unwrap();
         pool.write_block(1, 0, b"first").unwrap();
         pool.write_block(1, 0, b"second").unwrap();
         assert_eq!(pool.read_block(1, 0).unwrap().unwrap(), b"second");
@@ -1417,7 +1560,7 @@ mod tests {
     fn a_depth_two_vdisk_round_trips_across_checkpoints() {
         let mut pool = pool(4);
         // 4 KiB blocks: 128 entries per node; 200 blocks needs depth 2.
-        pool.create_vdisk(1, 200 * BLOCK as u64).unwrap();
+        pool.create_vdisk(1, 200 * BLOCK as u64, 0).unwrap();
         pool.write_block(1, 0, b"low").unwrap();
         pool.write_block(1, 199, b"high").unwrap();
         pool.checkpoint().unwrap();
@@ -1433,8 +1576,8 @@ mod tests {
     #[test]
     fn two_vdisks_do_not_bleed_into_each_other() {
         let mut pool = pool(5);
-        pool.create_vdisk(1, 40 * BLOCK as u64).unwrap();
-        pool.create_vdisk(2, 40 * BLOCK as u64).unwrap();
+        pool.create_vdisk(1, 40 * BLOCK as u64, 0).unwrap();
+        pool.create_vdisk(2, 40 * BLOCK as u64, 0).unwrap();
         pool.write_block(1, 5, b"one's data").unwrap();
         pool.write_block(2, 5, b"two's data").unwrap();
         pool.checkpoint().unwrap();
@@ -1446,7 +1589,7 @@ mod tests {
     #[test]
     fn a_full_wal_is_an_error_a_checkpoint_cures() {
         let mut pool = pool(6);
-        pool.create_vdisk(1, 4000 * BLOCK as u64).unwrap();
+        pool.create_vdisk(1, 4000 * BLOCK as u64, 0).unwrap();
         let mut hit_full = false;
         for i in 0..4000u64 {
             match pool.write_block(1, i, &i.to_le_bytes()) {
@@ -1466,9 +1609,9 @@ mod tests {
     #[test]
     fn the_named_refusals_hold() {
         let mut pool = pool(7);
-        pool.create_vdisk(1, 10 * BLOCK as u64).unwrap();
+        pool.create_vdisk(1, 10 * BLOCK as u64, 0).unwrap();
         assert_eq!(
-            pool.create_vdisk(1, 10 * BLOCK as u64).unwrap_err(),
+            pool.create_vdisk(1, 10 * BLOCK as u64, 0).unwrap_err(),
             FsError::VdiskExists(1)
         );
         assert_eq!(
@@ -1502,7 +1645,7 @@ mod tests {
     #[test]
     fn a_trim_unmaps_through_wal_and_tree_alike() {
         let mut pool = pool(9);
-        pool.create_vdisk(1, 40 * BLOCK as u64).unwrap();
+        pool.create_vdisk(1, 40 * BLOCK as u64, 0).unwrap();
         pool.write_block(1, 3, b"here today").unwrap();
         pool.checkpoint().unwrap();
         pool.trim_block(1, 3).unwrap();
@@ -1523,8 +1666,8 @@ mod tests {
     #[test]
     fn a_deleted_vdisk_is_gone_through_wal_and_manifest_alike() {
         let mut pool = pool(10);
-        pool.create_vdisk(1, 10 * BLOCK as u64).unwrap();
-        pool.create_vdisk(2, 10 * BLOCK as u64).unwrap();
+        pool.create_vdisk(1, 10 * BLOCK as u64, 0).unwrap();
+        pool.create_vdisk(2, 10 * BLOCK as u64, 0).unwrap();
         pool.checkpoint().unwrap();
         pool.delete_vdisk(1).unwrap();
         pool.flush().unwrap();
@@ -1535,14 +1678,14 @@ mod tests {
         let mut pool = reopen(pool);
         assert_eq!(pool.vdisks(), vec![(2, 10 * BLOCK as u64)]);
         // The id is free again — a new vdisk, not a resurrection.
-        pool.create_vdisk(1, 20 * BLOCK as u64).unwrap();
+        pool.create_vdisk(1, 20 * BLOCK as u64, 0).unwrap();
         assert_eq!(pool.read_block(1, 0).unwrap(), None);
     }
 
     #[test]
     fn a_collection_reclaims_overwritten_history_and_current_data_survives() {
         let mut pool = pool(11);
-        pool.create_vdisk(1, 40 * BLOCK as u64).unwrap();
+        pool.create_vdisk(1, 40 * BLOCK as u64, 0).unwrap();
         // Rounds of overwrites with checkpoints between: old data blocks,
         // old tree nodes, and old manifests all become garbage.
         for round in 0..6u8 {
@@ -1567,8 +1710,8 @@ mod tests {
     #[test]
     fn deleting_a_vdisk_and_collecting_returns_its_space() {
         let mut pool = pool(12);
-        pool.create_vdisk(1, 40 * BLOCK as u64).unwrap();
-        pool.create_vdisk(2, 40 * BLOCK as u64).unwrap();
+        pool.create_vdisk(1, 40 * BLOCK as u64, 0).unwrap();
+        pool.create_vdisk(2, 40 * BLOCK as u64, 0).unwrap();
         for index in 0..30u64 {
             pool.write_block(1, index, &[7u8; 2000]).unwrap();
             let mut other = vec![8u8; 2000];
@@ -1599,7 +1742,7 @@ mod tests {
         // the only thing that helps. The reserve is what breaks that
         // circle, and this is the shape of the failure it prevents.
         let mut pool = pool(20);
-        pool.create_vdisk(1, 200 * BLOCK as u64).unwrap();
+        pool.create_vdisk(1, 200 * BLOCK as u64, 0).unwrap();
         let mut round = 0u8;
         loop {
             round = round.wrapping_add(1);
@@ -1646,7 +1789,7 @@ mod tests {
         // A vdisk about half the pool, overwritten far past its size: the
         // regime where live data alone denies any generous free-space goal.
         let capacity = 220u64;
-        pool.create_vdisk(1, capacity * BLOCK as u64).unwrap();
+        pool.create_vdisk(1, capacity * BLOCK as u64, 0).unwrap();
         let quarter = pool.space().segments_total / 4;
 
         let mut written = 0u64;
@@ -1704,7 +1847,7 @@ mod tests {
         // The whole reason it lives in the pool: a node that restarts must
         // know whether it may write before anyone tells it.
         let mut pool = pool(30);
-        pool.create_vdisk(1, 40 * BLOCK as u64).unwrap();
+        pool.create_vdisk(1, 40 * BLOCK as u64, 0).unwrap();
         pool.claim_lease(1, 7).unwrap();
         assert!(pool.may_write(1, 7));
         assert!(!pool.may_write(1, 8));
@@ -1722,7 +1865,7 @@ mod tests {
     #[test]
     fn a_handover_moves_the_pen_exactly_once() {
         let mut pool = pool(31);
-        pool.create_vdisk(1, 40 * BLOCK as u64).unwrap();
+        pool.create_vdisk(1, 40 * BLOCK as u64, 0).unwrap();
         pool.claim_lease(1, 0).unwrap();
 
         // The window: the guest still runs on 0, so 0 still writes and 1
@@ -1745,7 +1888,7 @@ mod tests {
     #[test]
     fn an_abandoned_migration_leaves_the_disk_where_it_was() {
         let mut pool = pool(32);
-        pool.create_vdisk(1, 40 * BLOCK as u64).unwrap();
+        pool.create_vdisk(1, 40 * BLOCK as u64, 0).unwrap();
         pool.claim_lease(1, 0).unwrap();
         pool.begin_handover(1, 0, 1).unwrap();
         pool.abort_handover(1, 0).unwrap();
@@ -1761,7 +1904,7 @@ mod tests {
     #[test]
     fn a_held_lease_is_refused_to_everyone_but_its_holder() {
         let mut pool = pool(33);
-        pool.create_vdisk(1, 40 * BLOCK as u64).unwrap();
+        pool.create_vdisk(1, 40 * BLOCK as u64, 0).unwrap();
         pool.claim_lease(1, 0).unwrap();
         assert_eq!(
             pool.claim_lease(1, 1).unwrap_err(),
@@ -1786,7 +1929,7 @@ mod tests {
         // could never take the pen, and the vdisk would be unwritable
         // exactly when someone needed to save it.
         let mut pool = pool(34);
-        pool.create_vdisk(1, 40 * BLOCK as u64).unwrap();
+        pool.create_vdisk(1, 40 * BLOCK as u64, 0).unwrap();
         pool.claim_lease(1, 0).unwrap();
         assert!(pool.may_write(1, 0));
 
@@ -1820,7 +1963,7 @@ mod tests {
         // its own next collection would sweep the offer's trees — unless
         // the pins hold them exactly as live as the present.
         let mut pool = pool(36);
-        pool.create_vdisk(1, 40 * BLOCK as u64).unwrap();
+        pool.create_vdisk(1, 40 * BLOCK as u64, 0).unwrap();
         let old_payloads: Vec<Vec<u8>> = (0..20u64)
             .map(|index| {
                 let mut data = vec![0u8; 600];
@@ -1833,12 +1976,12 @@ mod tests {
         }
         pool.checkpoint().unwrap();
         let (_, vdisks, _) = pool.sync_manifest();
-        let root = vdisks[0].2.expect("a checkpointed vdisk has a root");
+        let root = vdisks[0].3.expect("a checkpointed vdisk has a root");
         let depth = map::depth_for(
             (40 * BLOCK as u64).div_ceil(BLOCK as u64),
             map::entries_per_node(BLOCK as u32),
         );
-        pool.pin_sync(vec![(root, depth)]);
+        pool.pin_sync(vec![(root, depth, 0)]);
 
         // The offer becomes history: every index rewritten, checkpointed,
         // collected.
@@ -1852,18 +1995,18 @@ mod tests {
         pool.collect_garbage().unwrap();
         for data in &old_payloads {
             assert!(
-                pool.has_block(&hash_block(data)),
+                pool.has_block(0, &hash_block(data)),
                 "a collection swept a pinned offer's block"
             );
         }
-        assert!(pool.has_block(&root), "the pinned root itself was swept");
+        assert!(pool.has_block(0, &root), "the pinned root itself was swept");
 
         // Unpinned, the offer is garbage like any other history.
         pool.unpin_sync();
         pool.collect_garbage().unwrap();
         for data in &old_payloads {
             assert!(
-                !pool.has_block(&hash_block(data)),
+                !pool.has_block(0, &hash_block(data)),
                 "an unpinned offer survived collection"
             );
         }
@@ -1872,7 +2015,7 @@ mod tests {
     #[test]
     fn a_healthy_pool_scrubs_clean() {
         let mut pool = pool(13);
-        pool.create_vdisk(1, 40 * BLOCK as u64).unwrap();
+        pool.create_vdisk(1, 40 * BLOCK as u64, 0).unwrap();
         for index in 0..10u64 {
             pool.write_block(1, index, &index.to_le_bytes()).unwrap();
         }
@@ -1886,7 +2029,7 @@ mod tests {
     #[test]
     fn a_snapshot_pins_the_past_while_the_present_moves_on() {
         let mut pool = pool(15);
-        pool.create_vdisk(1, 40 * BLOCK as u64).unwrap();
+        pool.create_vdisk(1, 40 * BLOCK as u64, 0).unwrap();
         pool.write_block(1, 5, b"the past").unwrap();
         pool.snapshot_vdisk(1, 100).unwrap();
         pool.write_block(1, 5, b"the present").unwrap();
@@ -1911,7 +2054,7 @@ mod tests {
     #[test]
     fn a_rollback_discards_the_present_including_unflushed_writes() {
         let mut pool = pool(16);
-        pool.create_vdisk(1, 40 * BLOCK as u64).unwrap();
+        pool.create_vdisk(1, 40 * BLOCK as u64, 0).unwrap();
         pool.write_block(1, 0, b"keep me").unwrap();
         pool.snapshot_vdisk(1, 1).unwrap();
         pool.write_block(1, 0, b"checkpointed over").unwrap();
@@ -1929,7 +2072,7 @@ mod tests {
     #[test]
     fn a_clone_diverges_from_its_source_without_disturbing_it() {
         let mut pool = pool(17);
-        pool.create_vdisk(1, 40 * BLOCK as u64).unwrap();
+        pool.create_vdisk(1, 40 * BLOCK as u64, 0).unwrap();
         pool.write_block(1, 2, b"shared history").unwrap();
         pool.snapshot_vdisk(1, 1).unwrap();
         pool.clone_vdisk(9, 1, 1).unwrap();
@@ -1950,7 +2093,7 @@ mod tests {
     #[test]
     fn a_vdisk_with_snapshots_refuses_to_die_until_they_do() {
         let mut pool = pool(18);
-        pool.create_vdisk(1, 10 * BLOCK as u64).unwrap();
+        pool.create_vdisk(1, 10 * BLOCK as u64, 0).unwrap();
         pool.snapshot_vdisk(1, 7).unwrap();
         assert_eq!(pool.delete_vdisk(1).unwrap_err(), FsError::HasSnapshots(1));
         pool.delete_snapshot(1, 7).unwrap();
@@ -1967,7 +2110,7 @@ mod tests {
     #[test]
     fn gc_spares_what_a_snapshot_pins_and_reclaims_it_when_unpinned() {
         let mut pool = pool(19);
-        pool.create_vdisk(1, 40 * BLOCK as u64).unwrap();
+        pool.create_vdisk(1, 40 * BLOCK as u64, 0).unwrap();
         for index in 0..20u64 {
             let mut payload = vec![0xAB; 3000];
             payload[0..8].copy_from_slice(&index.to_le_bytes());
@@ -1998,7 +2141,7 @@ mod tests {
     fn scrub_names_the_vdisk_block_whose_data_rotted_away() {
         use crate::disk::Disk;
         let mut pool = pool(14);
-        pool.create_vdisk(1, 40 * BLOCK as u64).unwrap();
+        pool.create_vdisk(1, 40 * BLOCK as u64, 0).unwrap();
         let marker = b"scrub will come looking for exactly these bytes";
         pool.write_block(1, 6, marker).unwrap();
         pool.checkpoint().unwrap();

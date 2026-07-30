@@ -194,7 +194,7 @@ mod tests {
         )
         .unwrap();
         let mut pool = Pool::create(brick).unwrap();
-        pool.create_vdisk(1, VDISK_SIZE).unwrap();
+        pool.create_vdisk(1, VDISK_SIZE, 0).unwrap();
         pool
     }
 

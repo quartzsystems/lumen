@@ -147,8 +147,53 @@ pub struct Brick<D: Disk> {
 impl<D: Disk> Brick<D> {
     /// Lay the format down and return the opened, empty brick. Everything is
     /// written before the single flush, so a crash mid-format leaves either
-    /// a formatted brick or no brick — never half of one.
-    pub fn format(mut disk: D, params: BrickParams) -> Result<Brick<D>> {
+    /// a formatted brick or no brick — never half of one. A holder's initial
+    /// anchor rosters this brick alone — the single-brick pool's shape; a
+    /// set formatted together goes through [`Brick::format_rostered`].
+    pub fn format(disk: D, params: BrickParams) -> Result<Brick<D>> {
+        let roster = vec![RosterEntry {
+            brick_uuid: params.brick_uuid,
+            tier: params.tier,
+        }];
+        Self::format_inner(disk, params, roster)
+    }
+
+    /// Format the WAL holder of a multi-brick set: its initial anchor
+    /// rosters every brick of the set, itself included. The holder is
+    /// formatted *last*, so a crash anywhere in a set's format leaves no
+    /// anchor naming bricks that do not exist — just orphan non-holders a
+    /// retry reformats.
+    pub fn format_rostered(
+        disk: D,
+        params: BrickParams,
+        roster: Vec<RosterEntry>,
+    ) -> Result<Brick<D>> {
+        if !params.wal_holder {
+            return Err(FsError::BrickSetMismatch(
+                "only the WAL holder writes the anchor its roster lives in",
+            ));
+        }
+        if !roster
+            .iter()
+            .any(|entry| entry.brick_uuid == params.brick_uuid && entry.tier == params.tier)
+        {
+            return Err(FsError::BrickSetMismatch(
+                "a holder's roster must include the holder itself",
+            ));
+        }
+        if roster.len() > crate::format::ROSTER_CAP {
+            return Err(FsError::BrickSetMismatch(
+                "more bricks than one node's anchor can roster",
+            ));
+        }
+        Self::format_inner(disk, params, roster)
+    }
+
+    fn format_inner(
+        mut disk: D,
+        params: BrickParams,
+        roster: Vec<RosterEntry>,
+    ) -> Result<Brick<D>> {
         if params.block_size == 0 {
             return Err(FsError::BadGeometry("block size must be non-zero"));
         }
@@ -221,10 +266,7 @@ impl<D: Disk> Brick<D> {
                 wal_epoch: 1,
                 era: 1,
                 manifest_hash: [0; 32],
-                roster: vec![RosterEntry {
-                    brick_uuid: params.brick_uuid,
-                    tier: params.tier,
-                }],
+                roster,
             };
             let mut anchor_sector = vec![0u8; SECTOR_SIZE as usize];
             anchor_sector[..anchor.encode().len()].copy_from_slice(&anchor.encode());
@@ -387,6 +429,29 @@ impl<D: Disk> Brick<D> {
         let location = self.append_record(hash, payload)?;
         self.index.insert(hash, location);
         Ok(hash)
+    }
+
+    /// A put whose hash the caller already computed — the brick-set path,
+    /// where the set hashes once to consult its route and must not pay for
+    /// the same bytes twice. The within-brick dedupe check stays: a crash
+    /// can resurrect a copy here that the set routed elsewhere, and
+    /// appending a third would compound the leak GC exists to reclaim.
+    pub(crate) fn put_hashed(&mut self, hash: BlockHash, payload: &[u8]) -> Result<()> {
+        if payload.is_empty() {
+            return Err(FsError::EmptyPayload);
+        }
+        if payload.len() > self.sb.block_size as usize {
+            return Err(FsError::PayloadTooLarge {
+                len: payload.len(),
+                block_size: self.sb.block_size,
+            });
+        }
+        if self.index.contains_key(&hash) {
+            return Ok(());
+        }
+        let location = self.append_record(hash, payload)?;
+        self.index.insert(hash, location);
+        Ok(())
     }
 
     /// Append one record at the write head, regardless of the index — the
@@ -821,8 +886,55 @@ impl<D: Disk> Brick<D> {
 
     /// Hand the disk back — how a test crashes a brick: drop the handle,
     /// crash the disk, reopen.
+    /// Every hash the index holds — what a brick set's route is rebuilt
+    /// from at open, without re-reading a single payload.
+    pub fn indexed_hashes(&self) -> impl Iterator<Item = BlockHash> + '_ {
+        self.index.keys().copied()
+    }
+
+    /// Free segments right now — the allocation signal a brick set levels
+    /// by. Cheaper than [`Brick::stats`] on the hot path.
+    pub fn free_segments(&self) -> u64 {
+        self.free.len() as u64
+    }
+
     pub fn into_disk(self) -> D {
         self.disk
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The store seams the map layer builds on.
+
+/// Read-side content addressing: what a map lookup or walk needs. `Brick`
+/// implements it directly; a brick set implements it per tier, which is how
+/// the same fold code serves one disk or many without knowing which.
+pub trait BlockRead {
+    fn get(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>>;
+    fn contains(&self, hash: &BlockHash) -> bool;
+    fn block_size(&self) -> u32;
+}
+
+/// The write side a fold needs on top of reading.
+pub trait BlockWrite: BlockRead {
+    fn put(&mut self, payload: &[u8]) -> Result<BlockHash>;
+}
+
+impl<D: Disk> BlockRead for Brick<D> {
+    fn get(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>> {
+        Brick::get(self, hash)
+    }
+    fn contains(&self, hash: &BlockHash) -> bool {
+        Brick::contains(self, hash)
+    }
+    fn block_size(&self) -> u32 {
+        Brick::block_size(self)
+    }
+}
+
+impl<D: Disk> BlockWrite for Brick<D> {
+    fn put(&mut self, payload: &[u8]) -> Result<BlockHash> {
+        Brick::put(self, payload)
     }
 }
 

@@ -71,6 +71,21 @@ pub enum FsError {
     /// against the map it replaces. Placement is arithmetic — every one of
     /// these is a caller's mistake, never a runtime condition.
     Placement(&'static str),
+    /// An operation named a tier this node's brick set does not carry.
+    /// There is no spill: a vdisk's tier is part of its identity, and a
+    /// write that cannot land on it fails rather than landing elsewhere.
+    NoSuchTier(u8),
+    /// A vdisk create named a tier the replication peer's brick set does
+    /// not carry — learned from the handshake's tier inventory. Refused up
+    /// front, because an op the peer cannot apply would otherwise truncate
+    /// its replay into divergence.
+    TierNotOnPeer(u8),
+    /// The bricks opened together do not form one node's set: a foreign
+    /// pool among them, duplicate identities, no WAL holder or two, or a
+    /// roster in the anchor naming a different set than the one presented.
+    /// Fail loud at open — a set assembled from the wrong disks must never
+    /// get as far as serving reads.
+    BrickSetMismatch(&'static str),
 }
 
 impl fmt::Display for FsError {
@@ -134,6 +149,15 @@ impl fmt::Display for FsError {
                 "i/o is suspended: the peer is unreachable and not known dead"
             ),
             FsError::Placement(why) => write!(f, "placement is not well-formed: {why}"),
+            FsError::NoSuchTier(tier) => {
+                write!(f, "this node's brick set has no tier {tier} brick")
+            }
+            FsError::TierNotOnPeer(tier) => {
+                write!(f, "the peer's brick set has no tier {tier} brick")
+            }
+            FsError::BrickSetMismatch(why) => {
+                write!(f, "these bricks are not one node's set: {why}")
+            }
         }
     }
 }

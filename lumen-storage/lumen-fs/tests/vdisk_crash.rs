@@ -139,7 +139,7 @@ fn run_history(seed: u64) {
     let brick = Brick::format(SimDisk::new(8 * KIB * KIB, seed), params()).unwrap();
     let mut pool = Pool::create(brick).unwrap();
     for (id, capacity) in VDISKS {
-        pool.create_vdisk(id, capacity * BLOCK as u64).unwrap();
+        pool.create_vdisk(id, capacity * BLOCK as u64, 0).unwrap();
     }
     pool.flush().unwrap();
     let mut model = Model {
@@ -241,7 +241,7 @@ fn a_snapshot_stays_immutable_through_overwrites_crashes_and_rollback() {
         let mut rng = SplitMix64::new(seed);
         let brick = Brick::format(SimDisk::new(8 * KIB * KIB, seed), params()).unwrap();
         let mut pool = Pool::create(brick).unwrap();
-        pool.create_vdisk(1, 100 * BLOCK as u64).unwrap();
+        pool.create_vdisk(1, 100 * BLOCK as u64, 0).unwrap();
 
         // The state the snapshot must preserve, whatever happens after.
         let mut pinned: Vec<(u64, Vec<u8>)> = Vec::new();
@@ -299,7 +299,7 @@ fn a_crash_during_a_checkpoint_falls_back_to_the_previous_anchor() {
     for seed in 200..230 {
         let brick = Brick::format(SimDisk::new(8 * KIB * KIB, seed), params()).unwrap();
         let mut pool = Pool::create(brick).unwrap();
-        pool.create_vdisk(1, 50 * BLOCK as u64).unwrap();
+        pool.create_vdisk(1, 50 * BLOCK as u64, 0).unwrap();
         pool.write_block(1, 1, b"checkpointed").unwrap();
         pool.checkpoint().unwrap();
         pool.write_block(1, 2, b"tail write").unwrap();

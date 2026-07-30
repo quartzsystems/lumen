@@ -445,7 +445,9 @@ impl GuestHandle {
     /// Create a vdisk. Replicated like any other operation, so it exists
     /// on both members or the call refuses.
     pub fn create_vdisk(&self, vdisk: u64, size_bytes: u64) -> Result<(), FsError> {
-        self.blocking(|engine| engine.create_vdisk(vdisk, size_bytes))
+        // Tier 0 until the control surface learns the tier argument
+        // (phase 4's byte-capacity slice) — the one tier every set has.
+        self.blocking(|engine| engine.create_vdisk(vdisk, size_bytes, 0))
     }
 
     /// Destroy a vdisk. Refused while snapshots pin its history — the
@@ -969,7 +971,7 @@ pub fn format_brick(
     };
     let brick = Brick::format(disk, params).map_err(|err| err.to_string())?;
     let mut pool = Pool::create(brick).map_err(|err| err.to_string())?;
-    pool.create_vdisk(crate::nbd::VDISK, vdisk_bytes)
+    pool.create_vdisk(crate::nbd::VDISK, vdisk_bytes, 0)
         .map_err(|err| err.to_string())?;
     pool.checkpoint().map_err(|err| err.to_string())?;
     Ok(())

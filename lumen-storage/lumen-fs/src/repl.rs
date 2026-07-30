@@ -99,8 +99,8 @@ use crate::pool::{Lease, Pool};
 
 pub type NodeId = u8;
 
-/// One vdisk in a sync offer: id, size, checkpointed root.
-pub type VdiskOffer = (u64, u64, Option<BlockHash>);
+/// One vdisk in a sync offer: id, size, tier, checkpointed root.
+pub type VdiskOffer = (u64, u64, u8, Option<BlockHash>);
 /// One snapshot in a sync offer: vdisk, snapshot, size, pinned root.
 pub type SnapshotOffer = (u64, u64, u64, Option<BlockHash>);
 
@@ -121,21 +121,42 @@ const SYNC_BATCH: usize = 64;
 /// both ends, because both ends pin them: the source so its own progress
 /// cannot collect the offer, the target so its own collection cannot eat
 /// the top-connected fragment it has fetched so far.
-fn offer_pins(offer: &SyncOffer, block_size: u32) -> Vec<(BlockHash, u32)> {
+fn offer_pins(offer: &SyncOffer, block_size: u32) -> Vec<(BlockHash, u32, u8)> {
     let entries = map::entries_per_node(block_size);
     let block = block_size as u64;
     let mut pins = Vec::new();
-    for (_, size_bytes, root) in &offer.vdisks {
+    for (_, size_bytes, tier, root) in &offer.vdisks {
         if let Some(root) = root {
-            pins.push((*root, map::depth_for(size_bytes.div_ceil(block), entries)));
+            pins.push((
+                *root,
+                map::depth_for(size_bytes.div_ceil(block), entries),
+                *tier,
+            ));
         }
     }
-    for (_, _, size_bytes, root) in &offer.snapshots {
+    for (vdisk, _, size_bytes, root) in &offer.snapshots {
         if let Some(root) = root {
-            pins.push((*root, map::depth_for(size_bytes.div_ceil(block), entries)));
+            pins.push((
+                *root,
+                map::depth_for(size_bytes.div_ceil(block), entries),
+                offer_vdisk_tier(offer, *vdisk),
+            ));
         }
     }
     pins
+}
+
+/// The tier of a vdisk named in an offer. A snapshot's vdisk is always in
+/// the same offer — deleting a vdisk with snapshots is refused — so an
+/// absent one is a malformed offer, mapped to tier 0 here and caught by
+/// the adoption's own checks rather than a panic in pin arithmetic.
+fn offer_vdisk_tier(offer: &SyncOffer, vdisk: u64) -> u8 {
+    offer
+        .vdisks
+        .iter()
+        .find(|(id, _, _, _)| *id == vdisk)
+        .map(|(_, _, tier, _)| *tier)
+        .unwrap_or(0)
 }
 
 /// One replicated operation — the wire form of the pool's mutating API.
@@ -146,6 +167,7 @@ pub enum ReplOp {
     CreateVdisk {
         id: u64,
         size_bytes: u64,
+        tier: u8,
     },
     Write {
         vdisk: u64,
@@ -189,11 +211,19 @@ pub enum ReplOp {
 /// exactly as it owns sockets; the simulation passes these by value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerMessage {
-    /// Who I am and which era my state belongs to. Opens every connection;
-    /// both sides derive the same source/target roles from the pair.
-    Hello { era: u64, node: NodeId },
-    /// Data blocks ahead of the ops that reference them.
-    Payloads(Vec<Vec<u8>>),
+    /// Who I am, which era my state belongs to, and which tiers my brick
+    /// set carries. Opens every connection; both sides derive the same
+    /// source/target roles from the pair, and the tier inventory is what
+    /// lets a vdisk create refuse a tier the peer cannot hold instead of
+    /// failing the peer's replay.
+    Hello {
+        era: u64,
+        node: NodeId,
+        tiers: Vec<u8>,
+    },
+    /// Data blocks ahead of the ops that reference them, each on the tier
+    /// its op will reference it at.
+    Payloads(Vec<(u8, Vec<u8>)>),
     /// Ops in stream order. `first_rseq` numbers the first op; the rest
     /// follow sequentially — a gap means the transport lied.
     Apply { first_rseq: u64, ops: Vec<ReplOp> },
@@ -205,10 +235,11 @@ pub enum PeerMessage {
     SyncStart,
     /// The source's settled state, roots and all.
     SyncManifest(SyncOffer),
-    /// Blocks the target lacks.
-    SyncNeed(Vec<BlockHash>),
-    /// The blocks, payloads only — each self-identifies by its hash.
-    SyncData(Vec<Vec<u8>>),
+    /// Blocks the target lacks, each named with the tier it lives on —
+    /// the source's route is per tier, so a bare hash is half an address.
+    SyncNeed(Vec<(u8, BlockHash)>),
+    /// The blocks, tier and payload — each self-identifies by its hash.
+    SyncData(Vec<(u8, Vec<u8>)>),
     /// The pull is complete; the target asks leave to adopt. This is the
     /// source's cue to stop acknowledging alone: adoption hands the
     /// target the source's era, and a single-copy acknowledgement issued
@@ -259,16 +290,20 @@ pub enum ReplState {
 /// stops descending — hence the explicit name.
 #[derive(Debug, Default)]
 struct SyncPull {
-    /// Hashes to resolve locally: present ones get walked, absent ones get
-    /// requested.
-    pending: Vec<(BlockHash, u32)>,
-    /// `(hash, kind)` pairs already resolved — shared subtrees are common,
-    /// and a diff must not walk one twice.
-    seen: HashSet<(BlockHash, u32)>,
-    /// Absent here: hash → the kinds it is wanted as.
-    wanted: HashMap<BlockHash, Vec<u32>>,
-    /// Wanted but not yet requested.
-    unrequested: Vec<BlockHash>,
+    /// Hashes to resolve locally as `(hash, kind, data_tier)`: present
+    /// ones get walked, absent ones get requested. The data tier rides
+    /// along because a kind-0 entry is a data block on its vdisk's tier,
+    /// while every node above it lives on tier 0.
+    pending: Vec<(BlockHash, u32, u8)>,
+    /// Entries already resolved — shared subtrees are common, and a diff
+    /// must not walk one twice.
+    seen: HashSet<(BlockHash, u32, u8)>,
+    /// Absent here: `(hash, store_tier)` → the `(kind, data_tier)`
+    /// continuations waiting on it. One payload can be wanted by several
+    /// walks — and, across tiers, the same hash is different blocks.
+    wanted: HashMap<(BlockHash, u8), Vec<(u32, u8)>>,
+    /// Wanted but not yet requested, as `(store_tier, hash)`.
+    unrequested: Vec<(u8, BlockHash)>,
     /// Requested and not yet received.
     outstanding: usize,
     manifest: Option<SyncOffer>,
@@ -302,6 +337,9 @@ pub struct ReplNode<D: Disk> {
     /// era, crash before adopting it, then survive a verdict) is recorded
     /// in docs/lumenfs.md rather than closed.
     peer_era_seen: u64,
+    /// The tiers the peer's brick set carried at its last hello — what a
+    /// vdisk create checks before promising a tier the peer cannot hold.
+    peer_tiers: Vec<u8>,
     /// The target's buffer of the source's live stream, replayed in
     /// arrival order after adoption. Bounding it is flow control, which
     /// belongs to the daemon that owns the socket.
@@ -324,6 +362,7 @@ impl<D: Disk> ReplNode<D> {
             serving_source: false,
             stream_live: false,
             peer_era_seen: 0,
+            peer_tiers: Vec::new(),
             backlog: Vec::new(),
         }
     }
@@ -370,6 +409,7 @@ impl<D: Disk> ReplNode<D> {
         self.emit(Effect::Send(PeerMessage::Hello {
             era: self.pool.era(),
             node: self.node,
+            tiers: self.pool.tiers(),
         }));
     }
 
@@ -578,18 +618,28 @@ impl<D: Disk> ReplNode<D> {
         }
     }
 
-    pub fn create_vdisk(&mut self, id: u64, size_bytes: u64) -> Result<()> {
+    pub fn create_vdisk(&mut self, id: u64, size_bytes: u64, tier: u8) -> Result<()> {
         if !self.serving() {
             return Err(FsError::Suspended);
         }
-        self.with_wal_room(|pool| pool.create_vdisk(id, size_bytes))?;
+        // The op is about to stream to a peer that must apply it; a tier
+        // its brick set cannot hold would fail its replay into divergence,
+        // so the promise is refused here, where the caller can hear it.
+        if self.stream_active() && !self.peer_tiers.contains(&tier) {
+            return Err(FsError::TierNotOnPeer(tier));
+        }
+        self.with_wal_room(|pool| pool.create_vdisk(id, size_bytes, tier))?;
         // Whoever made it holds it, and that has to be durable before
         // anything is written to it.
         let node = self.node;
         self.pool.claim_lease(id, node)?;
         let lease = self.pool.lease(id).expect("just claimed");
         self.send_ops(vec![
-            ReplOp::CreateVdisk { id, size_bytes },
+            ReplOp::CreateVdisk {
+                id,
+                size_bytes,
+                tier,
+            },
             ReplOp::SetLease { vdisk: id, lease },
         ]);
         Ok(())
@@ -597,10 +647,14 @@ impl<D: Disk> ReplNode<D> {
 
     pub fn write_block(&mut self, vdisk: u64, index: u64, payload: &[u8]) -> Result<()> {
         self.writable(vdisk)?;
-        let hash = self.pool.put_block(payload)?;
+        let tier = self.pool.vdisk_tier(vdisk)?;
+        let hash = self.pool.put_block(tier, payload)?;
         self.with_wal_room(|pool| pool.write_block_prehashed(vdisk, index, hash))?;
         if self.stream_active() {
-            self.emit(Effect::Send(PeerMessage::Payloads(vec![payload.to_vec()])));
+            self.emit(Effect::Send(PeerMessage::Payloads(vec![(
+                tier,
+                payload.to_vec(),
+            )])));
             self.send_ops(vec![ReplOp::Write { vdisk, index, hash }]);
         }
         Ok(())
@@ -724,7 +778,7 @@ impl<D: Disk> ReplNode<D> {
 
     pub fn handle(&mut self, message: PeerMessage) -> Result<()> {
         match message {
-            PeerMessage::Hello { era, node } => self.on_hello(era, node),
+            PeerMessage::Hello { era, node, tiers } => self.on_hello(era, node, tiers),
             // A pulling target buffers the source's live stream rather than
             // applying it: its own state is about to be replaced by the
             // adoption, and anything applied before that would be applied
@@ -737,8 +791,8 @@ impl<D: Disk> ReplNode<D> {
                 Ok(())
             }
             PeerMessage::Payloads(payloads) => {
-                for payload in payloads {
-                    self.pool.put_block(&payload)?;
+                for (tier, payload) in payloads {
+                    self.pool.put_block(tier, &payload)?;
                 }
                 Ok(())
             }
@@ -769,9 +823,9 @@ impl<D: Disk> ReplNode<D> {
             PeerMessage::SyncManifest(offer) => self.on_sync_manifest(offer),
             PeerMessage::SyncNeed(hashes) => {
                 let mut payloads = Vec::with_capacity(hashes.len());
-                for hash in hashes {
-                    match self.pool.block_payload(&hash)? {
-                        Some(payload) => payloads.push(payload),
+                for (tier, hash) in hashes {
+                    match self.pool.block_payload(tier, &hash)? {
+                        Some(payload) => payloads.push((tier, payload)),
                         None => {
                             return Err(FsError::Corrupt(
                                 "the peer asked for a block this store does not hold",
@@ -811,11 +865,12 @@ impl<D: Disk> ReplNode<D> {
         self.pull = SyncPull::default();
     }
 
-    fn on_hello(&mut self, peer_era: u64, peer_node: NodeId) -> Result<()> {
+    fn on_hello(&mut self, peer_era: u64, peer_node: NodeId, peer_tiers: Vec<u8>) -> Result<()> {
         // Both sides compute the same answer from the same pair: higher
         // era is the source; equal eras fall to the lower node id — a tie
         // means both hold every acknowledged write, and the diff is cheap.
         self.peer_era_seen = self.peer_era_seen.max(peer_era);
+        self.peer_tiers = peer_tiers;
         // A hello opens a session; nothing numbered under an earlier one
         // may be mistaken for part of this one.
         self.reset_stream();
@@ -880,28 +935,31 @@ impl<D: Disk> ReplNode<D> {
     /// the point of a Merkle diff, is *transferring* any subtree already
     /// held.
     fn resolve_pending(&mut self) -> Result<()> {
-        while let Some((hash, kind)) = self.pull.pending.pop() {
-            if !self.pull.seen.insert((hash, kind)) {
+        while let Some((hash, kind, data_tier)) = self.pull.pending.pop() {
+            if !self.pull.seen.insert((hash, kind, data_tier)) {
                 continue;
             }
-            if self.pool.has_block(&hash) {
+            // A node lives on tier 0; a kind-0 entry is data on its
+            // vdisk's tier. That pair is the whole address.
+            let store_tier = if kind > 0 { 0 } else { data_tier };
+            if self.pool.has_block(store_tier, &hash) {
                 if kind > 0 {
                     let payload = self
                         .pool
-                        .block_payload(&hash)?
+                        .block_payload(0, &hash)?
                         .ok_or(FsError::Corrupt("a held block vanished mid-resync"))?;
                     for child in map::children(&payload) {
-                        self.pull.pending.push((child, kind - 1));
+                        self.pull.pending.push((child, kind - 1, data_tier));
                     }
                 }
                 continue;
             }
-            let entry = self.pull.wanted.entry(hash).or_default();
+            let entry = self.pull.wanted.entry((hash, store_tier)).or_default();
             if entry.is_empty() {
-                self.pull.unrequested.push(hash);
+                self.pull.unrequested.push((store_tier, hash));
             }
-            if !entry.contains(&kind) {
-                entry.push(kind);
+            if !entry.contains(&(kind, data_tier)) {
+                entry.push((kind, data_tier));
             }
         }
         Ok(())
@@ -918,7 +976,7 @@ impl<D: Disk> ReplNode<D> {
             return;
         }
         let take = self.pull.unrequested.len().min(SYNC_BATCH);
-        let batch: Vec<BlockHash> = self.pull.unrequested.drain(..take).collect();
+        let batch: Vec<(u8, BlockHash)> = self.pull.unrequested.drain(..take).collect();
         self.pull.outstanding = batch.len();
         self.emit(Effect::Send(PeerMessage::SyncNeed(batch)));
     }
@@ -929,6 +987,14 @@ impl<D: Disk> ReplNode<D> {
                 "offered a sync manifest while not pulling",
             ));
         }
+        // A vdisk on a tier this set lacks has nowhere for its data. The
+        // deployment error — asymmetric brick sets — is refused by name
+        // before a single block moves, not discovered at adoption.
+        for (_, _, tier, _) in &offer.vdisks {
+            if !self.pool.tiers().contains(tier) {
+                return Err(FsError::NoSuchTier(*tier));
+            }
+        }
         // Everything this pull fetches hangs off these roots, referenced
         // by nothing in this node's own manifest until adoption. The pull
         // arrives top-down, so the pins reach every fetched block through
@@ -938,17 +1004,19 @@ impl<D: Disk> ReplNode<D> {
         let entries = map::entries_per_node(self.pool.block_size());
         let block_size = self.pool.block_size() as u64;
         // A root of a depth-d tree is kind d: its children are kind d-1,
-        // and kind 0 is a data block.
-        for (_, size_bytes, root) in &offer.vdisks {
+        // and kind 0 is a data block on the vdisk's tier.
+        for (_, size_bytes, tier, root) in &offer.vdisks {
             if let Some(root) = root {
                 let depth = map::depth_for(size_bytes.div_ceil(block_size), entries);
-                self.pull.pending.push((*root, depth));
+                self.pull.pending.push((*root, depth, *tier));
             }
         }
-        for (_, _, size_bytes, root) in &offer.snapshots {
+        for (vdisk, _, size_bytes, root) in &offer.snapshots {
             if let Some(root) = root {
                 let depth = map::depth_for(size_bytes.div_ceil(block_size), entries);
-                self.pull.pending.push((*root, depth));
+                self.pull
+                    .pending
+                    .push((*root, depth, offer_vdisk_tier(&offer, *vdisk)));
             }
         }
         self.pull.manifest = Some(offer);
@@ -961,20 +1029,24 @@ impl<D: Disk> ReplNode<D> {
         Ok(())
     }
 
-    fn on_sync_data(&mut self, payloads: Vec<Vec<u8>>) -> Result<()> {
+    fn on_sync_data(&mut self, payloads: Vec<(u8, Vec<u8>)>) -> Result<()> {
         if self.state != (ReplState::Resyncing { source: false }) {
             return Err(FsError::Corrupt("sync data arrived while not pulling"));
         }
-        for payload in payloads {
-            let hash = self.pool.put_block(&payload)?;
+        for (store_tier, payload) in payloads {
+            let hash = self.pool.put_block(store_tier, &payload)?;
             self.pull.outstanding = self.pull.outstanding.saturating_sub(1);
-            let kinds = self.pull.wanted.remove(&hash).unwrap_or_default();
-            for kind in kinds {
+            let continuations = self
+                .pull
+                .wanted
+                .remove(&(hash, store_tier))
+                .unwrap_or_default();
+            for (kind, data_tier) in continuations {
                 // The block is here now; walking it from `pending` keeps
                 // one descent path for arrived and already-held blocks
                 // alike.
-                self.pull.seen.remove(&(hash, kind));
-                self.pull.pending.push((hash, kind));
+                self.pull.seen.remove(&(hash, kind, data_tier));
+                self.pull.pending.push((hash, kind, data_tier));
             }
         }
         self.resolve_pending()?;
@@ -1063,9 +1135,11 @@ impl<D: Disk> ReplNode<D> {
 
     fn apply_op(&mut self, op: ReplOp) -> Result<()> {
         match op {
-            ReplOp::CreateVdisk { id, size_bytes } => {
-                self.with_wal_room(|pool| pool.create_vdisk(id, size_bytes))
-            }
+            ReplOp::CreateVdisk {
+                id,
+                size_bytes,
+                tier,
+            } => self.with_wal_room(|pool| pool.create_vdisk(id, size_bytes, tier)),
             ReplOp::Write { vdisk, index, hash } => {
                 self.with_wal_room(|pool| pool.write_block_prehashed(vdisk, index, hash))
             }
@@ -1121,7 +1195,7 @@ mod tests {
         let mut a = node(1, 0);
         assert_eq!(a.state(), ReplState::Suspended);
         assert_eq!(
-            a.create_vdisk(1, 100 * 4096).unwrap_err(),
+            a.create_vdisk(1, 100 * 4096, 0).unwrap_err(),
             FsError::Suspended
         );
         let ticket = a.flush().unwrap();
@@ -1142,7 +1216,7 @@ mod tests {
         assert_eq!(a.pool().era(), 1);
         a.set_peer_fenced().unwrap();
         assert_eq!(a.pool().era(), 2);
-        a.create_vdisk(1, 100 * 4096).unwrap();
+        a.create_vdisk(1, 100 * 4096, 0).unwrap();
         a.write_block(1, 0, b"alone but honest").unwrap();
         let ticket = a.flush().unwrap();
         assert!(a.take_effects().contains(&Effect::FlushDone(ticket)));
@@ -1160,7 +1234,7 @@ mod tests {
     fn only_the_writer_writes() {
         let mut a = node(4, 0);
         a.set_peer_fenced().unwrap();
-        a.create_vdisk(1, 100 * 4096).unwrap();
+        a.create_vdisk(1, 100 * 4096, 0).unwrap();
         a.take_effects();
         // Another node's view: same vdisk, no writer role.
         let mut b = node(5, 1);
@@ -1176,7 +1250,7 @@ mod tests {
         fn pool_create_for_test(&mut self, id: u64) {
             // Create the vdisk without claiming the writer role, as an
             // applier would.
-            self.pool.create_vdisk(id, 100 * 4096).unwrap();
+            self.pool.create_vdisk(id, 100 * 4096, 0).unwrap();
         }
     }
 }

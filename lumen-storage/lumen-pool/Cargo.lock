@@ -470,6 +470,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "lumen-fs",
  "lumen-sys",
  "serde",
  "serde_json",

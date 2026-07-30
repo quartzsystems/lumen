@@ -21,8 +21,10 @@
 use lumen_fs::{BlockHash, Lease, PeerMessage, ReplOp, SyncOffer};
 
 /// Protocol magic + version. Bump the last byte to break compatibility
-/// loudly instead of misparsing quietly.
-pub const HANDSHAKE_MAGIC: [u8; 8] = *b"LFSPEER\x01";
+/// loudly instead of misparsing quietly — version 2 is phase 4's tiers: a
+/// tier byte on every payload and sync address, and the tier inventory in
+/// the hello. A phase-3 daemon is refused at the handshake, by name.
+pub const HANDSHAKE_MAGIC: [u8; 8] = *b"LFSPEER\x02";
 
 /// The largest frame either side will send or accept. Sync data batches
 /// are 64 blocks of at most the pool block size; this is generous headroom
@@ -128,10 +130,15 @@ fn put_lease(out: &mut Vec<u8>, vdisk: u64, lease: &Lease) {
 
 fn put_op(out: &mut Vec<u8>, op: &ReplOp) {
     match op {
-        ReplOp::CreateVdisk { id, size_bytes } => {
+        ReplOp::CreateVdisk {
+            id,
+            size_bytes,
+            tier,
+        } => {
             out.push(1);
             put_u64(out, *id);
             put_u64(out, *size_bytes);
+            out.push(*tier);
         }
         ReplOp::Write { vdisk, index, hash } => {
             out.push(2);
@@ -185,15 +192,18 @@ fn put_op(out: &mut Vec<u8>, op: &ReplOp) {
 pub fn encode(message: &PeerMessage) -> Vec<u8> {
     let mut out = Vec::new();
     match message {
-        PeerMessage::Hello { era, node } => {
+        PeerMessage::Hello { era, node, tiers } => {
             out.push(1);
             put_u64(&mut out, *era);
             out.push(*node);
+            out.push(tiers.len() as u8);
+            out.extend_from_slice(tiers);
         }
         PeerMessage::Payloads(payloads) => {
             out.push(2);
             put_u32(&mut out, payloads.len() as u32);
-            for payload in payloads {
+            for (tier, payload) in payloads {
+                out.push(*tier);
                 put_bytes(&mut out, payload);
             }
         }
@@ -218,9 +228,10 @@ pub fn encode(message: &PeerMessage) -> Vec<u8> {
             out.push(7);
             put_u64(&mut out, offer.era);
             put_u32(&mut out, offer.vdisks.len() as u32);
-            for (id, size_bytes, root) in &offer.vdisks {
+            for (id, size_bytes, tier, root) in &offer.vdisks {
                 put_u64(&mut out, *id);
                 put_u64(&mut out, *size_bytes);
+                out.push(*tier);
                 put_root(&mut out, root);
             }
             put_u32(&mut out, offer.snapshots.len() as u32);
@@ -238,14 +249,16 @@ pub fn encode(message: &PeerMessage) -> Vec<u8> {
         PeerMessage::SyncNeed(hashes) => {
             out.push(8);
             put_u32(&mut out, hashes.len() as u32);
-            for hash in hashes {
+            for (tier, hash) in hashes {
+                out.push(*tier);
                 out.extend_from_slice(hash.as_bytes());
             }
         }
         PeerMessage::SyncData(payloads) => {
             out.push(9);
             put_u32(&mut out, payloads.len() as u32);
-            for payload in payloads {
+            for (tier, payload) in payloads {
+                out.push(*tier);
                 put_bytes(&mut out, payload);
             }
         }
@@ -346,6 +359,7 @@ impl<'a> Reader<'a> {
             1 => Ok(ReplOp::CreateVdisk {
                 id: self.u64()?,
                 size_bytes: self.u64()?,
+                tier: self.u8()?,
             }),
             2 => Ok(ReplOp::Write {
                 vdisk: self.u64()?,
@@ -391,15 +405,19 @@ pub fn decode(buf: &[u8]) -> Result<PeerMessage, WireError> {
     }
     let mut r = Reader::new(buf);
     let message = match r.u8()? {
-        1 => PeerMessage::Hello {
-            era: r.u64()?,
-            node: r.u8()?,
-        },
+        1 => {
+            let era = r.u64()?;
+            let node = r.u8()?;
+            let tier_count = r.u8()? as usize;
+            let tiers = r.take(tier_count)?.to_vec();
+            PeerMessage::Hello { era, node, tiers }
+        }
         2 => {
-            let count = r.count(4)?;
+            let count = r.count(5)?;
             let mut payloads = Vec::with_capacity(count);
             for _ in 0..count {
-                payloads.push(r.bytes()?);
+                let tier = r.u8()?;
+                payloads.push((tier, r.bytes()?));
             }
             PeerMessage::Payloads(payloads)
         }
@@ -417,10 +435,10 @@ pub fn decode(buf: &[u8]) -> Result<PeerMessage, WireError> {
         6 => PeerMessage::SyncStart,
         7 => {
             let era = r.u64()?;
-            let vdisk_count = r.count(49)?;
+            let vdisk_count = r.count(50)?;
             let mut vdisks = Vec::with_capacity(vdisk_count);
             for _ in 0..vdisk_count {
-                vdisks.push((r.u64()?, r.u64()?, r.root()?));
+                vdisks.push((r.u64()?, r.u64()?, r.u8()?, r.root()?));
             }
             let snapshot_count = r.count(57)?;
             let mut snapshots = Vec::with_capacity(snapshot_count);
@@ -440,18 +458,20 @@ pub fn decode(buf: &[u8]) -> Result<PeerMessage, WireError> {
             })
         }
         8 => {
-            let count = r.count(32)?;
+            let count = r.count(33)?;
             let mut hashes = Vec::with_capacity(count);
             for _ in 0..count {
-                hashes.push(r.hash()?);
+                let tier = r.u8()?;
+                hashes.push((tier, r.hash()?));
             }
             PeerMessage::SyncNeed(hashes)
         }
         9 => {
-            let count = r.count(4)?;
+            let count = r.count(5)?;
             let mut payloads = Vec::with_capacity(count);
             for _ in 0..count {
-                payloads.push(r.bytes()?);
+                let tier = r.u8()?;
+                payloads.push((tier, r.bytes()?));
             }
             PeerMessage::SyncData(payloads)
         }
@@ -490,15 +510,25 @@ mod tests {
         round_trip(PeerMessage::Hello {
             era: u64::MAX,
             node: 1,
+            tiers: vec![0, 1, 2],
+        });
+        round_trip(PeerMessage::Hello {
+            era: 1,
+            node: 0,
+            tiers: vec![0],
         });
         round_trip(PeerMessage::Payloads(vec![]));
-        round_trip(PeerMessage::Payloads(vec![vec![], vec![0xAB; 16384]]));
+        round_trip(PeerMessage::Payloads(vec![
+            (0, vec![]),
+            (1, vec![0xAB; 16384]),
+        ]));
         round_trip(PeerMessage::Apply {
             first_rseq: 1,
             ops: vec![
                 ReplOp::CreateVdisk {
                     id: 1,
                     size_bytes: 1 << 40,
+                    tier: 2,
                 },
                 ReplOp::Write {
                     vdisk: 1,
@@ -547,7 +577,7 @@ mod tests {
         round_trip(PeerMessage::SyncStart);
         round_trip(PeerMessage::SyncManifest(SyncOffer {
             era: 5,
-            vdisks: vec![(1, 1 << 30, Some(hash(0x22))), (2, 4096, None)],
+            vdisks: vec![(1, 1 << 30, 0, Some(hash(0x22))), (2, 4096, 1, None)],
             snapshots: vec![(1, 1000, 1 << 30, Some(hash(0x33)))],
             leases: vec![(
                 1,
@@ -564,8 +594,11 @@ mod tests {
             snapshots: vec![],
             leases: vec![],
         }));
-        round_trip(PeerMessage::SyncNeed(vec![hash(0x44), hash(0x55)]));
-        round_trip(PeerMessage::SyncData(vec![vec![1, 2, 3]]));
+        round_trip(PeerMessage::SyncNeed(vec![
+            (0, hash(0x44)),
+            (2, hash(0x55)),
+        ]));
+        round_trip(PeerMessage::SyncData(vec![(1, vec![1, 2, 3])]));
         round_trip(PeerMessage::SyncReady);
         round_trip(PeerMessage::SyncAdopt { final_rseq: 77 });
         round_trip(PeerMessage::SyncDone { era: 6 });
@@ -573,7 +606,7 @@ mod tests {
 
     #[test]
     fn damage_is_an_error_never_a_guess() {
-        let good = encode(&PeerMessage::SyncNeed(vec![hash(0x66)]));
+        let good = encode(&PeerMessage::SyncNeed(vec![(0, hash(0x66))]));
         // Truncated anywhere: refused.
         for cut in 0..good.len() {
             assert!(

@@ -26,8 +26,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::brick::Brick;
-use crate::disk::Disk;
+use crate::brick::{BlockRead, BlockWrite};
 use crate::error::{FsError, Result};
 use crate::hash::BlockHash;
 
@@ -54,7 +53,11 @@ pub fn depth_for(capacity: u64, entries_per_node: u64) -> u32 {
     depth
 }
 
-fn load_node<D: Disk>(brick: &Brick<D>, hash: &BlockHash, block_size: u32) -> Result<Vec<u8>> {
+fn load_node<S: BlockRead + ?Sized>(
+    brick: &S,
+    hash: &BlockHash,
+    block_size: u32,
+) -> Result<Vec<u8>> {
     match brick.get(hash)? {
         Some(node) if node.len() == block_size as usize => Ok(node),
         Some(_) => Err(FsError::Corrupt("a map node has the wrong shape")),
@@ -82,8 +85,8 @@ fn set_entry(node: &mut [u8], slot: u64, value: Option<&BlockHash>) {
 
 /// Resolve one block index through the tree. `Ok(None)` is "unmapped" — a
 /// region never written, which the consumer renders as zeros.
-pub fn lookup<D: Disk>(
-    brick: &Brick<D>,
+pub fn lookup<S: BlockRead + ?Sized>(
+    brick: &S,
     root: &BlockHash,
     depth: u32,
     index: u64,
@@ -104,8 +107,8 @@ pub fn lookup<D: Disk>(
 /// Apply a batch of mutations to the tree rooted at `root` (or to the
 /// empty tree), writing new nodes along every touched path, and return the
 /// new root — `None` if the tree folded away entirely.
-pub fn fold<D: Disk>(
-    brick: &mut Brick<D>,
+pub fn fold<S: BlockWrite + ?Sized>(
+    brick: &mut S,
     root: Option<&BlockHash>,
     depth: u32,
     mutations: &BTreeMap<u64, Option<BlockHash>>,
@@ -114,8 +117,8 @@ pub fn fold<D: Disk>(
     fold_level(brick, root, depth - 1, &entries)
 }
 
-fn fold_level<D: Disk>(
-    brick: &mut Brick<D>,
+fn fold_level<S: BlockWrite + ?Sized>(
+    brick: &mut S,
     node_hash: Option<&BlockHash>,
     level: u32,
     mutations: &[(u64, Option<BlockHash>)],
@@ -183,8 +186,8 @@ pub enum MapItem {
 
 /// Visit every node and mapped block under a root — GC's mark phase and
 /// scrub's reachability sweep.
-pub fn walk<D: Disk>(
-    brick: &Brick<D>,
+pub fn walk<S: BlockRead + ?Sized>(
+    brick: &S,
     root: &BlockHash,
     depth: u32,
     visit: &mut dyn FnMut(MapItem),
@@ -192,8 +195,8 @@ pub fn walk<D: Disk>(
     walk_level(brick, root, depth - 1, 0, visit)
 }
 
-fn walk_level<D: Disk>(
-    brick: &Brick<D>,
+fn walk_level<S: BlockRead + ?Sized>(
+    brick: &S,
     hash: &BlockHash,
     level: u32,
     base: u64,
@@ -223,7 +226,7 @@ fn walk_level<D: Disk>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::brick::BrickParams;
+    use crate::brick::{Brick, BrickParams};
     use crate::sim::SimDisk;
 
     const KIB: u64 = 1024;
