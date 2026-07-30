@@ -51,7 +51,7 @@ pub use brick::{Brick, BrickParams, BrickStats, GcStats};
 pub use bytes::ByteView;
 pub use disk::Disk;
 pub use error::{FsError, Result};
-pub use format::{SECTOR_SIZE, SUPERBLOCK_SLOTS};
+pub use format::{RosterEntry, Superblock, ROSTER_CAP, SECTOR_SIZE, SUPERBLOCK_SLOTS};
 pub use hash::{hash_block, BlockHash};
 pub use pool::{Lease, Pool, ScrubReport};
 pub use repl::{Effect, NodeId, PeerMessage, ReplNode, ReplOp, ReplState, SyncOffer};

@@ -119,6 +119,8 @@ fn cmd_format(path: &str, disk_bytes: &str, vdisk_bytes: &str) -> std::result::R
         block_size: 16 * 1024,
         segment_size: if big { 64 << 20 } else { 4 << 20 },
         wal_size: if big { 64 << 20 } else { 8 << 20 },
+        tier: 0,
+        wal_holder: true,
     };
     let brick = Brick::format(disk, params).map_err(|err| err.to_string())?;
     let mut pool = Pool::create(brick).map_err(|err| err.to_string())?;

@@ -27,6 +27,12 @@ license = "MIT"
 # else in this crate reaches the kernel through /dev/zfs and needs nothing.
 # See lumen_sys::exec and docs/system.md.
 lumen-sys = { path = "../../lumen-system/lumen-sys" }
+# The LumenFS on-disk format, for exactly one read: the device scanner probes
+# each disk's first sector for a brick superblock, so a disk the pool engine
+# owns is reported as owned instead of offered as free. One decode definition,
+# shared with the engine that wrote it — a second parser would be a second
+# opinion about the same bytes.
+lumen-fs = { path = "../lumen-fs" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"

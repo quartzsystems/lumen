@@ -37,6 +37,8 @@ fn params() -> BrickParams {
         block_size: BLOCK as u32,
         segment_size: 128 * KIB,
         wal_size: 32 * KIB,
+        tier: 0,
+        wal_holder: true,
     }
 }
 

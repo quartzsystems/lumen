@@ -306,6 +306,27 @@ pub struct BlockDevice {
     /// scan. Only the layer that can also ask `zpool` may answer this.
     #[serde(default)]
     pub wipeable: bool,
+    /// This disk is a LumenFS brick, by its own superblock's account.
+    ///
+    /// The other owner a data disk can have (docs/lumenfs.md: ZFS pool or
+    /// LumenFS brick, never both). Read off the platter by the scan, the
+    /// same way mounts and swap are read from `/proc` — a brick's disk must
+    /// never be offered as free because a config file forgot it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lumenfs: Option<LumenBrick>,
+}
+
+/// A LumenFS brick's account of itself, decoded from its superblock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LumenBrick {
+    /// The pool it belongs to, as lowercase hex.
+    pub pool_uuid: String,
+    /// The brick itself, as lowercase hex.
+    pub brick_uuid: String,
+    /// The device class it was assigned at format: 0 the fastest, downward.
+    pub tier: u8,
+    /// Whether it hosts its node's WAL and anchors.
+    pub wal_holder: bool,
 }
 
 impl BlockDevice {

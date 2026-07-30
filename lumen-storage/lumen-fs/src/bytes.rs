@@ -188,6 +188,8 @@ mod tests {
                 block_size: BLOCK as u32,
                 segment_size: 128 * KIB,
                 wal_size: 64 * KIB,
+                tier: 0,
+                wal_holder: true,
             },
         )
         .unwrap();

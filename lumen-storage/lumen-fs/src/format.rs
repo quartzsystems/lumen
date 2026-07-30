@@ -1,4 +1,14 @@
-//! The on-disk shapes, version 1: superblock, segment header, block record.
+//! The on-disk shapes, version 2: superblock, segment header, block record.
+//!
+//! Version 2 (phase 4) adds two facts the drive wizard reads off the
+//! platter rather than out of a config file: the brick's **tier** (0 = the
+//! fastest class, downward from there) and whether this brick **hosts the
+//! WAL and anchors** for its node, plus a brick **roster** in the anchor so
+//! the set of bricks a node's pool spans is itself durable state. There is
+//! no upgrade path from version 1 — a v1 brick is refused by name
+//! (`UnsupportedVersion`), and the remedy is a reformat through the pool
+//! create workflow. Decided rather than defaulted: the only v1 bricks in
+//! existence are lab hardware the workflow recreates anyway.
 //!
 //! Layout of a brick:
 //!
@@ -57,7 +67,7 @@ pub const SECTOR_SIZE: u64 = 4096;
 /// Two superblock copies, so one torn superblock write cannot orphan a brick.
 pub const SUPERBLOCK_SLOTS: u64 = 2;
 
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 /// Two anchor copies right behind them, same reasoning.
 pub const ANCHOR_SLOTS: u64 = 2;
@@ -74,10 +84,20 @@ pub const ANCHOR_AREA_START: u64 = SECTOR_SIZE * SUPERBLOCK_SLOTS;
 /// the superblock says the segment area starts.
 pub const WAL_AREA_START: u64 = ANCHOR_AREA_START + SECTOR_SIZE * ANCHOR_SLOTS;
 
+/// The most bricks one node's anchor can roster. Well beyond any appliance
+/// chassis, and it keeps the anchor a fixed shape inside its one sector.
+pub const ROSTER_CAP: usize = 16;
+
+/// Superblock flag bit: this brick hosts its node's WAL and anchors.
+const FLAG_WAL_HOLDER: u8 = 1;
+
 /// Encoded sizes. The structs occupy the front of their sector; the rest is
 /// zeros.
-const SUPERBLOCK_LEN: usize = 128;
-const ANCHOR_LEN: usize = 112;
+const SUPERBLOCK_LEN: usize = 144;
+const ROSTER_ENTRY_LEN: usize = 17;
+const ANCHOR_ROSTER_AT: usize = 80;
+const ANCHOR_CHECK_AT: usize = ANCHOR_ROSTER_AT + 1 + ROSTER_CAP * ROSTER_ENTRY_LEN;
+const ANCHOR_LEN: usize = ANCHOR_CHECK_AT + 32;
 const SEGMENT_HEADER_LEN: usize = 72;
 pub const RECORD_HEADER_LEN: usize = 64;
 
@@ -116,10 +136,13 @@ fn get_u64(buf: &[u8], at: usize) -> u64 {
 ///   32..40  segment_count          u64
 ///   40..48  generation             u64   highest valid generation wins
 ///   48..56  wal_start              u64
-///   56..64  wal_size               u64
+///   56..64  wal_size               u64   0 permitted when not the WAL holder
 ///   64..80  pool_uuid              16 bytes
 ///   80..96  brick_uuid             16 bytes
-///   96..128 checksum               BLAKE3 of bytes 0..96
+///   96      tier                   u8    0 = the fastest class, downward
+///   97      flags                  u8    bit0: this brick hosts WAL + anchors
+///   98..112 reserved, zero
+///   112..144 checksum              BLAKE3 of bytes 0..112
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Superblock {
@@ -132,6 +155,13 @@ pub struct Superblock {
     pub wal_size: u64,
     pub pool_uuid: [u8; 16],
     pub brick_uuid: [u8; 16],
+    /// The device class this brick was assigned at format: 0 is the fastest
+    /// present in the pool, higher numbers slower. The assignment is the
+    /// wizard's; the platter remembers it so nothing else has to.
+    pub tier: u8,
+    /// Whether this brick hosts its node's WAL ring and anchor slots.
+    /// Exactly one brick per node says yes, and it is always a tier-0 brick.
+    pub wal_holder: bool,
 }
 
 impl Superblock {
@@ -148,25 +178,30 @@ impl Superblock {
         put_u64(&mut buf, 56, self.wal_size);
         buf[64..80].copy_from_slice(&self.pool_uuid);
         buf[80..96].copy_from_slice(&self.brick_uuid);
-        let check = full_check(&buf[0..96]);
-        buf[96..128].copy_from_slice(&check);
+        buf[96] = self.tier;
+        buf[97] = if self.wal_holder { FLAG_WAL_HOLDER } else { 0 };
+        let check = full_check(&buf[0..112]);
+        buf[112..144].copy_from_slice(&check);
         buf
     }
 
     /// Decode one slot. `Ok(None)` is "this slot holds no valid superblock"
-    /// — an ordinary answer during open; the *version* mismatch is an error
-    /// because a valid-but-newer superblock must stop the mount, not read as
-    /// blank.
+    /// — an ordinary answer during open; a *version* mismatch is an error
+    /// because a valid superblock of another version must stop the mount by
+    /// name, not read as blank. The version is judged before the checksum:
+    /// another version's checksum lives at another offset, so checking ours
+    /// first would make every foreign version read as no superblock at all
+    /// — exactly the silent answer the error exists to prevent.
     pub fn decode(buf: &[u8]) -> Result<Option<Superblock>> {
         if buf.len() < SUPERBLOCK_LEN || &buf[0..8] != SUPERBLOCK_MAGIC {
-            return Ok(None);
-        }
-        if full_check(&buf[0..96]) != buf[96..128] {
             return Ok(None);
         }
         let version = get_u32(buf, 8);
         if version != FORMAT_VERSION {
             return Err(FsError::UnsupportedVersion(version));
+        }
+        if full_check(&buf[0..112]) != buf[112..144] {
+            return Ok(None);
         }
         let mut pool_uuid = [0u8; 16];
         pool_uuid.copy_from_slice(&buf[64..80]);
@@ -182,6 +217,8 @@ impl Superblock {
             wal_size: get_u64(buf, 56),
             pool_uuid,
             brick_uuid,
+            tier: buf[96],
+            wal_holder: buf[97] & FLAG_WAL_HOLDER != 0,
         }))
     }
 
@@ -209,13 +246,21 @@ impl Superblock {
 ///   32..40  wal_epoch           u64   the epoch floor for replay
 ///   40..48  era                 u64   the data generation (replication)
 ///   48..80  manifest_hash       the vdisk manifest block; all-zeros = none
-///   80..112 checksum            BLAKE3 of bytes 0..80
+///   80      roster_len          u8    bricks this node's pool spans
+///   81..353 roster entries      roster_len × (brick_uuid 16 + tier 1);
+///                               the unused tail of the area stays zero
+///   353..385 checksum           BLAKE3 of bytes 0..353
 /// ```
 ///
 /// The era is the replication layer's generation counter — bumped when a
 /// survivor continues alone under a fence verdict, adopted by a peer that
 /// resyncs. It lives in the anchor because "I went on without my peer" is
 /// a fact a crashed survivor must still know at its next open.
+///
+/// The roster is the durable answer to "which bricks make up this node's
+/// pool". It lives in the anchor — rewritten at every checkpoint on the
+/// WAL-holding brick — so the set is derivable by reading, and a config
+/// file that names a different set is caught at open instead of trusted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Anchor {
     pub generation: u64,
@@ -224,10 +269,27 @@ pub struct Anchor {
     pub wal_epoch: u64,
     pub era: u64,
     pub manifest_hash: [u8; 32],
+    /// Every brick of this node's pool, the WAL holder included. At most
+    /// [`ROSTER_CAP`]; order is not meaningful.
+    pub roster: Vec<RosterEntry>,
+}
+
+/// One rostered brick: who it is and the tier it was assigned at format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RosterEntry {
+    pub brick_uuid: [u8; 16],
+    pub tier: u8,
 }
 
 impl Anchor {
+    /// Panics if the roster exceeds [`ROSTER_CAP`] — the cap is enforced
+    /// with a named error where bricks are assigned, so an oversized roster
+    /// here is a bug above, not an input.
     pub fn encode(&self) -> [u8; ANCHOR_LEN] {
+        assert!(
+            self.roster.len() <= ROSTER_CAP,
+            "anchor roster exceeds ROSTER_CAP"
+        );
         let mut buf = [0u8; ANCHOR_LEN];
         buf[0..8].copy_from_slice(ANCHOR_MAGIC);
         put_u64(&mut buf, 8, self.generation);
@@ -236,8 +298,14 @@ impl Anchor {
         put_u64(&mut buf, 32, self.wal_epoch);
         put_u64(&mut buf, 40, self.era);
         buf[48..80].copy_from_slice(&self.manifest_hash);
-        let check = full_check(&buf[0..80]);
-        buf[80..112].copy_from_slice(&check);
+        buf[ANCHOR_ROSTER_AT] = self.roster.len() as u8;
+        for (i, entry) in self.roster.iter().enumerate() {
+            let at = ANCHOR_ROSTER_AT + 1 + i * ROSTER_ENTRY_LEN;
+            buf[at..at + 16].copy_from_slice(&entry.brick_uuid);
+            buf[at + 16] = entry.tier;
+        }
+        let check = full_check(&buf[0..ANCHOR_CHECK_AT]);
+        buf[ANCHOR_CHECK_AT..ANCHOR_LEN].copy_from_slice(&check);
         buf
     }
 
@@ -247,8 +315,22 @@ impl Anchor {
         if buf.len() < ANCHOR_LEN || &buf[0..8] != ANCHOR_MAGIC {
             return None;
         }
-        if full_check(&buf[0..80]) != buf[80..112] {
+        if full_check(&buf[0..ANCHOR_CHECK_AT]) != buf[ANCHOR_CHECK_AT..ANCHOR_LEN] {
             return None;
+        }
+        let roster_len = buf[ANCHOR_ROSTER_AT] as usize;
+        if roster_len > ROSTER_CAP {
+            return None;
+        }
+        let mut roster = Vec::with_capacity(roster_len);
+        for i in 0..roster_len {
+            let at = ANCHOR_ROSTER_AT + 1 + i * ROSTER_ENTRY_LEN;
+            let mut brick_uuid = [0u8; 16];
+            brick_uuid.copy_from_slice(&buf[at..at + 16]);
+            roster.push(RosterEntry {
+                brick_uuid,
+                tier: buf[at + 16],
+            });
         }
         let mut manifest_hash = [0u8; 32];
         manifest_hash.copy_from_slice(&buf[48..80]);
@@ -259,6 +341,7 @@ impl Anchor {
             wal_epoch: get_u64(buf, 32),
             era: get_u64(buf, 40),
             manifest_hash,
+            roster,
         })
     }
 
@@ -410,6 +493,8 @@ mod tests {
             wal_size: 64 << 10,
             pool_uuid: [1; 16],
             brick_uuid: [2; 16],
+            tier: 0,
+            wal_holder: true,
         }
     }
 
@@ -418,12 +503,20 @@ mod tests {
         let sb = sample_superblock();
         let decoded = Superblock::decode(&sb.encode()).unwrap().unwrap();
         assert_eq!(sb, decoded);
+        let quiet = Superblock {
+            tier: 3,
+            wal_holder: false,
+            ..sample_superblock()
+        };
+        assert_eq!(Superblock::decode(&quiet.encode()).unwrap(), Some(quiet));
     }
 
     #[test]
     fn a_single_flipped_superblock_bit_reads_as_no_superblock() {
         let mut buf = sample_superblock().encode();
-        for bit_of in [0usize, 9, 17, 50, 60, 90, 110] {
+        // Every field but the version: the magic, geometry, uuids, the new
+        // tier and flags bytes, a reserved byte, and the checksum itself.
+        for bit_of in [0usize, 13, 17, 50, 60, 90, 96, 97, 105, 120, 140] {
             buf[bit_of] ^= 0x01;
             assert_eq!(Superblock::decode(&buf).unwrap(), None, "byte {bit_of}");
             buf[bit_of] ^= 0x01;
@@ -434,31 +527,105 @@ mod tests {
     fn a_valid_superblock_from_the_future_is_an_error_not_a_blank() {
         let mut buf = sample_superblock().encode();
         put_u32(&mut buf, 8, FORMAT_VERSION + 1);
-        let check = full_check(&buf[0..96]);
-        buf[96..128].copy_from_slice(&check);
+        let check = full_check(&buf[0..112]);
+        buf[112..144].copy_from_slice(&check);
         assert_eq!(
             Superblock::decode(&buf).unwrap_err(),
             FsError::UnsupportedVersion(FORMAT_VERSION + 1)
         );
     }
 
+    /// Phase 4's compatibility decision, pinned: version 1 has no upgrade
+    /// path — a real v1 superblock (its checksum at its own offsets, valid
+    /// under its own rules) is refused by name, never read as blank.
     #[test]
-    fn an_anchor_round_trips_and_a_flipped_bit_reads_as_no_anchor() {
-        let anchor = Anchor {
+    fn a_version_one_superblock_is_refused_by_name() {
+        // Hand-encode the v1 layout: same fields through byte 96, checksum
+        // over 0..96 at 96..128, nothing after 128.
+        let mut buf = [0u8; 144];
+        buf[0..8].copy_from_slice(b"LUMENFS\0");
+        put_u32(&mut buf, 8, 1);
+        put_u32(&mut buf, 12, 16384);
+        put_u64(&mut buf, 16, 1 << 20);
+        put_u64(&mut buf, 24, WAL_AREA_START + (64 << 10));
+        put_u64(&mut buf, 32, 7);
+        put_u64(&mut buf, 40, 3);
+        put_u64(&mut buf, 48, WAL_AREA_START);
+        put_u64(&mut buf, 56, 64 << 10);
+        buf[64..80].copy_from_slice(&[1; 16]);
+        buf[80..96].copy_from_slice(&[2; 16]);
+        let check = full_check(&buf[0..96]);
+        buf[96..128].copy_from_slice(&check);
+        assert_eq!(
+            Superblock::decode(&buf).unwrap_err(),
+            FsError::UnsupportedVersion(1)
+        );
+    }
+
+    fn sample_anchor() -> Anchor {
+        Anchor {
             generation: 12,
             wal_replay_offset: WAL_AREA_START + 4096,
             wal_replay_seq: 88,
             wal_epoch: 4,
             era: 3,
             manifest_hash: [9; 32],
-        };
+            roster: vec![
+                RosterEntry {
+                    brick_uuid: [2; 16],
+                    tier: 0,
+                },
+                RosterEntry {
+                    brick_uuid: [5; 16],
+                    tier: 1,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn an_anchor_round_trips_and_a_flipped_bit_reads_as_no_anchor() {
+        let anchor = sample_anchor();
         let mut buf = anchor.encode();
         assert_eq!(Anchor::decode(&buf), Some(anchor));
-        for bit_of in [0usize, 10, 20, 36, 44, 60, 100] {
+        // Fields old and new: header, roster length, a roster entry's uuid
+        // and tier, a byte of the unused roster tail, and the checksum.
+        for bit_of in [0usize, 10, 20, 36, 44, 60, 80, 85, 97, 200, 360] {
             buf[bit_of] ^= 0x01;
             assert_eq!(Anchor::decode(&buf), None, "byte {bit_of}");
             buf[bit_of] ^= 0x01;
         }
+    }
+
+    #[test]
+    fn a_roster_carries_up_to_the_cap_and_refuses_beyond_it() {
+        let full = Anchor {
+            roster: (0..ROSTER_CAP)
+                .map(|i| RosterEntry {
+                    brick_uuid: [i as u8; 16],
+                    tier: (i % 3) as u8,
+                })
+                .collect(),
+            ..sample_anchor()
+        };
+        let buf = full.encode();
+        assert_eq!(Anchor::decode(&buf), Some(full));
+        // A length beyond the cap is not an anchor, even re-checksummed:
+        // decode refuses before reading entries that have no reserved bytes.
+        let mut over = buf;
+        over[ANCHOR_ROSTER_AT] = ROSTER_CAP as u8 + 1;
+        let check = full_check(&over[0..ANCHOR_CHECK_AT]);
+        over[ANCHOR_CHECK_AT..ANCHOR_LEN].copy_from_slice(&check);
+        assert_eq!(Anchor::decode(&over), None);
+    }
+
+    #[test]
+    fn an_empty_roster_is_a_valid_anchor() {
+        let bare = Anchor {
+            roster: Vec::new(),
+            ..sample_anchor()
+        };
+        assert_eq!(Anchor::decode(&bare.encode()), Some(bare));
     }
 
     #[test]

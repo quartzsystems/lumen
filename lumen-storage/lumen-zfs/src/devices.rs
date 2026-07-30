@@ -29,7 +29,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::model::BlockDevice;
+use crate::model::{BlockDevice, LumenBrick};
 
 /// A sector, as `/sys/block/<name>/size` counts them. Always 512 regardless of
 /// the disk's real block size — this is the kernel's unit, not the disk's.
@@ -43,6 +43,9 @@ pub struct DeviceRoots {
     pub dev_by_id: PathBuf,
     pub proc_mounts: PathBuf,
     pub proc_swaps: PathBuf,
+    /// Where the device nodes themselves live — read for exactly one thing,
+    /// the LumenFS superblock probe.
+    pub dev: PathBuf,
 }
 
 impl Default for DeviceRoots {
@@ -52,6 +55,7 @@ impl Default for DeviceRoots {
             dev_by_id: "/dev/disk/by-id".into(),
             proc_mounts: "/proc/mounts".into(),
             proc_swaps: "/proc/swaps".into(),
+            dev: "/dev".into(),
         }
     }
 }
@@ -64,6 +68,7 @@ impl DeviceRoots {
             dev_by_id: root.join("dev/disk/by-id"),
             proc_mounts: root.join("proc/mounts"),
             proc_swaps: root.join("proc/swaps"),
+            dev: root.join("dev"),
         }
     }
 }
@@ -83,6 +88,46 @@ fn read_trimmed(path: &Path) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+/// What a LumenFS probe of one disk's first bytes found.
+enum BrickProbe {
+    /// No brick here.
+    None,
+    /// A brick of another format version. Spoken for — but the only fact its
+    /// layout is trusted for is its version number.
+    Foreign(u32),
+    /// A brick this release can read: whose pool, which tier.
+    Known(LumenBrick),
+}
+
+/// Read the disk's own first sector and ask whether a brick superblock is
+/// in it. Failure to open or read is an ordinary "no": a scan must never
+/// error a whole disk list because one device refused a read.
+fn lumenfs_probe(dev: &Path) -> BrickProbe {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(dev) else {
+        return BrickProbe::None;
+    };
+    let mut head = [0u8; 144];
+    if file.read_exact(&mut head).is_err() {
+        return BrickProbe::None;
+    }
+    match lumen_fs::Superblock::decode(&head) {
+        Ok(Some(sb)) => BrickProbe::Known(LumenBrick {
+            pool_uuid: hex(&sb.pool_uuid),
+            brick_uuid: hex(&sb.brick_uuid),
+            tier: sb.tier,
+            wal_holder: sb.wal_holder,
+        }),
+        Ok(None) => BrickProbe::None,
+        Err(lumen_fs::FsError::UnsupportedVersion(version)) => BrickProbe::Foreign(version),
+        Err(_) => BrickProbe::None,
+    }
+}
+
+fn hex(bytes: &[u8; 16]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Every disk on the node, with what is on it.
@@ -134,6 +179,31 @@ fn scan(roots: &DeviceRoots) -> Vec<BlockDevice> {
                     used_by.push(claim.clone());
                 }
             }
+            // A LumenFS brick claims its whole disk, and the superblock is
+            // the record — read off the platter exactly as mounts and swap
+            // are read from /proc, so a brick can never be offered as free
+            // because a config file forgot it. Counted as claimed: the scan
+            // cannot tell a serving pool's brick from an abandoned one, the
+            // same blindness it has toward imported ZFS pools, and the same
+            // conservative answer — the pool destroy workflow wipes its own
+            // bricks through its own guards.
+            let lumenfs = match lumenfs_probe(&roots.dev.join(&name)) {
+                BrickProbe::Known(brick) => {
+                    used_by.push(format!(
+                        "LumenFS brick (pool {}, tier {})",
+                        &brick.pool_uuid[..8],
+                        brick.tier
+                    ));
+                    Some(brick)
+                }
+                BrickProbe::Foreign(version) => {
+                    used_by.push(format!(
+                        "LumenFS brick (format v{version}, not this release's)"
+                    ));
+                    None
+                }
+                BrickProbe::None => None,
+            };
             // Whether anything live has it, recorded before the partition
             // count is folded into the same sentence. The two are the same
             // word to a reader and different answers to a wipe.
@@ -167,6 +237,7 @@ fn scan(roots: &DeviceRoots) -> Vec<BlockDevice> {
                 kernel_path,
                 name,
                 size,
+                lumenfs,
             })
         })
         .collect();
@@ -458,5 +529,90 @@ mod tests {
     #[test]
     fn a_node_that_reports_nothing_is_a_node_with_no_disks_rather_than_a_failure() {
         assert!(scan(&DeviceRoots::under("/nonexistent-lumen-test-root")).is_empty());
+    }
+
+    /// The other owner a data disk can have. A brick carries no partitions
+    /// and appears in no /proc file, so without the probe it scans as the
+    /// freest disk on the node — which is exactly how it would get eaten.
+    #[test]
+    fn a_lumenfs_brick_is_reported_as_owned_by_its_pool() {
+        let (roots, root) = node("lumenfs-brick");
+        fs::create_dir_all(&roots.dev).unwrap();
+        let sb = lumen_fs::Superblock {
+            block_size: 16 * 1024,
+            segment_size: 1 << 20,
+            segment_area_start: 1 << 20,
+            segment_count: 7,
+            generation: 1,
+            wal_start: 16384,
+            wal_size: 64 * 1024,
+            pool_uuid: [0xAB; 16],
+            brick_uuid: [0xCD; 16],
+            tier: 1,
+            wal_holder: false,
+        };
+        let mut head = vec![0u8; 4096];
+        let encoded = sb.encode();
+        head[..encoded.len()].copy_from_slice(&encoded);
+        fs::write(roots.dev.join("nvme0n1"), &head).unwrap();
+
+        let disks = scan(&roots);
+        let nvme = disks.iter().find(|d| d.name == "nvme0n1").unwrap();
+        assert!(nvme.in_use, "a brick's disk must never look free");
+        assert!(nvme.claimed, "the scan cannot tell a serving brick apart");
+        let used_by = nvme.used_by.clone().unwrap();
+        assert!(
+            used_by.contains("LumenFS brick (pool abababab, tier 1)"),
+            "{used_by}"
+        );
+        let brick = nvme.lumenfs.clone().expect("the typed fact rides along");
+        assert_eq!(brick.pool_uuid, "ab".repeat(16));
+        assert_eq!(brick.brick_uuid, "cd".repeat(16));
+        assert_eq!(brick.tier, 1);
+        assert!(!brick.wal_holder);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A brick of another format version is still a brick — spoken for by
+    /// name, with no facts invented from a layout this release cannot read.
+    #[test]
+    fn a_brick_of_another_format_version_is_still_spoken_for() {
+        let (roots, root) = node("lumenfs-foreign");
+        fs::create_dir_all(&roots.dev).unwrap();
+        let mut head = vec![0u8; 4096];
+        head[0..8].copy_from_slice(b"LUMENFS\0");
+        head[8..12].copy_from_slice(&1u32.to_le_bytes());
+        fs::write(roots.dev.join("nvme0n1"), &head).unwrap();
+
+        let disks = scan(&roots);
+        let nvme = disks.iter().find(|d| d.name == "nvme0n1").unwrap();
+        assert!(nvme.in_use && nvme.claimed);
+        let used_by = nvme.used_by.clone().unwrap();
+        assert!(
+            used_by.contains("LumenFS brick (format v1, not this release's)"),
+            "{used_by}"
+        );
+        assert_eq!(nvme.lumenfs, None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Anything short, unreadable, or plainly not a superblock leaves the
+    /// disk exactly as the rest of the scan judged it.
+    #[test]
+    fn a_disk_with_no_brick_on_it_is_untouched_by_the_probe() {
+        let (roots, root) = node("lumenfs-none");
+        fs::create_dir_all(&roots.dev).unwrap();
+        // A first sector full of filesystem, not brick.
+        fs::write(roots.dev.join("nvme0n1"), vec![0x42u8; 4096]).unwrap();
+        // And a device whose read comes up short.
+        fs::write(roots.dev.join("sdb"), b"tiny").unwrap();
+
+        let disks = scan(&roots);
+        let nvme = disks.iter().find(|d| d.name == "nvme0n1").unwrap();
+        assert!(!nvme.in_use);
+        assert_eq!(nvme.lumenfs, None);
+        let sdb = disks.iter().find(|d| d.name == "sdb").unwrap();
+        assert_eq!(sdb.lumenfs, None);
+        let _ = fs::remove_dir_all(root);
     }
 }

@@ -44,8 +44,8 @@ pub use iso::{IsoLibrary, IsoStoreView, IsoUpload, IsoView};
 pub use model::{
     device_path, is_lumen_volume, is_reserved_leaf, iso_dataset, iso_mountpoint, lumen_root,
     valid_device_path, valid_iso_name, valid_new_pool_name, valid_pool_name, vm_disk_path,
-    BlockDevice, Compression, Dataset, DatasetKind, Pool, PoolHealth, PoolRequest, SnapshotInfo,
-    VdevKind, VolumeRequest, DEFAULT_ASHIFT, ISO_MOUNT_ROOT, LUMEN_PREFIX,
+    BlockDevice, Compression, Dataset, DatasetKind, LumenBrick, Pool, PoolHealth, PoolRequest,
+    SnapshotInfo, VdevKind, VolumeRequest, DEFAULT_ASHIFT, ISO_MOUNT_ROOT, LUMEN_PREFIX,
 };
 pub use service::{DevicesResponse, PoolView, StorageService};
 pub use state::{PoolContents, StorageState};

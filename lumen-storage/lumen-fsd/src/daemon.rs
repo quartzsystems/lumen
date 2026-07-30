@@ -962,6 +962,10 @@ pub fn format_brick(
         block_size: 16 * 1024,
         segment_size: if big { 64 << 20 } else { 4 << 20 },
         wal_size: if big { 64 << 20 } else { 8 << 20 },
+        // The one brick a node has today is definitionally its tier-0 WAL
+        // holder; the drive wizard's multi-brick format arrives with it.
+        tier: 0,
+        wal_holder: true,
     };
     let brick = Brick::format(disk, params).map_err(|err| err.to_string())?;
     let mut pool = Pool::create(brick).map_err(|err| err.to_string())?;

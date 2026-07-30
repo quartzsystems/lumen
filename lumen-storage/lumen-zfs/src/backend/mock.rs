@@ -147,6 +147,7 @@ impl MockBackend {
             partitions: 0,
             claimed: false,
             wipeable: false,
+            lumenfs: None,
         }
     }
 

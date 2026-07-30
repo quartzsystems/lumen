@@ -842,6 +842,7 @@ impl<D: Disk> Pool<D> {
             wal_epoch: self.wal.epoch(),
             era: self.era,
             manifest_hash,
+            roster: vec![self.brick.roster_entry()],
         })?;
         self.brick.flush()
     }
@@ -1361,6 +1362,8 @@ mod tests {
             block_size: BLOCK as u32,
             segment_size: 128 * KIB,
             wal_size: 32 * KIB,
+            tier: 0,
+            wal_holder: true,
         }
     }
 

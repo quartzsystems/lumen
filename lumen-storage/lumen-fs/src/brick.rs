@@ -37,8 +37,8 @@ use std::collections::{HashMap, HashSet};
 use crate::disk::Disk;
 use crate::error::{FsError, Result};
 use crate::format::{
-    record_span, Anchor, RecordHeader, SegmentHeader, Superblock, ANCHOR_AREA_START, ANCHOR_SLOTS,
-    RECORD_HEADER_LEN, SECTOR_SIZE, WAL_AREA_START,
+    record_span, Anchor, RecordHeader, RosterEntry, SegmentHeader, Superblock, ANCHOR_AREA_START,
+    ANCHOR_SLOTS, RECORD_HEADER_LEN, SECTOR_SIZE, WAL_AREA_START,
 };
 use crate::hash::{hash_block, BlockHash};
 
@@ -55,8 +55,17 @@ pub struct BrickParams {
     pub segment_size: u64,
     /// Bytes reserved for the write-ahead ring; a sector multiple. The WAL
     /// itself is the pool's business (wal.rs) — the brick only carves out
-    /// and guards the space.
+    /// and guards the space. Zero — and only zero — when this brick is not
+    /// the WAL holder.
     pub wal_size: u64,
+    /// The device class assigned by the drive wizard: 0 is the fastest
+    /// class present, downward from there. Written into the superblock so
+    /// the platter is the record.
+    pub tier: u8,
+    /// Whether this brick hosts its node's WAL ring and anchor slots.
+    /// Exactly one brick per node does, always at tier 0; the others carry
+    /// only segments, with `wal_size` 0 and their anchor slots zeroed.
+    pub wal_holder: bool,
 }
 
 /// Where one block lives.
@@ -153,9 +162,17 @@ impl<D: Disk> Brick<D> {
                 "a segment must hold its header and one maximal block",
             ));
         }
-        if !params.wal_size.is_multiple_of(SECTOR_SIZE) || params.wal_size < 2 * SECTOR_SIZE {
+        if params.wal_holder {
+            if !params.wal_size.is_multiple_of(SECTOR_SIZE) || params.wal_size < 2 * SECTOR_SIZE {
+                return Err(FsError::BadGeometry(
+                    "the WAL area must be a sector multiple of at least two sectors",
+                ));
+            }
+        } else if params.wal_size != 0 {
+            // A ring nobody anchors is a ring nobody replays: space that
+            // could only ever hold debris.
             return Err(FsError::BadGeometry(
-                "the WAL area must be a sector multiple of at least two sectors",
+                "only the WAL holder carries a WAL area",
             ));
         }
         let segment_area_start = WAL_AREA_START + params.wal_size;
@@ -175,6 +192,8 @@ impl<D: Disk> Brick<D> {
             wal_size: params.wal_size,
             pool_uuid: params.pool_uuid,
             brick_uuid: params.brick_uuid,
+            tier: params.tier,
+            wal_holder: params.wal_holder,
         };
         let encoded = sb.encode();
         let mut sector = vec![0u8; SECTOR_SIZE as usize];
@@ -184,23 +203,33 @@ impl<D: Disk> Brick<D> {
         // Retire any anchors a previous format left behind (anchors carry
         // no brick uuid — zeroing the slots is what unlinks history), then
         // lay down the initial one: an empty pool, replay from the top of
-        // the WAL. The same single flush covers superblocks and anchor, so
-        // a crash mid-format still leaves a brick or no brick.
+        // the WAL, rostering this brick alone — a brick set grows by being
+        // formatted together, and every member of one appears in the anchor
+        // its holder writes. A non-holder gets only the zeroing: its anchor
+        // slots stay empty for good, because the holder's anchor speaks for
+        // the whole set. The same single flush covers superblocks and
+        // anchor, so a crash mid-format still leaves a brick or no brick.
         let zero = vec![0u8; SECTOR_SIZE as usize];
         for slot in 0..ANCHOR_SLOTS {
             disk.write_at(ANCHOR_AREA_START + slot * SECTOR_SIZE, &zero)?;
         }
-        let anchor = Anchor {
-            generation: 1,
-            wal_replay_offset: WAL_AREA_START,
-            wal_replay_seq: 1,
-            wal_epoch: 1,
-            era: 1,
-            manifest_hash: [0; 32],
-        };
-        let mut anchor_sector = vec![0u8; SECTOR_SIZE as usize];
-        anchor_sector[..anchor.encode().len()].copy_from_slice(&anchor.encode());
-        disk.write_at(Anchor::slot_offset(anchor.generation), &anchor_sector)?;
+        if params.wal_holder {
+            let anchor = Anchor {
+                generation: 1,
+                wal_replay_offset: WAL_AREA_START,
+                wal_replay_seq: 1,
+                wal_epoch: 1,
+                era: 1,
+                manifest_hash: [0; 32],
+                roster: vec![RosterEntry {
+                    brick_uuid: params.brick_uuid,
+                    tier: params.tier,
+                }],
+            };
+            let mut anchor_sector = vec![0u8; SECTOR_SIZE as usize];
+            anchor_sector[..anchor.encode().len()].copy_from_slice(&anchor.encode());
+            disk.write_at(Anchor::slot_offset(anchor.generation), &anchor_sector)?;
+        }
         disk.flush()?;
 
         // A fresh brick_uuid is what retires any segment headers left by a
@@ -223,20 +252,34 @@ impl<D: Disk> Brick<D> {
     /// into the index.
     pub fn open(disk: D) -> Result<Brick<D>> {
         let mut best: Option<Superblock> = None;
+        // A slot refusing by version does not end the open — its twin may
+        // be a valid superblock of this version, and the twin wins. Only
+        // when *no* slot is usable does the version refusal surface, which
+        // is exactly the v1 brick: both slots agree it is another format,
+        // and the answer is its name, not NotFormatted.
+        let mut refused: Option<FsError> = None;
         for slot in 0..2u64 {
             let mut buf = vec![0u8; SECTOR_SIZE as usize];
             disk.read_at(slot * SECTOR_SIZE, &mut buf)?;
-            if let Some(sb) = Superblock::decode(&buf)? {
-                let newer = best
-                    .as_ref()
-                    .map(|b| sb.generation > b.generation)
-                    .unwrap_or(true);
-                if newer {
-                    best = Some(sb);
+            match Superblock::decode(&buf) {
+                Ok(Some(sb)) => {
+                    let newer = best
+                        .as_ref()
+                        .map(|b| sb.generation > b.generation)
+                        .unwrap_or(true);
+                    if newer {
+                        best = Some(sb);
+                    }
                 }
+                Ok(None) => {}
+                Err(err) => refused = Some(err),
             }
         }
-        let sb = best.ok_or(FsError::NotFormatted)?;
+        let sb = match (best, refused) {
+            (Some(sb), _) => sb,
+            (None, Some(err)) => return Err(err),
+            (None, None) => return Err(FsError::NotFormatted),
+        };
         let area_end = sb
             .segment_area_start
             .checked_add(sb.segment_count.saturating_mul(sb.segment_size));
@@ -739,6 +782,25 @@ impl<D: Disk> Brick<D> {
         self.sb.block_size
     }
 
+    /// The device class this brick was assigned at format.
+    pub fn tier(&self) -> u8 {
+        self.sb.tier
+    }
+
+    /// Whether this brick hosts its node's WAL ring and anchor slots.
+    pub fn wal_holder(&self) -> bool {
+        self.sb.wal_holder
+    }
+
+    /// This brick as its own roster line — what a checkpoint writes into
+    /// the anchor for it.
+    pub fn roster_entry(&self) -> RosterEntry {
+        RosterEntry {
+            brick_uuid: self.sb.brick_uuid,
+            tier: self.sb.tier,
+        }
+    }
+
     /// The pool this brick belongs to — what a replication handshake
     /// checks before a single frame crosses.
     pub fn pool_uuid(&self) -> [u8; 16] {
@@ -778,6 +840,8 @@ mod tests {
             block_size: 16 * KIB as u32,
             segment_size: 256 * KIB,
             wal_size: 64 * KIB,
+            tier: 0,
+            wal_holder: true,
         }
     }
 
@@ -800,6 +864,94 @@ mod tests {
             Brick::open(SimDisk::new(4 * KIB * KIB, 2)).unwrap_err(),
             FsError::NotFormatted
         );
+    }
+
+    /// Phase 4's compatibility decision at the layer that enforces it: a
+    /// brick formatted under version 1 opens as its version's name, never
+    /// as an unformatted disk the caller might feel free to reuse.
+    #[test]
+    fn a_version_one_brick_is_refused_by_name_not_reported_blank() {
+        let mut buf = [0u8; 128];
+        buf[0..8].copy_from_slice(b"LUMENFS\0");
+        buf[8..12].copy_from_slice(&1u32.to_le_bytes());
+        buf[12..16].copy_from_slice(&(16 * KIB as u32).to_le_bytes());
+        buf[16..24].copy_from_slice(&(256 * KIB).to_le_bytes());
+        buf[24..32].copy_from_slice(&(WAL_AREA_START + 64 * KIB).to_le_bytes());
+        buf[32..40].copy_from_slice(&7u64.to_le_bytes());
+        buf[40..48].copy_from_slice(&1u64.to_le_bytes());
+        buf[48..56].copy_from_slice(&WAL_AREA_START.to_le_bytes());
+        buf[56..64].copy_from_slice(&(64 * KIB).to_le_bytes());
+        buf[64..80].copy_from_slice(&[1; 16]);
+        buf[80..96].copy_from_slice(&[2; 16]);
+        let check = crate::hash::full_check(&buf[0..96]);
+        buf[96..128].copy_from_slice(&check);
+
+        let mut disk = SimDisk::new(4 * KIB * KIB, 6);
+        let mut sector = vec![0u8; SECTOR_SIZE as usize];
+        sector[..buf.len()].copy_from_slice(&buf);
+        disk.write_at(0, &sector).unwrap();
+        disk.write_at(SECTOR_SIZE, &sector).unwrap();
+        disk.flush().unwrap();
+        assert_eq!(
+            Brick::open(disk).unwrap_err(),
+            FsError::UnsupportedVersion(1)
+        );
+    }
+
+    #[test]
+    fn a_non_holder_brick_carries_no_wal_and_no_anchor() {
+        let quiet = BrickParams {
+            wal_size: 0,
+            tier: 1,
+            wal_holder: false,
+            ..params()
+        };
+        let mut brick = Brick::format(SimDisk::new(4 * KIB * KIB, 7), quiet).unwrap();
+        assert_eq!(brick.wal_bounds(), (WAL_AREA_START, 0));
+        assert_eq!(brick.read_best_anchor().unwrap(), None);
+        assert_eq!(brick.tier(), 1);
+        assert!(!brick.wal_holder());
+        let hash = brick.put(b"payload").unwrap();
+        brick.flush().unwrap();
+        let brick = Brick::open(brick.into_disk()).unwrap();
+        assert_eq!(brick.get(&hash).unwrap().unwrap(), b"payload");
+        assert_eq!(brick.read_best_anchor().unwrap(), None);
+        assert_eq!(brick.tier(), 1);
+    }
+
+    #[test]
+    fn wal_geometry_must_match_the_holder_flag() {
+        // A holder without a ring has nowhere to anchor replay.
+        let holder_no_ring = BrickParams {
+            wal_size: 0,
+            ..params()
+        };
+        assert!(matches!(
+            Brick::format(SimDisk::new(4 * KIB * KIB, 8), holder_no_ring).unwrap_err(),
+            FsError::BadGeometry(_)
+        ));
+        // A ring on a non-holder is space nobody would ever replay.
+        let ring_no_holder = BrickParams {
+            wal_holder: false,
+            ..params()
+        };
+        assert!(matches!(
+            Brick::format(SimDisk::new(4 * KIB * KIB, 9), ring_no_holder).unwrap_err(),
+            FsError::BadGeometry(_)
+        ));
+    }
+
+    #[test]
+    fn a_formatted_brick_states_its_tier_and_rosters_itself() {
+        let tiered = BrickParams {
+            tier: 2,
+            ..params()
+        };
+        let brick = Brick::format(SimDisk::new(4 * KIB * KIB, 10), tiered).unwrap();
+        assert_eq!(brick.tier(), 2);
+        assert!(brick.wal_holder());
+        let anchor = brick.read_best_anchor().unwrap().unwrap();
+        assert_eq!(anchor.roster, vec![brick.roster_entry()]);
     }
 
     #[test]
