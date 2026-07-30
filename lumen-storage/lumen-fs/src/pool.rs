@@ -970,6 +970,11 @@ impl<D: Disk> Pool<D> {
         self.brick.block_size()
     }
 
+    /// The pool identity this brick was formatted into.
+    pub fn pool_uuid(&self) -> [u8; 16] {
+        self.brick.pool_uuid()
+    }
+
     /// How the brick's space stands. A caller that only ever learns about
     /// pressure from [`FsError::Full`] learns too late: by then every write
     /// triggers a collection, and the pool spends its time collecting

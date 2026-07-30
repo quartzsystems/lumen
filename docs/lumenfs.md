@@ -128,8 +128,72 @@ correctness, each pinned by a test that fails without it:
   pull. The equal-era tie keeps refusing writes for its (cheap) diff, as
   before: without a verdict there is no honest single-copy promise.
 
-Still ahead in phase 3: the ublk export and the compute-side integration;
-then the slice map that takes this past two nodes.
+**lumen-fsd exists: the engine has a daemon.** The crate the crates
+section below promised is real — std-only, threads and blocking sockets,
+no async runtime, because the honest first binding of a sans-IO core is
+the simplest one that can carry it (io_uring and ublk are Linux
+refinements that slot in underneath later, unfelt by the engine). It is
+deliberately a *harness*: the same role the test pump plays under
+simulation, played against reality.
+
+- **The wire format is the daemon's** (`wire.rs`), exactly as repl.rs
+  assigns it: hand-rolled fixed little-endian frames, strict decoding
+  (trailing bytes are an error, unknown tags are an error), every count
+  checked against the bytes present before anything is allocated. A
+  25-byte handshake opens each session — magic, pool uuid, node id — and
+  a brick from a different pool is refused before the engine hears a
+  word.
+- **Effects drain under the engine lock**, so the wire sees one ordered
+  stream no matter how many threads call in; **bytes never cross
+  connection incarnations** — every session boundary bumps an incarnation
+  and clears the outbound queue, the writer thread quits the moment its
+  incarnation is stale, and teardown is exactly-once by the same check
+  (a late teardown must not knock a Degraded node back to Suspended
+  after a verdict landed).
+- **Suspension is real**: a guest write against a suspended node blocks,
+  a guest flush blocks until its ticket resolves, and a fence verdict
+  releases both — DRBD's suspended I/O, reproduced honestly. The verdict
+  (`fence-peer` on the control socket, the break-glass until lumen-pool
+  wires the cluster's own machinery in) forces the link down before it
+  acts, because a pulled cable is silent and the verdict's authority
+  must not queue behind a TCP timeout.
+- **NBD rides the daemon now**: same bootstrap protocol as the smoke
+  tool, but through the replicated guest path, and the attach *claims
+  the writer lease at the door* — a vdisk the peer holds refuses the
+  client before promising a disk.
+
+The integration suite runs two whole daemons in-process over loopback —
+phase 2's exit test in harness form: write on one node and read it on the
+other; kill a peer and watch I/O suspend, not error and not diverge;
+fence and watch the parked write complete single-copy; restart the dead
+node from its own brick and watch it resync, rejoin, and answer reads it
+was dead for. Three findings from building it, each now pinned by a test:
+
+- **A survivor's own lease must ride through its own verdict.** The era
+  bump retires every lease of the era it closes — right for the dead
+  node's leases (that is what lets a failover claim them), wrong for the
+  survivor's own: its guest is still running, and its next write found
+  the pen gone. `set_peer_fenced` now re-issues the survivor's held
+  leases under the new era; a handover window open toward the dead node
+  closes in the same stroke. The sim suite had never noticed because its
+  tests always re-claimed by habit — it took a daemon behaving like a
+  daemon to ask.
+- **A thread parked in `accept()` cannot be woken by a promise.** The
+  shutdown path signalled the accept thread by connecting to its own
+  listener — a one-shot signal that a full backlog silently eats, and
+  the backlog *was* full, because a dialer whose handshake was being
+  refused (which is not a failed connect) redialled in a tight loop.
+  One hang in roughly thirty-five runs. The accept loop is a
+  nonblocking poll now, and a dialer pauses after every session ending,
+  refusal included.
+- Suspension-blocking guest calls and ticket waits all wake on a shared
+  condition rather than sleeping on the world: the daemon has no
+  polling in its data path, only in its edges.
+
+Still ahead in phase 3: the ublk export on this daemon, the compute-side
+integration (the narrow `VmVolumes`-shaped trait over vdisks and
+leases), HA sweep eligibility, and the console pages; then the slice map
+that takes this past two nodes.
 
 ## Burning it in
 
@@ -480,7 +544,8 @@ lumen-storage/
 │                     driven by deterministic simulation in cargo test
 ├── lumen-pool/   the orchestration domain, house style:
 │                 model / render / state / peers / backend(cli|mock|unavailable) / service
-└── lumen-fsd     the daemon binary: io_uring, vhost-user-blk, the real I/O
+└── lumen-fsd     the daemon binary: sockets, exports (NBD now, ublk next),
+                  threads and files today, io_uring when measurements ask
 ```
 
 The split is the testing strategy. Everything that can corrupt data lives in
@@ -490,8 +555,10 @@ histories: crashes at every fsync boundary, torn writes, reordered peers,
 partitions mid-resync, each with a seed that replays the failure exactly.
 This is how FoundationDB earned trust and it is the only way a from-scratch
 engine gets to hold customer data. `lumen-fsd` is a thin binding of that
-core to io_uring and sockets; `lumen-pool` tests against `MockPeers` and a
-mock daemon exactly as `lumen-drbd` does today.
+core to sockets and files (io_uring when measurements ask for it), and its
+integration suite runs two whole daemons in-process over loopback;
+`lumen-pool` tests against `MockPeers` and a mock daemon exactly as
+`lumen-drbd` does today.
 
 ## Phases
 

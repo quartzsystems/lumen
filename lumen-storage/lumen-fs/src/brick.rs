@@ -739,6 +739,12 @@ impl<D: Disk> Brick<D> {
         self.sb.block_size
     }
 
+    /// The pool this brick belongs to — what a replication handshake
+    /// checks before a single frame crosses.
+    pub fn pool_uuid(&self) -> [u8; 16] {
+        self.sb.pool_uuid
+    }
+
     pub fn stats(&self) -> BrickStats {
         BrickStats {
             blocks: self.index.len() as u64,

@@ -497,6 +497,29 @@ fn a_failover_takes_a_lease_the_dead_node_still_held() {
 }
 
 #[test]
+fn a_survivors_own_lease_rides_through_its_own_verdict() {
+    // The era bump retires the dead node's leases so a failover can claim
+    // them — but the survivor's own guest is still running, and its next
+    // write must not find the pen gone. Found by the daemon's integration
+    // harness: the sim tests had always re-claimed by habit.
+    let (mut a, mut b, mut net, mut guests) = synced_pair(80);
+    a.write_block(VDISK, 0, b"mine before").unwrap();
+    a.flush().unwrap();
+    pump(&mut a, &mut b, &mut net, &mut guests);
+
+    net.partition();
+    a.peer_lost();
+    let _b_gone = crash_and_restart(b, 1);
+    a.set_peer_fenced().unwrap();
+    // No re-claim: the write must simply work.
+    a.write_block(VDISK, 1, b"mine still").unwrap();
+    let ticket = a.flush().unwrap();
+    pump_one(&mut a, &mut guests, 0);
+    assert!(guests.done[0].contains(&ticket));
+    assert_eq!(a.lease(VDISK).unwrap().era, a.pool().era());
+}
+
+#[test]
 fn a_resync_interrupted_partway_resumes_without_adopting_a_hole() {
     // The hazard content addressing tempts you into: a target that already
     // holds an interior node looks like a target that holds its whole

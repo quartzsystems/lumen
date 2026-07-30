@@ -404,6 +404,23 @@ impl<D: Disk> ReplNode<D> {
             ));
         }
         self.pool.bump_era(self.peer_era_seen)?;
+        // The bump retired every lease of the era it closed — including
+        // this node's own. The dead peer's leases must stay retired, so a
+        // failover can claim them; but a guest already running *here* must
+        // not lose its pen to its peer's death, so leases this node held
+        // are re-issued under the new era. A handover window open toward
+        // the dead node closes in the same stroke, which is the abort that
+        // migration was owed.
+        let mine: Vec<u64> = self
+            .pool
+            .leases()
+            .into_iter()
+            .filter(|(_, lease)| lease.holder == self.node)
+            .map(|(vdisk, _)| vdisk)
+            .collect();
+        for vdisk in mine {
+            self.pool.claim_lease(vdisk, self.node)?;
+        }
         let parked = std::mem::take(&mut self.parked);
         for (ticket, _) in parked {
             self.emit(Effect::FlushDone(ticket));

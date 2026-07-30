@@ -24,127 +24,17 @@
 //! instead of a modelled one. See the burn-in section of docs/lumenfs.md
 //! and `burn-in.sh`.
 
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::Path;
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use lumen_fs::file_disk::{is_block_device, FileDisk};
 use lumen_fs::{
-    hash_block, Brick, BrickParams, Disk, FsError, Pool, Result, SplitMix64, SECTOR_SIZE,
+    hash_block, Brick, BrickParams, ByteView, Disk, FsError, Pool, Result, SplitMix64, SECTOR_SIZE,
 };
-
-// ---------------------------------------------------------------------------
-// A real file as a Disk. Flush is fsync — the honest barrier.
-
-struct FileDisk {
-    file: File,
-    size: u64,
-}
-
-/// Whether this path is a raw block device — a disk, not a file that
-/// stands in for one. The two are formatted differently and only one of
-/// them can be created.
-#[cfg(unix)]
-fn is_block_device(path: &str) -> bool {
-    use std::os::unix::fs::FileTypeExt;
-    std::fs::metadata(path)
-        .map(|meta| meta.file_type().is_block_device())
-        .unwrap_or(false)
-}
-
-#[cfg(windows)]
-fn is_block_device(_path: &str) -> bool {
-    false
-}
-
-impl FileDisk {
-    fn open(path: &str) -> std::io::Result<FileDisk> {
-        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
-        // Seeking to the end, rather than asking the metadata: a block
-        // device reports a length of zero in its metadata, and a pool that
-        // believes its disk is zero bytes long refuses every write it is
-        // ever asked to make.
-        let size = file.seek(SeekFrom::End(0))?;
-        Ok(FileDisk { file, size })
-    }
-
-    fn check(&self, offset: u64, len: usize) -> Result<()> {
-        match offset.checked_add(len as u64) {
-            Some(end) if end <= self.size => Ok(()),
-            _ => Err(FsError::OutOfBounds {
-                offset,
-                len: len as u64,
-                disk_size: self.size,
-            }),
-        }
-    }
-}
-
-fn io_failed(err: std::io::Error) -> FsError {
-    // The engine's error type has no io variant on purpose (the simulation
-    // never fails); at the edge of reality, an io error is the device
-    // contradicting itself.
-    eprintln!("io error against the backing file: {err}");
-    FsError::Corrupt("the backing file failed an i/o")
-}
-
-#[cfg(unix)]
-fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
-    use std::os::unix::fs::FileExt;
-    file.read_exact_at(buf, offset)
-}
-
-#[cfg(unix)]
-fn write_at(file: &File, offset: u64, data: &[u8]) -> std::io::Result<()> {
-    use std::os::unix::fs::FileExt;
-    file.write_all_at(data, offset)
-}
-
-#[cfg(windows)]
-fn read_at(file: &File, mut offset: u64, mut buf: &mut [u8]) -> std::io::Result<()> {
-    use std::os::windows::fs::FileExt;
-    while !buf.is_empty() {
-        let n = file.seek_read(buf, offset)?;
-        if n == 0 {
-            return Err(std::io::ErrorKind::UnexpectedEof.into());
-        }
-        buf = &mut buf[n..];
-        offset += n as u64;
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn write_at(file: &File, mut offset: u64, mut data: &[u8]) -> std::io::Result<()> {
-    use std::os::windows::fs::FileExt;
-    while !data.is_empty() {
-        let n = file.seek_write(data, offset)?;
-        data = &data[n..];
-        offset += n as u64;
-    }
-    Ok(())
-}
-
-impl Disk for FileDisk {
-    fn size(&self) -> u64 {
-        self.size
-    }
-
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
-        self.check(offset, buf.len())?;
-        read_at(&self.file, offset, buf).map_err(io_failed)
-    }
-
-    fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<()> {
-        self.check(offset, data.len())?;
-        write_at(&self.file, offset, data).map_err(io_failed)
-    }
-
-    fn flush(&mut self) -> Result<()> {
-        self.file.sync_all().map_err(io_failed)
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -195,7 +85,7 @@ fn cmd_format(path: &str, disk_bytes: &str, vdisk_bytes: &str) -> std::result::R
     // in place — the caller is expected to have meant it. Anything else
     // must not exist yet: `create_new` is what keeps a stray argument from
     // eating a file somebody wanted.
-    if !is_block_device(path) {
+    if !is_block_device(Path::new(path)) {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -206,7 +96,7 @@ fn cmd_format(path: &str, disk_bytes: &str, vdisk_bytes: &str) -> std::result::R
             .map_err(|err| format!("cannot size {path}: {err}"))?;
         drop(file);
     }
-    let disk = FileDisk::open(path).map_err(|err| err.to_string())?;
+    let disk = FileDisk::open(Path::new(path)).map_err(|err| err.to_string())?;
     let disk_bytes = disk.size();
 
     // The engine has no randomness by design; the tool is the impure shell,
@@ -287,7 +177,7 @@ fn cmd_gc(path: &str) -> std::result::Result<(), String> {
 }
 
 fn cmd_scrub(path: &str) -> std::result::Result<(), String> {
-    let disk = FileDisk::open(path).map_err(|err| err.to_string())?;
+    let disk = FileDisk::open(Path::new(path)).map_err(|err| err.to_string())?;
     let pool = Pool::open(Brick::open(disk).map_err(|err| err.to_string())?)
         .map_err(|err| err.to_string())?;
     let report = pool.scrub().map_err(|err| err.to_string())?;
@@ -348,7 +238,7 @@ fn op_target(seed: u64, n: u64, blocks: u64) -> (u64, bool) {
 }
 
 fn open_pool(path: &str) -> std::result::Result<Pool<FileDisk>, String> {
-    let disk = FileDisk::open(path).map_err(|err| err.to_string())?;
+    let disk = FileDisk::open(Path::new(path)).map_err(|err| err.to_string())?;
     Pool::open(Brick::open(disk).map_err(|err| err.to_string())?).map_err(|err| err.to_string())
 }
 
@@ -522,7 +412,7 @@ fn cmd_verify(path: &str, seed: &str, min_watermark: &str) -> std::result::Resul
 }
 
 fn cmd_serve(path: &str, addr: &str) -> std::result::Result<(), String> {
-    let disk = FileDisk::open(path).map_err(|err| err.to_string())?;
+    let disk = FileDisk::open(Path::new(path)).map_err(|err| err.to_string())?;
     let mut pool = Pool::open(Brick::open(disk).map_err(|err| err.to_string())?)
         .map_err(|err| err.to_string())?;
     let size = pool.vdisk_size(VDISK).map_err(|err| err.to_string())?;

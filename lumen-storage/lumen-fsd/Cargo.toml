@@ -1,0 +1,24 @@
+# lumen-fsd — the LumenFS data-plane daemon: the thin binding of the pure
+# engine (lumen-fs) to reality — sockets toward the peer, exports toward
+# the guests, files and devices underneath.
+#
+# Deliberately NOT a workspace member, like its siblings — see the note at
+# the top of lumen-cluster/Cargo.toml.
+#
+# Everything that can corrupt data lives in lumen-fs under the simulation;
+# this crate owns only wire plumbing, threads, and policy for when to
+# checkpoint and collect. It is std-only on purpose: blocking sockets and
+# threads are the honest first binding, and io_uring/ublk arrive as Linux
+# refinements without the engine noticing. No async runtime, no clap, no
+# serde — the wire formats are hand-rolled fixed little-endian, exactly
+# like the on-disk formats in the engine.
+
+[package]
+name = "lumen-fsd"
+version = "0.1.0"
+edition = "2021"
+description = "LumenFS data-plane daemon: peer replication and guest exports"
+license = "MIT"
+
+[dependencies]
+lumen-fs = { path = "../lumen-fs" }

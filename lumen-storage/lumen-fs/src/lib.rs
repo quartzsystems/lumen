@@ -22,6 +22,7 @@
 //!               snapshots, clones, rollback, GC, scrub
 //!   bytes.rs    the byte-granular view a block device speaks
 //!   repl.rs     two-node synchronous replication, sans-IO
+//!   file_disk.rs  a real file or device as a Disk — the shells' shared edge
 //! ```
 //!
 //! The durability contract, stated once and tested everywhere: a block is
@@ -35,6 +36,7 @@ pub mod brick;
 pub mod bytes;
 pub mod disk;
 pub mod error;
+pub mod file_disk;
 pub mod format;
 pub mod hash;
 pub mod map;
@@ -44,6 +46,7 @@ pub mod sim;
 pub mod wal;
 
 pub use brick::{Brick, BrickParams, BrickStats, GcStats};
+pub use bytes::ByteView;
 pub use disk::Disk;
 pub use error::{FsError, Result};
 pub use format::{SECTOR_SIZE, SUPERBLOCK_SLOTS};

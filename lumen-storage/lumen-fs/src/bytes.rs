@@ -20,32 +20,43 @@
 //!   That is safe to leave: the caller checkpoints and retries the whole
 //!   call, and rewriting the finished blocks is a dedupe hit, not a second
 //!   copy.
+//!
+//! The view is a trait rather than pool methods because two things speak
+//! blocks underneath it: a bare [`Pool`] (the single-node tool) and a
+//! [`ReplNode`] (the daemon's guest path, where every write must also
+//! cross the wire). One copy of the edge logic, tested once under the
+//! simulation, serving both — a second hand-rolled RMW loop is exactly
+//! where a quiet corruption would grow.
 
 use crate::disk::Disk;
 use crate::error::{FsError, Result};
 use crate::pool::Pool;
+use crate::repl::ReplNode;
 
-impl<D: Disk> Pool<D> {
-    fn byte_bounds(&self, vdisk: u64, offset: u64, len: u64) -> Result<u64> {
-        let size = self.vdisk_size(vdisk)?;
-        let end = offset.checked_add(len);
-        match end {
-            Some(end) if end <= size => Ok(size),
-            _ => {
-                let block_size = self.block_size() as u64;
-                Err(FsError::OutOfRange {
-                    index: offset / block_size,
-                    capacity: size.div_ceil(block_size),
-                })
-            }
-        }
+fn byte_bounds(size: u64, block_size: u64, offset: u64, len: u64) -> Result<()> {
+    match offset.checked_add(len) {
+        Some(end) if end <= size => Ok(()),
+        _ => Err(FsError::OutOfRange {
+            index: offset / block_size,
+            capacity: size.div_ceil(block_size),
+        }),
     }
+}
+
+/// Byte-granular I/O over anything that reads and writes vdisk blocks.
+pub trait ByteView {
+    fn block_size(&self) -> u32;
+    fn vdisk_size(&self, vdisk: u64) -> Result<u64>;
+    fn read_block(&self, vdisk: u64, index: u64) -> Result<Option<Vec<u8>>>;
+    fn write_block(&mut self, vdisk: u64, index: u64, payload: &[u8]) -> Result<()>;
+    fn trim_block(&mut self, vdisk: u64, index: u64) -> Result<()>;
 
     /// Read a byte range. Always returns exactly `len` bytes; what was
     /// never written is zeros.
-    pub fn read_bytes(&self, vdisk: u64, offset: u64, len: u64) -> Result<Vec<u8>> {
-        self.byte_bounds(vdisk, offset, len)?;
+    fn read_bytes(&self, vdisk: u64, offset: u64, len: u64) -> Result<Vec<u8>> {
+        let size = self.vdisk_size(vdisk)?;
         let block_size = self.block_size() as u64;
+        byte_bounds(size, block_size, offset, len)?;
         let mut out = vec![0u8; len as usize];
         let mut pos = offset;
         while pos < offset + len {
@@ -64,9 +75,10 @@ impl<D: Disk> Pool<D> {
 
     /// Write a byte range. Blocks covered only in part are read, overlaid,
     /// and rewritten whole.
-    pub fn write_bytes(&mut self, vdisk: u64, offset: u64, data: &[u8]) -> Result<()> {
-        let size = self.byte_bounds(vdisk, offset, data.len() as u64)?;
+    fn write_bytes(&mut self, vdisk: u64, offset: u64, data: &[u8]) -> Result<()> {
+        let size = self.vdisk_size(vdisk)?;
         let block_size = self.block_size() as u64;
+        byte_bounds(size, block_size, offset, data.len() as u64)?;
         let mut pos = offset;
         while pos < offset + data.len() as u64 {
             let block = pos / block_size;
@@ -96,9 +108,10 @@ impl<D: Disk> Pool<D> {
     /// Discard a byte range, unmapping every block the range covers whole.
     /// Partial edges are untouched — a trim is advice, and this is the
     /// advice's honest granularity.
-    pub fn trim_bytes(&mut self, vdisk: u64, offset: u64, len: u64) -> Result<()> {
-        let size = self.byte_bounds(vdisk, offset, len)?;
+    fn trim_bytes(&mut self, vdisk: u64, offset: u64, len: u64) -> Result<()> {
+        let size = self.vdisk_size(vdisk)?;
         let block_size = self.block_size() as u64;
+        byte_bounds(size, block_size, offset, len)?;
         let first = offset.div_ceil(block_size);
         let end = offset + len;
         // Reaching the vdisk's edge covers its (possibly short) final
@@ -115,8 +128,47 @@ impl<D: Disk> Pool<D> {
     }
 }
 
+impl<D: Disk> ByteView for Pool<D> {
+    fn block_size(&self) -> u32 {
+        Pool::block_size(self)
+    }
+    fn vdisk_size(&self, vdisk: u64) -> Result<u64> {
+        Pool::vdisk_size(self, vdisk)
+    }
+    fn read_block(&self, vdisk: u64, index: u64) -> Result<Option<Vec<u8>>> {
+        Pool::read_block(self, vdisk, index)
+    }
+    fn write_block(&mut self, vdisk: u64, index: u64, payload: &[u8]) -> Result<()> {
+        Pool::write_block(self, vdisk, index, payload)
+    }
+    fn trim_block(&mut self, vdisk: u64, index: u64) -> Result<()> {
+        Pool::trim_block(self, vdisk, index)
+    }
+}
+
+/// The daemon's guest path: reads stay local, mutations replicate. Same
+/// byte semantics, because they are the same code.
+impl<D: Disk> ByteView for ReplNode<D> {
+    fn block_size(&self) -> u32 {
+        self.pool().block_size()
+    }
+    fn vdisk_size(&self, vdisk: u64) -> Result<u64> {
+        self.pool().vdisk_size(vdisk)
+    }
+    fn read_block(&self, vdisk: u64, index: u64) -> Result<Option<Vec<u8>>> {
+        ReplNode::read_block(self, vdisk, index)
+    }
+    fn write_block(&mut self, vdisk: u64, index: u64, payload: &[u8]) -> Result<()> {
+        ReplNode::write_block(self, vdisk, index, payload)
+    }
+    fn trim_block(&mut self, vdisk: u64, index: u64) -> Result<()> {
+        ReplNode::trim_block(self, vdisk, index)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::ByteView;
     use crate::brick::{Brick, BrickParams};
     use crate::error::FsError;
     use crate::pool::Pool;
