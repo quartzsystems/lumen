@@ -25,6 +25,30 @@ use serde::{Deserialize, Serialize};
 use crate::error::{DrbdError, Result};
 use crate::service::{DrbdService, VolumeCreate, VolumeMemberCreate};
 
+/// What a live migration is asking of the storage layer at this instant.
+///
+/// DRBD's window is symmetric — allow two primaries, or do not — but a
+/// LumenFS lease handover names its destination, and it distinguishes a
+/// migration that completed from one that was abandoned. One shape serves
+/// both engines: the DRBD implementation collapses `Accepted` and
+/// `Aborted` into "close the window", because which one it was does not
+/// change what DRBD must do, while a pooled implementation uses all three.
+///
+/// It also lets the caller say what it already knows. Migration closes the
+/// window on every path out, and has always known whether the move
+/// succeeded; the old boolean discarded that at the door.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MigrationWindow {
+    /// Both members may hold the disk open. The machine is still running
+    /// here, and `destination` is the node it is moving to.
+    Open { destination: String },
+    /// The machine is running on the destination now: hand the disk over.
+    Accepted,
+    /// The migration did not happen. Close the window; the disk stays
+    /// exactly where it was.
+    Aborted,
+}
+
 /// What the compute domain asks for: a disk of `size_bytes`, named by its
 /// machine. `members` empty means "place it for me" — this node plus the
 /// least-utilized other member, each on the pool its existing replicas
@@ -77,9 +101,9 @@ pub trait VmVolumes: Send + Sync {
     /// replicated, by name.
     async fn common_members(&self, devices: &[String]) -> Result<Vec<String>>;
 
-    /// Open or close the two-primaries window on the resource behind
-    /// `device`, on every member. The live-migration guard's two calls.
-    async fn set_two_primaries(&self, device: &str, allow: bool) -> Result<()>;
+    /// Move the live-migration window through one of its states on the
+    /// resource behind `device`, on every member.
+    async fn migration_window(&self, device: &str, window: MigrationWindow) -> Result<()>;
 }
 
 #[async_trait]
@@ -173,12 +197,16 @@ impl VmVolumes for DrbdService {
         Ok(common.unwrap_or_default())
     }
 
-    async fn set_two_primaries(&self, device: &str, allow: bool) -> Result<()> {
+    async fn migration_window(&self, device: &str, window: MigrationWindow) -> Result<()> {
         let Some(disk) = self.disk_of(device).await? else {
             return Err(DrbdError::NotFound(format!(
                 "\"{device}\" is not a replicated volume this environment knows."
             )));
         };
+        // DRBD has one switch, so both endings collapse to closing it: a
+        // closed window is a machine that cannot have a second writer,
+        // whether the migration landed or not.
+        let allow = matches!(window, MigrationWindow::Open { .. });
         self.adjust_two_primaries(&disk.cluster, &disk.name, allow)
             .await
     }
@@ -205,8 +233,8 @@ struct MockVmInner {
     cluster: Option<(String, Vec<String>)>,
     next_minor: u32,
     disks: Vec<ReplicatedDisk>,
-    /// Every window adjustment, in order: (device, allow).
-    windows: Vec<(String, bool)>,
+    /// Every window adjustment, in order, as asked for.
+    windows: Vec<(String, MigrationWindow)>,
     destroyed: Vec<String>,
     fail_migration_window: bool,
 }
@@ -245,8 +273,26 @@ impl MockVmVolumes {
         self.inner.lock().unwrap().destroyed.clone()
     }
 
-    /// Every window adjustment, in order: (device, allow).
+    /// Every window adjustment, in order, as open-or-closed — the view
+    /// that asks only "was the window up at this point".
     pub fn windows(&self) -> Vec<(String, bool)> {
+        self.inner
+            .lock()
+            .unwrap()
+            .windows
+            .iter()
+            .map(|(device, window)| {
+                (
+                    device.clone(),
+                    matches!(window, MigrationWindow::Open { .. }),
+                )
+            })
+            .collect()
+    }
+
+    /// Every window adjustment with its full meaning, so a test can tell a
+    /// completed migration from an abandoned one.
+    pub fn window_states(&self) -> Vec<(String, MigrationWindow)> {
         self.inner.lock().unwrap().windows.clone()
     }
 
@@ -255,8 +301,8 @@ impl MockVmVolumes {
     pub fn open_windows(&self) -> Vec<String> {
         let inner = self.inner.lock().unwrap();
         let mut open: Vec<String> = Vec::new();
-        for (device, allow) in &inner.windows {
-            if *allow {
+        for (device, window) in &inner.windows {
+            if matches!(window, MigrationWindow::Open { .. }) {
                 if !open.contains(device) {
                     open.push(device.clone());
                 }
@@ -341,15 +387,15 @@ impl VmVolumes for MockVmVolumes {
         Ok(common.unwrap_or_default())
     }
 
-    async fn set_two_primaries(&self, device: &str, allow: bool) -> Result<()> {
+    async fn migration_window(&self, device: &str, window: MigrationWindow) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        if allow && inner.fail_migration_window {
+        if matches!(window, MigrationWindow::Open { .. }) && inner.fail_migration_window {
             inner.fail_migration_window = false;
             return Err(DrbdError::Conflict(
                 "the peer refused to open the window".to_string(),
             ));
         }
-        inner.windows.push((device.to_string(), allow));
+        inner.windows.push((device.to_string(), window));
         Ok(())
     }
 }
@@ -378,10 +424,18 @@ mod tests {
             })
             .await
             .unwrap();
-        volumes.set_two_primaries(&disk.device, true).await.unwrap();
+        volumes
+            .migration_window(
+                &disk.device,
+                MigrationWindow::Open {
+                    destination: "lumen02".to_string(),
+                },
+            )
+            .await
+            .unwrap();
         assert_eq!(volumes.open_windows(), vec![disk.device.clone()]);
         volumes
-            .set_two_primaries(&disk.device, false)
+            .migration_window(&disk.device, MigrationWindow::Accepted)
             .await
             .unwrap();
         assert!(volumes.open_windows().is_empty());

@@ -1886,7 +1886,7 @@ mod tests {
     /// reaches every member in both directions.
     #[tokio::test]
     async fn the_compute_door_places_on_this_node_and_works_the_window() {
-        use crate::vm::{VmDiskRequest, VmVolumes};
+        use crate::vm::{MigrationWindow, VmDiskRequest, VmVolumes};
         let backend = Arc::new(MockBackend::appliance());
         let peers = Arc::new(MockVolumePeers::new().with_backend(backend.clone()));
         let service = service_with(backend, peers.clone(), &alpha_membership(), "vm-door");
@@ -1957,10 +1957,20 @@ mod tests {
             vec!["alpha-1", "alpha-2"]
         );
 
-        // The window opens on every member and closes on every member.
-        service.set_two_primaries(&disk.device, true).await.unwrap();
+        // The window opens on every member and closes on every member —
+        // and a completed migration closes it exactly as an abandoned one
+        // would, because DRBD has only the one switch.
         service
-            .set_two_primaries(&disk.device, false)
+            .migration_window(
+                &disk.device,
+                MigrationWindow::Open {
+                    destination: "alpha-2".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        service
+            .migration_window(&disk.device, MigrationWindow::Accepted)
             .await
             .unwrap();
         let adjustments = peers.two_primaries();

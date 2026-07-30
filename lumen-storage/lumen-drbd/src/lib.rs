@@ -50,4 +50,4 @@ pub use service::{
     VolumeHealth, VolumeMemberCreate, VolumeView,
 };
 pub use state::{DeviceStatus, PeerDeviceStatus, PeerStatus, ResourceStatus};
-pub use vm::{MockVmVolumes, ReplicatedDisk, VmDiskRequest, VmVolumes};
+pub use vm::{MigrationWindow, MockVmVolumes, ReplicatedDisk, VmDiskRequest, VmVolumes};

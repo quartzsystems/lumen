@@ -434,10 +434,10 @@ destination refused before the handover, the source's `relinquish`
 answered, the destination's `accept` then confirming, the source refused
 afterward, and the filesystem mounted from the destination byte-identical.
 
-**And the seam's window verb changes shape to match** (same decision).
-`set_two_primaries(device, allow)` is symmetric because DRBD's window is;
+**And the seam's window verb has changed shape to match.**
+`set_two_primaries(device, allow)` was symmetric because DRBD's window is;
 a lease handover names its destination and distinguishes success from
-failure. It becomes one method over an enum:
+failure. It is now one method over an enum:
 
 ```rust
 async fn migration_window(&self, device: &str, window: MigrationWindow) -> Result<()>;
@@ -445,10 +445,19 @@ async fn migration_window(&self, device: &str, window: MigrationWindow) -> Resul
 enum MigrationWindow { Open { destination: String }, Accepted, Aborted }
 ```
 
-DRBD's implementation collapses `Accepted` and `Aborted` into
-`allow=no` and loses nothing; the LumenFS implementation uses all three.
-It also lets `VirtService::migrate` say out loud whether its close is a
-success or a failure — something it already knows and currently discards.
+DRBD's implementation collapses `Accepted` and `Aborted` into `allow=no`
+and loses nothing, because which ending it was does not change what DRBD
+must do; the LumenFS implementation will use all three. And
+`VirtService::migrate` now says out loud whether its close is a success or
+a failure — something it always knew and used to discard at the door. A
+test asserts each ending reaches the storage layer, and fails if the
+distinction is dropped.
+
+This was the first change to reach the shipping crates, and it reached
+only the seam: `lumen-drbd` (trait, `DrbdService`, `MockVmVolumes`) and the
+two call sites in `lumen-virt::migrate`. Nothing about DRBD's behavior
+changed — 38 storage tests, 96 compute tests, and the controlplane's suites
+all pass untouched.
 
 Still ahead in phase 3 beyond that: the console pages (pool and vdisk
 views with the snapshot dialog).

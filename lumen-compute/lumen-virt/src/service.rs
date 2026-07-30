@@ -1562,13 +1562,18 @@ impl VirtService {
         }
 
         // Open the window on every disk; then, whatever happens, close it on
-        // everything that opened. DRBD refuses a second writer the moment
-        // the window shuts, so a closed window after a failed migration is a
-        // machine exactly where it started.
+        // everything that opened — and say which ending it was. A closed
+        // window is a machine that cannot have a second writer, and for a
+        // storage engine that hands a lease over rather than toggling a
+        // switch, "the machine landed" and "the machine never left" call for
+        // opposite acts.
         let mut opened: Vec<String> = Vec::new();
         let mut failure: Option<VirtError> = None;
         for device in &devices {
-            match self.volumes.set_two_primaries(device, true).await {
+            let opening = lumen_drbd::MigrationWindow::Open {
+                destination: target.to_string(),
+            };
+            match self.volumes.migration_window(device, opening).await {
                 Ok(()) => opened.push(device.clone()),
                 Err(err) => {
                     failure = Some(VirtError::Conflict(format!(
@@ -1584,8 +1589,15 @@ impl VirtService {
                 failure = Some(err);
             }
         }
+        // The ending, named: the machine is either on the destination now
+        // or it never left, and the storage layer is told which.
+        let ending = if failure.is_none() {
+            lumen_drbd::MigrationWindow::Accepted
+        } else {
+            lumen_drbd::MigrationWindow::Aborted
+        };
         for device in opened.iter().rev() {
-            if let Err(err) = self.volumes.set_two_primaries(device, false).await {
+            if let Err(err) = self.volumes.migration_window(device, ending.clone()).await {
                 tracing::error!(%device, "the two-primaries window did not close: {err}");
                 if failure.is_none() {
                     failure = Some(VirtError::Conflict(format!(
@@ -3263,6 +3275,24 @@ mod tests {
             ]
         );
         assert!(h.volumes.open_windows().is_empty());
+        // And the storage layer was told which ending this was, and where
+        // the machine went — the two things a lease handover needs and a
+        // bare "close it" cannot express.
+        assert_eq!(
+            h.volumes.window_states(),
+            vec![
+                (
+                    "/dev/drbd1".to_string(),
+                    lumen_drbd::MigrationWindow::Open {
+                        destination: "lumen02".to_string()
+                    }
+                ),
+                (
+                    "/dev/drbd1".to_string(),
+                    lumen_drbd::MigrationWindow::Accepted
+                )
+            ]
+        );
 
         // The machine has one home, and it is not this node.
         assert!(h.service.get(vm.vmid).await.is_err());
@@ -3283,6 +3313,14 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("dropped"), "{err}");
+        // A failure closes the window as an *abort*: the machine never
+        // left, so a lease-based engine must keep the pen where it was
+        // rather than hand it on.
+        assert_eq!(
+            h.volumes.window_states().last().map(|(_, w)| w.clone()),
+            Some(lumen_drbd::MigrationWindow::Aborted),
+            "a failed migration must abort the window, not accept it"
+        );
         assert!(
             h.volumes.open_windows().is_empty(),
             "the window must close on failure too"
