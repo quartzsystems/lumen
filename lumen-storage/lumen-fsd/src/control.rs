@@ -120,6 +120,46 @@ pub fn command(daemon: &Daemon, line: &str) -> String {
                     .collect();
                 listed.join(" ")
             }
+            "snapshot" => {
+                let (vdisk, snapshot) = (number(1)?, number(2)?);
+                daemon
+                    .guest()
+                    .snapshot_vdisk(vdisk, snapshot)
+                    .map(|()| format!("vdisk={vdisk} snapshot={snapshot}"))
+                    .map_err(|err| err.to_string())?
+            }
+            "snapshots" => {
+                // Optionally narrowed to one vdisk: a machine's page wants
+                // its own disk's history, not the whole pool's.
+                let only = match words.get(1) {
+                    Some(_) => Some(number(1)?),
+                    None => None,
+                };
+                let listed: Vec<String> = daemon
+                    .guest()
+                    .snapshots()
+                    .into_iter()
+                    .filter(|(vdisk, _, _)| only.is_none_or(|want| *vdisk == want))
+                    .map(|(vdisk, snapshot, size)| format!("{vdisk}:{snapshot}:{size}"))
+                    .collect();
+                listed.join(" ")
+            }
+            "snapshot-delete" => {
+                let (vdisk, snapshot) = (number(1)?, number(2)?);
+                daemon
+                    .guest()
+                    .delete_snapshot(vdisk, snapshot)
+                    .map(|()| format!("vdisk={vdisk} snapshot={snapshot}"))
+                    .map_err(|err| err.to_string())?
+            }
+            "rollback" => {
+                // Through the daemon, not the guest handle: the refusal
+                // while this member is serving the disk lives there.
+                let (vdisk, snapshot) = (number(1)?, number(2)?);
+                daemon
+                    .rollback_vdisk(vdisk, snapshot)
+                    .map(|()| format!("vdisk={vdisk} snapshot={snapshot}"))?
+            }
             "lease" => {
                 let vdisk = number(1)?;
                 // Existence first: "nobody holds it" and "there is no such
@@ -604,6 +644,46 @@ impl Client {
 
     /// Open the migration window toward `to`. Runs on the source, whose
     /// guest keeps running and keeps writing.
+    pub fn snapshot(&mut self, vdisk: u64, snapshot: u64) -> Result<(), String> {
+        self.ask(&format!("snapshot {vdisk} {snapshot}"))
+            .map(|_| ())
+    }
+
+    /// Every snapshot, or only one vdisk's, as `(vdisk, snapshot, bytes)`.
+    pub fn snapshots(&mut self, vdisk: Option<u64>) -> Result<Vec<(u64, u64, u64)>, String> {
+        let reply = match vdisk {
+            Some(vdisk) => self.ask(&format!("snapshots {vdisk}"))?,
+            None => self.ask("snapshots")?,
+        };
+        if reply.is_empty() {
+            return Ok(Vec::new());
+        }
+        reply
+            .split_whitespace()
+            .map(|entry| {
+                let mut parts = entry.split(':');
+                let parsed = (|| {
+                    Some((
+                        parts.next()?.parse().ok()?,
+                        parts.next()?.parse().ok()?,
+                        parts.next()?.parse().ok()?,
+                    ))
+                })();
+                parsed.ok_or_else(|| format!("unintelligible snapshot: {entry}"))
+            })
+            .collect()
+    }
+
+    pub fn delete_snapshot(&mut self, vdisk: u64, snapshot: u64) -> Result<(), String> {
+        self.ask(&format!("snapshot-delete {vdisk} {snapshot}"))
+            .map(|_| ())
+    }
+
+    pub fn rollback(&mut self, vdisk: u64, snapshot: u64) -> Result<(), String> {
+        self.ask(&format!("rollback {vdisk} {snapshot}"))
+            .map(|_| ())
+    }
+
     pub fn handover(&mut self, vdisk: u64, to: NodeId) -> Result<(), String> {
         self.ask(&format!("handover {vdisk} {to}")).map(|_| ())
     }

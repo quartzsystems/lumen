@@ -26,7 +26,7 @@ use lumen_drbd::{MigrationWindow, ReplicatedDisk, Result as SeamResult, VmDiskRe
 use crate::error::{PoolError, Result};
 use crate::fleet::PoolFleet;
 use crate::model::{self, DiskName};
-use crate::state::{self, MemberView, PoolMember, PoolState};
+use crate::state::{self, MemberView, PoolMember, PoolState, SnapshotView};
 
 /// How long the source waits for the destination to see the pen arrive.
 /// Generous: it is one op crossing a healthy link, and the alternative to
@@ -99,6 +99,94 @@ impl PoolService {
         }))
     }
 
+    /// Take a snapshot of a machine's disk.
+    ///
+    /// Replicated by the engine, so one member is told and both have it —
+    /// which is the property that makes a snapshot worth offering at all: one
+    /// that lived only on the member that took it would be gone exactly when
+    /// it was wanted, after that member died.
+    ///
+    /// The id is the caller's: the console passes a Unix timestamp so the
+    /// ids sort and display as the moments they are, and the engine refuses
+    /// a duplicate rather than overwriting one.
+    pub async fn snapshot(&self, device: &str, snapshot: u64) -> Result<()> {
+        let vdisk = self.pooled(device)?;
+        let here = self.here().await?;
+        self.fleet.snapshot(&here, vdisk, snapshot).await
+    }
+
+    /// One disk's snapshots, newest id last.
+    pub async fn snapshots(&self, device: &str) -> Result<Vec<SnapshotView>> {
+        let vdisk = self.pooled(device)?;
+        let here = self.here().await?;
+        let mut listed: Vec<SnapshotView> = self
+            .fleet
+            .snapshots(&here, Some(vdisk))
+            .await?
+            .into_iter()
+            .map(|(_, snapshot, size_bytes)| SnapshotView {
+                snapshot,
+                size_bytes,
+            })
+            .collect();
+        listed.sort_by_key(|s| s.snapshot);
+        Ok(listed)
+    }
+
+    /// Drop a snapshot, releasing whatever it alone was pinning.
+    pub async fn delete_snapshot(&self, device: &str, snapshot: u64) -> Result<()> {
+        let vdisk = self.pooled(device)?;
+        let here = self.here().await?;
+        self.fleet.delete_snapshot(&here, vdisk, snapshot).await
+    }
+
+    /// Put a disk back to a snapshot — **refused while it is open anywhere
+    /// in the pool**.
+    ///
+    /// This is the contract the console has always promised for a rollback,
+    /// and here it has to be built rather than inherited: the engine swaps
+    /// the map root whenever it is asked and has no idea a guest is mounted
+    /// on the other side of a device. Rolling back underneath a running
+    /// machine would replace every block beneath a live filesystem without
+    /// telling it.
+    ///
+    /// So every member is asked what it is serving first, and a single
+    /// export anywhere refuses the whole operation. The member that owns the
+    /// disk refuses too, which makes this belt and braces — deliberately,
+    /// because the orchestration layer must not be the only thing standing
+    /// between an operator and a corrupted guest.
+    ///
+    /// A member that cannot be reached also refuses it. That is the
+    /// conservative direction: a silent member might be the one serving the
+    /// disk, and "I could not check" must never read as "nobody has it".
+    pub async fn rollback(&self, device: &str, snapshot: u64) -> Result<()> {
+        let vdisk = self.pooled(device)?;
+        let members = self.members().await?;
+        for member in &members {
+            let serving = self.fleet.exports(member).await.map_err(|err| {
+                PoolError::Conflict(format!(
+                    "cannot roll back {device}: {member} could not say whether it is serving the \
+                     disk ({err})"
+                ))
+            })?;
+            if serving.iter().any(|(id, _)| *id == vdisk) {
+                return Err(PoolError::Conflict(format!(
+                    "{device} is in use on {member} — stop the machine using it before rolling back"
+                )));
+            }
+        }
+        let here = &members[0];
+        self.fleet.rollback(here, vdisk, snapshot).await
+    }
+
+    /// The vdisk behind a device path, refusing anything that is not a
+    /// pooled machine disk by name rather than guessing.
+    fn pooled(&self, device: &str) -> Result<u64> {
+        model::vdisk_of_device(device)
+            .filter(|vdisk| DiskName::from_vdisk(*vdisk).is_some())
+            .ok_or_else(|| PoolError::NotFound(format!("{device} is not a disk this pool serves")))
+    }
+
     /// The pool as it is right now — one call, everything a console page
     /// renders. Read live and never stored: a pool's health is a fact about
     /// this instant.
@@ -152,7 +240,22 @@ impl PoolService {
 
         // The vdisk listing and the leases are replicated, and they arrived
         // with the status — so one answering member speaks for the pool and
-        // nothing is asked twice.
+        // nothing is asked twice. Snapshots are replicated too, but they are
+        // not in the status line, so the same speaker is asked once for the
+        // whole pool's rather than once per disk.
+        let speaker = members
+            .iter()
+            .filter(|m| m.view.status().is_some())
+            .map(|m| m.name.clone())
+            .next();
+        let snapshots = match &speaker {
+            Some(speaker) => self
+                .fleet
+                .snapshots(speaker, None)
+                .await
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
         let vdisks = members
             .iter()
             .filter_map(|m| m.view.status())
@@ -165,7 +268,7 @@ impl PoolService {
                         let lease = speaker
                             .lease(*vdisk)
                             .map(|seen| (seen.holder, seen.handing_to));
-                        state::vdisk_view(*vdisk, *size_bytes, lease, &exports)
+                        state::vdisk_view(*vdisk, *size_bytes, lease, &exports, &snapshots)
                     })
                     .collect()
             })

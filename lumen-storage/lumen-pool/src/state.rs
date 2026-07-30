@@ -21,10 +21,12 @@
 //! console can say "cannot tell" where it would otherwise say something
 //! confident and wrong.
 
+use serde::{Deserialize, Serialize};
+
 use crate::model::{device_path, DiskName};
 
 /// A lease as a member reports it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseSeen {
     pub holder: u8,
     pub era: u64,
@@ -39,7 +41,7 @@ pub struct LeaseSeen {
 /// mean a round trip per vdisk to learn who holds each pen — and since the
 /// fleet opens a fresh control connection per call, a pool of fifty disks
 /// would cost fifty-one connections to draw one page.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberStatus {
     /// The engine's node id — what a lease names.
     pub node: u8,
@@ -69,9 +71,7 @@ impl MemberStatus {
             .find(|(id, _)| *id == vdisk)
             .map(|(_, lease)| *lease)
     }
-}
 
-impl MemberStatus {
     /// Free brick space as a percentage, for a meter. Zero segments total is
     /// a brick that has not been formatted, and answers `None` rather than
     /// dividing by it.
@@ -86,7 +86,7 @@ impl MemberStatus {
 /// A flattening of the engine's `ReplState`: `Resyncing` keeps its direction
 /// because the two ends mean opposite things to an operator — a source is
 /// still serving guests, a target is not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Replication {
     /// No peer and no verdict. Reads serve, writes refuse, flushes park —
     /// the integrity stop, and the state an operator must act on.
@@ -107,7 +107,7 @@ impl Replication {
 }
 
 /// How a member answered, or that it did not.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MemberView {
     Answered(MemberStatus),
     /// The daemon could not be reached, or said something unintelligible.
@@ -126,7 +126,7 @@ impl MemberView {
 }
 
 /// One member of the pool, named and observed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoolMember {
     pub name: String,
     pub view: MemberView,
@@ -138,7 +138,7 @@ pub struct PoolMember {
 /// does not decode to a machine disk (the one a `format` mints, say) is
 /// listed with `disk: None` rather than hidden: the console should show
 /// everything the pool is carrying, including anything it did not put there.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VdiskView {
     pub vdisk: u64,
     pub size_bytes: u64,
@@ -152,6 +152,19 @@ pub struct VdiskView {
     pub handing_to: Option<u8>,
     /// The member names actually serving this vdisk as a device.
     pub exported_on: Vec<String>,
+    /// Retained map roots, newest id last. Replicated like the vdisk
+    /// itself, so this is the pool's history and not one member's.
+    pub snapshots: Vec<SnapshotView>,
+}
+
+/// One retained point in a vdisk's history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotView {
+    /// The id the snapshot was taken under. The console passes a Unix
+    /// timestamp, so these sort and display as the moments they are.
+    pub snapshot: u64,
+    /// The vdisk's size when it was taken — a rollback restores this too.
+    pub size_bytes: u64,
 }
 
 impl VdiskView {
@@ -171,7 +184,7 @@ impl VdiskView {
 }
 
 /// The pool's health, as one word for a badge.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PoolHealth {
     /// Every member answered, every one Synced.
     Healthy,
@@ -186,7 +199,7 @@ pub enum PoolHealth {
 }
 
 /// A pool as one console page needs it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoolState {
     pub members: Vec<PoolMember>,
     pub vdisks: Vec<VdiskView>,
@@ -256,13 +269,24 @@ fn verdict(members: &[PoolMember]) -> PoolHealth {
 }
 
 /// Build a vdisk view from the replicated listing plus what was observed.
-/// `exports` is `(member name, vdisks it serves)`.
+/// `exports` is `(member name, vdisks it serves)`; `snapshots` is the
+/// pool-wide listing as `(vdisk, snapshot, size_bytes)`.
 pub fn vdisk_view(
     vdisk: u64,
     size_bytes: u64,
     lease: Option<(u8, Option<u8>)>,
     exports: &[(String, Vec<u64>)],
+    snapshots: &[(u64, u64, u64)],
 ) -> VdiskView {
+    let mut mine: Vec<SnapshotView> = snapshots
+        .iter()
+        .filter(|(id, _, _)| *id == vdisk)
+        .map(|(_, snapshot, size_bytes)| SnapshotView {
+            snapshot: *snapshot,
+            size_bytes: *size_bytes,
+        })
+        .collect();
+    mine.sort_by_key(|s| s.snapshot);
     VdiskView {
         vdisk,
         size_bytes,
@@ -275,6 +299,7 @@ pub fn vdisk_view(
             .filter(|(_, serving)| serving.contains(&vdisk))
             .map(|(member, _)| member.clone())
             .collect(),
+        snapshots: mine,
     }
 }
 
@@ -393,25 +418,41 @@ mod tests {
             ("lumen01".to_string(), vec![1795]),
             ("lumen02".to_string(), vec![]),
         ];
-        let view = vdisk_view(1795, 512 << 20, Some((0, Some(1))), &exports);
+        // Snapshots arrive as the whole pool's listing and are filtered to
+        // this disk — another vdisk's history must not appear here.
+        let snapshots = vec![
+            (1795, 300, 512 << 20),
+            (1795, 100, 512 << 20),
+            (7, 200, 1 << 30),
+        ];
+        let view = vdisk_view(1795, 512 << 20, Some((0, Some(1))), &exports, &snapshots);
         assert_eq!(view.disk, Some(DiskName { vmid: 7, index: 3 }));
         assert_eq!(view.label(), "vm-7-disk-3");
         assert_eq!(view.device, "/dev/ublkb1795");
         assert_eq!(view.holder, Some(0));
         assert!(view.migrating(), "an open window is a migration in flight");
         assert_eq!(view.exported_on, vec!["lumen01"]);
+        assert_eq!(
+            view.snapshots
+                .iter()
+                .map(|s| s.snapshot)
+                .collect::<Vec<_>>(),
+            vec![100, 300],
+            "this disk's snapshots, oldest first, and nobody else's"
+        );
     }
 
     #[test]
     fn a_vdisk_that_is_not_a_machines_is_shown_rather_than_hidden() {
         // Vdisk 1 is what `format` mints. It is not a machine disk, and the
         // console should still show that the pool is carrying it.
-        let view = vdisk_view(1, 1 << 30, None, &[]);
+        let view = vdisk_view(1, 1 << 30, None, &[], &[]);
         assert_eq!(view.disk, None);
         assert_eq!(view.label(), "vdisk 1");
         assert_eq!(view.holder, None);
         assert!(!view.migrating());
         assert!(view.exported_on.is_empty());
+        assert!(view.snapshots.is_empty());
     }
 
     #[test]

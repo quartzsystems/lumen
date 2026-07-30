@@ -36,6 +36,8 @@
 //! deployment, it is a mistake, and it is refused by name rather than
 //! silently aliased onto another machine's disk.
 
+use serde::{Deserialize, Serialize};
+
 /// Disks per machine. The low byte of a vdisk id.
 pub const DISKS_PER_MACHINE: u64 = 256;
 
@@ -43,7 +45,7 @@ pub const DISKS_PER_MACHINE: u64 = 256;
 pub const MAX_VMID: u64 = (u32::MAX as u64) / DISKS_PER_MACHINE;
 
 /// A machine's disk, by the only two numbers that identify it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiskName {
     pub vmid: u64,
     pub index: u64,

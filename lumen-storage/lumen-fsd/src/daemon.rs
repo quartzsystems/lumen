@@ -458,6 +458,36 @@ impl GuestHandle {
         self.shared.with_engine(|engine| engine.pool().vdisks())
     }
 
+    /// Take a snapshot: a retained map root, instant and crash-consistent.
+    /// Replicated like every other operation, so it exists on both members
+    /// or the call refuses — which is what keeps a snapshot from vanishing
+    /// the moment the member that took it is the one that dies.
+    pub fn snapshot_vdisk(&self, vdisk: u64, snapshot: u64) -> Result<(), FsError> {
+        self.blocking(|engine| engine.snapshot_vdisk(vdisk, snapshot))
+    }
+
+    /// Drop a snapshot, releasing whatever it alone was pinning.
+    pub fn delete_snapshot(&self, vdisk: u64, snapshot: u64) -> Result<(), FsError> {
+        self.blocking(|engine| engine.delete_snapshot(vdisk, snapshot))
+    }
+
+    /// Put a vdisk back to a snapshot, discarding everything written since.
+    ///
+    /// The engine does exactly what it is told here — it swaps the map root
+    /// and does not ask whether anything is using the disk. **The refusal
+    /// while the disk is open lives above this**, in
+    /// [`Daemon::rollback_vdisk`] for this member and in the orchestration
+    /// layer for the pool, because only they know about exports.
+    pub fn rollback_vdisk(&self, vdisk: u64, snapshot: u64) -> Result<(), FsError> {
+        self.blocking(|engine| engine.rollback_vdisk(vdisk, snapshot))
+    }
+
+    /// Every snapshot the pool holds, as `(vdisk, snapshot, size_bytes)`.
+    /// Replicated state, so any member answers the same.
+    pub fn snapshots(&self) -> Vec<(u64, u64, u64)> {
+        self.shared.with_engine(|engine| engine.pool().snapshots())
+    }
+
     pub fn vdisk_size(&self, vdisk: u64) -> Result<u64, FsError> {
         self.shared.with_engine(|engine| engine.vdisk_size(vdisk))
     }
@@ -780,6 +810,38 @@ impl Daemon {
             .remove(&vdisk)
             .ok_or_else(|| format!("vdisk {vdisk} is not exported"))?;
         export.stop()
+    }
+
+    /// Roll a vdisk back to a snapshot — **refused while this member is
+    /// serving it**.
+    ///
+    /// The engine will swap the map root whenever it is asked; it has no
+    /// idea a guest is mounted on the other side of a ublk device. Rolling
+    /// back underneath a running machine would replace every block beneath
+    /// a live filesystem, and the guest would not be told. So the export
+    /// map — which only the daemon has — is what turns the engine's
+    /// unconditional operation into the contract the console promises.
+    ///
+    /// This covers *this* member. A pool has more than one, and the
+    /// orchestration layer refuses if any member is serving the disk; the
+    /// check lives in both places on purpose, because the daemon must not
+    /// depend on being called politely.
+    ///
+    /// One honest limit: it sees the exports it owns, which is every ublk
+    /// device. The `--nbd` bootstrap export is served on its own thread and
+    /// was never in this map, so it is not covered — that path is a
+    /// diagnostic one the shipped unit does not use, and making it a
+    /// first-class export is a change to the bootstrap posture rather than
+    /// something to do quietly here.
+    pub fn rollback_vdisk(&self, vdisk: u64, snapshot: u64) -> Result<(), String> {
+        if self.exports.lock().unwrap().contains_key(&vdisk) {
+            return Err(format!(
+                "vdisk {vdisk} is being served here — stop the machine using it before rolling back"
+            ));
+        }
+        self.guest()
+            .rollback_vdisk(vdisk, snapshot)
+            .map_err(|err| err.to_string())
     }
 
     /// Every live export, `(vdisk, description)`, sorted.

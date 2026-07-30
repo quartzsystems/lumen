@@ -60,6 +60,21 @@ pub trait PoolFleet: Send + Sync {
     /// What this member is serving, as `(vdisk, device)`.
     async fn exports(&self, member: &str) -> Result<Vec<(u64, String)>>;
 
+    /// Take a snapshot. Replicated: one member is enough, and both have it.
+    async fn snapshot(&self, member: &str, vdisk: u64, snapshot: u64) -> Result<()>;
+
+    /// Every snapshot, or one vdisk's, as `(vdisk, snapshot, size_bytes)`.
+    /// Replicated state, so any member answers the same.
+    async fn snapshots(&self, member: &str, vdisk: Option<u64>) -> Result<Vec<(u64, u64, u64)>>;
+
+    /// Drop a snapshot. Replicated.
+    async fn delete_snapshot(&self, member: &str, vdisk: u64, snapshot: u64) -> Result<()>;
+
+    /// Put a vdisk back to a snapshot. Replicated — and refused by the
+    /// member if it is serving the disk, which is the last line of a
+    /// defence the orchestration layer makes first.
+    async fn rollback(&self, member: &str, vdisk: u64, snapshot: u64) -> Result<()>;
+
     /// Who holds a vdisk's pen as this member sees it, and whether a window
     /// is open: `(holder, handing_to)`. `None` means nobody has claimed it.
     /// The open window is the record of its own destination, which is how a
@@ -94,6 +109,8 @@ struct MockInner {
     /// `None` is the standalone appliance: no pool here.
     members: Option<Vec<String>>,
     vdisks: BTreeMap<u64, u64>,
+    /// `(vdisk, snapshot) -> size_bytes`. Replicated, like the vdisks.
+    snapshots: BTreeMap<(u64, u64), u64>,
     leases: BTreeMap<u64, Lease>,
     /// Per member, the vdisks it is serving — the asymmetry that matters.
     exports: BTreeMap<String, Vec<u64>>,
@@ -178,16 +195,24 @@ impl MockFleet {
             .map(|l| (l.holder, l.handing_to))
     }
 
+    /// The member's engine id — and the one place silence is enforced, so a
+    /// silenced member refuses *every* verb rather than only the one a test
+    /// happened to think of. An unreachable daemon does not answer some
+    /// questions and not others.
     fn id_of(inner: &MockInner, member: &str) -> Result<u8> {
         let members = inner
             .members
             .as_ref()
             .ok_or_else(|| PoolError::Unavailable("this node carries no pool".into()))?;
-        members
+        let id = members
             .iter()
             .position(|m| m == member)
             .map(|at| at as u8)
-            .ok_or_else(|| PoolError::NotFound(format!("{member} is not a member of this pool")))
+            .ok_or_else(|| PoolError::NotFound(format!("{member} is not a member of this pool")))?;
+        match inner.silent.get(member) {
+            Some(why) => Err(PoolError::Backend(why.clone())),
+            None => Ok(id),
+        }
     }
 }
 
@@ -211,9 +236,6 @@ impl PoolFleet for MockFleet {
     async fn status(&self, member: &str) -> Result<MemberStatus> {
         let inner = self.inner.lock().unwrap();
         let node = MockFleet::id_of(&inner, member)?;
-        if let Some(why) = inner.silent.get(member) {
-            return Err(PoolError::Backend(why.clone()));
-        }
         // The listings come from the mock's own state whether or not a test
         // pinned the health, so a status can never disagree with what the
         // other verbs would answer about the same pool.
@@ -343,6 +365,65 @@ impl PoolFleet for MockFleet {
             .into_iter()
             .map(|vdisk| (vdisk, crate::model::device_path(vdisk)))
             .collect())
+    }
+
+    async fn snapshot(&self, member: &str, vdisk: u64, snapshot: u64) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        MockFleet::id_of(&inner, member)?;
+        let size = *inner
+            .vdisks
+            .get(&vdisk)
+            .ok_or_else(|| PoolError::NotFound(format!("no vdisk {vdisk}")))?;
+        if inner.snapshots.contains_key(&(vdisk, snapshot)) {
+            return Err(PoolError::Conflict(format!(
+                "vdisk {vdisk} already has a snapshot {snapshot}"
+            )));
+        }
+        inner.snapshots.insert((vdisk, snapshot), size);
+        Ok(())
+    }
+
+    async fn snapshots(&self, member: &str, vdisk: Option<u64>) -> Result<Vec<(u64, u64, u64)>> {
+        let inner = self.inner.lock().unwrap();
+        MockFleet::id_of(&inner, member)?;
+        Ok(inner
+            .snapshots
+            .iter()
+            .filter(|((id, _), _)| vdisk.is_none_or(|want| *id == want))
+            .map(|((id, snapshot), size)| (*id, *snapshot, *size))
+            .collect())
+    }
+
+    async fn delete_snapshot(&self, member: &str, vdisk: u64, snapshot: u64) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        MockFleet::id_of(&inner, member)?;
+        inner
+            .snapshots
+            .remove(&(vdisk, snapshot))
+            .map(|_| ())
+            .ok_or_else(|| PoolError::NotFound(format!("vdisk {vdisk} has no snapshot {snapshot}")))
+    }
+
+    async fn rollback(&self, member: &str, vdisk: u64, snapshot: u64) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        MockFleet::id_of(&inner, member)?;
+        // The daemon's own guard, modelled: a member refuses to roll back a
+        // disk it is serving. The service refuses earlier and for the whole
+        // pool, and this is what makes that belt-and-braces real in tests.
+        if inner
+            .exports
+            .get(member)
+            .is_some_and(|serving| serving.contains(&vdisk))
+        {
+            return Err(PoolError::Conflict(format!(
+                "vdisk {vdisk} is being served on {member}"
+            )));
+        }
+        let size = *inner.snapshots.get(&(vdisk, snapshot)).ok_or_else(|| {
+            PoolError::NotFound(format!("vdisk {vdisk} has no snapshot {snapshot}"))
+        })?;
+        inner.vdisks.insert(vdisk, size);
+        Ok(())
     }
 
     async fn lease(&self, member: &str, vdisk: u64) -> Result<Option<(u8, Option<u8>)>> {

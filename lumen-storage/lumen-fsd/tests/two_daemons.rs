@@ -236,6 +236,60 @@ fn a_vdisks_life_replicates_from_either_end() {
     a.shutdown();
 }
 
+/// Snapshots are replicated operations, which is the whole reason they are
+/// worth offering: a snapshot that lived only on the member that took it
+/// would be gone exactly when it was needed — after that member died.
+#[test]
+fn a_snapshot_reaches_the_peer_and_rolling_back_restores_what_it_held() {
+    let (a, b, _ba, _bb) = synced_pair("snapshots");
+    let guest = a.guest();
+    guest.create_vdisk(SECOND, 4 << 20).unwrap();
+    wait_until("the peer to learn the vdisk", || {
+        b.guest().vdisk_size(SECOND).is_ok()
+    });
+
+    guest.write(SECOND, 0, b"before the snapshot").unwrap();
+    guest.flush().unwrap();
+    guest.snapshot_vdisk(SECOND, 1).unwrap();
+
+    // The peer knows about it without being told — the same asymmetry that
+    // makes vdisk creation a one-member call.
+    wait_until("the peer to learn the snapshot", || {
+        b.guest()
+            .snapshots()
+            .iter()
+            .any(|(v, s, _)| *v == SECOND && *s == 1)
+    });
+
+    // Write past it, then go back.
+    guest.write(SECOND, 0, b"after ").unwrap();
+    guest.flush().unwrap();
+    assert_eq!(guest.read(SECOND, 0, 6).unwrap(), b"after ");
+
+    a.rollback_vdisk(SECOND, 1).unwrap();
+    assert_eq!(
+        a.guest().read(SECOND, 0, 19).unwrap(),
+        b"before the snapshot",
+        "the rollback did not restore the snapshot's contents"
+    );
+    // And the rollback replicated too: the peer sees the same bytes.
+    wait_until("the peer to see the rollback", || {
+        b.guest().read(SECOND, 0, 19).unwrap() == b"before the snapshot"
+    });
+
+    // Deleting a snapshot replicates as well.
+    a.guest().delete_snapshot(SECOND, 1).unwrap();
+    wait_until("the peer to lose the snapshot", || {
+        !b.guest()
+            .snapshots()
+            .iter()
+            .any(|(v, s, _)| *v == SECOND && *s == 1)
+    });
+
+    b.shutdown();
+    a.shutdown();
+}
+
 #[test]
 fn a_live_migration_moves_the_pen_and_never_lends_it_twice() {
     // The shape the compute seam drives: the destination opens the disk

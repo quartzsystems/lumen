@@ -1,5 +1,20 @@
 //! The fleet over real sockets: one control connection per call, to each
-//! member's daemon.
+//! member's daemon **at an address this process can actually dial**.
+//!
+//! ## What this is not
+//!
+//! It is tempting to read this as the production fleet. It is not, and the
+//! reason is the daemon's control surface: it binds to loopback and stays
+//! there — the shipped unit passes `--control 127.0.0.1:7799`, and
+//! `lumen-pool.xml` deliberately does not open that port. A member's daemon
+//! is reachable only from the machine it runs on, so this type can address
+//! every member only where every daemon is loopback-reachable: two daemons
+//! in one test process, and nowhere else. Point it at a peer on real
+//! hardware and the connection is refused.
+//!
+//! [`PeeredFleet`](crate::PeeredFleet) is the production shape — this node's
+//! daemon over loopback, every other member through its own control plane —
+//! and this remains what the tests drive two real daemons with.
 //!
 //! Two choices worth stating, because both look like shortcuts and are not.
 //!
@@ -159,6 +174,27 @@ impl PoolFleet for SocketFleet {
 
     async fn exports(&self, member: &str) -> Result<Vec<(u64, String)>> {
         self.on(member, |client| client.exports()).await
+    }
+
+    async fn snapshot(&self, member: &str, vdisk: u64, snapshot: u64) -> Result<()> {
+        self.on(member, move |client| client.snapshot(vdisk, snapshot))
+            .await
+    }
+
+    async fn snapshots(&self, member: &str, vdisk: Option<u64>) -> Result<Vec<(u64, u64, u64)>> {
+        self.on(member, move |client| client.snapshots(vdisk)).await
+    }
+
+    async fn delete_snapshot(&self, member: &str, vdisk: u64, snapshot: u64) -> Result<()> {
+        self.on(member, move |client| {
+            client.delete_snapshot(vdisk, snapshot)
+        })
+        .await
+    }
+
+    async fn rollback(&self, member: &str, vdisk: u64, snapshot: u64) -> Result<()> {
+        self.on(member, move |client| client.rollback(vdisk, snapshot))
+            .await
     }
 
     async fn lease(&self, member: &str, vdisk: u64) -> Result<Option<(u8, Option<u8>)>> {

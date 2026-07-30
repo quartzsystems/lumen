@@ -28,6 +28,9 @@ lumen-drbd = { path = "../lumen-drbd" }
 lumen-fsd = { path = "../lumen-fsd" }
 anyhow = "1"
 async-trait = "0.1"
+# The peer channel carries typed verbs between control planes, and the
+# observed view is served as JSON to the console.
+serde = { version = "1", features = ["derive"] }
 # `spawn_blocking`: the control client is blocking by design, and blocking
 # a reactor thread is how an async service quietly stops answering.
 tokio = { version = "1", features = ["rt", "sync", "macros", "time"] }
@@ -35,3 +38,5 @@ tracing = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+# The peer verbs cross control planes as JSON; the round trip is pinned.
+serde_json = "1"

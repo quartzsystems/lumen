@@ -445,6 +445,8 @@ dependencies = [
  "async-trait",
  "lumen-drbd",
  "lumen-fsd",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]

@@ -8,7 +8,9 @@
 use std::sync::Arc;
 
 use lumen_drbd::{MigrationWindow, VmDiskRequest, VmVolumes};
-use lumen_pool::{MemberStatus, MemberView, MockFleet, PoolHealth, PoolService, Replication};
+use lumen_pool::{
+    MemberStatus, MemberView, MockFleet, PoolFleet, PoolHealth, PoolService, Replication,
+};
 
 const HERE: &str = "lumen01";
 const THERE: &str = "lumen02";
@@ -409,6 +411,140 @@ async fn a_fenced_survivor_reads_as_degraded_rather_than_unknown() {
     let status = state.members[0].view.status().unwrap();
     assert_eq!(status.era, 2, "a bumped era is what a survivor runs at");
     assert_eq!(status.free_percent(), Some(10));
+}
+
+/// Snapshots are replicated, so taking one is a one-member call — and the
+/// observed view carries each disk's history so the dialog needs no second
+/// round of questions.
+#[tokio::test]
+async fn a_snapshot_is_taken_once_and_shows_up_on_the_disk_it_belongs_to() {
+    let (_fleet, service) = pooled();
+    let disk = service
+        .create_disk(&request("vm-7-disk-3", 512 << 20))
+        .await
+        .unwrap();
+    let other = service
+        .create_disk(&request("vm-8-disk-0", 1 << 30))
+        .await
+        .unwrap();
+
+    service.snapshot(&disk.device, 1_700_000_100).await.unwrap();
+    service.snapshot(&disk.device, 1_700_000_200).await.unwrap();
+    service
+        .snapshot(&other.device, 1_700_000_300)
+        .await
+        .unwrap();
+
+    let listed = service.snapshots(&disk.device).await.unwrap();
+    assert_eq!(
+        listed.iter().map(|s| s.snapshot).collect::<Vec<_>>(),
+        vec![1_700_000_100, 1_700_000_200],
+        "one disk's history, oldest first, and nobody else's"
+    );
+
+    // And the same history reaches the page without asking again.
+    let state = service.state().await;
+    let view = state
+        .vdisks
+        .iter()
+        .find(|v| v.device == disk.device)
+        .unwrap();
+    assert_eq!(view.snapshots.len(), 2);
+
+    // Taking the same id twice is refused rather than silently replacing a
+    // snapshot somebody may be relying on.
+    assert!(service.snapshot(&disk.device, 1_700_000_100).await.is_err());
+
+    // Deleting takes exactly the one named.
+    service
+        .delete_snapshot(&disk.device, 1_700_000_100)
+        .await
+        .unwrap();
+    let listed = service.snapshots(&disk.device).await.unwrap();
+    assert_eq!(
+        listed.iter().map(|s| s.snapshot).collect::<Vec<_>>(),
+        vec![1_700_000_200]
+    );
+}
+
+/// The contract the console promises, and the one the engine will not keep
+/// on its own: a rollback replaces every block under a live filesystem, so
+/// it must be refused while anything is serving the disk.
+#[tokio::test]
+async fn a_rollback_is_refused_while_the_disk_is_open_anywhere_in_the_pool() {
+    let (fleet, service) = pooled();
+    let disk = service
+        .create_disk(&request("vm-7-disk-0", 1 << 30))
+        .await
+        .unwrap();
+    service.snapshot(&disk.device, 1_700_000_100).await.unwrap();
+
+    // Created here, so it is being served here: refused, and the member
+    // holding it is named rather than left to be guessed at.
+    let err = service
+        .rollback(&disk.device, 1_700_000_100)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("in use on lumen01"),
+        "the member serving it should be named: {err}"
+    );
+
+    // Now take the local device down and serve it on the FAR member only —
+    // the case a check that only looked at this node would wave through,
+    // and the reason every member is asked.
+    let vdisk = 7 * 256;
+    fleet.unexport(HERE, vdisk).await.unwrap();
+    service
+        .migration_window(
+            &disk.device,
+            MigrationWindow::Open {
+                destination: THERE.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(fleet.exported_on(HERE).is_empty());
+    assert_eq!(fleet.exported_on(THERE), vec![vdisk]);
+
+    let err = service
+        .rollback(&disk.device, 1_700_000_100)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("in use on lumen02"),
+        "a disk open only on the far member must still refuse: {err}"
+    );
+
+    // With it served nowhere, the same rollback goes through.
+    fleet.unexport(THERE, vdisk).await.unwrap();
+    service.rollback(&disk.device, 1_700_000_100).await.unwrap();
+}
+
+/// "I could not check" must never read as "nobody has it": a member that
+/// cannot answer refuses the rollback, because it might be the one serving
+/// the disk.
+#[tokio::test]
+async fn a_member_that_cannot_be_asked_refuses_the_rollback() {
+    let (fleet, service) = pooled();
+    let disk = service
+        .create_disk(&request("vm-7-disk-0", 1 << 30))
+        .await
+        .unwrap();
+    service.snapshot(&disk.device, 1_700_000_100).await.unwrap();
+    // Nothing is serving it anywhere — so the only thing standing between
+    // this rollback and the engine is the member that cannot answer.
+    fleet.unexport(HERE, 7 * 256).await.unwrap();
+    fleet.silence(THERE, "connection refused");
+
+    let err = service
+        .rollback(&disk.device, 1_700_000_100)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("could not say"),
+        "an unreachable member should block a rollback, not be assumed idle: {err}"
+    );
 }
 
 #[tokio::test]

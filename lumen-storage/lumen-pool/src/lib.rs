@@ -7,9 +7,13 @@
 //! change to the compute domain.
 //!
 //! ```text
+//!   config.rs   whether this node carries a pool, read from the daemon's
+//!               own drop-in rather than remembered a second time
 //!   model.rs    names, ids, device paths — and why no vdisk record exists
 //!   fleet.rs    the pool's members as something callable, plus a mock
-//!   socket.rs   the fleet for real: a control connection per member
+//!   socket.rs   control connections by address — loopback-reachable only
+//!   peers.rs    the fleet for real: this node's daemon over loopback, and
+//!               every other member through its own control plane
 //!   service.rs  the five verbs, as naming and fan-out
 //!   state.rs    observed pool state: the shapes a console page renders
 //!   error.rs    what goes wrong, and how the compute domain reads it
@@ -26,18 +30,23 @@
 //! pool-creation workflow — nothing yet writes `/etc/lumen/fsd.conf`, so a
 //! pool is still brought up by hand.
 
+pub mod config;
 pub mod error;
 pub mod fleet;
 pub mod model;
+pub mod peers;
 pub mod service;
 pub mod socket;
 pub mod state;
 
+pub use config::PoolConfig;
 pub use error::{PoolError, Result};
 pub use fleet::{MockFleet, PoolFleet};
 pub use model::{device_path, vdisk_of_device, DiskName, DISKS_PER_MACHINE};
+pub use peers::{execute, PeeredFleet, PoolAnswer, PoolPeers, PoolVerb};
 pub use service::PoolService;
 pub use socket::SocketFleet;
 pub use state::{
-    LeaseSeen, MemberStatus, MemberView, PoolHealth, PoolMember, PoolState, Replication, VdiskView,
+    LeaseSeen, MemberStatus, MemberView, PoolHealth, PoolMember, PoolState, Replication,
+    SnapshotView, VdiskView,
 };

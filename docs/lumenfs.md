@@ -594,11 +594,83 @@ per vdisk to learn who holds each pen — and since the fleet opens a fresh
 control connection per call, a fifty-disk pool would have cost fifty-one
 connections to draw one page.
 
-Still ahead in phase 3 beyond that: the controlplane routes that serve this
-view, and the console pages that render it (pool and vdisk views with the
-snapshot dialog). Also still owed before a pool can be made from the
-console at all: nothing yet writes `/etc/lumen/fsd.conf`, so a pool is
-brought up by hand.
+**And then the view was the thing that exposed a hole under the whole
+seam.** Wiring a console route meant asking how a control plane reaches
+each member's daemon, and the answer was that it cannot. The daemon's
+control surface binds to loopback and stays there — the shipped unit passes
+`--control 127.0.0.1:7799`, and `lumen-pool.xml` opens the peer link's
+ports while pointedly not opening that one, because the control surface is
+the local orchestration seam and `fence-peer` is on it. `SocketFleet`
+addressed every member by socket, which is honest only where every daemon
+happens to be loopback-reachable: two daemons in one test process. Two
+machines was never tested, because the hardware runs drove each box's
+control surface over its own ssh session rather than through the fleet.
+Confirmed on the pair rather than reasoned about — lumen2's daemon bound to
+`127.0.0.1:7799`, and lumen1 refused on both the management and the Core
+address.
+
+That is not a cosmetic gap. `migration_window(Open)` exports the disk on
+the **destination**, `destroy_disk` unexports on **every** member, and the
+observed view asks **each** member how it is doing — so live migration
+between two machines could not have worked through the seam, and every
+remote member would have read as permanently silent.
+
+`peers.rs` is the fix, and its shape is the one the rest of the appliance
+already uses: this node's daemon over loopback, every other member through
+its own control plane, which then talks to *its* daemon over *its*
+loopback. Each daemon is still only ever spoken to by the machine it runs
+on, which is the property that let the control surface be loopback-bound in
+the first place. `PoolVerb` is a **closed enum**, not a command string — a
+member being able to ask a peer to run one of twelve named verbs is a
+reviewable thing and "run whatever you like" is not — and `execute` is the
+single definition of what each verb does, called by whichever machine owns
+the daemon, so a local verb and a remote one cannot drift apart. Both
+routing directions are sabotage-tested: sending the local member through
+the peer channel fails a named test, and so does dialling every member
+directly, which is the original bug.
+
+**The snapshot vertical, which the engine had and nothing above it did.**
+`lumen-fs` has had `snapshot_vdisk`, `delete_snapshot`, `rollback_vdisk`
+and `snapshots()` since phase 1, but `GuestHandle` exposed none of them, so
+neither did the control surface, the typed client, the peer verbs, the
+fleet, or the service. All four now run the whole way up, and they are
+replicated operations like vdisk creation — one member is told and both
+have it, which is the only reason a snapshot is worth offering: one that
+lived on the member that took it would be gone exactly when it was wanted,
+after that member died.
+
+**Rollback needed a guard built rather than inherited.** The engine swaps
+the map root whenever it is asked; it has no idea a guest is mounted on the
+other side of a ublk device, so a rollback under a running machine would
+replace every block beneath a live filesystem without telling it. The
+contract — refused while the disk is open anywhere — is therefore enforced
+twice on purpose. The daemon refuses to roll back a disk *it* is serving,
+because it must not depend on being called politely; and the service asks
+**every** member what it is serving first, so a disk open only on the far
+member still refuses. A member that cannot be reached refuses it too: it
+might be the one serving the disk, and "I could not check" must never read
+as "nobody has it". Both halves are sabotage-tested, and the daemon's own —
+which no off-appliance suite can reach, since WSL has no `ublk_drv` — was
+verified on lumen1 against a real device: refused while served, filesystem
+untouched by the refusal, and after an unexport the rollback restored the
+snapshot's bytes exactly.
+
+**And a pool says whether it exists in one place.** `config.rs` reads the
+daemon's own drop-in, `/etc/lumen/fsd.conf` — the `EnvironmentFile` the
+shipped unit already reads. Its presence is the answer to "is there a pool
+here"; membership is not in it and does not belong in it, because a pool
+spans its cluster and the control plane already knows who those members
+are. A second file or a replicated record would only be a second thing to
+disagree. A file that exists but does not say what it must is an error
+rather than an absent pool, so a half-written drop-in cannot hide behind a
+console page that cheerfully reports nothing to show.
+
+Still ahead in phase 3: the control plane's half of the peer channel (a
+route carrying `PoolVerb`, and `PoolPeers` over the existing authenticated
+transport), the routes that serve the observed view and the snapshot verbs,
+and the console pages that render them. Pool *creation* stays with phase
+4's drive wizard, where choosing which disks become bricks belongs — until
+then `/etc/lumen/fsd.conf` is written by hand.
 
 **Phase 5 has begun with placement, which is pure arithmetic and so goes
 first.** `slice.rs` is the whole of "which members hold a block": hash →
