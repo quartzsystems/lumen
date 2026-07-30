@@ -142,15 +142,25 @@ pub fn command(daemon: &Daemon, line: &str) -> String {
                     None => "unheld".into(),
                 }
             }
-            // The migration window as three explicit acts: `handover` opens it
-            // on the source, `accept` runs on the *destination* and is the
-            // instant the pen moves, `abort` closes a window nobody used.
+            // The migration window, all of it driven from the source:
+            // `handover` opens it, `relinquish` hands the pen over, `abort`
+            // closes a window nobody used. `accept` is the destination's
+            // only verb and it merely asks whether the pen has arrived —
+            // nothing there can take it.
             "handover" => {
                 let (vdisk, to) = (number(1)?, number(2)?);
                 daemon
                     .guest()
                     .begin_handover(vdisk, to as NodeId)
                     .map(|()| format!("window open on vdisk {vdisk} toward node {to}"))
+                    .map_err(|err| err.to_string())?
+            }
+            "relinquish" => {
+                let (vdisk, to) = (number(1)?, number(2)?);
+                daemon
+                    .guest()
+                    .relinquish(vdisk, to as NodeId)
+                    .map(|()| format!("vdisk {vdisk} handed to node {to}"))
                     .map_err(|err| err.to_string())?
             }
             "accept" => {
@@ -207,7 +217,8 @@ pub fn command(daemon: &Daemon, line: &str) -> String {
                             scrub. vdisks: vdisks, vdisk-create <id> <bytes>, \
                             vdisk-delete <id>, hash <id>. exports: export <id> <dev>, \
                             unexport <id>, exports. migration: lease <id>, \
-                            handover <id> <to>, accept <id>, abort <id>"
+                            handover <id> <to>, relinquish <id> <to>, \
+                            accept <id>, abort <id>"
                         .into(),
                 )
             }
@@ -441,8 +452,15 @@ impl Client {
         self.ask(&format!("handover {vdisk} {to}")).map(|_| ())
     }
 
-    /// Take a lease handed here. Runs on the destination, and is the
-    /// instant the guest becomes ours.
+    /// Hand the pen to `to`. Runs on the source, once its guest has
+    /// stopped writing — this is the instant the writer changes.
+    pub fn relinquish(&mut self, vdisk: u64, to: NodeId) -> Result<(), String> {
+        self.ask(&format!("relinquish {vdisk} {to}")).map(|_| ())
+    }
+
+    /// Ask whether the pen has arrived. Runs on the destination, and takes
+    /// nothing: it refuses until the source has handed over, so a caller
+    /// polls this rather than commanding it.
     pub fn accept(&mut self, vdisk: u64) -> Result<(), String> {
         self.ask(&format!("accept {vdisk}")).map(|_| ())
     }

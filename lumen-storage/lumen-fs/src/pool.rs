@@ -467,13 +467,27 @@ impl<D: Disk> Pool<D> {
         }
     }
 
-    /// The migration completed: the lease moves, in one durable step. From
-    /// here the old holder cannot write and the new one can, with no
-    /// instant in between where both could.
-    pub fn accept_handover(&mut self, vdisk: u64, to: NodeId) -> Result<()> {
+    /// The migration completed: the holder **hands the pen over**, in one
+    /// durable step, and the window closes with it.
+    ///
+    /// This runs on the source, and that is the whole point. If the
+    /// destination took the lease instead, the source would go on believing
+    /// it could write until the change reached it — an interval, however
+    /// short, in which two nodes both think they hold the pen. Because only
+    /// the holder ever changes the record, no such interval exists: the
+    /// source stops being the writer at the instant it says so, and the
+    /// destination becomes one only once that has been said.
+    pub fn relinquish_lease(&mut self, vdisk: u64, from: NodeId, to: NodeId) -> Result<()> {
         let lease = self.leases.get(&vdisk).copied();
         match lease {
-            Some(lease) if lease.handing_to == Some(to) && lease.era >= self.era => {
+            // A window must already be open toward exactly this
+            // destination: handing the pen somewhere nobody asked for it is
+            // not a migration, it is a giveaway.
+            Some(lease)
+                if lease.holder == from
+                    && lease.handing_to == Some(to)
+                    && lease.era >= self.era =>
+            {
                 let era = self.era;
                 self.set_lease(
                     vdisk,
@@ -1719,7 +1733,7 @@ mod tests {
         );
 
         // The instant of handover.
-        pool.accept_handover(1, 1).unwrap();
+        pool.relinquish_lease(1, 0, 1).unwrap();
         assert!(!pool.may_write(1, 0));
         assert!(pool.may_write(1, 1));
         assert_eq!(pool.lease(1).unwrap().handing_to, None);
@@ -1736,7 +1750,7 @@ mod tests {
         assert!(!pool.may_write(1, 1));
         // And with the window closed, the destination cannot take it.
         assert_eq!(
-            pool.accept_handover(1, 1).unwrap_err(),
+            pool.relinquish_lease(1, 0, 1).unwrap_err(),
             FsError::NoSuchHandover(1)
         );
     }

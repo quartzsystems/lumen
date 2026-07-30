@@ -404,9 +404,20 @@ fn a_live_migration_hands_the_pen_over_without_ever_dropping_it() {
         FsError::NotWriter(VDISK)
     );
 
-    // The instant of handover.
-    b.accept_handover(VDISK).unwrap();
+    // The destination cannot take the pen — only ask for it, and be told
+    // no until the source has handed it over. That refusal is what closes
+    // the interval in which both nodes could think they hold it.
+    assert_eq!(
+        b.accept_handover(VDISK).unwrap_err(),
+        FsError::NoSuchHandover(VDISK),
+        "the destination seized a pen the source still held"
+    );
+
+    // The instant of handover, performed by the holder.
+    a.relinquish(VDISK, 1).unwrap();
     pump(&mut a, &mut b, &mut net, &mut guests);
+    b.accept_handover(VDISK)
+        .expect("the destination should see the pen arrive once it replicates");
     assert_eq!(
         a.write_block(VDISK, 3, b"not yours any more").unwrap_err(),
         FsError::NotWriter(VDISK)
@@ -436,8 +447,15 @@ fn an_abandoned_migration_leaves_the_writer_where_it_started() {
     pump(&mut a, &mut b, &mut net, &mut guests);
 
     assert_eq!(b.lease(VDISK).unwrap().handing_to, None);
+    // Neither half of the destination's story works on a withdrawn offer:
+    // it cannot confirm a pen it never received, and the source cannot be
+    // made to hand one over now that the window is shut.
     assert_eq!(
         b.accept_handover(VDISK).unwrap_err(),
+        FsError::NoSuchHandover(VDISK)
+    );
+    assert_eq!(
+        a.relinquish(VDISK, 1).unwrap_err(),
         FsError::NoSuchHandover(VDISK)
     );
     // A is still the writer, and still works.

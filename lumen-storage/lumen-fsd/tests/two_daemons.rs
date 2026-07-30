@@ -282,9 +282,22 @@ fn a_live_migration_moves_the_pen_and_never_lends_it_twice() {
         FsError::NotWriter(SECOND)
     );
 
-    // The instant of handover, and it is exactly an instant: after it the
+    // The destination cannot take the pen, only ask for it — and is told
+    // no while the source still holds it.
+    assert_eq!(
+        destination.accept_handover(SECOND).unwrap_err(),
+        FsError::NoSuchHandover(SECOND),
+        "the destination seized a pen the source still held"
+    );
+
+    // The instant of handover, performed by the holder: after it the
     // source is the one refused.
-    destination.accept_handover(SECOND).unwrap();
+    source.relinquish(SECOND, 1).unwrap();
+    // `accept` is a poll, not a command: the destination sees the pen once
+    // the source's decision replicates to it.
+    wait_until("the destination to see the pen arrive", || {
+        destination.accept_handover(SECOND).is_ok()
+    });
     destination
         .write(SECOND, 8192, b"written after the move")
         .unwrap();
@@ -353,6 +366,11 @@ fn an_aborted_migration_leaves_the_disk_where_it_started() {
         destination.accept_handover(SECOND).unwrap_err(),
         FsError::NoSuchHandover(SECOND)
     );
+    assert_eq!(
+        source.relinquish(SECOND, 1).unwrap_err(),
+        FsError::NoSuchHandover(SECOND),
+        "a closed window is not a standing offer"
+    );
     assert!(destination.attach(SECOND).is_err());
 
     // And the source is still the writer, and still works.
@@ -391,23 +409,30 @@ fn an_orchestrator_drives_a_whole_migration_over_the_control_protocol() {
     wait_until("the window to reach the destination", || {
         destination(&format!("lease {SECOND}")) == "ok: holder=0 era=1 handing=1"
     });
-    // Accepting is the destination's act, and refused on the source.
+    // The destination can only ask, and is refused until the source hands
+    // the pen over; the source cannot confirm a pen it is giving away.
+    assert!(
+        destination(&format!("accept {SECOND}")).starts_with("error"),
+        "the destination seized a pen the source still held"
+    );
     assert!(
         source(&format!("accept {SECOND}")).starts_with("error"),
-        "the source accepted its own handover"
+        "the source confirmed a handover it had not performed"
     );
-    assert!(destination(&format!("accept {SECOND}")).starts_with("ok"));
-    // The destination holds the pen the instant it accepts; the source
-    // learns by replication, so its view catches up rather than changing
-    // with it. That gap is real and is discussed in docs/lumenfs.md — the
-    // guest being paused on the source is what keeps it from mattering.
+    assert!(source(&format!("relinquish {SECOND} 1")).starts_with("ok"));
+    wait_until("the destination to see the pen arrive", || {
+        destination(&format!("accept {SECOND}")).starts_with("ok")
+    });
+    // The source's own record changed at the instant it relinquished, so
+    // there is no moment where it still believes itself the writer; the
+    // destination's view catches up by replication.
     assert_eq!(
-        destination(&format!("lease {SECOND}")),
+        source(&format!("lease {SECOND}")),
         "ok: holder=1 era=1",
-        "the destination did not take the pen on accepting"
+        "the source did not hand the pen over"
     );
-    wait_until("the source to learn the pen moved", || {
-        source(&format!("lease {SECOND}")) == "ok: holder=1 era=1"
+    wait_until("the destination to learn the pen moved", || {
+        destination(&format!("lease {SECOND}")) == "ok: holder=1 era=1"
     });
 
     // Errors carry reasons, and unknown verbs do not panic.

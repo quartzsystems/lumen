@@ -90,10 +90,20 @@ moment somebody needed to rescue it.
 Live migration gets the window DRBD spends `--allow-two-primaries` on,
 without ever having two writers. `begin_handover` marks the lease as
 passing to the destination — both nodes may hold the disk open, **the
-source keeps writing**, the destination may not — and `accept_handover`
-moves it in one durable step, so there is no instant in between when both
-could write. Every path out closes the window, `abort_handover` included,
-because a window left open is how two writers eventually happen.
+source keeps writing**, the destination may not — and `relinquish` moves
+it in one durable step. Every path out closes the window,
+`abort_handover` included, because a window left open is how two writers
+eventually happen.
+
+**The pen is always handed over, never taken**, and that asymmetry is the
+whole of why there is no interval with two writers. `relinquish` runs on
+the source; the destination's `accept_handover` merely *asks* whether the
+pen has arrived, and refuses until it has — which is what an orchestrator
+waits on. Were it the other way round, the destination could take the
+lease while the source went on believing it may write until the change
+replicated to it. Because only the holder ever changes the record, that
+window does not exist. (It briefly did, and driving a migration through
+the control protocol is what showed it.)
 
 **A resync no longer stops the guests.** A source with era superiority —
 the fence-verdict survivor, the node actually running the machines — keeps
@@ -403,17 +413,26 @@ by the migration protocol above it. But that means the lease is a backstop
 against mistakes rather than a mutual-exclusion primitive across the
 propagation delay.
 
-**That gap is to be closed, by making the source relinquish** (Cody,
-2026-07-29). The source hands the pen — it sets `holder = destination` in
-one durable step, replicated like any other lease change — and the
-destination waits to see the lease name it. Because only one node ever
-changes the record, there is no interval in which two nodes both believe
-they may write, and the backstop becomes as strong as the record. `accept`
-survives as a *verification* rather than a seizure: it succeeds when the
-lease already names this node and refuses otherwise, so no path remains by
-which a destination can take a pen the source has not handed over. The
-unplanned case needs nothing new — a source that is simply gone is a
-failover, which the era bump and a fresh claim already handle.
+**That gap is closed: the source relinquishes.** It sets
+`holder = destination` in one durable step, replicated like any other
+lease change, and the destination waits to see the lease name it. Because
+only one node ever changes the record, there is no interval in which two
+nodes both believe they may write, and the backstop is now exactly as
+strong as the record. `accept` survives as a *verification* rather than a
+seizure — it succeeds only when the lease names this node **and no window
+is still open**, and refuses otherwise, so no path remains by which a
+destination takes a pen the source has not handed over. That second
+condition is not pedantry: a node holding the pen mid-window is
+mid-migration, and answering yes there would let a caller treat an
+unfinished handover as a finished one. The unplanned case needs nothing
+new — a source that is simply gone is a failover, which the era bump and a
+fresh claim already handle.
+
+Both halves are pinned by tests that fail when either is removed, and the
+whole sequence is validated on lumen1 against real ublk devices: the
+destination refused before the handover, the source's `relinquish`
+answered, the destination's `accept` then confirming, the source refused
+afterward, and the filesystem mounted from the destination byte-identical.
 
 **And the seam's window verb changes shape to match** (same decision).
 `set_two_primaries(device, allow)` is symmetric because DRBD's window is;

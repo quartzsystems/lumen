@@ -450,11 +450,41 @@ impl<D: Disk> ReplNode<D> {
         self.lease_change(vdisk, |pool, node| pool.begin_handover(vdisk, node, to))
     }
 
-    /// Take a lease that was handed to this node: the instant the guest
-    /// becomes ours. One durable step, so there is no moment in which both
-    /// nodes could write.
+    /// Hand the pen to the destination: the instant this node stops being
+    /// the writer and the other starts. Runs on the **source**, because
+    /// only the holder changing the record leaves no interval in which two
+    /// nodes both believe they hold it.
+    pub fn relinquish(&mut self, vdisk: u64, to: NodeId) -> Result<()> {
+        self.lease_change(vdisk, |pool, node| pool.relinquish_lease(vdisk, node, to))
+    }
+
+    /// Confirm the pen is here and settled — the destination's half of a
+    /// migration, and deliberately a *question* rather than an act.
+    ///
+    /// Nothing here can take a lease. A destination that could seize one
+    /// would be the second opinion this whole design exists to prevent: the
+    /// source would go on believing it may write until the change reached
+    /// it. So this succeeds only once the source has handed over, and until
+    /// then it refuses — which is what an orchestrator waits on.
+    ///
+    /// "Settled" is the second half and it is not pedantry: a node holding
+    /// the pen with a window still open is mid-migration, and answering yes
+    /// there would let a caller treat an unfinished handover as a finished
+    /// one.
     pub fn accept_handover(&mut self, vdisk: u64) -> Result<()> {
-        self.lease_change(vdisk, |pool, node| pool.accept_handover(vdisk, node))
+        match self.state {
+            ReplState::Synced | ReplState::Degraded | ReplState::Resyncing { .. } => {}
+            _ => return Err(FsError::Suspended),
+        }
+        let settled = self
+            .pool
+            .lease(vdisk)
+            .is_some_and(|lease| lease.handing_to.is_none());
+        if settled && self.pool.may_write(vdisk, self.node) {
+            Ok(())
+        } else {
+            Err(FsError::NoSuchHandover(vdisk))
+        }
     }
 
     /// The migration failed. The window closes and the disk stays where it

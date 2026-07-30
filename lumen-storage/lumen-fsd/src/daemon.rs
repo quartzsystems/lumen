@@ -388,10 +388,10 @@ impl GuestHandle {
     /// single-writer. But a migration *destination* must open the disk
     /// while the source is still writing it, so an attach that found a
     /// window open toward this node opens **penless**: reads work, writes
-    /// refuse with `NotWriter`, and the pen arrives at
-    /// [`GuestHandle::accept_handover`] — one durable step, no instant
-    /// with two writers. An attach where the peer holds the lease and no
-    /// window names us is somebody else's disk, and is refused.
+    /// refuse with `NotWriter`, and the pen arrives when the *source*
+    /// relinquishes it — one durable step, no instant with two writers. An
+    /// attach where the peer holds the lease and no window names us is
+    /// somebody else's disk, and is refused.
     pub fn attach(&self, vdisk: u64) -> Result<Attach, FsError> {
         // Existence first: a claim on a vdisk that is not here should say
         // so, not report a lease problem.
@@ -419,8 +419,15 @@ impl GuestHandle {
         self.blocking(|engine| engine.begin_handover(vdisk, to))
     }
 
-    /// Take a lease handed to this node: the instant the guest becomes
-    /// ours. Runs on the destination, when the guest starts writing there.
+    /// Hand the pen to the destination — the instant this node stops being
+    /// the writer. Runs on the **source**, once its guest has stopped.
+    pub fn relinquish(&self, vdisk: u64, to: u8) -> Result<(), FsError> {
+        self.blocking(|engine| engine.relinquish(vdisk, to))
+    }
+
+    /// Ask whether the pen has arrived: the destination's half, and a
+    /// question rather than an act. Refuses until the source has handed it
+    /// over, which is what a caller waits on.
     pub fn accept_handover(&self, vdisk: u64) -> Result<(), FsError> {
         self.blocking(|engine| engine.accept_handover(vdisk))
     }
