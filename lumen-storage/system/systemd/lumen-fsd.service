@@ -1,0 +1,48 @@
+[Unit]
+# The LumenFS pool daemon: it serves each vdisk as a ublk block device and
+# replicates writes to the pool's other member. Guest disks are open through
+# it, so its lifetime is a guest's lifetime.
+Description=Lumen pooled storage daemon
+Documentation=https://quartz.systems/
+# ublk is the guest device interface; without the module there is nothing to
+# serve through.
+Requires=modprobe@ublk_drv.service
+After=modprobe@ublk_drv.service network-online.target
+Wants=network-online.target
+# The peer link rides the Core network, which corosync also brings into use;
+# ordering after it keeps a cold boot from opening a replication socket
+# before the cluster has an opinion about who is present.
+After=corosync.service
+
+[Service]
+Type=exec
+# Configuration is a drop-in, not a compiled-in default: the brick path, the
+# node id, and the peer address are per-node facts, and a pool's second
+# member is not knowable at package time. The workflows that create a pool
+# write /etc/lumen/fsd.conf; until one exists the unit stays down, which is
+# what the preset also says.
+EnvironmentFile=/etc/lumen/fsd.conf
+ExecStart=/usr/sbin/lumen-fsd serve ${LUMEN_FSD_BRICK} ${LUMEN_FSD_NODE} \
+    ${LUMEN_FSD_PEER} --control 127.0.0.1:7799
+# Raw disks and io_uring, so: privileged, and not sandboxed into uselessness.
+# The sysctl drop-in (50-lumen-pool.conf) raises io_uring to privileged
+# callers only; this is the privileged caller it was raised for.
+AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_RAWIO
+NoNewPrivileges=no
+# Guest I/O is in flight through this process. A stop must take the exports
+# down in order — cancel parked requests, stop the device, join the queue,
+# delete it — and that is what the daemon does on SIGTERM. Killing it while a
+# request is outstanding leaves a ublk device nobody can complete and nobody
+# can remove until the machine reboots, so the timeout is generous and
+# SIGKILL is the last resort it always is.
+KillSignal=SIGTERM
+TimeoutStopSec=120
+# Deliberately NOT Restart=always. A restarted daemon has no exports, so
+# every guest disk it was serving vanishes underneath a running machine.
+# Coming back needs the machines drained first, which is what the rolling
+# update path does; an unattended restart would turn one crash into every
+# guest losing its disk.
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

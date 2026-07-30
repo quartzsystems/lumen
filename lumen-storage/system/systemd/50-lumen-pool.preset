@@ -1,0 +1,12 @@
+# Lumen: the pooled storage daemon, installed everywhere and running
+# nowhere until a pool exists.
+#
+# Same shape as the cluster stack's preset and for the same reason. The unit
+# needs /etc/lumen/fsd.conf — a brick to serve, this node's id, and the
+# peer's address — and none of that is knowable at package time. A pool is
+# created by a workflow, which writes that file and starts the unit; a node
+# that never joins one never runs it.
+#
+# Disabled rather than absent, so the unit is on disk and inspectable, and so
+# an operator who enables it by hand keeps it enabled across upgrades.
+disable lumen-fsd.service

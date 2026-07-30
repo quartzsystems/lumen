@@ -78,6 +78,21 @@ echo "==> Building lumen-webui (static export)"
 tar -czf "$TOPDIR/SOURCES/lumen-webui.tar.gz" -C "$REPO_ROOT/lumen-webui/out" .
 
 cp "$REPO_ROOT/build/cargo-target-cp/release/lumen-controlplane" "$TOPDIR/SOURCES/"
+
+# --- pooled storage daemon ----------------------------------------------------
+# Its own binary and its own package, because restarting it takes every guest
+# disk down with it — see the note at the top of packages/lumen-fsd.spec. Built
+# here for the same reason the controlplane is: cargo needs the network, and
+# rpmbuild is not where that belongs.
+echo "==> Building lumen-fsd (cargo, release)"
+cargo_fetch_with_retry "$REPO_ROOT/lumen-storage/lumen-fsd/Cargo.toml"
+cargo build --release --locked \
+    --manifest-path "$REPO_ROOT/lumen-storage/lumen-fsd/Cargo.toml" \
+    --target-dir "$REPO_ROOT/build/cargo-target-fsd"
+cp "$REPO_ROOT/build/cargo-target-fsd/release/lumen-fsd" "$TOPDIR/SOURCES/"
+cp "$REPO_ROOT/lumen-storage/system/systemd/lumen-fsd.service" \
+   "$REPO_ROOT/lumen-storage/system/systemd/50-lumen-pool.preset" \
+   "$TOPDIR/SOURCES/"
 # The PAM file shares the daemon's name in-tree; stage it under a distinct
 # source name so it can't collide with the binary in SOURCES/.
 cp "$REPO_ROOT/lumen-controlplane/pam/lumen-controlplane" \
