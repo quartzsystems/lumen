@@ -26,6 +26,7 @@ use lumen_drbd::{MigrationWindow, ReplicatedDisk, Result as SeamResult, VmDiskRe
 use crate::error::{PoolError, Result};
 use crate::fleet::PoolFleet;
 use crate::model::{self, DiskName};
+use crate::state::{self, MemberView, PoolMember, PoolState};
 
 /// How long the source waits for the destination to see the pen arrive.
 /// Generous: it is one op crossing a healthy link, and the alternative to
@@ -96,6 +97,81 @@ impl PoolService {
             size_bytes,
             members,
         }))
+    }
+
+    /// The pool as it is right now — one call, everything a console page
+    /// renders. Read live and never stored: a pool's health is a fact about
+    /// this instant.
+    ///
+    /// **No member's silence fails this.** Asking every member and refusing
+    /// the whole view because one did not answer would blank the page in
+    /// exactly the situation an operator opened it to understand, so a
+    /// member that cannot be reached becomes a [`MemberView::Silent`] beside
+    /// the others and the verdict downgrades to
+    /// [`PoolHealth::Unknown`](crate::state::PoolHealth::Unknown). The
+    /// replicated listings are read from the first member that *does*
+    /// answer, because any member answers the same — and if none does, the
+    /// members are still reported with their reasons.
+    pub async fn state(&self) -> PoolState {
+        let names = match self.fleet.members().await {
+            Ok(names) if !names.is_empty() => names,
+            // No pool here, or a fleet that cannot say: either way there is
+            // nothing to describe, and that is a state rather than an error.
+            _ => return PoolState::none(),
+        };
+
+        let mut members = Vec::with_capacity(names.len());
+        for name in &names {
+            let view = match self.fleet.status(name).await {
+                Ok(status) => MemberView::Answered(status),
+                Err(why) => MemberView::Silent(why.to_string()),
+            };
+            members.push(PoolMember {
+                name: name.clone(),
+                view,
+            });
+        }
+
+        // Exports are per-member, so every member is asked; a silent one
+        // contributes nothing rather than an empty list that would read as
+        // "serving nothing".
+        let answering: Vec<String> = members
+            .iter()
+            .filter(|m| m.view.status().is_some())
+            .map(|m| m.name.clone())
+            .collect();
+        let mut exports: Vec<(String, Vec<u64>)> = Vec::new();
+        for name in &answering {
+            if let Ok(serving) = self.fleet.exports(name).await {
+                exports.push((
+                    name.clone(),
+                    serving.into_iter().map(|(id, _)| id).collect(),
+                ));
+            }
+        }
+
+        // The vdisk listing and the leases are replicated, and they arrived
+        // with the status — so one answering member speaks for the pool and
+        // nothing is asked twice.
+        let vdisks = members
+            .iter()
+            .filter_map(|m| m.view.status())
+            .next()
+            .map(|speaker| {
+                speaker
+                    .vdisks
+                    .iter()
+                    .map(|(vdisk, size_bytes)| {
+                        let lease = speaker
+                            .lease(*vdisk)
+                            .map(|seen| (seen.holder, seen.handing_to));
+                        state::vdisk_view(*vdisk, *size_bytes, lease, &exports)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        PoolState::assemble(members, vdisks)
     }
 }
 

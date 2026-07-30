@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use lumen_drbd::{MigrationWindow, VmDiskRequest, VmVolumes};
-use lumen_pool::{MockFleet, PoolService};
+use lumen_pool::{MemberStatus, MemberView, MockFleet, PoolHealth, PoolService, Replication};
 
 const HERE: &str = "lumen01";
 const THERE: &str = "lumen02";
@@ -274,6 +274,150 @@ async fn placement_is_every_member_and_a_foreign_disk_is_named() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("/dev/drbd1"), "{err}");
+}
+
+/// The observed view is what a console page renders, so what matters is that
+/// it describes the pool an operator actually has: every member named, every
+/// vdisk carrying the machine disk it backs, and the pen shown as a member's
+/// name rather than an engine node id.
+#[tokio::test]
+async fn the_observed_view_describes_the_pool_a_console_would_draw() {
+    let (fleet, service) = pooled();
+    let disk = service
+        .create_disk(&request("vm-7-disk-3", 512 << 20))
+        .await
+        .unwrap();
+
+    let state = service.state().await;
+    assert_eq!(state.health, PoolHealth::Healthy);
+    assert_eq!(
+        state.members.iter().map(|m| &m.name).collect::<Vec<_>>(),
+        vec![HERE, THERE]
+    );
+    assert_eq!(state.answering(), vec![HERE, THERE]);
+
+    let vdisk = state
+        .vdisks
+        .iter()
+        .find(|v| v.device == disk.device)
+        .expect("the created disk should be in the view");
+    assert_eq!(vdisk.label(), "vm-7-disk-3");
+    assert_eq!(vdisk.size_bytes, 512 << 20);
+    assert!(!vdisk.migrating());
+    // Created here, so served here and nowhere else — the asymmetry the
+    // whole service is shaped around, visible in the view.
+    assert_eq!(vdisk.exported_on, vec![HERE]);
+    // And the pen reads back as a member's name, which is what an operator
+    // recognises.
+    assert_eq!(state.member_named(vdisk.holder.unwrap()), Some(HERE));
+
+    // A window in flight is visible as one.
+    service
+        .migration_window(
+            &disk.device,
+            MigrationWindow::Open {
+                destination: THERE.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    let migrating = service.state().await;
+    let vdisk = migrating
+        .vdisks
+        .iter()
+        .find(|v| v.device == disk.device)
+        .unwrap();
+    assert!(vdisk.migrating(), "an open window should show as one");
+    assert_eq!(
+        migrating.member_named(vdisk.handing_to.unwrap()),
+        Some(THERE)
+    );
+    // Both members serve the disk mid-window: that is what penless means.
+    assert_eq!(vdisk.exported_on, vec![HERE, THERE]);
+    let _ = fleet;
+}
+
+/// The case the view exists to get right: one member unreachable. A pool of
+/// two with a silent member is not a healthy pool of one, and the page an
+/// operator opened to find that out must not be the thing that blanks.
+#[tokio::test]
+async fn a_silent_member_downgrades_the_verdict_without_blanking_the_view() {
+    let (fleet, service) = pooled();
+    let disk = service
+        .create_disk(&request("vm-9-disk-0", 1 << 30))
+        .await
+        .unwrap();
+    fleet.silence(
+        THERE,
+        "cannot reach lumen02's pool daemon: connection refused",
+    );
+
+    let state = service.state().await;
+    assert_eq!(
+        state.health,
+        PoolHealth::Unknown,
+        "a pool with a member it cannot see does not get to claim health"
+    );
+    assert_eq!(state.members.len(), 2, "the silent member was dropped");
+    assert_eq!(state.answering(), vec![HERE]);
+    // The reason reaches the console instead of becoming "unknown".
+    let MemberView::Silent(why) = &state.members[1].view else {
+        panic!("expected lumen02 to be silent, got {:?}", state.members[1]);
+    };
+    assert!(why.contains("lumen02"), "{why}");
+
+    // And the rest of the pool is still described — read from the member
+    // that did answer, because the listings are replicated.
+    let vdisk = state
+        .vdisks
+        .iter()
+        .find(|v| v.device == disk.device)
+        .expect("the view should still describe the pool's disks");
+    assert_eq!(vdisk.label(), "vm-9-disk-0");
+    assert_eq!(
+        vdisk.exported_on,
+        vec![HERE],
+        "a silent member should contribute nothing rather than an empty list"
+    );
+}
+
+/// Trouble that was actually observed is reported as trouble — distinct from
+/// not being able to see.
+#[tokio::test]
+async fn a_fenced_survivor_reads_as_degraded_rather_than_unknown() {
+    let (fleet, service) = pooled();
+    for (member, node) in [(HERE, 0u8), (THERE, 1u8)] {
+        fleet.set_status(
+            member,
+            MemberStatus {
+                node,
+                replication: Replication::Degraded,
+                era: 2,
+                accepts_writes: true,
+                segments_free: 3,
+                segments_total: 30,
+                // The mock fills the listings from its own pool state, so
+                // these are what a test pins health with, not the data.
+                vdisks: Vec::new(),
+                leases: Vec::new(),
+                stream: (12, 12, 0),
+            },
+        );
+    }
+    let state = service.state().await;
+    assert_eq!(state.health, PoolHealth::Degraded);
+    let status = state.members[0].view.status().unwrap();
+    assert_eq!(status.era, 2, "a bumped era is what a survivor runs at");
+    assert_eq!(status.free_percent(), Some(10));
+}
+
+#[tokio::test]
+async fn a_node_with_no_pool_has_a_view_that_says_so() {
+    let service = PoolService::new(Arc::new(MockFleet::standalone()), "pool0");
+    let state = service.state().await;
+    assert_eq!(state.health, PoolHealth::None);
+    assert!(state.members.is_empty());
+    assert!(state.vdisks.is_empty());
 }
 
 #[test]

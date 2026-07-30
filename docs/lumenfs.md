@@ -551,8 +551,54 @@ nobody had hit yet: a daemon restart loses its exports, so even a normal
 start of a stopped machine needs the device made again. A test asserts both
 starts ready their devices, and fails if the loop is removed.
 
-Still ahead in phase 3 beyond that: the console pages (pool and vdisk
-views with the snapshot dialog).
+**The observed view exists, and typing it fixed the one reply that was
+still prose.** A console page needs to know what the pool is doing right
+now, so `lumen-pool` gained `state.rs` and `PoolService::state()`: per-member
+replication state, era, brick space, and stream counters, joined with every
+vdisk, the machine disk its id decodes to, who holds its pen, and which
+members are actually serving it as a device. Read live and never stored — a
+pool's health is a fact about this instant, and the same rule `lumen-drbd`'s
+state module follows.
+
+Two rules carried over from the DRBD side shaped these types more than
+anything else. **A member that does not answer is presented, not dropped**:
+a pool of two with one member unreachable is not a healthy pool of one, so
+silence is a variant that carries its reason rather than a row that
+disappears. And **a verdict is never better than its evidence**: with a
+member silent this cannot tell whether the pool is fine or halved, so
+`Unknown` exists and is deliberately *not* folded into `Degraded`. Both are
+sabotage-tested — reversing the verdict's precedence, or filtering silent
+members out of the view, each fails a named test.
+
+Typing the status forced a wire change worth recording. Every other
+machine-read reply became `key=value` in the control-surface slice, but
+`status` was left as prose because nothing typed consumed it yet. It could
+not have survived being parsed: `ReplState` derives `Debug`, and
+`Resyncing { source: true }` renders **with spaces in it**, so a
+space-separated line could never be read past `state`. The direction now
+rides its own key — `state=resyncing sync=source` — absent for the other
+three states rather than filled in with a lie, and a resync with no
+direction is refused, because a target that refuses writes must never read
+as a source that serves them. Nothing is defaulted on a parse failure
+either: a status that reads "era 0, nothing exported" when it could not be
+understood is how an orchestrator concludes a healthy pool is an empty one.
+The formatter and the parser live in different crates, so the round trip is
+pinned against a real daemon rather than a canned string, and the
+appliance's smoke scripts were updated with it — the two-host migration was
+re-run end to end on the new format.
+
+One consequence went the other way and is worth the sentence: because the
+daemon already puts the vdisk and lease listings in the status reply,
+`MemberStatus` carries them. Asking separately would have cost a round trip
+per vdisk to learn who holds each pen — and since the fleet opens a fresh
+control connection per call, a fifty-disk pool would have cost fifty-one
+connections to draw one page.
+
+Still ahead in phase 3 beyond that: the controlplane routes that serve this
+view, and the console pages that render it (pool and vdisk views with the
+snapshot dialog). Also still owed before a pool can be made from the
+console at all: nothing yet writes `/etc/lumen/fsd.conf`, so a pool is
+brought up by hand.
 
 **Phase 5 has begun with placement, which is pure arithmetic and so goes
 first.** `slice.rs` is the whole of "which members hold a block": hash →

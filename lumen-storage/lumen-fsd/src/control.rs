@@ -24,7 +24,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
 
-use lumen_fs::{hash_block, NodeId};
+use lumen_fs::{hash_block, NodeId, ReplState};
 
 use crate::daemon::Daemon;
 
@@ -232,8 +232,31 @@ pub fn command(daemon: &Daemon, line: &str) -> String {
     }
 }
 
+/// The engine's state as one word, plus the direction a resync is going.
+///
+/// `ReplState` derives `Debug`, and `Resyncing { source: true }` renders
+/// with spaces in it — so a `{:?}` here would put a value containing spaces
+/// into a space-separated line, and nothing after `state=` could be parsed.
+/// The direction rides its own key instead, absent for the other three
+/// states rather than filled in with a lie.
+fn state_words(state: ReplState) -> (&'static str, Option<&'static str>) {
+    match state {
+        ReplState::Suspended => ("suspended", None),
+        ReplState::Synced => ("synced", None),
+        ReplState::Degraded => ("degraded", None),
+        ReplState::Resyncing { source: true } => ("resyncing", Some("source")),
+        ReplState::Resyncing { source: false } => ("resyncing", Some("target")),
+    }
+}
+
 fn status_line(daemon: &Daemon) -> String {
     let s = daemon.status();
+    let (state, sync) = state_words(s.state);
+    let vdisks: Vec<String> = s
+        .vdisks
+        .iter()
+        .map(|(id, size)| format!("{id}:{size}"))
+        .collect();
     let leases: Vec<String> = s
         .leases
         .iter()
@@ -249,21 +272,23 @@ fn status_line(daemon: &Daemon) -> String {
             )
         })
         .collect();
-    format!(
-        "node {} state {:?} era {} writes {} vdisks {:?} leases [{}] free {}/{} \
-         stream sent={} durable={} applied={}",
-        s.node,
-        s.state,
+    let mut line = format!("node={} state={state}", s.node);
+    if let Some(sync) = sync {
+        line.push_str(&format!(" sync={sync}"));
+    }
+    line.push_str(&format!(
+        " era={} writes={} free={}/{} vdisks={} leases={} sent={} durable={} applied={}",
         s.era,
         if s.accepts_writes { "open" } else { "held" },
-        s.vdisks,
-        leases.join(","),
         s.space.segments_free,
         s.space.segments_total,
+        vdisks.join(","),
+        leases.join(","),
         s.stream.0,
         s.stream.1,
         s.stream.2,
-    )
+    ));
+    line
 }
 
 /// A deterministic content hash of a whole vdisk (a hash of per-chunk
@@ -299,6 +324,134 @@ pub struct LeaseView {
     pub holder: NodeId,
     pub era: u64,
     pub handing_to: Option<NodeId>,
+}
+
+/// One member's whole picture in one round trip: who it is, what the
+/// replication is doing, how much brick is left, and every vdisk with its
+/// pen. The console renders a pool from one of these per member, which is
+/// why it carries the listings rather than making the caller ask again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusView {
+    pub node: NodeId,
+    pub state: ReplState,
+    pub era: u64,
+    /// False while writes refuse — suspended without a verdict, or a resync
+    /// target about to be replaced.
+    pub accepts_writes: bool,
+    pub segments_free: u64,
+    pub segments_total: u64,
+    pub vdisks: Vec<(u64, u64)>,
+    pub leases: Vec<(u64, LeaseView)>,
+    /// `(sent, peer_confirmed_durable, applied_from_peer)` — the counters
+    /// that convicted the elided-flush bug, so they are worth carrying.
+    pub stream: (u64, u64, u64),
+}
+
+/// Parse `1:0@3->1,2:1@3` — the lease listing inside a status line.
+fn parse_leases(field: &str) -> Option<Vec<(u64, LeaseView)>> {
+    if field.is_empty() {
+        return Some(Vec::new());
+    }
+    field
+        .split(',')
+        .map(|entry| {
+            let (vdisk, rest) = entry.split_once(':')?;
+            let (rest, handing_to) = match rest.split_once("->") {
+                Some((rest, to)) => (rest, Some(to.parse().ok()?)),
+                None => (rest, None),
+            };
+            let (holder, era) = rest.split_once('@')?;
+            Some((
+                vdisk.parse().ok()?,
+                LeaseView {
+                    holder: holder.parse().ok()?,
+                    era: era.parse().ok()?,
+                    handing_to,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Parse `1:1073741824,2:536870912` — a `(id, bytes)` listing.
+fn parse_sized(field: &str) -> Option<Vec<(u64, u64)>> {
+    if field.is_empty() {
+        return Some(Vec::new());
+    }
+    field
+        .split(',')
+        .map(|entry| {
+            let (id, size) = entry.split_once(':')?;
+            Some((id.parse().ok()?, size.parse().ok()?))
+        })
+        .collect()
+}
+
+/// Parse a whole status reply. Keys are read by name, not position, so a
+/// later field can be added without breaking a caller — and anything
+/// missing or malformed is refused rather than defaulted, because a status
+/// that reads `era 0, nothing exported` when it could not be parsed is how
+/// an orchestrator concludes a healthy pool is empty.
+fn parse_status(reply: &str) -> Option<StatusView> {
+    let mut node = None;
+    let mut state = None;
+    let mut sync = None;
+    let mut era = None;
+    let mut writes = None;
+    let mut free = None;
+    let mut total = None;
+    let mut vdisks = None;
+    let mut leases = None;
+    let (mut sent, mut durable, mut applied) = (None, None, None);
+    for token in reply.split_whitespace() {
+        let (key, value) = token.split_once('=')?;
+        match key {
+            "node" => node = Some(value.parse().ok()?),
+            "state" => state = Some(value),
+            "sync" => sync = Some(value),
+            "era" => era = Some(value.parse().ok()?),
+            "writes" => {
+                writes = Some(match value {
+                    "open" => true,
+                    "held" => false,
+                    _ => return None,
+                })
+            }
+            "free" => {
+                let (f, t) = value.split_once('/')?;
+                free = Some(f.parse().ok()?);
+                total = Some(t.parse().ok()?);
+            }
+            "vdisks" => vdisks = Some(parse_sized(value)?),
+            "leases" => leases = Some(parse_leases(value)?),
+            "sent" => sent = Some(value.parse().ok()?),
+            "durable" => durable = Some(value.parse().ok()?),
+            "applied" => applied = Some(value.parse().ok()?),
+            // An unknown key is a newer daemon, not a broken one.
+            _ => {}
+        }
+    }
+    let state = match (state?, sync) {
+        ("suspended", _) => ReplState::Suspended,
+        ("synced", _) => ReplState::Synced,
+        ("degraded", _) => ReplState::Degraded,
+        ("resyncing", Some("source")) => ReplState::Resyncing { source: true },
+        ("resyncing", Some("target")) => ReplState::Resyncing { source: false },
+        // Resyncing without a direction says less than nothing: guessing
+        // would make a target that refuses writes look like a serving source.
+        _ => return None,
+    };
+    Some(StatusView {
+        node: node?,
+        state,
+        era: era?,
+        accepts_writes: writes?,
+        segments_free: free?,
+        segments_total: total?,
+        vdisks: vdisks?,
+        leases: leases?,
+        stream: (sent?, durable?, applied?),
+    })
 }
 
 /// A connection to one daemon's control surface.
@@ -353,8 +506,11 @@ impl Client {
         }
     }
 
-    pub fn status(&mut self) -> Result<String, String> {
-        self.ask("status")
+    /// The member's whole picture, typed. `ask("status")` still returns the
+    /// raw line for an operator or a log.
+    pub fn status(&mut self) -> Result<StatusView, String> {
+        let reply = self.ask("status")?;
+        parse_status(&reply).ok_or(format!("unintelligible status: {reply}"))
     }
 
     pub fn vdisks(&mut self) -> Result<Vec<(u64, u64)>, String> {
@@ -563,10 +719,115 @@ mod tests {
         // empty — the first shape below — and a client that read it as a
         // parse failure would report a healthy pool as broken. `ok:` with
         // an empty tail means the same and is tolerated.
-        let mut client = responder(vec!["ok", "ok:", "ok"]);
+        let mut client = responder(vec!["ok", "ok:"]);
         assert_eq!(client.vdisks().unwrap(), vec![]);
         assert_eq!(client.exports().unwrap(), vec![]);
-        assert_eq!(client.status().unwrap(), "");
+    }
+
+    /// A status line is the one reply a program reads in full, so it is
+    /// parsed by key rather than position — and an empty pool answers with
+    /// empty listings, not with missing ones.
+    #[test]
+    fn a_status_line_reads_back_as_the_daemon_meant_it() {
+        let mut client = responder(vec![
+            "ok: node=1 state=synced era=3 writes=open free=29/30 \
+             vdisks=1:1073741824,2:536870912 leases=1:0@3,2:1@3->0 \
+             sent=5 durable=5 applied=2",
+            "ok: node=0 state=resyncing sync=target era=2 writes=held free=1/30 \
+             vdisks= leases= sent=0 durable=0 applied=0",
+        ]);
+        let status = client.status().unwrap();
+        assert_eq!(status.node, 1);
+        assert_eq!(status.state, ReplState::Synced);
+        assert_eq!(status.era, 3);
+        assert!(status.accepts_writes);
+        assert_eq!((status.segments_free, status.segments_total), (29, 30));
+        assert_eq!(status.vdisks, vec![(1, 1073741824), (2, 536870912)]);
+        assert_eq!(
+            status.leases,
+            vec![
+                (
+                    1,
+                    LeaseView {
+                        holder: 0,
+                        era: 3,
+                        handing_to: None
+                    }
+                ),
+                (
+                    2,
+                    LeaseView {
+                        holder: 1,
+                        era: 3,
+                        handing_to: Some(0)
+                    }
+                ),
+            ]
+        );
+        assert_eq!(status.stream, (5, 5, 2));
+
+        // A resync target: the direction rides its own key, and an empty
+        // pool's listings are empty rather than absent.
+        let target = client.status().unwrap();
+        assert_eq!(target.state, ReplState::Resyncing { source: false });
+        assert!(!target.accepts_writes, "a resync target refuses writes");
+        assert_eq!(target.vdisks, vec![]);
+        assert_eq!(target.leases, vec![]);
+    }
+
+    /// The formatter and the parser are one contract; a round trip through
+    /// both is what keeps them from drifting apart in separate edits.
+    #[test]
+    fn every_state_survives_the_round_trip_including_the_one_with_a_direction() {
+        for state in [
+            ReplState::Suspended,
+            ReplState::Synced,
+            ReplState::Degraded,
+            ReplState::Resyncing { source: true },
+            ReplState::Resyncing { source: false },
+        ] {
+            let (word, sync) = state_words(state);
+            let mut line = format!("node=0 state={word}");
+            if let Some(sync) = sync {
+                line.push_str(&format!(" sync={sync}"));
+            }
+            line.push_str(" era=1 writes=open free=1/2 vdisks= leases= sent=0 durable=0 applied=0");
+            assert_eq!(
+                parse_status(&line).map(|s| s.state),
+                Some(state),
+                "{line} did not survive"
+            );
+        }
+    }
+
+    #[test]
+    fn a_status_line_that_says_nothing_useful_is_not_guessed_at() {
+        // Defaulting a missing field is how an orchestrator concludes that a
+        // healthy pool is an empty one, so every one of these is refused.
+        for nonsense in [
+            "",
+            "ok",
+            "node=0",
+            // A resync with no direction: a target that refuses writes must
+            // never read as a source that serves them.
+            "node=0 state=resyncing era=1 writes=open free=1/2 vdisks= leases= \
+             sent=0 durable=0 applied=0",
+            // The old prose format, which is what this replaced.
+            "node 0 state Synced era 1 writes open vdisks [] leases [] free 1/2",
+            // Malformed pieces of an otherwise good line.
+            "node=x state=synced era=1 writes=open free=1/2 vdisks= leases= \
+             sent=0 durable=0 applied=0",
+            "node=0 state=synced era=1 writes=maybe free=1/2 vdisks= leases= \
+             sent=0 durable=0 applied=0",
+            "node=0 state=synced era=1 writes=open free=1 vdisks= leases= \
+             sent=0 durable=0 applied=0",
+            "node=0 state=synced era=1 writes=open free=1/2 vdisks=1 leases= \
+             sent=0 durable=0 applied=0",
+            "node=0 state=synced era=1 writes=open free=1/2 vdisks= leases=1:0 \
+             sent=0 durable=0 applied=0",
+        ] {
+            assert_eq!(parse_status(nonsense), None, "{nonsense} was parsed anyway");
+        }
     }
 
     #[test]
@@ -575,6 +836,7 @@ mod tests {
             "error: no vdisk 404 exists in this pool",
             "ok: 1=not-a-number",
             "ok: era=3",
+            "ok: node=0 state=synced",
             "surprise",
         ]);
         assert_eq!(
@@ -586,6 +848,10 @@ mod tests {
         assert!(
             client.lease(1).is_err(),
             "a lease with no holder is not a lease"
+        );
+        assert!(
+            client.status().is_err(),
+            "half a status is not a status — it must not be defaulted out"
         );
         assert!(client.status().is_err(), "a non-reply is an error");
     }

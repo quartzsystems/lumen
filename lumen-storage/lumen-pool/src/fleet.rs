@@ -20,6 +20,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 
 use crate::error::{PoolError, Result};
+use crate::state::{LeaseSeen, MemberStatus, Replication};
 
 /// What a member's daemon can be asked. Names are cluster node names; the
 /// `u8` ids are the node ids the engine's leases speak.
@@ -31,6 +32,12 @@ pub trait PoolFleet: Send + Sync {
 
     /// The engine's node id for a member, which is what a lease names.
     async fn node_id(&self, member: &str) -> Result<u8>;
+
+    /// Everything one member says about itself in a single round trip:
+    /// replication state, era, brick space, stream counters. The console's
+    /// view is built from one of these per member, so it is one call rather
+    /// than five.
+    async fn status(&self, member: &str) -> Result<MemberStatus>;
 
     /// Every vdisk the pool holds, as `(id, size_bytes)`. Replicated
     /// state, so any member answers the same.
@@ -91,6 +98,12 @@ struct MockInner {
     /// Per member, the vdisks it is serving — the asymmetry that matters.
     exports: BTreeMap<String, Vec<u64>>,
     fail_next_export: bool,
+    /// What a member reports about itself, when a test cares. Absent means
+    /// the plausible default: Synced, era 1, room to spare.
+    statuses: BTreeMap<String, MemberStatus>,
+    /// Members whose daemon cannot be reached — the case a view must
+    /// present rather than drop.
+    silent: BTreeMap<String, String>,
 }
 
 pub struct MockFleet {
@@ -119,6 +132,24 @@ impl MockFleet {
     /// Make the next export fail once — the moment a create must unwind.
     pub fn fail_next_export(&self) {
         self.inner.lock().unwrap().fail_next_export = true;
+    }
+
+    /// Make a member report something other than the healthy default.
+    pub fn set_status(&self, member: &str, status: MemberStatus) {
+        self.inner
+            .lock()
+            .unwrap()
+            .statuses
+            .insert(member.to_string(), status);
+    }
+
+    /// Make a member's daemon unreachable, with a reason.
+    pub fn silence(&self, member: &str, why: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .silent
+            .insert(member.to_string(), why.to_string());
     }
 
     /// Which vdisks a member is serving right now.
@@ -175,6 +206,44 @@ impl PoolFleet for MockFleet {
     async fn node_id(&self, member: &str) -> Result<u8> {
         let inner = self.inner.lock().unwrap();
         MockFleet::id_of(&inner, member)
+    }
+
+    async fn status(&self, member: &str) -> Result<MemberStatus> {
+        let inner = self.inner.lock().unwrap();
+        let node = MockFleet::id_of(&inner, member)?;
+        if let Some(why) = inner.silent.get(member) {
+            return Err(PoolError::Backend(why.clone()));
+        }
+        // The listings come from the mock's own state whether or not a test
+        // pinned the health, so a status can never disagree with what the
+        // other verbs would answer about the same pool.
+        let vdisks = inner.vdisks.iter().map(|(id, size)| (*id, *size)).collect();
+        let leases = inner
+            .leases
+            .iter()
+            .map(|(vdisk, lease)| {
+                (
+                    *vdisk,
+                    LeaseSeen {
+                        holder: lease.holder,
+                        era: 1,
+                        handing_to: lease.handing_to,
+                    },
+                )
+            })
+            .collect();
+        let pinned = inner.statuses.get(member);
+        Ok(MemberStatus {
+            node,
+            replication: pinned.map_or(Replication::Synced, |s| s.replication),
+            era: pinned.map_or(1, |s| s.era),
+            accepts_writes: pinned.is_none_or(|s| s.accepts_writes),
+            segments_free: pinned.map_or(20, |s| s.segments_free),
+            segments_total: pinned.map_or(30, |s| s.segments_total),
+            vdisks,
+            leases,
+            stream: pinned.map_or((0, 0, 0), |s| s.stream),
+        })
     }
 
     async fn vdisks(&self, member: &str) -> Result<Vec<(u64, u64)>> {

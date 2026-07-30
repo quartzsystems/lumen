@@ -24,10 +24,11 @@
 use std::net::SocketAddr;
 
 use async_trait::async_trait;
-use lumen_fsd::Client;
+use lumen_fsd::{Client, ReplState};
 
 use crate::error::{PoolError, Result};
 use crate::fleet::PoolFleet;
+use crate::state::{LeaseSeen, MemberStatus, Replication};
 
 /// Every member's control address, this node first.
 pub struct SocketFleet {
@@ -81,11 +82,50 @@ impl PoolFleet for SocketFleet {
     }
 
     async fn node_id(&self, member: &str) -> Result<u8> {
-        let status = self.on(member, |client| client.status()).await?;
-        node_id_of(&status).ok_or_else(|| {
-            PoolError::Backend(format!(
-                "{member}'s daemon did not say which node it is: {status}"
-            ))
+        Ok(self.status(member).await?.node)
+    }
+
+    async fn status(&self, member: &str) -> Result<MemberStatus> {
+        // A status the client could not parse is a `Conflict` by `on`'s
+        // mapping, but nothing was learned about the pool — so it is
+        // reported as a backend failure like an unreachable daemon.
+        let view = self
+            .on(member, |client| client.status())
+            .await
+            .map_err(|err| match err {
+                PoolError::Conflict(why) => PoolError::Backend(format!(
+                    "{member}'s daemon did not answer for itself: {why}"
+                )),
+                other => other,
+            })?;
+        Ok(MemberStatus {
+            node: view.node,
+            replication: match view.state {
+                ReplState::Suspended => Replication::Suspended,
+                ReplState::Synced => Replication::Synced,
+                ReplState::Degraded => Replication::Degraded,
+                ReplState::Resyncing { source } => Replication::Resyncing { source },
+            },
+            era: view.era,
+            accepts_writes: view.accepts_writes,
+            segments_free: view.segments_free,
+            segments_total: view.segments_total,
+            vdisks: view.vdisks,
+            leases: view
+                .leases
+                .into_iter()
+                .map(|(vdisk, lease)| {
+                    (
+                        vdisk,
+                        LeaseSeen {
+                            holder: lease.holder,
+                            era: lease.era,
+                            handing_to: lease.handing_to,
+                        },
+                    )
+                })
+                .collect(),
+            stream: view.stream,
         })
     }
 
@@ -145,37 +185,9 @@ impl PoolFleet for SocketFleet {
     }
 }
 
-/// The node id out of a status line: `node 0 state Synced era 1 …`.
-fn node_id_of(status: &str) -> Option<u8> {
-    let mut words = status.split_whitespace();
-    while let Some(word) = words.next() {
-        if word == "node" {
-            return words.next()?.parse().ok();
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_node_id_comes_from_the_daemons_own_status() {
-        // Configuring this separately is how the two come to disagree, so it
-        // is parsed from what the daemon says about itself.
-        let real = "node 1 state Synced era 3 writes open vdisks [(1, 1024)] \
-                    leases [1:1@3] free 29/30 stream sent=5 durable=5 applied=0";
-        assert_eq!(node_id_of(real), Some(1));
-        assert_eq!(node_id_of("node 0 state Suspended era 1"), Some(0));
-    }
-
-    #[test]
-    fn a_status_line_that_says_nothing_useful_is_not_guessed_at() {
-        for nonsense in ["", "ok", "state Synced era 1", "node", "node x", "node 999"] {
-            assert_eq!(node_id_of(nonsense), None, "{nonsense} was parsed anyway");
-        }
-    }
 
     #[test]
     fn a_member_outside_the_pool_is_named_rather_than_dialed() {

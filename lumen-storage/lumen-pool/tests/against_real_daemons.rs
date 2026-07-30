@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lumen_fsd::{control, format_brick, Config, Daemon};
-use lumen_pool::{PoolFleet, SocketFleet};
+use lumen_pool::{PoolFleet, Replication, SocketFleet};
 
 const DISK_BYTES: u64 = 64 << 20;
 const VDISK_BYTES: u64 = 8 << 20;
@@ -116,6 +116,58 @@ async fn the_fleet_reaches_both_daemons_and_their_ids_are_their_own() {
     let here = fleet.vdisks("lumen01").await.unwrap();
     assert_eq!(here, vec![(1, VDISK_BYTES)]);
     assert_eq!(fleet.vdisks("lumen02").await.unwrap(), here);
+}
+
+/// The status line is written by the daemon and read by the fleet, and the
+/// two halves live in different crates — so the round trip is pinned against
+/// a **real** daemon rather than a canned string. A formatter and a parser
+/// that agree only in a unit test are one edit from agreeing nowhere.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_real_daemon_describes_itself_and_the_fleet_reads_every_field() {
+    let (fleet, _a, _b) = real_pool("status");
+    wait_until("the pair to sync", || {
+        futures_lite_block(fleet.status("lumen01"))
+            .is_ok_and(|s| s.replication == Replication::Synced)
+    });
+
+    let status = fleet.status("lumen01").await.unwrap();
+    assert_eq!(status.node, 0);
+    assert_eq!(status.replication, Replication::Synced);
+    assert!(status.accepts_writes, "a synced member takes writes");
+    assert!(status.era >= 1, "era should be a real generation");
+    assert!(
+        status.segments_total > 0 && status.segments_free <= status.segments_total,
+        "brick space came back nonsense: {status:?}"
+    );
+    assert!(status.free_percent().is_some());
+
+    // The peer answers for itself, with its own id.
+    assert_eq!(fleet.status("lumen02").await.unwrap().node, 1);
+
+    // And the listings inside the line parse: a real write moves the stream
+    // counters, which is the field that convicted the elided-flush bug.
+    let vdisk = 2;
+    fleet
+        .create_vdisk("lumen01", vdisk, VDISK_BYTES)
+        .await
+        .unwrap();
+    wait_until("the vdisk to reach both members", || {
+        futures_lite_block(fleet.status("lumen02"))
+            .is_ok_and(|s| s.vdisks.iter().any(|(id, _)| *id == vdisk))
+    });
+    let status = fleet.status("lumen01").await.unwrap();
+    assert!(
+        status.vdisks.contains(&(vdisk, VDISK_BYTES)),
+        "the vdisk listing did not survive the round trip: {status:?}"
+    );
+    assert!(
+        status.leases.iter().any(|(id, _)| *id == vdisk),
+        "the lease listing did not survive the round trip: {status:?}"
+    );
+    assert!(
+        status.stream.0 > 0,
+        "creating a vdisk should have crossed the wire: {status:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

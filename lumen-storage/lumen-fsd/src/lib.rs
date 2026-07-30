@@ -30,5 +30,8 @@ pub mod nbd;
 pub mod ublk;
 pub mod wire;
 
-pub use control::Client;
+pub use control::{Client, LeaseView, StatusView};
 pub use daemon::{format_brick, Config, Daemon, GuestHandle, Status};
+/// Re-exported because [`StatusView`] names it: a caller reading a member's
+/// status should not need a dependency on the engine crate to match on it.
+pub use lumen_fs::ReplState;

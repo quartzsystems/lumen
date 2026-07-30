@@ -447,7 +447,7 @@ fn an_orchestrator_drives_a_whole_migration_over_the_control_protocol() {
 
     // And the node-wide verbs answer, including the cross-member
     // diagnostic that says whether the two really agree.
-    assert!(source("status").contains("state Synced"));
+    assert!(source("status").contains("state=synced"));
     assert_eq!(source("checkpoint"), "ok");
     assert!(source("scrub").contains("corrupt=0"));
     assert_eq!(

@@ -11,6 +11,7 @@
 //!   fleet.rs    the pool's members as something callable, plus a mock
 //!   socket.rs   the fleet for real: a control connection per member
 //!   service.rs  the five verbs, as naming and fan-out
+//!   state.rs    observed pool state: the shapes a console page renders
 //!   error.rs    what goes wrong, and how the compute domain reads it
 //! ```
 //!
@@ -20,19 +21,23 @@
 //! the daemon for the rest, which is why there is no record to fall out of
 //! step with the pool.
 //!
-//! **What is not here yet**: the console's render and state modules, and
-//! the HA materialization step described on
-//! `PoolService::migration_window` — the one thing that keeps a pooled disk
-//! from failing over.
+//! **What is not here yet**: the controlplane routes that serve
+//! [`PoolService::state`] and the console pages that render it, and the
+//! pool-creation workflow — nothing yet writes `/etc/lumen/fsd.conf`, so a
+//! pool is still brought up by hand.
 
 pub mod error;
 pub mod fleet;
 pub mod model;
 pub mod service;
 pub mod socket;
+pub mod state;
 
 pub use error::{PoolError, Result};
 pub use fleet::{MockFleet, PoolFleet};
 pub use model::{device_path, vdisk_of_device, DiskName, DISKS_PER_MACHINE};
 pub use service::PoolService;
 pub use socket::SocketFleet;
+pub use state::{
+    LeaseSeen, MemberStatus, MemberView, PoolHealth, PoolMember, PoolState, Replication, VdiskView,
+};
