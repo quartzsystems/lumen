@@ -249,10 +249,51 @@ at every unmount. The module doc had warned that an export that quietly
 swallows flushes passes every casual test; it was right, it was this
 export, and only a kill-mid-stream test could have said so.
 
-Still ahead in phase 3: the compute-side integration (the narrow
-`VmVolumes`-shaped trait over vdisks and leases), HA sweep eligibility,
-and the console pages; then the slice map that takes this past two
-nodes.
+**The compute seam, mapped.** The next slice is surveyed and its shape
+decided, so it is written here rather than rediscovered. The seam is
+`lumen_drbd::VmVolumes` (lumen-drbd/src/vm.rs) — five async methods, and
+`VirtService` holds it as `Arc<dyn VmVolumes>`, so a LumenFS-backed
+implementation slots into `VirtService::new` without one compute change.
+The mapping:
+
+- `create_disk` → create the vdisk through the daemon (replicated op),
+  export it as `/dev/ublkb<id>` **on every member** — the stable
+  identical path is the contract — and return that device with the
+  pool's member list. Vdisk id, ublk id, and the record entry are one
+  allocation, recorded as a sibling collection on `ClusterRecord`
+  (`#[serde(default)]`, the `volumes: Vec<VolumeRecord>` pattern).
+- `disk_of` → parse `/dev/ublkb<N>`, answer from the records; `None`
+  for anything else — the predicate the callers lean on.
+- `destroy_disk` → detach the exports, delete the vdisk (replicated),
+  drop the record. Refused while snapshots pin it, as the engine already
+  insists.
+- `common_members` → for pooled vdisks: every member that can reach a
+  quorate pool — which is the phase-3 HA-eligibility change arriving
+  through the seam ha.rs already uses (`ha.rs:114`), with no sweep
+  changes at all. Two members while Synced; the survivor while
+  Degraded.
+- `set_two_primaries(device, allow)` → the lease window, and here the
+  seam needs one honest adjustment: DRBD's window is symmetric, but a
+  handover names its destination, and `accept` must run on the
+  *destination* when the guest starts writing there. So the LumenFS
+  implementation takes the window verbs through the daemon —
+  `begin_handover` on the source at open; on close, `accept_handover`
+  on the destination when the migration succeeded and `abort_handover`
+  on the source when it did not — which likely means the trait's window
+  method grows a destination parameter (or a sibling method), decided
+  when the implementation lands.
+
+Two consequences the export must absorb first: the daemon needs vdisk
+lifecycle verbs on its control surface (today it serves exactly vdisk 1
+via a boot flag), and the ublk attach must stop claiming the writer
+lease unconditionally — a migration destination opens the device
+*without* the pen, and writes refuse until the handover's accept. The
+claim moves to "first attach outside a window", which the lease state
+already distinguishes.
+
+Still ahead in phase 3 beyond that: the console pages (pool and vdisk
+views with the snapshot dialog); then the slice map that takes this past
+two nodes.
 
 ## Burning it in
 
