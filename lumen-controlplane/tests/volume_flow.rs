@@ -170,6 +170,7 @@ fn harness(tag: &str, membership: &EnvironmentMembership) -> Harness {
         cluster: cluster.clone(),
         peers: Arc::new(lumen_controlplane::inventory::NoPeers),
         drbd,
+        pool: lumen_controlplane::pool::PoolPresence::Absent,
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
         updates: Arc::new(lumen_update::UpdateService::new(
             Arc::new(lumen_update::MockUpdates::new()),

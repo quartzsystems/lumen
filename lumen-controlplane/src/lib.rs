@@ -6,6 +6,7 @@ pub mod ha;
 pub mod inventory;
 pub mod maintenance;
 pub mod peers;
+pub mod pool;
 pub mod realm;
 pub mod security;
 pub mod tasks;
@@ -65,6 +66,10 @@ pub struct AppState {
     /// the cluster and storage domains, which is why it is constructed after
     /// both.
     pub drbd: Arc<DrbdService>,
+    /// The LumenFS pool on this node's cluster, if there is one — decided by
+    /// the daemon's own drop-in at startup, never by a second record. On a
+    /// pooled node this is also the engine `virt` holds as its `VmVolumes`.
+    pub pool: pool::PoolPresence,
     /// What this node could install, and installing it. Depends on nothing
     /// else here: the packages waiting for a node are a fact about the node,
     /// not about its machines or its cluster.

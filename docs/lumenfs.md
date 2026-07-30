@@ -665,12 +665,59 @@ disagree. A file that exists but does not say what it must is an error
 rather than an absent pool, so a half-written drop-in cannot hide behind a
 console page that cheerfully reports nothing to show.
 
-Still ahead in phase 3: the control plane's half of the peer channel (a
-route carrying `PoolVerb`, and `PoolPeers` over the existing authenticated
-transport), the routes that serve the observed view and the snapshot verbs,
-and the console pages that render them. Pool *creation* stays with phase
-4's drive wizard, where choosing which disks become bricks belongs — until
-then `/etc/lumen/fsd.conf` is written by hand.
+**Phase 3 closes with the control plane and the console.** The peer
+channel's pool half is `impl PoolPeers for HttpPeerChannel` plus one route,
+`/api/peer/pool/verb`: a member's control plane asks another to run one of
+the closed enum's verbs against its own daemon over its own loopback, under
+the same peer tickets and environment CA as every other member-to-member
+call — and there is deliberately no local short-circuit, because
+`PeeredFleet` already routes the local member straight to loopback, so a
+request for this node arriving over HTTPS is a routing bug and is refused
+by name rather than buried. Writing that route's test found a bug shipped
+with the enum itself: `PoolAnswer` was internally tagged, and internal
+tagging cannot serialize a newtype variant holding a sequence or a string —
+`Vdisks` and `Device` would have failed at runtime on the first real call.
+The round-trip test had covered `Status`, the one variant whose content is
+a map, which is the one shape internal tagging happens to allow. The enum
+is adjacently tagged now and the test sweeps **every** variant of both
+enums.
+
+The control plane decides whether this node carries a pool the same way
+everything else about the pool is decided — by reading, not remembering:
+`PoolPresence` is `Absent` (no drop-in: the standalone appliance, or a
+DRBD cluster), `Broken` (a drop-in that exists but could not be assembled,
+shown as its own sentence because "nothing to show" and "your deployment
+is broken" must never look alike), or `Present`. On a pooled node the pool
+service **is** the `VmVolumes` the compute domain gets — the seam's
+promise, kept in `main.rs` with four lines and no compute change — and the
+engine choice is exactly "one engine per cluster ever" made mechanical.
+
+The operator surface is `GET /api/storage/pool` (the observed view, one
+read) plus snapshot/delete/rollback routes addressed by the disk's *name* —
+`vm-7-disk-3`, the same fact as the device path without the slashes in it —
+and the console's Volumes page gains a Pooled Storage section beside the
+replicated one: members with replication state, era, and brick space
+(a silent member shown unreachable with its reason, never dropped), vdisks
+with their writer as a member's name, an open migration window as
+`source → destination`, and the snapshot dialog — take, list, delete, and
+rollback behind the same acknowledgement the DRBD dialog requires, with
+snapshot ids minted as Unix seconds so the list reads as history. At most
+one of the two sections renders, because a cluster runs one engine.
+
+The route tests run the real router: the observed view changing as the
+verbs run, the rollback guard refusing unacknowledged and refusing while
+served, the name-only addressing, and the peer verb executed against a
+**real daemon** on loopback — plus the two authentication rules, a browser
+cookie never opening the peer surface and a verb outside the closed enum
+never running anything.
+
+Pool *creation* stays with phase 4's drive wizard, where choosing which
+disks become bricks belongs — until then `/etc/lumen/fsd.conf` is written
+by hand, and `PoolPresence` reads whatever it says. Owed to the burn-in
+ledger rather than to phase 3: a seam-driven migration between the two
+real machines (the fleet and peer route are proven against real daemons
+in-process; the two-controlplane run needs a pool wired under the
+appliances' own control planes, which is the deployment phase 4 builds).
 
 **Phase 5 has begun with placement, which is pure arithmetic and so goes
 first.** `slice.rs` is the whole of "which members hold a block": hash →

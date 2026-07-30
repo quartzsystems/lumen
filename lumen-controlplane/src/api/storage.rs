@@ -363,3 +363,147 @@ pub async fn delete_iso(
     state.storage.delete_iso(&pool, &name).await?;
     Ok(Json(serde_json::json!({ "storage": pool, "name": name })))
 }
+
+// --- the LumenFS pool --------------------------------------------------------
+
+/// GET /api/storage/pool — the pooled storage on this node's cluster, as it
+/// is right now.
+///
+/// Three honest shapes in one response. `pool: null, error: null` is the
+/// standalone appliance (or a DRBD cluster): the console renders no section
+/// at all. `pool: null, error: "..."` is a drop-in that exists but could not
+/// be assembled — a broken deployment, shown as its own sentence rather than
+/// hidden behind an empty page. And a present pool is the observed view:
+/// every member's answer or its silence, every vdisk with its snapshots.
+#[derive(Debug, serde::Serialize)]
+pub struct PooledStorageResponse {
+    pub pool: Option<PooledStorageView>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct PooledStorageView {
+    /// The pool is named for its cluster, so this page and the machine
+    /// pages call the same thing by the same name.
+    pub name: String,
+    #[serde(flatten)]
+    pub state: lumen_pool::PoolState,
+}
+
+pub async fn pooled_storage(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<PooledStorageResponse>, ApiError> {
+    Ok(Json(match &state.pool {
+        crate::pool::PoolPresence::Absent => PooledStorageResponse {
+            pool: None,
+            error: None,
+        },
+        crate::pool::PoolPresence::Broken(why) => PooledStorageResponse {
+            pool: None,
+            error: Some(why.clone()),
+        },
+        crate::pool::PoolPresence::Present { service, .. } => PooledStorageResponse {
+            pool: Some(PooledStorageView {
+                name: service.name().to_string(),
+                state: service.state().await,
+            }),
+            error: None,
+        },
+    }))
+}
+
+/// The routes below address a disk by the compute domain's name for it —
+/// `vm-7-disk-3` — because the device path has slashes in it and the name is
+/// the same fact in another form. Anything else is refused by name.
+fn pooled_device(name: &str) -> Result<String, ApiError> {
+    lumen_pool::DiskName::parse(name)
+        .and_then(|disk| disk.vdisk())
+        .map(lumen_pool::device_path)
+        .ok_or_else(|| {
+            ApiError::NotFound(format!(
+                "{name} is not a pooled machine disk (vm-<vmid>-disk-<n>)"
+            ))
+        })
+}
+
+fn pool_service(state: &AppState) -> Result<&Arc<lumen_pool::PoolService>, ApiError> {
+    state
+        .pool
+        .service()
+        .ok_or_else(|| ApiError::Conflict("this node carries no LumenFS pool".into()))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PoolSnapshotRequest {
+    /// The snapshot's id. The console passes Unix seconds so ids sort and
+    /// display as the moments they are; the engine refuses a duplicate.
+    snapshot: u64,
+}
+
+/// POST /api/storage/pool/disks/{name}/snapshots — take one. Replicated by
+/// the engine: one member is told, both have it.
+pub async fn snapshot_pooled_disk(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    raw: Body,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let request: PoolSnapshotRequest = required_body(raw)?;
+    let device = pooled_device(&name)?;
+    pool_service(&state)?
+        .snapshot(&device, request.snapshot)
+        .await?;
+    Ok(Json(serde_json::json!({ "taken": true })))
+}
+
+/// DELETE /api/storage/pool/disks/{name}/snapshots/{snapshot} — drop one,
+/// releasing whatever it alone was pinning.
+pub async fn delete_pooled_snapshot(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    Path((name, snapshot)): Path<(String, u64)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let device = pooled_device(&name)?;
+    pool_service(&state)?
+        .delete_snapshot(&device, snapshot)
+        .await?;
+    Ok(Json(serde_json::json!({ "deleted": true })))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PoolRollbackRequest {
+    snapshot: u64,
+    #[serde(default)]
+    i_understand_this_may_lose_data: bool,
+}
+
+/// POST /api/storage/pool/disks/{name}/rollback — put the disk back to a
+/// snapshot, discarding everything written since.
+///
+/// The service refuses while the disk is open anywhere in the pool — a
+/// member serving it, or a member that cannot say — and this handler
+/// refuses without the acknowledgement, because "discards everything
+/// written since" is a sentence an operator must have read.
+pub async fn rollback_pooled_disk(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    raw: Body,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let request: PoolRollbackRequest = required_body(raw)?;
+    if !request.i_understand_this_may_lose_data {
+        return Err(ApiError::Conflict(
+            "rolling back discards everything written since the snapshot; acknowledge with \
+             i_understand_this_may_lose_data"
+                .into(),
+        ));
+    }
+    let device = pooled_device(&name)?;
+    pool_service(&state)?
+        .rollback(&device, request.snapshot)
+        .await?;
+    Ok(Json(serde_json::json!({ "rolled_back": true })))
+}

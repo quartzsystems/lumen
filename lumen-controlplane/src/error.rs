@@ -215,6 +215,19 @@ impl From<lumen_drbd::DrbdError> for ApiError {
     }
 }
 
+impl From<lumen_pool::PoolError> for ApiError {
+    fn from(err: lumen_pool::PoolError) -> Self {
+        match err {
+            lumen_pool::PoolError::NotFound(message) => ApiError::NotFound(message),
+            lumen_pool::PoolError::Conflict(message) => ApiError::Conflict(message),
+            // "No pool here" is a state the caller can act on, not a broken
+            // backend — the same reading the compute seam gives it.
+            lumen_pool::PoolError::Unavailable(message) => ApiError::Conflict(message),
+            lumen_pool::PoolError::Backend(message) => ApiError::Internal(anyhow::anyhow!(message)),
+        }
+    }
+}
+
 impl From<anyhow::Error> for ApiError {
     fn from(err: anyhow::Error) -> Self {
         ApiError::Internal(err)

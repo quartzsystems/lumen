@@ -78,8 +78,14 @@ pub enum PoolVerb {
 
 /// What a verb answered. One variant per shape rather than a string, so a
 /// caller cannot read a device path as a lease.
+///
+/// Adjacently tagged, not internally: internal tagging cannot serialize a
+/// newtype variant holding a sequence or a string — `Vdisks` and `Device`
+/// would fail at runtime, on the wire, on the first real call. The
+/// round-trip test below covers **every** variant because the one it
+/// originally covered was the one shape internal tagging happens to allow.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "answer", rename_all = "kebab-case")]
+#[serde(tag = "answer", content = "value", rename_all = "kebab-case")]
 pub enum PoolAnswer {
     Status(MemberStatus),
     Vdisks(Vec<(u64, u64)>),
@@ -592,35 +598,81 @@ mod tests {
         // round-trip — and it is a closed set, not a command string.
         for verb in [
             PoolVerb::Status,
+            PoolVerb::Vdisks,
             PoolVerb::CreateVdisk {
                 vdisk: 1795,
                 size_bytes: 512 << 20,
             },
-            PoolVerb::Handover { vdisk: 1795, to: 1 },
+            PoolVerb::DeleteVdisk { vdisk: 1795 },
+            PoolVerb::Export { vdisk: 1795 },
+            PoolVerb::Unexport { vdisk: 1795 },
+            PoolVerb::Exports,
+            PoolVerb::Snapshot {
+                vdisk: 1795,
+                snapshot: 7,
+            },
+            PoolVerb::Snapshots { vdisk: None },
+            PoolVerb::Snapshots { vdisk: Some(1795) },
+            PoolVerb::DeleteSnapshot {
+                vdisk: 1795,
+                snapshot: 7,
+            },
+            PoolVerb::Rollback {
+                vdisk: 1795,
+                snapshot: 7,
+            },
             PoolVerb::Lease { vdisk: 1795 },
+            PoolVerb::Handover { vdisk: 1795, to: 1 },
+            PoolVerb::Relinquish { vdisk: 1795, to: 1 },
+            PoolVerb::Abort { vdisk: 1795 },
+            PoolVerb::Accept { vdisk: 1795 },
         ] {
             let json = serde_json::to_string(&verb).unwrap();
             assert_eq!(serde_json::from_str::<PoolVerb>(&json).unwrap(), verb);
         }
-        let answer = PoolAnswer::Status(MemberStatus {
-            node: 1,
-            replication: Replication::Resyncing { source: false },
-            era: 4,
-            accepts_writes: false,
-            segments_free: 1,
-            segments_total: 30,
-            vdisks: vec![(1795, 512 << 20)],
-            leases: vec![(
-                1795,
-                LeaseSeen {
-                    holder: 0,
-                    era: 4,
-                    handing_to: Some(1),
-                },
-            )],
-            stream: (9, 9, 3),
-        });
-        let json = serde_json::to_string(&answer).unwrap();
-        assert_eq!(serde_json::from_str::<PoolAnswer>(&json).unwrap(), answer);
+        // EVERY answer variant, deliberately: the tagging that looked fine
+        // for `Status` — a map, the one shape internal tagging allows —
+        // failed at serialization for a sequence or a string, and only a
+        // sweep of the whole enum catches the next variant added wrong.
+        for answer in [
+            PoolAnswer::Status(MemberStatus {
+                node: 1,
+                replication: Replication::Resyncing { source: false },
+                era: 4,
+                accepts_writes: false,
+                segments_free: 1,
+                segments_total: 30,
+                vdisks: vec![(1795, 512 << 20)],
+                leases: vec![(
+                    1795,
+                    LeaseSeen {
+                        holder: 0,
+                        era: 4,
+                        handing_to: Some(1),
+                    },
+                )],
+                stream: (9, 9, 3),
+            }),
+            PoolAnswer::Vdisks(vec![(1795, 512 << 20), (2, 8 << 20)]),
+            PoolAnswer::Vdisks(Vec::new()),
+            PoolAnswer::Exports(vec![(1795, "/dev/ublkb1795".into())]),
+            PoolAnswer::Snapshots(vec![(1795, 7, 512 << 20)]),
+            PoolAnswer::Device("/dev/ublkb1795".into()),
+            PoolAnswer::Lease(Some(LeaseSeen {
+                holder: 0,
+                era: 4,
+                handing_to: None,
+            })),
+            PoolAnswer::Lease(None),
+            PoolAnswer::Done,
+        ] {
+            let json = serde_json::to_string(&answer)
+                .unwrap_or_else(|err| panic!("{answer:?} would not even serialize: {err}"));
+            assert_eq!(
+                serde_json::from_str::<PoolAnswer>(&json).unwrap(),
+                answer,
+                "{json} did not survive"
+            );
+        }
     }
 }

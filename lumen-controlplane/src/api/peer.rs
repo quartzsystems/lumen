@@ -16,6 +16,7 @@ use axum::Json;
 
 use crate::error::ApiError;
 use crate::inventory::NodeInventory;
+use crate::pool::PoolPresence;
 use crate::security::PeerSession;
 use crate::AppState;
 use lumen_cluster::{
@@ -578,4 +579,44 @@ pub async fn drop_definition(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     state.cluster.peer_drop_definition(payload.vmid)?;
     Ok(Json(serde_json::json!({ "dropped": true })))
+}
+
+/// POST /api/peer/pool/verb — run one pool verb against **this node's own
+/// daemon**, on behalf of another member's control plane.
+///
+/// This route exists because the daemon's control surface is loopback-only
+/// by design: `fence-peer` lives on it, and a fence verdict arriving from
+/// off-box is not something the appliance accepts. So a member that needs a
+/// device exported *here* — a migration destination, a rollback checking
+/// exports — asks this control plane, and this control plane speaks to its
+/// own daemon over its own loopback. Each daemon is only ever addressed by
+/// the machine it runs on.
+///
+/// The verb is a closed enum, deserialized before anything runs: a peer can
+/// ask for one of the named verbs and nothing else.
+pub async fn pool_verb(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+    Json(verb): Json<lumen_pool::PoolVerb>,
+) -> Result<Json<lumen_pool::PoolAnswer>, ApiError> {
+    let PoolPresence::Present { control, .. } = &state.pool else {
+        // Absent and Broken answer the same sentence: either way there is
+        // no daemon here to run the verb, and the pool-wide caller treats
+        // both as this member refusing.
+        return Err(ApiError::Conflict(
+            "this node carries no pool daemon".into(),
+        ));
+    };
+    let control = *control;
+    let answer = tokio::task::spawn_blocking(move || {
+        // Blocking client, blocking pool — the same discipline as the
+        // fleet's own local calls.
+        let mut client = lumen_pool::Client::connect(control)
+            .map_err(|err| format!("this node's pool daemon did not answer: {err}"))?;
+        lumen_pool::execute(&mut client, &verb)
+    })
+    .await
+    .map_err(|err| ApiError::Internal(anyhow::anyhow!("the pool verb never ran: {err}")))?
+    .map_err(ApiError::Conflict)?;
+    Ok(Json(answer))
 }

@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use lumen_cluster::backend::cli::CliBackend as ClusterCliBackend;
 use lumen_cluster::ClusterService;
 use lumen_controlplane::config::Config;
+use lumen_controlplane::pool::PoolPresence;
 use lumen_controlplane::realm::{lumen::LumenRealm, RealmRegistry};
 use lumen_controlplane::{app, security, tls, AppState};
 use lumen_drbd::backend::cli::CliBackend as DrbdCliBackend;
@@ -169,6 +170,20 @@ async fn main() -> Result<()> {
     ));
     peers.bind_volumes(drbd.clone());
 
+    // The LumenFS pool, if this node carries one — decided by the daemon's
+    // own drop-in, never a second record. One engine per cluster ever: a
+    // pooled node's machines live on vdisks, so the pool service is also
+    // the `VmVolumes` the compute domain gets below; everywhere else the
+    // DRBD path stays exactly what it was.
+    let pool = PoolPresence::assemble(&cluster, peers.clone());
+    match &pool {
+        PoolPresence::Absent => {}
+        PoolPresence::Broken(why) => {
+            tracing::error!("the pool configuration is unusable: {why}")
+        }
+        PoolPresence::Present { .. } => tracing::info!("this node serves a LumenFS pool"),
+    }
+
     // Virtual machines. The hypervisor is a privileged daemon reached over its
     // own socket, exactly as networking reaches NetworkManager over the bus —
     // so the unit's hardening stays as it is. Same failure policy: an operator
@@ -186,11 +201,15 @@ async fn main() -> Result<()> {
     // Constructed last, and given the other three: a machine needs a bridge
     // to attach to and a volume — local or replicated — to boot from, while
     // none of those domains has any reason to know a machine exists.
+    let vm_volumes: Arc<dyn lumen_drbd::VmVolumes> = match &pool {
+        PoolPresence::Present { service, .. } => service.clone(),
+        _ => drbd.clone(),
+    };
     let virt = Arc::new(VirtService::new(
         virt_backend,
         storage.clone(),
         network.clone(),
-        drbd.clone(),
+        vm_volumes,
     ));
 
     // Updates. Constructed after clustering only because it wants the node's
@@ -287,6 +306,7 @@ async fn main() -> Result<()> {
         cluster,
         peers,
         drbd,
+        pool,
         updates,
         tasks: lumen_controlplane::tasks::TaskLog::open(state_dir.join("vm-tasks.jsonl")),
         drain: Default::default(),

@@ -37,6 +37,11 @@ lumen-cluster = { path = "../lumen-storage/lumen-cluster" }
 # two domains above it; reads drbdsetup, hands drbdadm to systemd, links
 # nothing.
 lumen-drbd = { path = "../lumen-storage/lumen-drbd" }
+# The LumenFS pool: the other engine behind the same compute seam. Reads the
+# daemon's own drop-in to decide whether this node carries one, and speaks
+# only to the local daemon's loopback control surface — every other member is
+# reached through the peer channel above.
+lumen-pool = { path = "../lumen-storage/lumen-pool" }
 # The peer channel: one control plane calling another over TLS. hyper and
 # hyper-util are already under axum; tokio-rustls is already under
 # axum-server; http-body-util already backs the tests. Naming them makes the
@@ -94,6 +99,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
+# The peer pool-verb route speaks to a real daemon over a real loopback
+# socket, and the test brings one up in-process rather than mocking the one
+# hop the route exists to make.
+lumen-fsd = { path = "../lumen-storage/lumen-fsd" }
 
 [profile.release]
 lto = true

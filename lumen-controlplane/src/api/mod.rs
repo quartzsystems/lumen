@@ -290,6 +290,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/peer/volume/apply-policy",
             post(peer::apply_volume_policy),
         )
+        // The pool half of the peer surface: one closed verb enum, run
+        // against this node's own daemon over its own loopback — the only
+        // way a pool daemon is ever addressed from off-box.
+        .route("/api/peer/pool/verb", post(peer::pool_verb))
         .route("/api/peer/definition/store", post(peer::store_definition))
         .route("/api/peer/definition/drop", post(peer::drop_definition))
         // The node itself: its local accounts, and its power state. Every
@@ -358,6 +362,22 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/storage/replicated/{cluster}/{name}/resolve-split-brain",
             post(storage::resolve_split_brain),
+        )
+        // The LumenFS pool: the observed view, and the snapshot verbs. Disks
+        // are addressed by the compute domain's name for them — the device
+        // path is the same fact with slashes in it.
+        .route("/api/storage/pool", get(storage::pooled_storage))
+        .route(
+            "/api/storage/pool/disks/{name}/snapshots",
+            post(storage::snapshot_pooled_disk),
+        )
+        .route(
+            "/api/storage/pool/disks/{name}/snapshots/{snapshot}",
+            delete(storage::delete_pooled_snapshot),
+        )
+        .route(
+            "/api/storage/pool/disks/{name}/rollback",
+            post(storage::rollback_pooled_disk),
         )
         .route("/api/storage/iso", get(storage::isos))
         .route("/api/storage/iso/{pool}", post(storage::create_iso_store))

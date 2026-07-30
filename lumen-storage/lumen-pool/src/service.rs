@@ -50,6 +50,11 @@ impl PoolService {
         }
     }
 
+    /// The pool's name — its cluster's, so every page calls it one thing.
+    pub fn name(&self) -> &str {
+        &self.pool
+    }
+
     /// The pool's members, this node first — or a refusal that says there is
     /// no pool here rather than returning an empty list nobody checks.
     async fn members(&self) -> Result<Vec<String>> {

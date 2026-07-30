@@ -25,10 +25,11 @@
 //! the daemon for the rest, which is why there is no record to fall out of
 //! step with the pool.
 //!
-//! **What is not here yet**: the controlplane routes that serve
-//! [`PoolService::state`] and the console pages that render it, and the
-//! pool-creation workflow — nothing yet writes `/etc/lumen/fsd.conf`, so a
-//! pool is still brought up by hand.
+//! **What is not here**: the pool-creation workflow. Nothing writes
+//! `/etc/lumen/fsd.conf` — that is phase 4's drive wizard, where choosing
+//! which disks become bricks belongs — so a pool is brought up by hand and
+//! everything above (the controlplane's routes, the console's pages) reads
+//! whatever that file says.
 
 pub mod config;
 pub mod error;
@@ -42,6 +43,9 @@ pub mod state;
 pub use config::PoolConfig;
 pub use error::{PoolError, Result};
 pub use fleet::{MockFleet, PoolFleet};
+/// Re-exported for whoever serves a peer's verb: [`execute`] takes one of
+/// these, and the caller should not need the daemon crate to make it.
+pub use lumen_fsd::Client;
 pub use model::{device_path, vdisk_of_device, DiskName, DISKS_PER_MACHINE};
 pub use peers::{execute, PeeredFleet, PoolAnswer, PoolPeers, PoolVerb};
 pub use service::PoolService;

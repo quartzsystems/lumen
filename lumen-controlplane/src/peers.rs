@@ -977,3 +977,63 @@ impl VolumePeers for HttpPeerChannel {
         .await
     }
 }
+
+/// The pool half: one member's control plane asking another to run a verb
+/// against its own daemon.
+///
+/// Unlike the volume half above, there is **no local short-circuit** — the
+/// pool daemon's control surface is loopback-only and `PeeredFleet` already
+/// routes the local member straight to it, so a request for this node
+/// arriving here is a routing bug, and dialing our own HTTPS to ask
+/// ourselves would only bury it. It is refused by name instead.
+#[async_trait]
+impl lumen_pool::PoolPeers for HttpPeerChannel {
+    async fn run(
+        &self,
+        member: &str,
+        verb: lumen_pool::PoolVerb,
+    ) -> lumen_pool::Result<lumen_pool::PoolAnswer> {
+        use lumen_pool::PoolError;
+
+        let backend = |err: ClusterError| PoolError::Backend(err.to_string());
+        let service = self.service().map_err(backend)?;
+        let record = service
+            .environment_record()
+            .map_err(backend)?
+            .ok_or_else(|| {
+                PoolError::Backend(
+                    "this node has not joined an environment, so no peer can be reached".into(),
+                )
+            })?;
+        let node = record
+            .nodes
+            .iter()
+            .find(|n| n.name == member)
+            .ok_or_else(|| {
+                PoolError::NotFound(format!("{member} is not in the environment record"))
+            })?;
+        if self.is_local(node) {
+            return Err(PoolError::Backend(format!(
+                "a pool verb for {member} was routed through the peer channel to itself — \
+                 the local daemon is reached over loopback, never over HTTPS"
+            )));
+        }
+        // A rollback checkpoints and an export waits on a kernel, so the
+        // generous deadline is the honest one.
+        self.call(
+            &node.address,
+            "/api/peer/pool/verb",
+            &verb,
+            self.ca_client_config().map_err(backend)?,
+            Some(self.peer_ticket().map_err(backend)?),
+            SLOW_CALL_DEADLINE,
+        )
+        .await
+        .map_err(|err| match err {
+            // The peer's own sentence — a daemon refusal carried across
+            // intact, which is what the fleet's callers act on.
+            ClusterError::Conflict(message) => PoolError::Conflict(message),
+            other => PoolError::Backend(other.to_string()),
+        })
+    }
+}

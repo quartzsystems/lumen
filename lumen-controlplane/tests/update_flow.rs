@@ -142,6 +142,7 @@ async fn harness(tag: &str, mock: MockUpdates) -> Harness {
         cluster,
         peers: Arc::new(lumen_controlplane::inventory::NoPeers),
         drbd,
+        pool: lumen_controlplane::pool::PoolPresence::Absent,
         updates: Arc::new(UpdateService::new(updates.clone(), "lumen")),
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
         drain: Default::default(),

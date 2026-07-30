@@ -155,6 +155,7 @@ fn harness_with_storage(
         cluster,
         peers: Arc::new(lumen_controlplane::inventory::NoPeers),
         drbd,
+        pool: lumen_controlplane::pool::PoolPresence::Absent,
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
         updates: Arc::new(lumen_update::UpdateService::new(
             Arc::new(lumen_update::MockUpdates::new()),
@@ -958,6 +959,7 @@ async fn a_cluster_create_reports_per_node_per_step_progress_and_completes() {
         cluster,
         peers: Arc::new(lumen_controlplane::inventory::NoPeers),
         drbd,
+        pool: lumen_controlplane::pool::PoolPresence::Absent,
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
         updates: Arc::new(lumen_update::UpdateService::new(
             Arc::new(lumen_update::MockUpdates::new()),
