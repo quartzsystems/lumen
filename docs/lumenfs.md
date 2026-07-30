@@ -354,9 +354,21 @@ last four steps — each one unblocking the next:
 Both were diagnosed the same way — thread wait-channels on the live box,
 which named the exact kernel function each side was parked in — and
 neither was reachable from the simulation or from a test that never tore
-an export down while its node was suspended. The first is confirmed on
-hardware; the second is proven by a test that fails without the fix, with
-its hardware run still owed (see below).
+an export down while its node was suspended. Both are confirmed on
+hardware: with the peer killed unfenced and a guest write parked,
+`unexport` now returns in **under a second** where it previously never
+returned, the parked write gets an honest `EIO`, no device is left
+behind, and the control surface keeps answering — three rounds, with the
+migration story re-run alongside to show the reordering cost it nothing.
+
+One thing that recovery taught, and it is the daemon's own contract
+paying off: the wedge was cleared **without a reboot** by restarting the
+dead peer. Suspended I/O waits for a verdict *or a peer*, and the peer
+link is independent of the control surface — so bringing the peer back
+ended the suspension, completed the parked write two-node, released the
+frozen queue, and let the stuck teardown finish on its own. A node whose
+control surface is blocked is not necessarily a node that needs the power
+cycled.
 
 **An operational rule the second one taught, worth stating for anyone who
 ever debugs this daemon: never `kill -9` a ublk server while a guest
