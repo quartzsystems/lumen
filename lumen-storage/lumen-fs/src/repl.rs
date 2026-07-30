@@ -332,6 +332,13 @@ impl<D: Disk> ReplNode<D> {
         self.state
     }
 
+    /// The stream position, for observability: ops sent, ops the peer has
+    /// confirmed durable, ops applied from the peer. A survivor's claim of
+    /// honesty is checkable from outside only if these are visible.
+    pub fn stream_counters(&self) -> (u64, u64, u64) {
+        (self.next_rseq - 1, self.durable_rseq, self.applied_rseq)
+    }
+
     pub fn node(&self) -> NodeId {
         self.node
     }

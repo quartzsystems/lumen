@@ -22,3 +22,9 @@ license = "MIT"
 
 [dependencies]
 lumen-fs = { path = "../lumen-fs" }
+
+# The ublk export's system edge: syscalls, mmap, errno names. Boring on
+# purpose — hand-rolled inline-asm syscalls would be cleverness in the
+# exact place guest data crosses the kernel boundary.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

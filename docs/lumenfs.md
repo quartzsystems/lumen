@@ -190,10 +190,69 @@ was dead for. Three findings from building it, each now pinned by a test:
   condition rather than sleeping on the world: the daemon has no
   polling in its data path, only in its edges.
 
-Still ahead in phase 3: the ublk export on this daemon, the compute-side
-integration (the narrow `VmVolumes`-shaped trait over vdisks and
-leases), HA sweep eligibility, and the console pages; then the slice map
-that takes this past two nodes.
+**The ublk export is real, and it ran on the real kernel.** A vdisk is a
+block device now — `/dev/ublkb<id>`, the same id on every member, exactly
+the stable-path shape `domain_xml.rs` already leans on. The split honors
+what can be verified where: `ublk/uapi.rs` transcribes the 6.12 kernel
+interface with layout tests that run on every dev box (a wrong offset is
+guest corruption on hardware, caught on a laptop as arithmetic);
+`ublk/uring.rs` is a minimal hand-rolled io_uring — setup, three mmaps,
+uring_cmd submit, wait — with unsafe confined to one file; the server is
+one queue of thirty-two kernel-copied buffers whose every operation lands
+on the daemon's guest path, so replication, the flush contract, and
+suspension apply to the block device by construction. The device
+advertises a volatile cache on purpose: that is what makes the kernel
+*send* flushes, and a flush completes only on the engine's two-node (or
+verdict-backed) acknowledgement — an export that quietly swallowed
+flushes would pass every casual test and lose acknowledged writes at the
+first power cut. Discard maps to trim at whole-block granularity;
+write-zeroes writes literal zeros, which dedupe makes nearly free and
+which trim's advisory semantics could not honestly promise.
+
+Run against lumen1's EL10 kernel, not just written: ext4 on the export,
+hundreds of megabytes round-tripped checksum-stable through cache drops
+and remounts, fstrim honored, engine scrub clean — and then the whole
+failover story as one script: a filesystem written through node A's
+device with two-node acknowledgement, A killed uncleanly, B fenced by
+verdict, and the same filesystem mounted from B's own brick,
+byte-identical, twenty-plus rounds. Three things the kernel taught that
+the header file does not say:
+
+- **EL10 ships io_uring disabled** (`kernel.io_uring_disabled=2`), so the
+  export dies at setup with EPERM until a sysctl opens it. The appliance
+  needs a `sysctl.d` drop-in in the storage package — recorded as a
+  packaging follow-on, and the kind of default that would have cost a
+  support call in the field.
+- ADD_DEV with an explicit device id demands the no-queue sentinel
+  (`queue_id = 0xFFFF`) in the control command, or answers EINVAL.
+- The driver requires 128-byte SQEs on both rings — including the data
+  ring, whose 16-byte commands would fit a plain SQE.
+
+And the failover loop earned its keep: roughly one round in fifteen, the
+filesystem mounted from B was missing its acknowledged tail — 2,300-odd
+operations that an fsync-backed `dd` and a clean unmount had supposedly
+committed two-node. The engine was innocent, and proving that is what
+took the time: the failed brick scrubbed clean, hashes matched at every
+stage, and content-addressing left nothing to hide behind. The bug was
+one anonymous bit in the export: `attrs: 1 << 1` is ROTATIONAL, not
+VOLATILE_CACHE (`1 << 2`), so the block layer treated the device as
+write-through and **elided every flush** — fsync succeeded without the
+durability contract ever engaging, and the "committed" tail was just
+whatever had happened to drain across the wire before the kill. What
+convicted it was observability added for the hunt: the daemon's stream
+counters showed `durable=0` after a "successful" fsync — in the passing
+rounds too, which is the tell that a guarantee is being skipped rather
+than raced. The attrs are named constants now, the smoke asserts
+`durable > 0` after every fsync-backed write as a permanent regression
+guard, and forty consecutive failover rounds pass with `sent == durable`
+at every unmount. The module doc had warned that an export that quietly
+swallows flushes passes every casual test; it was right, it was this
+export, and only a kill-mid-stream test could have said so.
+
+Still ahead in phase 3: the compute-side integration (the narrow
+`VmVolumes`-shaped trait over vdisks and leases), HA sweep eligibility,
+and the console pages; then the slice map that takes this past two
+nodes.
 
 ## Burning it in
 

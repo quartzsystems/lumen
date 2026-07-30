@@ -24,6 +24,7 @@
 
 pub mod daemon;
 pub mod nbd;
+pub mod ublk;
 pub mod wire;
 
 pub use daemon::{format_brick, Config, Daemon, GuestHandle, Status};

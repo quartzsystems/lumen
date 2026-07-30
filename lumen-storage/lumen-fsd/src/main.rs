@@ -37,10 +37,12 @@ fn main() -> ExitCode {
             args.get(5).map(String::as_str),
         ),
         Some("serve") if args.len() >= 5 => cmd_serve(&args[2..]),
+        Some("ublk-del") if args.len() == 3 => cmd_ublk_del(&args[2]),
         _ => {
             eprintln!("usage: lumen-fsd format <file> <disk-bytes> <vdisk-bytes> [pool-uuid-hex]");
-            eprintln!("       lumen-fsd serve  <file> <node-id> --listen <addr> [--nbd <addr>] [--control <addr>]");
-            eprintln!("       lumen-fsd serve  <file> <node-id> --dial   <addr> [--nbd <addr>] [--control <addr>]");
+            eprintln!("       lumen-fsd serve  <file> <node-id> --listen <addr> [--nbd <addr>] [--ublk <dev-id>] [--control <addr>]");
+            eprintln!("       lumen-fsd serve  <file> <node-id> --dial   <addr> [--nbd <addr>] [--ublk <dev-id>] [--control <addr>]");
+            eprintln!("       lumen-fsd ublk-del <dev-id>   # clean up after an unclean death");
             return ExitCode::from(2);
         }
     };
@@ -117,6 +119,23 @@ fn cmd_format(
     Ok(())
 }
 
+fn cmd_ublk_del(dev_id: &str) -> Result<(), String> {
+    let dev_id: u32 = dev_id
+        .parse()
+        .map_err(|_| format!("not a device id: {dev_id}"))?;
+    #[cfg(target_os = "linux")]
+    {
+        lumen_fsd::ublk::delete_device(dev_id)?;
+        println!("ublk device {dev_id} stopped and deleted");
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = dev_id;
+        Err("the ublk export needs a Linux kernel".into())
+    }
+}
+
 fn cmd_serve(args: &[String]) -> Result<(), String> {
     let brick = PathBuf::from(&args[0]);
     let node: u8 = args[1]
@@ -126,9 +145,18 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
     let mut dial = None;
     let mut nbd_addr = None;
     let mut control_addr = None;
+    let mut ublk_dev: Option<u32> = None;
     let mut rest = args[2..].iter();
     while let Some(flag) = rest.next() {
         let value = rest.next().ok_or_else(|| format!("{flag} needs a value"))?;
+        if flag == "--ublk" {
+            ublk_dev = Some(
+                value
+                    .parse()
+                    .map_err(|_| format!("not a device id: {value}"))?,
+            );
+            continue;
+        }
         let addr: SocketAddr = value
             .parse()
             .map_err(|_| format!("not an address: {value}"))?;
@@ -158,6 +186,19 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
         println!("nbd export on {addr}");
         let guest = daemon.guest();
         threads.push(std::thread::spawn(move || nbd::serve(listener, guest)));
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(dev_id) = ublk_dev {
+        let guest = daemon.guest();
+        threads.push(std::thread::spawn(move || {
+            if let Err(err) = lumen_fsd::ublk::serve(guest, dev_id) {
+                eprintln!("ublk export failed: {err}");
+            }
+        }));
+    }
+    #[cfg(not(target_os = "linux"))]
+    if ublk_dev.is_some() {
+        return Err("the ublk export needs a Linux kernel".into());
     }
     if let Some(addr) = control_addr {
         let listener =
@@ -223,7 +264,7 @@ fn control_command(daemon: &Daemon, command: &str) -> String {
                 })
                 .collect();
             format!(
-                "node {} state {:?} era {} writes {} vdisks {:?} leases [{}] free {}/{}",
+                "node {} state {:?} era {} writes {} vdisks {:?} leases [{}] free {}/{} stream sent={} durable={} applied={}",
                 s.node,
                 s.state,
                 s.era,
@@ -232,6 +273,9 @@ fn control_command(daemon: &Daemon, command: &str) -> String {
                 leases.join(","),
                 s.space.segments_free,
                 s.space.segments_total,
+                s.stream.0,
+                s.stream.1,
+                s.stream.2,
             )
         }
         "fence-peer" => match daemon.fence_peer() {
@@ -258,6 +302,43 @@ fn control_command(daemon: &Daemon, command: &str) -> String {
             ),
             Err(err) => format!("error: {err}"),
         },
-        _ => "error: unknown command (status, fence-peer, checkpoint, gc, scrub)".into(),
+        _ => {
+            if let Some(vdisk) = command.strip_prefix("hash ") {
+                return match vdisk.parse::<u64>() {
+                    Ok(vdisk) => match vdisk_content_hash(daemon, vdisk) {
+                        Ok(hash) => format!("ok: {hash}"),
+                        Err(err) => format!("error: {err}"),
+                    },
+                    Err(_) => format!("error: not a vdisk id: {vdisk}"),
+                };
+            }
+            "error: unknown command (status, fence-peer, checkpoint, gc, scrub, hash <vdisk>)"
+                .into()
+        }
     }
+}
+
+/// A deterministic content hash of a whole vdisk (hash of per-chunk
+/// hashes), for comparing two nodes' answers from the outside — the
+/// diagnostic that localizes "who lost it" when a byte goes missing.
+fn vdisk_content_hash(daemon: &Daemon, vdisk: u64) -> Result<String, String> {
+    const CHUNK: u64 = 16 << 20;
+    let guest = daemon.guest();
+    let size = guest.vdisk_size(vdisk).map_err(|err| err.to_string())?;
+    let mut digests = Vec::new();
+    let mut offset = 0;
+    while offset < size {
+        let len = CHUNK.min(size - offset);
+        let chunk = guest
+            .read(vdisk, offset, len)
+            .map_err(|err| err.to_string())?;
+        digests.extend_from_slice(hash_block(&chunk).as_bytes());
+        offset += len;
+    }
+    let combined = hash_block(&digests);
+    Ok(combined
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
 }

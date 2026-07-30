@@ -80,6 +80,8 @@ pub struct Status {
     pub vdisks: Vec<(u64, u64)>,
     pub leases: Vec<(u64, Lease)>,
     pub space: BrickStats,
+    /// `(sent, peer_confirmed_durable, applied_from_peer)`.
+    pub stream: (u64, u64, u64),
 }
 
 struct Outbound {
@@ -340,6 +342,11 @@ impl GuestHandle {
     pub fn vdisk_size(&self, vdisk: u64) -> Result<u64, FsError> {
         self.shared.with_engine(|engine| engine.vdisk_size(vdisk))
     }
+
+    /// The pool's block size — what exports report as optimal I/O.
+    pub fn block_size(&self) -> u32 {
+        self.shared.with_engine(|engine| engine.pool().block_size())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -406,6 +413,7 @@ fn run_session(shared: &Arc<Shared>, mut stream: TcpStream) {
     // open the session in the engine.
     *shared.live_socket.lock().unwrap() = stream.try_clone().ok();
     let incarnation = shared.session_up();
+    eprintln!("peer session {incarnation} up (node {})", theirs.node);
 
     let writer = {
         let shared = Arc::clone(shared);
@@ -437,6 +445,7 @@ fn run_session(shared: &Arc<Shared>, mut stream: TcpStream) {
 
     let _ = stream.shutdown(Shutdown::Both);
     shared.session_down(incarnation);
+    eprintln!("peer session {incarnation} down");
     let _ = writer.join();
 }
 
@@ -637,6 +646,7 @@ impl Daemon {
             vdisks: engine.pool().vdisks(),
             leases: engine.pool().leases(),
             space: engine.pool().space(),
+            stream: engine.stream_counters(),
         })
     }
 
