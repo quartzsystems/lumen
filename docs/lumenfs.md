@@ -503,18 +503,36 @@ pooled HA eligibility — placement is by content hash, so no member holds a
 better share of any one disk than another, and `ha.rs` needs no change at
 all.
 
-**Two things this slice deliberately leaves open.** The fleet — the trait
-the service calls — has a mock that refuses what the daemon refuses (an
-export whose pen another member holds, a handover nobody opened, a device
-that is not there), but its implementation over real sockets is not written
-yet: a `lumen_fsd::Client` per member behind `spawn_blocking`, which is
-mechanical. And **an HA restart does not pass through `migration_window`**,
-so nothing exports the device on the survivor. Two ways to close that,
-neither chosen: let the export happen at attach time on any member — which
-means relaxing the daemon's "somebody else's disk" refusal into a penless
-open — or give the seam a verb for "make this device exist here". Until
-then pooled disks migrate but do not fail over, and saying so is better
-than shipping a sweep that half-works.
+**The fleet is real now too.** `SocketFleet` is a control connection per
+member per call, each behind `spawn_blocking` — a connection per call
+because these are administrative verbs rather than a data path, and holding
+connections that can go stale while nobody is looking buys nothing but
+liveness checks and half-open sockets discovered mid-verb. The node ids the
+leases speak are *asked for* rather than configured: a daemon reports its
+own id in `status`, and duplicating that in configuration is how the two
+come to disagree. Four tests drive it against two real daemons over real
+sockets — ids, replicated creation and deletion, and a lease actually
+moving between two engines with the destination refused until the source
+hands over — leaving only the ublk export untested here, since that needs a
+kernel and lives in the appliance smoke scripts.
+
+**And the failover gap is closed.** The sweep starts a machine on a
+survivor without passing through a migration window, so nothing had
+exported the device there. Investigating it corrected a wrong assumption
+worth recording: the *lease* was never the obstacle — after a fence verdict
+the era bumps, the dead holder's lease stops binding, and the attach claims
+successfully. The only missing step was that nobody called `export`.
+
+So the seam gained a verb, `ensure_local_device(device)`, and the compute
+domain calls it in `start_domain` — the one chokepoint every start passes
+through, `adopt` and ordinary starts alike. DRBD's implementation is a
+lookup and nothing else, because its device exists wherever the resource
+does; LumenFS exports if it is not already serving, leaving an existing
+export alone rather than cycling it out from under whatever is using it.
+Putting it on every start rather than only the HA path also fixes a case
+nobody had hit yet: a daemon restart loses its exports, so even a normal
+start of a stopped machine needs the device made again. A test asserts both
+starts ready their devices, and fails if the loop is removed.
 
 Still ahead in phase 3 beyond that: the console pages (pool and vdisk
 views with the snapshot dialog).

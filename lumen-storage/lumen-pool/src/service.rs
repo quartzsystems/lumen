@@ -202,6 +202,46 @@ impl VmVolumes for PoolService {
         Ok(members)
     }
 
+    /// Make the device exist here, because a machine is about to start.
+    ///
+    /// This is the verb an HA restart needs and the reason it exists: the
+    /// sweep defines and starts a machine on a survivor without passing
+    /// through a migration window, and a pooled device exists only where
+    /// the daemon serves it. Starting a machine after the daemon restarted
+    /// needs the same thing, which is why it belongs on every start rather
+    /// than only on the failover path.
+    ///
+    /// Idempotent, and cheap when there is nothing to do: an export already
+    /// up is left alone rather than cycled, because cycling it would take
+    /// the device out from under whatever is using it.
+    async fn ensure_local_device(&self, device: &str) -> SeamResult<()> {
+        let Some(disk) = self.lookup(device).await? else {
+            return Err(PoolError::NotFound(format!(
+                "\"{device}\" is not a pooled disk this node knows."
+            ))
+            .into());
+        };
+        let vdisk = model::vdisk_of_device(device).expect("looked up by this path");
+        let here = self.here().await?;
+        if self
+            .fleet
+            .exports(&here)
+            .await?
+            .iter()
+            .any(|(id, _)| *id == vdisk)
+        {
+            return Ok(());
+        }
+        // The export's own attach decides whether this node may write:
+        // ours after a fence verdict retired the dead holder's lease,
+        // penless inside a migration window, refused if a live peer holds
+        // it — which is the right refusal, because then the machine should
+        // not be starting here at all.
+        self.fleet.export(&here, vdisk).await?;
+        tracing::info!(name = %disk.name, vdisk, %here, "pooled device readied for a local start");
+        Ok(())
+    }
+
     /// The migration window, mapped onto the lease.
     ///
     /// `Open` opens the window **and exports on the destination**, because

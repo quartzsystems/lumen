@@ -104,6 +104,22 @@ pub trait VmVolumes: Send + Sync {
     /// Move the live-migration window through one of its states on the
     /// resource behind `device`, on every member.
     async fn migration_window(&self, device: &str, window: MigrationWindow) -> Result<()>;
+
+    /// Make `device` exist on *this* node, because a machine is about to be
+    /// started here.
+    ///
+    /// DRBD needs nothing: `/dev/drbd<minor>` exists on every member for as
+    /// long as the resource does. A pooled engine does, because its device
+    /// is served by a daemon and exists only where that daemon has been
+    /// asked to serve it — at create on the node that made it, on the
+    /// destination when a migration window opens, and here whenever a
+    /// machine arrives by any other route. An HA restart is exactly that
+    /// other route, and so is starting a machine after the daemon
+    /// restarted.
+    ///
+    /// Idempotent by contract: called before every start, including the
+    /// ones where the device is already there.
+    async fn ensure_local_device(&self, device: &str) -> Result<()>;
 }
 
 #[async_trait]
@@ -210,6 +226,18 @@ impl VmVolumes for DrbdService {
         self.adjust_two_primaries(&disk.cluster, &disk.name, allow)
             .await
     }
+
+    async fn ensure_local_device(&self, device: &str) -> Result<()> {
+        // Nothing to do, and the check earns its keep anyway: a device this
+        // environment does not know is a machine about to start on a disk
+        // nobody can account for.
+        match self.disk_of(device).await? {
+            Some(_) => Ok(()),
+            None => Err(DrbdError::NotFound(format!(
+                "\"{device}\" is not a replicated volume this environment knows."
+            ))),
+        }
+    }
 }
 
 /// The minor out of `/dev/drbd<minor>`, and nothing looser.
@@ -236,6 +264,8 @@ struct MockVmInner {
     /// Every window adjustment, in order, as asked for.
     windows: Vec<(String, MigrationWindow)>,
     destroyed: Vec<String>,
+    /// Devices readied for a local start, in order.
+    ensured: Vec<String>,
     fail_migration_window: bool,
 }
 
@@ -271,6 +301,12 @@ impl MockVmVolumes {
 
     pub fn destroyed(&self) -> Vec<String> {
         self.inner.lock().unwrap().destroyed.clone()
+    }
+
+    /// Devices readied for a local start, in order — how a test sees that a
+    /// machine's disks were made to exist before it was started.
+    pub fn ensured(&self) -> Vec<String> {
+        self.inner.lock().unwrap().ensured.clone()
     }
 
     /// Every window adjustment, in order, as open-or-closed — the view
@@ -385,6 +421,17 @@ impl VmVolumes for MockVmVolumes {
             });
         }
         Ok(common.unwrap_or_default())
+    }
+
+    async fn ensure_local_device(&self, device: &str) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.disks.iter().any(|disk| disk.device == device) {
+            return Err(DrbdError::NotFound(format!(
+                "\"{device}\" is not a replicated volume this environment knows."
+            )));
+        }
+        inner.ensured.push(device.to_string());
+        Ok(())
     }
 
     async fn migration_window(&self, device: &str, window: MigrationWindow) -> Result<()> {

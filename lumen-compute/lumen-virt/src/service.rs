@@ -1404,6 +1404,18 @@ impl VirtService {
     // --- lifecycle --------------------------------------------------------
 
     async fn start_domain(&self, config: &VmConfig) -> Result<()> {
+        // A replicated device is served, not simply present. DRBD's exists
+        // on every member for as long as the resource does, but a pooled
+        // disk's exists only where its daemon has been asked to serve it —
+        // so every start readies its own devices first. That is what makes
+        // an HA restart work, and a start after the storage daemon
+        // restarted, without either path having to know which engine is
+        // underneath. For DRBD it is a lookup and nothing else.
+        for disk in &config.disks {
+            if self.volumes.disk_of(&disk.source).await?.is_some() {
+                self.volumes.ensure_local_device(&disk.source).await?;
+            }
+        }
         self.backend.start(&config.name).await?;
         // Record when, on the running machine only, so an uptime survives a
         // control-plane restart and disappears by itself when the machine
@@ -3296,6 +3308,43 @@ mod tests {
 
         // The machine has one home, and it is not this node.
         assert!(h.service.get(vm.vmid).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn every_start_readies_its_replicated_devices_first() {
+        // A pooled device exists only where its daemon serves it, so the
+        // start path has to ask for it — this is what makes an HA restart on
+        // a survivor, and a start after the storage daemon restarted, find a
+        // device to open at all.
+        let h = clustered_harness("ready-devices").await;
+        let mut request = create("web01");
+        request.disks = vec![replicated_disk(10)];
+        request.start = true;
+        let vm = h.service.create(request).await.unwrap();
+        assert_eq!(
+            h.volumes.ensured(),
+            vec!["/dev/drbd1".to_string()],
+            "creating and starting a machine did not ready its device"
+        );
+
+        // And again on an ordinary start, because the device may have gone
+        // away with a daemon while the machine was stopped.
+        h.service
+            .stop(
+                vm.vmid,
+                Acknowledgements {
+                    may_lose_data: true,
+                    ..Acknowledgements::default()
+                },
+            )
+            .await
+            .unwrap();
+        h.service.start(vm.vmid).await.unwrap();
+        assert_eq!(
+            h.volumes.ensured(),
+            vec!["/dev/drbd1".to_string(), "/dev/drbd1".to_string()],
+            "a restart did not ready the device again"
+        );
     }
 
     #[tokio::test]
