@@ -87,7 +87,8 @@ fn real_pool(tag: &str) -> (SocketFleet, Scratch, Scratch) {
         node: 0,
         bricks: vec![brick_a.0.clone()],
         listen: Some("127.0.0.1:0".parse().unwrap()),
-        dial: None,
+        dials: Vec::new(),
+        members: Vec::new(),
     })
     .unwrap();
     let peer = a.peer_addr().unwrap();
@@ -95,7 +96,8 @@ fn real_pool(tag: &str) -> (SocketFleet, Scratch, Scratch) {
         node: 1,
         bricks: vec![brick_b.0.clone()],
         listen: None,
-        dial: Some(peer),
+        dials: vec![peer],
+        members: Vec::new(),
     })
     .unwrap();
 

@@ -225,9 +225,45 @@ pub fn command(daemon: &Daemon, line: &str) -> String {
                     .map(|()| format!("window on vdisk {vdisk} closed"))
                     .map_err(|err| err.to_string())?
             }
-            "fence-peer" => daemon
-                .fence_peer()
-                .map(|()| "continuing alone under the verdict".to_string())
+            "fence-peer" => {
+                // Two forms: bare (the two-member legacy — the sole peer,
+                // the local floor) and `fence-peer <node> <era>`, where
+                // the verdict layer computed one era from every
+                // survivor's reported floor.
+                if words.len() >= 3 {
+                    let (node, era) = (number(1)?, number(2)?);
+                    daemon
+                        .fence_member(node as u8, era)
+                        .map(|()| format!("continuing without node {node} at era {era}"))
+                        .map_err(|err| err.to_string())?
+                } else {
+                    daemon
+                        .fence_peer()
+                        .map(|()| "continuing alone under the verdict".to_string())
+                        .map_err(|err| err.to_string())?
+                }
+            }
+            "reassign" => {
+                let version = number(1)?;
+                let members: Vec<u8> = words[2..]
+                    .iter()
+                    .map(|word| word.parse::<u8>().map_err(|_| "bad member id".to_string()))
+                    .collect::<Result<Vec<u8>, String>>()?;
+                if members.len() < 2 {
+                    return Err("a reassignment names at least two members".into());
+                }
+                daemon
+                    .reassign(version, &members)
+                    .map(|()| format!("reassignment to version {version} open"))
+                    .map_err(|err| err.to_string())?
+            }
+            "reassign-status" => match daemon.reassign_status().map_err(|err| err.to_string())? {
+                Some((version, owed)) => format!("pending={version} owed={owed}"),
+                None => "pending=none".into(),
+            },
+            "reassign-commit" => daemon
+                .commit_reassign()
+                .map(|()| "the new map governs".to_string())
                 .map_err(|err| err.to_string())?,
             "checkpoint" => daemon
                 .checkpoint()
@@ -300,16 +336,16 @@ pub fn command(daemon: &Daemon, line: &str) -> String {
                 entries.join(" ")
             }
             _ => {
-                return Err(
-                    "unknown command. node: status, capacity, brick-list, fence-peer, \
-                            checkpoint, gc, scrub. vdisks: vdisks, \
+                return Err("unknown command. node: status, capacity, brick-list, \
+                            fence-peer [node era], checkpoint, gc, scrub. \
+                            placement: reassign <version> <member>..., \
+                            reassign-status, reassign-commit. vdisks: vdisks, \
                             vdisk-create <id> <bytes> [tier], \
                             vdisk-delete <id>, hash <id>. exports: export <id> <dev>, \
                             unexport <id>, exports. migration: lease <id>, \
                             handover <id> <to>, relinquish <id> <to>, \
                             accept <id>, abort <id>"
-                        .into(),
-                )
+                    .into())
             }
         })
     })();
@@ -380,9 +416,10 @@ fn status_line(daemon: &Daemon) -> String {
         ));
     }
     line.push_str(&format!(
-        " era={} writes={} free={}/{} usable={usable} free_bytes={free_bytes}{tier_fields} \
-         vdisks={} leases={} sent={} durable={} applied={}",
+        " era={} era_target={} writes={} free={}/{} usable={usable} \
+         free_bytes={free_bytes}{tier_fields} vdisks={} leases={} sent={} durable={} applied={}",
         s.era,
+        s.era_target,
         if s.accepts_writes { "open" } else { "held" },
         s.space.segments_free,
         s.space.segments_total,
@@ -392,6 +429,19 @@ fn status_line(daemon: &Daemon) -> String {
         s.stream.1,
         s.stream.2,
     ));
+    // The mesh's honest stream picture, one dot-key trio per peer, plus
+    // the map facts a placement-aware caller reads.
+    for (peer, sent, durable, applied) in &s.peers {
+        line.push_str(&format!(
+            " peer{peer}.sent={sent} peer{peer}.durable={durable} peer{peer}.applied={applied}"
+        ));
+    }
+    if let Some(version) = s.map_version {
+        line.push_str(&format!(" map={version}"));
+    }
+    if let Some(version) = s.reassign_pending {
+        line.push_str(&format!(" reassign={version}"));
+    }
     line
 }
 
@@ -461,6 +511,17 @@ pub struct StatusView {
     /// `(sent, peer_confirmed_durable, applied_from_peer)` — the counters
     /// that convicted the elided-flush bug, so they are worth carrying.
     pub stream: (u64, u64, u64),
+    /// The same, per peer — `(peer, sent, durable, applied)`, the mesh's
+    /// honest form. Empty from a pre-mesh daemon.
+    pub peers: Vec<(u8, u64, u64, u64)>,
+    /// The floor a fence-verdict era must clear from this member's
+    /// vantage — what the verdict layer maxes over survivors. Absent from
+    /// a pre-mesh daemon.
+    pub era_target: Option<u64>,
+    /// The committed slice map's version; `None` when unplaced.
+    pub map_version: Option<u64>,
+    /// The version a reassignment is moving to, while one is open.
+    pub reassign_pending: Option<u64>,
 }
 
 /// One tier's byte figures as a member reports them.
@@ -545,8 +606,35 @@ fn parse_status(reply: &str) -> Option<StatusView> {
     let mut vdisks = None;
     let mut leases = None;
     let (mut sent, mut durable, mut applied) = (None, None, None);
+    let mut peers: Vec<(u8, u64, u64, u64)> = Vec::new();
+    let mut era_target = None;
+    let mut map_version = None;
+    let mut reassign_pending = None;
     for token in reply.split_whitespace() {
         let (key, value) = token.split_once('=')?;
+        // Per-peer stream figures ride keys of the form peerN.sent /
+        // peerN.durable / peerN.applied — the peer id is data, so it
+        // lives in the key the same way a tier number does.
+        if let Some(rest) = key.strip_prefix("peer") {
+            if let Some((peer, field)) = rest.split_once('.') {
+                let peer: u8 = peer.parse().ok()?;
+                let value: u64 = value.parse().ok()?;
+                let entry = match peers.iter_mut().find(|p| p.0 == peer) {
+                    Some(entry) => entry,
+                    None => {
+                        peers.push((peer, 0, 0, 0));
+                        peers.last_mut().unwrap()
+                    }
+                };
+                match field {
+                    "sent" => entry.1 = value,
+                    "durable" => entry.2 = value,
+                    "applied" => entry.3 = value,
+                    _ => {}
+                }
+                continue;
+            }
+        }
         // Per-tier byte figures ride keys of the form tierN.usable /
         // tierN.free — a tier number is data, so it lives in the key the
         // same way it lives in the report.
@@ -597,10 +685,14 @@ fn parse_status(reply: &str) -> Option<StatusView> {
             "sent" => sent = Some(value.parse().ok()?),
             "durable" => durable = Some(value.parse().ok()?),
             "applied" => applied = Some(value.parse().ok()?),
+            "era_target" => era_target = Some(value.parse().ok()?),
+            "map" => map_version = Some(value.parse().ok()?),
+            "reassign" => reassign_pending = Some(value.parse().ok()?),
             // An unknown key is a newer daemon, not a broken one.
             _ => {}
         }
     }
+    peers.sort_by_key(|p| p.0);
     tiers.sort_by_key(|t| t.tier);
     let state = match (state?, sync) {
         ("suspended", _) => ReplState::Suspended,
@@ -625,6 +717,10 @@ fn parse_status(reply: &str) -> Option<StatusView> {
         vdisks: vdisks?,
         leases: leases?,
         stream: (sent?, durable?, applied?),
+        peers,
+        era_target,
+        map_version,
+        reassign_pending,
     })
 }
 
@@ -885,6 +981,47 @@ impl Client {
 
     pub fn fence_peer(&mut self) -> Result<(), String> {
         self.ask("fence-peer").map(|_| ())
+    }
+
+    /// The mesh verdict: the member and the era the verdict layer agreed
+    /// from every survivor's reported `era_target`.
+    pub fn fence_member(&mut self, node: u8, era: u64) -> Result<(), String> {
+        self.ask(&format!("fence-peer {node} {era}")).map(|_| ())
+    }
+
+    pub fn reassign(&mut self, version: u64, members: &[u8]) -> Result<(), String> {
+        let members: Vec<String> = members.iter().map(u8::to_string).collect();
+        self.ask(&format!("reassign {version} {}", members.join(" ")))
+            .map(|_| ())
+    }
+
+    /// `(pending version, blocks still owed)`; `None` when nothing is
+    /// open. Asking also nudges the moves along.
+    pub fn reassign_status(&mut self) -> Result<Option<(u64, usize)>, String> {
+        let reply = self.ask("reassign-status")?;
+        let mut pending = None;
+        let mut owed = 0usize;
+        for token in reply.split_whitespace() {
+            match token.split_once('=') {
+                Some(("pending", "none")) => return Ok(None),
+                Some(("pending", value)) => {
+                    pending = Some(
+                        value
+                            .parse()
+                            .map_err(|_| format!("bad pending version: {value}"))?,
+                    )
+                }
+                Some(("owed", value)) => {
+                    owed = value.parse().map_err(|_| format!("bad owed: {value}"))?
+                }
+                _ => {}
+            }
+        }
+        Ok(pending.map(|version| (version, owed)))
+    }
+
+    pub fn commit_reassign(&mut self) -> Result<(), String> {
+        self.ask("reassign-commit").map(|_| ())
     }
 
     pub fn checkpoint(&mut self) -> Result<(), String> {

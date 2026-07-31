@@ -37,7 +37,6 @@ use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -66,11 +65,17 @@ pub struct Config {
     /// checks decide whether they belong together; the daemon just opens
     /// what it is given and refuses to guess.
     pub bricks: Vec<PathBuf>,
-    /// Accept the peer here. Exactly one of `listen`/`dial` is set — the
-    /// two ends of one link, decided by deployment rather than guessed.
+    /// Accept peers here. The mesh convention: every member listens and
+    /// each dials every lower-id member, so a pair has exactly one dialer
+    /// — decided by deployment, carried in the conf.
     pub listen: Option<SocketAddr>,
-    /// Dial the peer there.
-    pub dial: Option<SocketAddr>,
+    /// Dial these peers — one address per lower-id member.
+    pub dials: Vec<SocketAddr>,
+    /// The pool's member ids, for placement. Empty is the two-member
+    /// legacy: unplaced, every member holds everything. With members the
+    /// pool opens placed — the manifest's committed map when one is
+    /// anchored, the derived first map when the brick is virgin.
+    pub members: Vec<u8>,
 }
 
 /// What the daemon will say about itself, to the console and the tests.
@@ -85,8 +90,18 @@ pub struct Status {
     pub space: BrickStats,
     /// The same space said in bytes, per tier and per brick.
     pub report: SpaceReport,
-    /// `(sent, peer_confirmed_durable, applied_from_peer)`.
+    /// `(sent, peer_confirmed_durable, applied_from_peer)` — the busiest
+    /// stream's triple, kept for the two-member surface.
     pub stream: (u64, u64, u64),
+    /// The same, per peer — the mesh's honest form.
+    pub peers: Vec<(u8, u64, u64, u64)>,
+    /// The floor a fence-verdict era must clear from this node — what the
+    /// verdict layer maxes over survivors to agree one number.
+    pub era_target: u64,
+    /// The committed slice map's version; `None` when unplaced.
+    pub map_version: Option<u64>,
+    /// The version a reassignment is moving to, while one is open.
+    pub reassign_pending: Option<u64>,
 }
 
 /// What an attach got: the pen, or a seat beside it.
@@ -109,13 +124,19 @@ pub trait ExportControl: Send {
     fn stop(self: Box<Self>) -> Result<(), String>;
 }
 
-struct Outbound {
+/// One peer's link: its outbound queue, its session generation, and the
+/// live socket if any. The mesh is a map of these, keyed by the peer's
+/// node id from the handshake — a new connection replaces only *that*
+/// peer's session.
+#[derive(Default)]
+struct PeerLink {
     queue: VecDeque<PeerMessage>,
     /// The session generation. Bumped at every session start, every
     /// session death, and every forced link reset — and checked by the
     /// writer and by teardown, so nothing written for one session can act
     /// on another.
     incarnation: u64,
+    socket: Option<TcpStream>,
 }
 
 #[derive(Default)]
@@ -134,26 +155,19 @@ struct Reads {
 
 struct Shared {
     node_id: u8,
-    /// The peer this single-link daemon last shook hands with. The engine
-    /// speaks in addressed sessions now; until the mesh lands (phase 5's
-    /// daemon slice) there is exactly one, and this is its name. A fence
-    /// verdict arriving before any handshake falls back to the two-member
-    /// convention: node ids are 0 and 1, so the peer is whichever this
-    /// node is not.
-    peer: Mutex<Option<u8>>,
     engine: Mutex<ReplNode<FileDisk>>,
     /// Notified after every engine call — the wakeable "something changed"
     /// every blocked guest operation waits on. Paired with `engine`.
     changed: Condvar,
-    outbound: Mutex<Outbound>,
+    /// Every peer's link, keyed by node id — sockets held so a verdict or
+    /// a replacement connection can kill exactly one peer's session from
+    /// outside its own threads.
+    links: Mutex<HashMap<u8, PeerLink>>,
     out_ready: Condvar,
     flushes: Mutex<Flushes>,
     flush_ready: Condvar,
     reads: Mutex<Reads>,
     read_ready: Condvar,
-    /// The live peer socket, if any — held so a verdict or a replacement
-    /// connection can kill it from outside its own threads.
-    live_socket: Mutex<Option<TcpStream>>,
     shutdown: AtomicBool,
 }
 
@@ -167,15 +181,16 @@ impl Shared {
         if effects.is_empty() {
             return;
         }
-        let mut ob = self.outbound.lock().unwrap();
+        let mut links = self.links.lock().unwrap();
         let mut fl = self.flushes.lock().unwrap();
         let mut rd = self.reads.lock().unwrap();
         for effect in effects {
             match effect {
-                // One queue because there is one peer: the single-link
-                // daemon's outbound is that peer's session by definition.
-                // The mesh keys queues by the addressee.
-                Effect::Send(_, message) => ob.queue.push_back(message),
+                // Routed by the addressee the engine named: each peer's
+                // writer drains its own queue.
+                Effect::Send(to, message) => {
+                    links.entry(to).or_default().queue.push_back(message);
+                }
                 Effect::FlushDone(ticket) => {
                     fl.outcomes.insert(ticket, true);
                 }
@@ -209,17 +224,22 @@ impl Shared {
         out
     }
 
-    /// A session is up: open a fresh incarnation (dropping anything queued
-    /// for a dead one) and say hello. Returns the incarnation this session
+    /// A session is up: register its socket (replacing only this peer's
+    /// old one), open a fresh incarnation (dropping anything queued for a
+    /// dead one), and say hello. Returns the incarnation this session
     /// owns — its identity for the writer and for teardown.
-    fn session_up(&self, peer: u8) -> u64 {
+    fn session_up(&self, peer: u8, socket: Option<TcpStream>) -> u64 {
         let mut engine = self.engine.lock().unwrap();
-        *self.peer.lock().unwrap() = Some(peer);
         let incarnation = {
-            let mut ob = self.outbound.lock().unwrap();
-            ob.incarnation += 1;
-            ob.queue.clear();
-            ob.incarnation
+            let mut links = self.links.lock().unwrap();
+            let link = links.entry(peer).or_default();
+            if let Some(old) = link.socket.take() {
+                let _ = old.shutdown(Shutdown::Both);
+            }
+            link.socket = socket;
+            link.incarnation += 1;
+            link.queue.clear();
+            link.incarnation
         };
         engine.connect(peer);
         self.drain(&mut engine);
@@ -228,13 +248,22 @@ impl Shared {
         incarnation
     }
 
-    /// The one peer this daemon speaks to: the last handshake's node id,
-    /// or — before any handshake — the two-member convention's other id.
-    fn peer_id(&self) -> u8 {
-        self.peer
-            .lock()
-            .unwrap()
-            .unwrap_or(if self.node_id == 0 { 1 } else { 0 })
+    /// The peer a bare (legacy, two-member) fence verdict means: the one
+    /// link if exactly one exists, else the two-member convention's other
+    /// id.
+    fn sole_peer(&self) -> u8 {
+        let links = self.links.lock().unwrap();
+        let mut keys = links.keys();
+        match (keys.next(), keys.next()) {
+            (Some(peer), None) => *peer,
+            _ => {
+                if self.node_id == 0 {
+                    1
+                } else {
+                    0
+                }
+            }
+        }
     }
 
     /// A session died. Exactly-once semantics ride the incarnation: if it
@@ -242,20 +271,21 @@ impl Shared {
     /// verdict forced the link down — this teardown is history's and does
     /// nothing, which is what keeps it from knocking a Degraded node back
     /// to Suspended after a verdict already landed.
-    fn session_down(&self, my_incarnation: u64) {
+    fn session_down(&self, peer: u8, my_incarnation: u64) {
         let mut engine = self.engine.lock().unwrap();
         let stale = {
-            let mut ob = self.outbound.lock().unwrap();
-            if ob.incarnation != my_incarnation {
+            let mut links = self.links.lock().unwrap();
+            let link = links.entry(peer).or_default();
+            if link.incarnation != my_incarnation {
                 true
             } else {
-                ob.incarnation += 1;
-                ob.queue.clear();
+                link.incarnation += 1;
+                link.queue.clear();
+                link.socket = None;
                 false
             }
         };
         if !stale {
-            let peer = self.peer_id();
             engine.peer_lost(peer);
             self.drain(&mut engine);
         }
@@ -263,17 +293,21 @@ impl Shared {
         self.notify_all();
     }
 
-    /// The cluster's verdict, applied: force the link down and continue
-    /// alone at the agreed era. Fencing a member already fenced is already
-    /// done — the verdict layer may retry, and a retry must not error.
-    fn fence_peer(&self) -> Result<(), FsError> {
-        let peer = self.peer_id();
-        self.kill_link();
+    /// The cluster's verdict, applied to one member: force its link down
+    /// and continue at the agreed era. Fencing a member already fenced is
+    /// already done — the verdict layer may retry, and a retry must not
+    /// error. `era` is the number the layer above computed from every
+    /// survivor's floor; `None` (the two-member legacy verb) uses this
+    /// sole survivor's own floor, which at two members is the whole
+    /// computation.
+    fn fence_member(&self, peer: u8, era: Option<u64>) -> Result<(), FsError> {
+        self.kill_link(peer);
         let mut engine = self.engine.lock().unwrap();
         {
-            let mut ob = self.outbound.lock().unwrap();
-            ob.incarnation += 1;
-            ob.queue.clear();
+            let mut links = self.links.lock().unwrap();
+            let link = links.entry(peer).or_default();
+            link.incarnation += 1;
+            link.queue.clear();
         }
         if engine.is_fenced(peer) {
             drop(engine);
@@ -281,10 +315,7 @@ impl Shared {
             return Ok(());
         }
         engine.peer_lost(peer);
-        // At two members the sole survivor's own floor is the whole
-        // computation; the mesh daemon's verdict verb carries the number
-        // the layer above agreed.
-        let era = engine.era_target();
+        let era = era.unwrap_or_else(|| engine.era_target());
         let outcome = engine.set_member_fenced(peer, era);
         self.drain(&mut engine);
         drop(engine);
@@ -304,9 +335,21 @@ impl Shared {
     }
 
     /// Kill the live peer socket, if any, so its threads notice promptly.
-    fn kill_link(&self) {
-        if let Some(socket) = self.live_socket.lock().unwrap().take() {
-            let _ = socket.shutdown(Shutdown::Both);
+    fn kill_link(&self, peer: u8) {
+        let mut links = self.links.lock().unwrap();
+        if let Some(link) = links.get_mut(&peer) {
+            if let Some(socket) = link.socket.take() {
+                let _ = socket.shutdown(Shutdown::Both);
+            }
+        }
+    }
+
+    fn kill_every_link(&self) {
+        let mut links = self.links.lock().unwrap();
+        for link in links.values_mut() {
+            if let Some(socket) = link.socket.take() {
+                let _ = socket.shutdown(Shutdown::Both);
+            }
         }
     }
 }
@@ -359,29 +402,31 @@ impl GuestHandle {
             let outcome = self
                 .shared
                 .with_engine(|engine| engine.read_bytes(vdisk, offset, len));
-            let (tier, hash) = match outcome {
-                Err(FsError::BlockElsewhere { tier, hash }) => (tier, hash),
+            match outcome {
+                Err(FsError::BlockElsewhere { tier, hash }) => self.fetch(tier, hash)?,
                 other => return other,
-            };
-            let ticket = self
-                .shared
-                .with_engine(|engine| engine.fetch_block(tier, hash))?;
-            let mut reads = self.shared.reads.lock().unwrap();
-            loop {
-                if let Some(arrived) = reads.outcomes.remove(&ticket) {
-                    // Arrived or not, the answer is another pass: a
-                    // landed payload serves the retry, a dead session's
-                    // retry re-fetches from the co-home.
-                    let _ = arrived;
-                    break;
-                }
-                if self.shared.shutdown.load(Ordering::SeqCst)
-                    || self.cancelled.load(Ordering::SeqCst)
-                {
-                    return Err(FsError::Suspended);
-                }
-                reads = self.shared.read_ready.wait_timeout(reads, TICK).unwrap().0;
             }
+        }
+    }
+
+    /// Fetch one block from a home and wait for it to land. Arrived or
+    /// failed, the answer is another pass by the caller: a landed payload
+    /// serves the retry, a dead session's retry re-fetches from the
+    /// co-home.
+    fn fetch(&self, tier: u8, hash: lumen_fs::BlockHash) -> Result<(), FsError> {
+        let ticket = self
+            .shared
+            .with_engine(|engine| engine.fetch_block(tier, hash))?;
+        let mut reads = self.shared.reads.lock().unwrap();
+        loop {
+            if reads.outcomes.remove(&ticket).is_some() {
+                return Ok(());
+            }
+            if self.shared.shutdown.load(Ordering::SeqCst) || self.cancelled.load(Ordering::SeqCst)
+            {
+                return Err(FsError::Suspended);
+            }
+            reads = self.shared.read_ready.wait_timeout(reads, TICK).unwrap().0;
         }
     }
 
@@ -423,7 +468,15 @@ impl GuestHandle {
     }
 
     pub fn write(&self, vdisk: u64, offset: u64, data: &[u8]) -> Result<(), FsError> {
-        self.blocking(|engine| engine.write_bytes(vdisk, offset, data))
+        // A write can need a block too: the read-modify-write edge of a
+        // partial block on a member that does not home it. Same loop as a
+        // read — fetch what the engine names, go again.
+        loop {
+            match self.blocking(|engine| engine.write_bytes(vdisk, offset, data)) {
+                Err(FsError::BlockElsewhere { tier, hash }) => self.fetch(tier, hash)?,
+                other => return other,
+            }
+        }
     }
 
     pub fn trim(&self, vdisk: u64, offset: u64, len: u64) -> Result<(), FsError> {
@@ -642,11 +695,10 @@ fn run_session(shared: &Arc<Shared>, mut stream: TcpStream) {
         return;
     }
 
-    // Register the socket so a verdict or a replacement can kill it, then
-    // open the session in the engine.
-    *shared.live_socket.lock().unwrap() = stream.try_clone().ok();
+    // Register the socket under this peer — replacing only this peer's
+    // old session, never another's — then open the session in the engine.
     let peer_node = theirs.node;
-    let incarnation = shared.session_up(peer_node);
+    let incarnation = shared.session_up(peer_node, stream.try_clone().ok());
     eprintln!("peer session {incarnation} up (node {peer_node})");
 
     let writer = {
@@ -654,7 +706,7 @@ fn run_session(shared: &Arc<Shared>, mut stream: TcpStream) {
         let stream = stream.try_clone();
         std::thread::spawn(move || {
             let Ok(mut stream) = stream else { return };
-            writer_loop(&shared, &mut stream, incarnation);
+            writer_loop(&shared, peer_node, &mut stream, incarnation);
         })
     };
 
@@ -678,23 +730,24 @@ fn run_session(shared: &Arc<Shared>, mut stream: TcpStream) {
     }
 
     let _ = stream.shutdown(Shutdown::Both);
-    shared.session_down(incarnation);
+    shared.session_down(peer_node, incarnation);
     eprintln!("peer session {incarnation} down");
     let _ = writer.join();
 }
 
-fn writer_loop(shared: &Arc<Shared>, stream: &mut TcpStream, incarnation: u64) {
+fn writer_loop(shared: &Arc<Shared>, peer: u8, stream: &mut TcpStream, incarnation: u64) {
     loop {
         let message = {
-            let mut ob = shared.outbound.lock().unwrap();
+            let mut links = shared.links.lock().unwrap();
             loop {
-                if shared.shutdown.load(Ordering::SeqCst) || ob.incarnation != incarnation {
+                let link = links.entry(peer).or_default();
+                if shared.shutdown.load(Ordering::SeqCst) || link.incarnation != incarnation {
                     return;
                 }
-                if let Some(message) = ob.queue.pop_front() {
+                if let Some(message) = link.queue.pop_front() {
                     break message;
                 }
-                ob = shared.out_ready.wait_timeout(ob, TICK).unwrap().0;
+                links = shared.out_ready.wait_timeout(links, TICK).unwrap().0;
             }
         };
         let payload = wire::encode(&message);
@@ -726,8 +779,10 @@ pub struct Daemon {
 
 impl Daemon {
     pub fn start(config: Config) -> Result<Daemon, String> {
-        if config.listen.is_some() == config.dial.is_some() {
-            return Err("exactly one of listen/dial must be configured".into());
+        if config.listen.is_none() && config.dials.is_empty() {
+            return Err(
+                "a pool daemon needs at least one peer endpoint: listen, dial, or both".into(),
+            );
         }
         if config.bricks.is_empty() {
             return Err("a daemon with no bricks has nothing to serve".into());
@@ -750,25 +805,30 @@ impl Daemon {
             brick_paths.insert(brick.roster_entry().brick_uuid, path.clone());
             bricks.push(brick);
         }
-        let pool = Pool::open_set(BrickSet::from_bricks(bricks).map_err(|err| err.to_string())?)
-            .map_err(|err| err.to_string())?;
+        let set = BrickSet::from_bricks(bricks).map_err(|err| err.to_string())?;
+        let pool = if config.members.is_empty() {
+            Pool::open_set(set).map_err(|err| err.to_string())?
+        } else {
+            // Placed at open — WAL replay's home-awareness needs the seat
+            // before the first entry replays. The derived first map is
+            // only a seed: an anchored (reassigned) map in the manifest
+            // wins over it.
+            let map = lumen_fs::SliceMap::for_members(1, &config.members)
+                .map_err(|err| err.to_string())?;
+            Pool::open_set_placed(set, config.node, map).map_err(|err| err.to_string())?
+        };
         let engine = ReplNode::new(pool, config.node);
 
         let shared = Arc::new(Shared {
             node_id: config.node,
-            peer: Mutex::new(None),
             engine: Mutex::new(engine),
             changed: Condvar::new(),
-            outbound: Mutex::new(Outbound {
-                queue: VecDeque::new(),
-                incarnation: 0,
-            }),
+            links: Mutex::new(HashMap::new()),
             out_ready: Condvar::new(),
             flushes: Mutex::new(Flushes::default()),
             flush_ready: Condvar::new(),
             reads: Mutex::new(Reads::default()),
             read_ready: Condvar::new(),
-            live_socket: Mutex::new(None),
             shutdown: AtomicBool::new(false),
         });
 
@@ -779,15 +839,16 @@ impl Daemon {
             let listener =
                 TcpListener::bind(listen).map_err(|err| format!("cannot bind {listen}: {err}"))?;
             peer_addr = Some(listener.local_addr().map_err(|err| err.to_string())?);
-            let (tx, rx) = mpsc::channel::<TcpStream>();
 
-            // Accept thread: replaces the live session by killing its
-            // socket, so a reconnecting peer is never stuck behind a
-            // half-open corpse. The accept is a nonblocking poll: a thread
-            // parked inside accept() can only be woken by a connection,
-            // and "make a connection to wake it" is exactly the kind of
-            // one-shot signal a full backlog silently eats — this hung a
-            // shutdown for real before it became a poll.
+            // Accept thread: each connection gets its own session thread —
+            // the mesh runs one live session per peer, concurrently, and
+            // which existing session a newcomer replaces is decided by the
+            // handshake's node id inside run_session, never here. The
+            // accept is a nonblocking poll: a thread parked inside
+            // accept() can only be woken by a connection, and "make a
+            // connection to wake it" is exactly the kind of one-shot
+            // signal a full backlog silently eats — this hung a shutdown
+            // for real before it became a poll.
             listener
                 .set_nonblocking(true)
                 .map_err(|err| err.to_string())?;
@@ -809,30 +870,14 @@ impl Daemon {
                 if stream.set_nonblocking(false).is_err() {
                     continue;
                 }
-                accept_shared.kill_link();
-                if tx.send(stream).is_err() {
-                    return;
-                }
-            }));
-
-            // Runner thread: sessions strictly in sequence.
-            let run_shared = Arc::clone(&shared);
-            threads.push(std::thread::spawn(move || loop {
-                let stream = match rx.recv_timeout(TICK) {
-                    Ok(stream) => stream,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        if run_shared.shutdown.load(Ordering::SeqCst) {
-                            return;
-                        }
-                        continue;
-                    }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                };
-                run_session(&run_shared, stream);
+                // Session threads die with their sockets; shutdown kills
+                // every registered socket, so none outlives the daemon.
+                let session_shared = Arc::clone(&accept_shared);
+                std::thread::spawn(move || run_session(&session_shared, stream));
             }));
         }
 
-        if let Some(dial) = config.dial {
+        for dial in config.dials {
             let dial_shared = Arc::clone(&shared);
             threads.push(std::thread::spawn(move || loop {
                 if dial_shared.shutdown.load(Ordering::SeqCst) {
@@ -863,6 +908,12 @@ impl Daemon {
                 }
                 ticks += 1;
                 let outcome = maint_shared.with_engine(|engine| {
+                    // A pending reassignment is driven from here: each
+                    // tick re-requests whatever moves are still owed —
+                    // idempotent, so a lost batch just goes again.
+                    if engine.reassign_pending().is_some() {
+                        engine.step_reassign()?;
+                    }
                     let space = engine.pool().space();
                     if space.segments_free < space.segments_total / 4 {
                         engine.collect_garbage().map(|_| ())
@@ -993,9 +1044,41 @@ impl Daemon {
         }
     }
 
-    /// The cluster's verdict, delivered over the control surface.
+    /// The cluster's verdict, delivered over the control surface. The
+    /// bare form is the two-member legacy: the sole peer, the local floor.
     pub fn fence_peer(&self) -> Result<(), FsError> {
-        self.shared.fence_peer()
+        let peer = self.shared.sole_peer();
+        self.shared.fence_member(peer, None)
+    }
+
+    /// The mesh form: the member and the era the verdict layer agreed.
+    pub fn fence_member(&self, peer: u8, era: u64) -> Result<(), FsError> {
+        self.shared.fence_member(peer, Some(era))
+    }
+
+    /// Open a reassignment; the maintenance loop drives the moves.
+    pub fn reassign(&self, version: u64, members: &[u8]) -> Result<(), FsError> {
+        self.shared
+            .with_engine(|engine| engine.prepare_reassign(version, members))
+    }
+
+    /// `(pending version, blocks still owed)` — `None` when no
+    /// reassignment is open. Asking also nudges the moves along.
+    pub fn reassign_status(&self) -> Result<Option<(u64, usize)>, FsError> {
+        self.shared
+            .with_engine(|engine| match engine.reassign_pending() {
+                Some(version) => {
+                    let owed = engine.step_reassign()?;
+                    Ok(Some((version, owed)))
+                }
+                None => Ok(None),
+            })
+    }
+
+    /// Commit — refused while blocks are owed; the caller confirms every
+    /// member first.
+    pub fn commit_reassign(&self) -> Result<(), FsError> {
+        self.shared.with_engine(|engine| engine.commit_reassign())
     }
 
     pub fn status(&self) -> Status {
@@ -1003,12 +1086,16 @@ impl Daemon {
             node: engine.node(),
             state: engine.state(),
             era: engine.pool().era(),
+            era_target: engine.era_target(),
+            map_version: engine.pool().placement().map(|(_, map)| map.version()),
+            reassign_pending: engine.reassign_pending(),
             accepts_writes: engine.accepts_writes(),
             vdisks: engine.pool().vdisks(),
             leases: engine.pool().leases(),
             space: engine.pool().space(),
             report: engine.pool().space_report(),
             stream: engine.stream_counters(),
+            peers: engine.peer_counters(),
         })
     }
 
@@ -1037,7 +1124,7 @@ impl Daemon {
     pub fn shutdown(self) {
         self.stop_all_exports();
         self.shared.shutdown.store(true, Ordering::SeqCst);
-        self.shared.kill_link();
+        self.shared.kill_every_link();
         self.shared.notify_all();
         for thread in self.threads {
             let _ = thread.join();

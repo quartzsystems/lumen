@@ -575,6 +575,15 @@ impl<D: Disk> ReplNode<D> {
             .unwrap_or((0, 0, 0))
     }
 
+    /// Every session's stream position, per peer: `(peer, sent, durable,
+    /// applied)` — the mesh's status surface.
+    pub fn peer_counters(&self) -> Vec<(NodeId, u64, u64, u64)> {
+        self.peers
+            .iter()
+            .map(|(id, s)| (*id, s.next_rseq - 1, s.durable_rseq, s.applied_rseq))
+            .collect()
+    }
+
     pub fn node(&self) -> NodeId {
         self.node
     }

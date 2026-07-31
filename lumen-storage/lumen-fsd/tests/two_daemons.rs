@@ -60,7 +60,8 @@ fn listener_daemon(brick: &Scratch, node: u8) -> Daemon {
         node,
         bricks: vec![brick.0.clone()],
         listen: Some("127.0.0.1:0".parse().unwrap()),
-        dial: None,
+        dials: Vec::new(),
+        members: Vec::new(),
     })
     .unwrap()
 }
@@ -70,7 +71,8 @@ fn dialer_daemon(brick: &Scratch, node: u8, peer: SocketAddr) -> Daemon {
         node,
         bricks: vec![brick.0.clone()],
         listen: None,
-        dial: Some(peer),
+        dials: vec![peer],
+        members: Vec::new(),
     })
     .unwrap()
 }

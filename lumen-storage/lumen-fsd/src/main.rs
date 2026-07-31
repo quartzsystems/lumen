@@ -3,8 +3,8 @@
 //! ```text
 //!   lumen-fsd format <path> --tier <n> [--wal] [--roster <uuid>:<tier>]...
 //!                    [--bytes <n>] [--vdisk-bytes <n>] [--pool-uuid <hex>]
-//!   lumen-fsd serve  <brick>... --node <id> --listen <addr> [--nbd <addr>] [--control <addr>]
-//!   lumen-fsd serve  <brick>... --node <id> --dial   <addr> [--nbd <addr>] [--control <addr>]
+//!   lumen-fsd serve  <brick>... --node <id> [--listen <addr>] [--dial <addr>]...
+//!                    [--members <id,id,...>] [--nbd <addr>] [--control <addr>]
 //! ```
 //!
 //! A node's bricks are formatted one invocation each, the WAL holder
@@ -43,8 +43,7 @@ fn main() -> ExitCode {
                 "usage: lumen-fsd format <path> --tier <n> [--wal] [--roster <uuid>:<tier>]... \
                  [--bytes <n>] [--vdisk-bytes <n>] [--pool-uuid <hex>] [--brick-uuid <hex>]"
             );
-            eprintln!("       lumen-fsd serve  <brick>... --node <id> --listen <addr> [--nbd <addr>] [--ublk <dev-id>] [--control <addr>]");
-            eprintln!("       lumen-fsd serve  <brick>... --node <id> --dial   <addr> [--nbd <addr>] [--ublk <dev-id>] [--control <addr>]");
+            eprintln!("       lumen-fsd serve  <brick>... --node <id> [--listen <addr>] [--dial <addr>]... [--members <id,id,...>] [--nbd <addr>] [--ublk <dev-id>] [--control <addr>]");
             eprintln!("       lumen-fsd ublk-del <dev-id>   # clean up after an unclean death");
             return ExitCode::from(2);
         }
@@ -205,7 +204,8 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
     }
     let mut node: Option<u8> = None;
     let mut listen = None;
-    let mut dial = None;
+    let mut dials = Vec::new();
+    let mut members = Vec::new();
     let mut nbd_addr = None;
     let mut control_addr = None;
     let mut ublk_dev: Option<u32> = None;
@@ -227,13 +227,24 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
                         .map_err(|_| format!("not a device id: {value}"))?,
                 )
             }
+            "--members" => {
+                // The pool's member ids, comma-separated — what places
+                // this node's data. Omitted is the two-member legacy:
+                // unplaced, everyone holds everything.
+                members = value
+                    .split(',')
+                    .map(|id| id.parse().map_err(|_| format!("not a member id: {id}")))
+                    .collect::<Result<Vec<u8>, String>>()?;
+            }
             _ => {
                 let addr: SocketAddr = value
                     .parse()
                     .map_err(|_| format!("not an address: {value}"))?;
                 match flag.as_str() {
                     "--listen" => listen = Some(addr),
-                    "--dial" => dial = Some(addr),
+                    // Repeatable: one entry per lower-id member in the
+                    // mesh convention.
+                    "--dial" => dials.push(addr),
                     "--nbd" => nbd_addr = Some(addr),
                     "--control" => control_addr = Some(addr),
                     _ => return Err(format!("unknown flag {flag}")),
@@ -247,7 +258,8 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
         node,
         bricks,
         listen,
-        dial,
+        dials,
+        members,
     })?;
     if let Some(addr) = daemon.peer_addr() {
         println!("peer link listening on {addr}");
