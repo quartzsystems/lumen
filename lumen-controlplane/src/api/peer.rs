@@ -620,3 +620,62 @@ pub async fn pool_verb(
     .map_err(ApiError::Conflict)?;
     Ok(Json(answer))
 }
+
+/// POST /api/peer/pool/preflight — what this node would bring to a pool,
+/// read fresh: its drop-in state, its ublk device, its disks as its own
+/// scanner sees them right now.
+pub async fn pool_preflight(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<crate::pool_workflow::PoolNodeFacts>, ApiError> {
+    Ok(Json(crate::pool_workflow::local_preflight(&state).await?))
+}
+
+/// POST /api/peer/pool/prepare — become a pool member, on this node's own
+/// disks and through its own guards.
+///
+/// No acknowledgement is taken from the wire: the operator's consent was
+/// given to the coordinator, and a peer route that accepted "yes, erase
+/// them" from a body would be a second, quieter way to reformat a node.
+pub async fn pool_prepare(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+    Json(prepare): Json<crate::pool_workflow::PoolPrepare>,
+) -> Result<Json<crate::pool_workflow::PoolPrepared>, ApiError> {
+    Ok(Json(
+        crate::pool_workflow::local_prepare(&state, &prepare).await?,
+    ))
+}
+
+/// POST /api/peer/pool/teardown — stop carrying a pool: daemon down,
+/// bricks wiped, drop-in removed. The destroy workflow and the create
+/// workflow's unwind share this one definition.
+pub async fn pool_teardown(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    crate::pool_workflow::local_teardown(&state).await?;
+    Ok(Json(serde_json::json!({ "cleared": true })))
+}
+
+/// POST /api/peer/controlplane/restart — reply first, restart after.
+///
+/// `PoolPresence` is resolved once at startup, so adopting a created or
+/// destroyed pool means restarting this process. The restart runs as a
+/// detached transient unit *after* the reply is on the wire, so the
+/// coordinator hears "restarting" from a control plane that then actually
+/// goes away. Distinct from `/api/peer/restart`, which reboots the node.
+pub async fn controlplane_restart(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let deploy = state.pool_deploy.clone();
+    tokio::spawn(async move {
+        // A beat for the reply to leave the socket.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        if let Err(err) = deploy.restart_controlplane().await {
+            tracing::warn!("the requested control plane restart failed: {err}");
+        }
+    });
+    Ok(Json(serde_json::json!({ "restarting": true })))
+}

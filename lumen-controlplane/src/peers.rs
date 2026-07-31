@@ -327,6 +327,95 @@ impl rustls::client::danger::ServerCertVerifier for FingerprintVerifier {
 /// the crate that defines that trait has no business depending on all three.
 ///
 /// The local node is not short-circuited here: only the caller holds the
+/// The pool workflows' fan-out: preflight, prepare, teardown, and the
+/// reply-first restart, each a peer route on the member being acted on.
+/// The local member never travels through these — the workflow calls its
+/// own halves directly.
+#[async_trait]
+impl crate::pool_workflow::PoolWorkflowPeers for HttpPeerChannel {
+    async fn pool_preflight(
+        &self,
+        node: &EnvironmentNode,
+    ) -> Result<crate::pool_workflow::PoolNodeFacts, ClusterError> {
+        self.call(
+            &node.address,
+            "/api/peer/pool/preflight",
+            &serde_json::json!({}),
+            self.ca_client_config()?,
+            Some(self.peer_ticket()?),
+            CALL_DEADLINE,
+        )
+        .await
+    }
+
+    async fn pool_prepare(
+        &self,
+        node: &EnvironmentNode,
+        prepare: &crate::pool_workflow::PoolPrepare,
+    ) -> Result<crate::pool_workflow::PoolPrepared, ClusterError> {
+        self.call(
+            &node.address,
+            "/api/peer/pool/prepare",
+            prepare,
+            self.ca_client_config()?,
+            Some(self.peer_ticket()?),
+            // Wipes, formats, a unit start, and a daemon answering — a
+            // shelf of disks takes its time.
+            SLOW_CALL_DEADLINE,
+        )
+        .await
+    }
+
+    async fn pool_teardown(&self, node: &EnvironmentNode) -> Result<(), ClusterError> {
+        let _: serde_json::Value = self
+            .call(
+                &node.address,
+                "/api/peer/pool/teardown",
+                &serde_json::json!({}),
+                self.ca_client_config()?,
+                Some(self.peer_ticket()?),
+                SLOW_CALL_DEADLINE,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn restart_controlplane(&self, node: &EnvironmentNode) -> Result<(), ClusterError> {
+        let _: serde_json::Value = self
+            .call(
+                &node.address,
+                "/api/peer/controlplane/restart",
+                &serde_json::json!({}),
+                self.ca_client_config()?,
+                Some(self.peer_ticket()?),
+                CALL_DEADLINE,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn pool_present(&self, node: &EnvironmentNode) -> Result<bool, ClusterError> {
+        // The status verb through the peer relay. An answer is a pool; the
+        // relay's own "no pool daemon" refusal is a definite no; anything
+        // else is a member that could not be asked.
+        let outcome: Result<lumen_pool::PoolAnswer, ClusterError> = self
+            .call(
+                &node.address,
+                "/api/peer/pool/verb",
+                &lumen_pool::PoolVerb::Status,
+                self.ca_client_config()?,
+                Some(self.peer_ticket()?),
+                CALL_DEADLINE,
+            )
+            .await;
+        match outcome {
+            Ok(_) => Ok(true),
+            Err(ClusterError::Conflict(why)) if why.contains("no pool daemon") => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+}
+
 /// state those three answers are assembled from, so it answers for itself and
 /// calls this for everyone else.
 #[async_trait]

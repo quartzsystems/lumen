@@ -72,6 +72,16 @@ impl Drop for TempDir {
 /// A router whose pool is whatever the test hands in; everything else is
 /// the standard in-memory appliance.
 fn router_with(tag: &str, pool: PoolPresence) -> (axum::Router, TempDir) {
+    let (router, dir, _exec) = router_with_deploy(tag, pool);
+    (router, dir)
+}
+
+/// The same, keeping the deployment exec so a workflow test can assert
+/// the exact privileged argv it ran.
+fn router_with_deploy(
+    tag: &str,
+    pool: PoolPresence,
+) -> (axum::Router, TempDir, Arc<lumen_sys::exec::MockExec>) {
     let mut config = Config::from_env();
     config.webui_dir = std::env::temp_dir().join("lumen-webui-none");
     config.no_tls = true;
@@ -82,8 +92,14 @@ fn router_with(tag: &str, pool: PoolPresence) -> (axum::Router, TempDir) {
         &state_dir.0.join("net"),
         60,
     ));
+    // Three disks, exactly as the prepare route will judge them: the one
+    // the system runs from, and two a pool could take.
     let storage = Arc::new(StorageService::new(Arc::new(
-        lumen_zfs::backend::mock::MockBackend::appliance(),
+        lumen_zfs::backend::mock::MockBackend::appliance().with_disks(vec![
+            lumen_zfs::backend::mock::MockBackend::busy_disk("sda", 1 << 40),
+            lumen_zfs::backend::mock::MockBackend::free_disk("sdb", 1 << 40),
+            lumen_zfs::backend::mock::MockBackend::free_disk("sdc", 1 << 40),
+        ]),
     )));
     let virt = Arc::new(VirtService::new(
         Arc::new(lumen_virt::backend::mock::MockBackend::appliance()),
@@ -111,6 +127,7 @@ fn router_with(tag: &str, pool: PoolPresence) -> (axum::Router, TempDir) {
         cluster.clone(),
         storage.clone(),
     ));
+    let deploy_exec = lumen_sys::exec::MockExec::working();
     let router = app(Arc::new(AppState {
         config,
         jwt_secret: security::session_secret(TICKET_SECRET.to_vec()),
@@ -132,8 +149,11 @@ fn router_with(tag: &str, pool: PoolPresence) -> (axum::Router, TempDir) {
         drain: Default::default(),
         update_job: Default::default(),
         roll: Default::default(),
+        pool_deploy: Arc::new(lumen_pool::PoolDeploy::new(deploy_exec.clone())),
+        pool_peers: Arc::new(lumen_controlplane::inventory::NoPeers),
+        pool_job: Default::default(),
     }));
-    (router, state_dir)
+    (router, state_dir, deploy_exec)
 }
 
 use lumen_cluster::ClusterService;
@@ -552,6 +572,272 @@ async fn a_peer_verb_reaches_this_nodes_real_daemon_and_nothing_else_does() {
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+// --- the create/destroy workflows -------------------------------------------
+
+/// Poll the pending feed until the job leaves Running, or give up.
+async fn settled_job(router: &axum::Router, cookie: &str) -> serde_json::Value {
+    for _ in 0..100 {
+        let (status, body) = request(
+            router,
+            Method::GET,
+            "/api/storage/pool/pending",
+            Some(cookie),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        if body["phase"] != "running" {
+            return body;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the pool job never settled");
+}
+
+#[tokio::test]
+async fn a_create_on_an_unclustered_node_is_refused_and_no_job_starts() {
+    let (router, _dir) = router_with("create-unclustered", PoolPresence::Absent);
+    let cookie = sign_in(&router).await;
+    let (status, body) = request(
+        &router,
+        Method::POST,
+        "/api/storage/pool",
+        Some(&cookie),
+        None,
+        Some(serde_json::json!({
+            "seats": [{ "node": HERE, "bricks": [{ "disk": "sdb", "tier": 0 }] }],
+            "i_understand_this_erases_the_disks": true,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("environment"),
+        "{body}"
+    );
+    // Nothing was started, so there is nothing pending.
+    let (status, _) = request(
+        &router,
+        Method::GET,
+        "/api/storage/pool/pending",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_destroy_needs_the_acknowledgement_before_anything_else() {
+    let (_fleet, pool) = pooled();
+    let (router, _dir) = router_with("destroy-ack", pool);
+    let cookie = sign_in(&router).await;
+    let (status, body) = request(
+        &router,
+        Method::DELETE,
+        "/api/storage/pool",
+        Some(&cookie),
+        None,
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let listed = body["errors"].to_string();
+    assert!(
+        listed.contains("unacknowledged_destructive_operation"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn a_destroy_on_a_poolless_node_names_the_absence() {
+    let (router, _dir) = router_with("destroy-absent", PoolPresence::Absent);
+    let cookie = sign_in(&router).await;
+    let (status, body) = request(
+        &router,
+        Method::DELETE,
+        "/api/storage/pool",
+        Some(&cookie),
+        None,
+        Some(serde_json::json!({ "i_understand_this_may_lose_data": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+#[tokio::test]
+async fn a_destroy_is_refused_while_the_pool_still_holds_disks() {
+    let (fleet, pool) = pooled();
+    fleet.create_vdisk(HERE, 1795, 512 << 20, 0).await.unwrap();
+    let (router, _dir) = router_with("destroy-vdisks", pool);
+    let cookie = sign_in(&router).await;
+    let (status, body) = request(
+        &router,
+        Method::DELETE,
+        "/api/storage/pool",
+        Some(&cookie),
+        None,
+        Some(serde_json::json!({ "i_understand_this_may_lose_data": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("Delete the machines"),
+        "{body}"
+    );
+}
+
+/// A broken pool is destroyable — the repair path out of Broken — and the
+/// teardown runs the exact privileged commands: daemon down, drop-in
+/// removed, and the control plane restarted only after the job already
+/// reads complete.
+#[tokio::test]
+async fn destroying_a_broken_pool_is_the_way_out_of_broken() {
+    let (router, _dir, exec) = router_with_deploy(
+        "destroy-broken",
+        PoolPresence::Broken("a drop-in that does not parse".into()),
+    );
+    let cookie = sign_in(&router).await;
+    let (status, body) = request(
+        &router,
+        Method::DELETE,
+        "/api/storage/pool",
+        Some(&cookie),
+        None,
+        Some(serde_json::json!({ "i_understand_this_may_lose_data": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["action"], "destroy");
+
+    let settled = settled_job(&router, &cookie).await;
+    assert_eq!(settled["phase"], "complete", "{settled}");
+
+    assert!(
+        exec.ran_with("/usr/bin/systemctl", &["disable", "--now", "lumen-fsd"])
+            .await
+    );
+    assert!(
+        exec.ran_with("/usr/bin/rm", &["-f", "/etc/lumen/fsd.conf"])
+            .await
+    );
+    // The coordinator restarts itself only after the job is complete.
+    assert!(
+        exec.ran_with(
+            "/usr/bin/systemctl",
+            &["restart", "--no-block", "lumen-controlplane"]
+        )
+        .await
+    );
+}
+
+/// The prepare route, against a real daemon: the member wipes and formats
+/// through its own guards (the exec records every argv), writes the
+/// drop-in, and is not called prepared until a daemon **actually answers**
+/// the control socket it was told — here, a real one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_prepare_formats_writes_the_drop_in_and_hears_the_daemon_answer() {
+    let dir = TempDir::new("peer-prepare");
+    let control = real_daemon_control(&dir.0);
+    let (router, _dir, exec) = router_with_deploy("prepare", PoolPresence::Absent);
+    let ticket = security::issue_peer_ticket(TICKET_SECRET, THERE).unwrap();
+    let (status, body) = request(
+        &router,
+        Method::POST,
+        "/api/peer/pool/prepare",
+        None,
+        Some(&ticket),
+        Some(serde_json::json!({
+            "node_id": 1,
+            "pool_uuid": "aa".repeat(16),
+            "bricks": [
+                { "disk": "sdb", "tier": 0, "wal_holder": true, "brick_uuid": "bb".repeat(16) },
+                { "disk": "sdc", "tier": 1, "wal_holder": false, "brick_uuid": "cc".repeat(16) },
+            ],
+            "peer": { "role": "dial", "addr": "10.10.0.1:7800" },
+            "control": control.to_string(),
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["node_id"], 1);
+
+    let ran = exec.ran().await;
+    // The non-holder formats first; the holder formats last, with the
+    // non-holder in its roster.
+    let formats: Vec<_> = ran
+        .iter()
+        .filter(|r| r.program == "/usr/sbin/lumen-fsd")
+        .collect();
+    assert_eq!(formats.len(), 2, "{ran:#?}");
+    assert!(formats[0].args.contains(&"--tier".to_string()));
+    assert!(!formats[0].args.contains(&"--wal".to_string()));
+    assert!(formats[1].args.contains(&"--wal".to_string()));
+    assert!(
+        formats[1]
+            .args
+            .windows(2)
+            .any(|w| w[0] == "--roster" && w[1] == format!("{}:1", "cc".repeat(16))),
+        "{ran:#?}"
+    );
+    // The drop-in carries the member's whole address book.
+    let conf = ran
+        .iter()
+        .find(|r| r.program == "/usr/bin/install")
+        .expect("the drop-in was written");
+    let stdin = conf.stdin.as_deref().unwrap();
+    assert!(stdin.contains("LUMEN_FSD_NODE=1"), "{stdin}");
+    assert!(
+        stdin.contains("LUMEN_FSD_PEER=--dial 10.10.0.1:7800"),
+        "{stdin}"
+    );
+    assert!(
+        stdin.contains(&format!("LUMEN_FSD_CONTROL={control}")),
+        "{stdin}"
+    );
+    assert!(
+        exec.ran_with("/usr/bin/systemctl", &["enable", "--now", "lumen-fsd"])
+            .await
+    );
+}
+
+/// A prepare that names a disk the member does not have, or one that is
+/// claimed, refuses before anything is wiped.
+#[tokio::test]
+async fn a_peer_prepare_refuses_a_disk_it_cannot_vouch_for() {
+    let (router, _dir, exec) = router_with_deploy("prepare-refuse", PoolPresence::Absent);
+    let ticket = security::issue_peer_ticket(TICKET_SECRET, THERE).unwrap();
+    for disk in ["sdz", "sda"] {
+        let (status, body) = request(
+            &router,
+            Method::POST,
+            "/api/peer/pool/prepare",
+            None,
+            Some(&ticket),
+            Some(serde_json::json!({
+                "node_id": 0,
+                "pool_uuid": "aa".repeat(16),
+                "bricks": [
+                    { "disk": disk, "tier": 0, "wal_holder": true, "brick_uuid": "bb".repeat(16) },
+                ],
+                "peer": null,
+                "control": "127.0.0.1:7799",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{disk}: {body}");
+    }
+    assert!(
+        exec.ran().await.is_empty(),
+        "a refused prepare must not have run anything"
+    );
 }
 
 #[tokio::test]

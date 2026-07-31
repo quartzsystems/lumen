@@ -41,7 +41,7 @@ fn main() -> ExitCode {
         _ => {
             eprintln!(
                 "usage: lumen-fsd format <path> --tier <n> [--wal] [--roster <uuid>:<tier>]... \
-                 [--bytes <n>] [--vdisk-bytes <n>] [--pool-uuid <hex>]"
+                 [--bytes <n>] [--vdisk-bytes <n>] [--pool-uuid <hex>] [--brick-uuid <hex>]"
             );
             eprintln!("       lumen-fsd serve  <brick>... --node <id> --listen <addr> [--nbd <addr>] [--ublk <dev-id>] [--control <addr>]");
             eprintln!("       lumen-fsd serve  <brick>... --node <id> --dial   <addr> [--nbd <addr>] [--ublk <dev-id>] [--control <addr>]");
@@ -104,6 +104,7 @@ fn cmd_format(args: &[String]) -> Result<(), String> {
     let mut create_bytes: Option<u64> = None;
     let mut vdisk_bytes: Option<u64> = None;
     let mut pool_uuid: Option<[u8; 16]> = None;
+    let mut brick_uuid: Option<[u8; 16]> = None;
     let mut rest = args[1..].iter();
     while let Some(flag) = rest.next() {
         if flag == "--wal" {
@@ -133,6 +134,9 @@ fn cmd_format(args: &[String]) -> Result<(), String> {
             "--bytes" => create_bytes = Some(parse_bytes(value)?),
             "--vdisk-bytes" => vdisk_bytes = Some(parse_bytes(value)?),
             "--pool-uuid" => pool_uuid = Some(parse_uuid(value)?),
+            // The workflow mints identities up front so the holder's roster
+            // is known without parsing this command's stdout.
+            "--brick-uuid" => brick_uuid = Some(parse_uuid(value)?),
             _ => return Err(format!("unknown flag {flag}")),
         }
     }
@@ -141,7 +145,7 @@ fn cmd_format(args: &[String]) -> Result<(), String> {
         return Err("the WAL holder is always a tier-0 brick".into());
     }
     let pool_uuid = pool_uuid.unwrap_or_else(|| fresh_uuid("pool"));
-    let brick_uuid = fresh_uuid("brick");
+    let brick_uuid = brick_uuid.unwrap_or_else(|| fresh_uuid("brick"));
     format_brick(
         std::path::Path::new(path),
         create_bytes,

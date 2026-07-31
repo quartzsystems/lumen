@@ -66,6 +66,21 @@ pub enum ValidationCode {
     InvalidVolumeName,
     DuplicateVolumeName,
     InvalidVolumeSize,
+    // The LumenFS pool workflow (lumen-controlplane's pool_workflow.rs).
+    // Same reasoning as the volume codes above: the console matches on
+    // them in one place, so they live in one place.
+    EngineConflict,
+    PoolAlreadyPresent,
+    PoolMemberMissing,
+    PoolMemberUnreachable,
+    NoCoreSeat,
+    NotQuorate,
+    UnknownDisk,
+    DiskInUse,
+    DuplicateDisk,
+    NoBricksForMember,
+    NoTierZeroBrick,
+    UblkUnavailable,
 }
 
 impl ValidationCode {
@@ -107,6 +122,18 @@ impl ValidationCode {
             ValidationCode::InvalidVolumeName => "invalid_volume_name",
             ValidationCode::DuplicateVolumeName => "duplicate_volume_name",
             ValidationCode::InvalidVolumeSize => "invalid_volume_size",
+            ValidationCode::EngineConflict => "engine_conflict",
+            ValidationCode::PoolAlreadyPresent => "pool_already_present",
+            ValidationCode::PoolMemberMissing => "pool_member_missing",
+            ValidationCode::PoolMemberUnreachable => "pool_member_unreachable",
+            ValidationCode::NoCoreSeat => "no_core_seat",
+            ValidationCode::NotQuorate => "not_quorate",
+            ValidationCode::UnknownDisk => "unknown_disk",
+            ValidationCode::DiskInUse => "disk_in_use",
+            ValidationCode::DuplicateDisk => "duplicate_disk",
+            ValidationCode::NoBricksForMember => "no_bricks_for_member",
+            ValidationCode::NoTierZeroBrick => "no_tier_zero_brick",
+            ValidationCode::UblkUnavailable => "ublk_unavailable",
         }
     }
 }

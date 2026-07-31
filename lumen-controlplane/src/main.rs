@@ -304,9 +304,15 @@ async fn main() -> Result<()> {
         storage,
         virt,
         cluster,
-        peers,
+        peers: peers.clone(),
         drbd,
         pool,
+        // The pool workflows: their privileged verbs behind the same
+        // transient-unit runner as everything else, and their fan-out over
+        // the same authenticated channel.
+        pool_deploy: Arc::new(lumen_pool::PoolDeploy::new(exec.clone())),
+        pool_peers: peers,
+        pool_job: Default::default(),
         updates,
         tasks: lumen_controlplane::tasks::TaskLog::open(state_dir.join("vm-tasks.jsonl")),
         drain: Default::default(),

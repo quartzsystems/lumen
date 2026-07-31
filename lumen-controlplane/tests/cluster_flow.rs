@@ -164,6 +164,11 @@ fn harness_with_storage(
         drain: Default::default(),
         update_job: Default::default(),
         roll: Default::default(),
+        pool_deploy: std::sync::Arc::new(lumen_pool::PoolDeploy::new(
+            lumen_sys::exec::MockExec::working(),
+        )),
+        pool_peers: std::sync::Arc::new(lumen_controlplane::inventory::NoPeers),
+        pool_job: Default::default(),
     };
     Harness {
         router: app(Arc::new(state)),
@@ -968,6 +973,11 @@ async fn a_cluster_create_reports_per_node_per_step_progress_and_completes() {
         drain: Default::default(),
         update_job: Default::default(),
         roll: Default::default(),
+        pool_deploy: std::sync::Arc::new(lumen_pool::PoolDeploy::new(
+            lumen_sys::exec::MockExec::working(),
+        )),
+        pool_peers: std::sync::Arc::new(lumen_controlplane::inventory::NoPeers),
+        pool_job: Default::default(),
     }));
 
     let cookie = sign_in(&router).await;

@@ -26,6 +26,12 @@ license = "MIT"
 lumen-drbd = { path = "../lumen-drbd" }
 # The daemon's typed control client is this crate's backend.
 lumen-fsd = { path = "../lumen-fsd" }
+# The engine, for one hash: minting brick/pool identities in the impure
+# shell, the same recipe the daemon's own format uses.
+lumen-fs = { path = "../lumen-fs" }
+# The exec seam the deployment verbs run through — format, the drop-in
+# write, systemctl — so the workflows test against MockExec's exact argv.
+lumen-sys = { path = "../../lumen-system/lumen-sys" }
 anyhow = "1"
 async-trait = "0.1"
 # The peer channel carries typed verbs between control planes, and the

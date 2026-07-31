@@ -7,6 +7,7 @@ pub mod inventory;
 pub mod maintenance;
 pub mod peers;
 pub mod pool;
+pub mod pool_workflow;
 pub mod realm;
 pub mod security;
 pub mod tasks;
@@ -70,6 +71,16 @@ pub struct AppState {
     /// the daemon's own drop-in at startup, never by a second record. On a
     /// pooled node this is also the engine `virt` holds as its `VmVolumes`.
     pub pool: pool::PoolPresence,
+    /// The pool deployment's privileged verbs — format, the drop-in, the
+    /// unit, the wipe — behind the exec seam, so the workflows test
+    /// against exact argv.
+    pub pool_deploy: Arc<lumen_pool::PoolDeploy>,
+    /// How the pool workflows reach the other members' control planes.
+    pub pool_peers: Arc<dyn pool_workflow::PoolWorkflowPeers>,
+    /// The pool create or destroy in flight, if any. In-memory: the
+    /// coordinator's own restart is the workflow's last act, and the
+    /// observed pool is the truth that survives it.
+    pub pool_job: pool_workflow::PoolJobHandle,
     /// What this node could install, and installing it. Depends on nothing
     /// else here: the packages waiting for a node are a fact about the node,
     /// not about its machines or its cluster.

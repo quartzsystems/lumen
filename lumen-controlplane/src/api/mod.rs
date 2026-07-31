@@ -294,6 +294,16 @@ pub fn router(state: Arc<AppState>) -> Router {
         // against this node's own daemon over its own loopback — the only
         // way a pool daemon is ever addressed from off-box.
         .route("/api/peer/pool/verb", post(peer::pool_verb))
+        // The pool workflows' per-member acts: what a node would bring,
+        // becoming a member, ceasing to be one, and the reply-first
+        // restart that adopts either. Consent never travels these.
+        .route("/api/peer/pool/preflight", post(peer::pool_preflight))
+        .route("/api/peer/pool/prepare", post(peer::pool_prepare))
+        .route("/api/peer/pool/teardown", post(peer::pool_teardown))
+        .route(
+            "/api/peer/controlplane/restart",
+            post(peer::controlplane_restart),
+        )
         .route("/api/peer/definition/store", post(peer::store_definition))
         .route("/api/peer/definition/drop", post(peer::drop_definition))
         // The node itself: its local accounts, and its power state. Every
@@ -367,6 +377,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         // are addressed by the compute domain's name for them — the device
         // path is the same fact with slashes in it.
         .route("/api/storage/pool", get(storage::pooled_storage))
+        .route("/api/storage/pool", post(storage::create_lumen_pool))
+        .route("/api/storage/pool", delete(storage::destroy_lumen_pool))
+        .route(
+            "/api/storage/pool/pending",
+            get(storage::lumen_pool_pending),
+        )
         .route(
             "/api/storage/pool/disks/{name}/snapshots",
             post(storage::snapshot_pooled_disk),

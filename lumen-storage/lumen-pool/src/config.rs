@@ -54,8 +54,11 @@ pub struct PoolConfig {
 }
 
 /// The peer link's two ends: one member listens, the other dials. The
-/// value is the flag the unit hands the daemon, verbatim.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// value is the flag the unit hands the daemon, verbatim. Serialized
+/// because the create workflow's prepare payload carries one to each
+/// member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "role", content = "addr", rename_all = "kebab-case")]
 pub enum PeerRole {
     Listen(SocketAddr),
     Dial(SocketAddr),

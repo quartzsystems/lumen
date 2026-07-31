@@ -32,6 +32,58 @@ struct DestroyPoolRequest {
     i_understand_this_may_lose_data: bool,
 }
 
+/// POST /api/storage/pool — start the LumenFS pool create. Validation
+/// answers now with every problem; the build itself runs behind the 202,
+/// on the pending feed.
+pub async fn create_lumen_pool(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    raw: Body,
+) -> Result<
+    (
+        axum::http::StatusCode,
+        Json<crate::pool_workflow::PoolProgress>,
+    ),
+    ApiError,
+> {
+    let request: crate::pool_workflow::LumenPoolCreate = required_body(raw)?;
+    let progress = crate::pool_workflow::create_pool(&state, request).await?;
+    Ok((axum::http::StatusCode::ACCEPTED, Json(progress)))
+}
+
+/// DELETE /api/storage/pool — destroy it: every brick wiped, every
+/// drop-in removed, every control plane restarted out of it.
+pub async fn destroy_lumen_pool(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    raw: Body,
+) -> Result<
+    (
+        axum::http::StatusCode,
+        Json<crate::pool_workflow::PoolProgress>,
+    ),
+    ApiError,
+> {
+    let request: DestroyPoolRequest = body(raw)?;
+    let progress =
+        crate::pool_workflow::destroy_pool(&state, request.i_understand_this_may_lose_data).await?;
+    Ok((axum::http::StatusCode::ACCEPTED, Json(progress)))
+}
+
+/// GET /api/storage/pool/pending — the running (or last finished) pool
+/// job. 404 when none has been started; after the coordinator's own
+/// restart the feed is gone too, and the observed pool is the answer.
+pub async fn lumen_pool_pending(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<crate::pool_workflow::PoolProgress>, ApiError> {
+    state
+        .pool_job
+        .snapshot()
+        .map(Json)
+        .ok_or_else(|| ApiError::NotFound("No pool job has been started.".to_string()))
+}
+
 /// POST /api/storage/pools — the acknowledgement rides alongside the pool.
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]

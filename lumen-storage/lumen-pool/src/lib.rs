@@ -32,6 +32,7 @@
 //! whatever that file says.
 
 pub mod config;
+pub mod deploy;
 pub mod error;
 pub mod fleet;
 pub mod model;
@@ -40,7 +41,8 @@ pub mod service;
 pub mod socket;
 pub mod state;
 
-pub use config::{PeerRole, PoolConfig};
+pub use config::{PeerRole, PoolConfig, DEFAULT_CONTROL, FSD_CONF};
+pub use deploy::{mint_brick_uuid, mint_pool_uuid, ublk_available, BrickFormat, PoolDeploy};
 pub use error::{PoolError, Result};
 pub use fleet::{MockFleet, PoolFleet};
 /// Re-exported for whoever serves a peer's verb: [`execute`] takes one of

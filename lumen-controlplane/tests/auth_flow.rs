@@ -104,6 +104,11 @@ fn test_app() -> axum::Router {
         drain: Default::default(),
         update_job: Default::default(),
         roll: Default::default(),
+        pool_deploy: std::sync::Arc::new(lumen_pool::PoolDeploy::new(
+            lumen_sys::exec::MockExec::working(),
+        )),
+        pool_peers: std::sync::Arc::new(lumen_controlplane::inventory::NoPeers),
+        pool_job: Default::default(),
     };
     app(Arc::new(state))
 }
