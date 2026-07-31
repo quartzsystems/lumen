@@ -398,6 +398,9 @@ async fn a_fenced_survivor_reads_as_degraded_rather_than_unknown() {
                 accepts_writes: true,
                 segments_free: 3,
                 segments_total: 30,
+                usable_bytes: 0,
+                free_bytes: 0,
+                tiers: Vec::new(),
                 // The mock fills the listings from its own pool state, so
                 // these are what a test pins health with, not the data.
                 vdisks: Vec::new(),

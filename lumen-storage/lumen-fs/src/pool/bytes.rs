@@ -169,10 +169,10 @@ impl<D: Disk> ByteView for ReplNode<D> {
 #[cfg(test)]
 mod tests {
     use super::ByteView;
-    use crate::brick::{Brick, BrickParams};
+    use crate::disk::sim::{SimDisk, SplitMix64};
     use crate::error::FsError;
     use crate::pool::Pool;
-    use crate::sim::{SimDisk, SplitMix64};
+    use crate::store::brick::{Brick, BrickParams};
 
     const KIB: u64 = 1024;
     const BLOCK: u64 = 4 * KIB;

@@ -36,11 +36,11 @@ use std::collections::{HashMap, HashSet};
 
 use crate::disk::Disk;
 use crate::error::{FsError, Result};
-use crate::format::{
+use crate::hash::{hash_block, BlockHash};
+use crate::store::format::{
     record_span, Anchor, RecordHeader, RosterEntry, SegmentHeader, Superblock, ANCHOR_AREA_START,
     ANCHOR_SLOTS, RECORD_HEADER_LEN, SECTOR_SIZE, WAL_AREA_START,
 };
-use crate::hash::{hash_block, BlockHash};
 
 /// Everything format-time about a brick. The caller supplies the UUIDs —
 /// this crate has no randomness of its own, by design.
@@ -96,6 +96,27 @@ pub struct BrickStats {
     pub segments_free: u64,
     /// Payload bytes the index points at (not the padded on-disk spans).
     pub payload_bytes: u64,
+}
+
+/// A brick's space said in bytes — see [`Brick::byte_space`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ByteSpace {
+    /// What this brick can hold: every segment outside the collection
+    /// reserve, at full-block payload density.
+    pub usable_bytes: u64,
+    /// What it can still take, on the same accounting.
+    pub free_bytes: u64,
+    /// What it holds now: the payload bytes the index points at.
+    pub payload_bytes: u64,
+}
+
+impl ByteSpace {
+    /// Fold another brick's figures into these — how a set and a tier sum.
+    pub fn add(&mut self, other: &ByteSpace) {
+        self.usable_bytes += other.usable_bytes;
+        self.free_bytes += other.free_bytes;
+        self.payload_bytes += other.payload_bytes;
+    }
 }
 
 /// What one garbage collection accomplished.
@@ -181,7 +202,7 @@ impl<D: Disk> Brick<D> {
                 "a holder's roster must include the holder itself",
             ));
         }
-        if roster.len() > crate::format::ROSTER_CAP {
+        if roster.len() > crate::store::format::ROSTER_CAP {
             return Err(FsError::BrickSetMismatch(
                 "more bricks than one node's anchor can roster",
             ));
@@ -898,6 +919,28 @@ impl<D: Disk> Brick<D> {
         self.free.len() as u64
     }
 
+    /// This brick's space in bytes, honestly: what segments flatter away —
+    /// headers, record padding, the collection reserve — is charged here,
+    /// so "usable" is the number an operator can actually store against.
+    /// Dedupe is deliberately not modeled: it only makes these numbers
+    /// conservative, which is the direction a capacity figure is allowed
+    /// to be wrong in.
+    pub fn byte_space(&self) -> ByteSpace {
+        let block_size = self.sb.block_size;
+        // A maximal record's on-disk span, and how many fit a segment
+        // beside its header sector.
+        let blocks_per_segment = (self.sb.segment_size - SECTOR_SIZE) / record_span(block_size);
+        let segment_payload = blocks_per_segment * block_size as u64;
+        let usable_segments = self.sb.segment_count.saturating_sub(self.reserve);
+        let free_segments = (self.free.len() as u64).saturating_sub(self.reserve);
+        let stats = self.stats();
+        ByteSpace {
+            usable_bytes: usable_segments * segment_payload,
+            free_bytes: free_segments * segment_payload,
+            payload_bytes: stats.payload_bytes,
+        }
+    }
+
     pub fn into_disk(self) -> D {
         self.disk
     }
@@ -941,7 +984,7 @@ impl<D: Disk> BlockWrite for Brick<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sim::SimDisk;
+    use crate::disk::sim::SimDisk;
 
     const KIB: u64 = 1024;
 

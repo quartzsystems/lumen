@@ -36,11 +36,11 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::brick::{BlockRead, BlockWrite, Brick, BrickStats, GcStats};
 use crate::disk::Disk;
 use crate::error::{FsError, Result};
-use crate::format::RosterEntry;
 use crate::hash::{hash_block, BlockHash};
+use crate::store::brick::{BlockRead, BlockWrite, Brick, BrickStats, ByteSpace, GcStats};
+use crate::store::format::RosterEntry;
 
 #[derive(Debug)]
 pub struct BrickSet<D: Disk> {
@@ -75,13 +75,20 @@ impl<D: Disk> BrickSet<D> {
         Self::assemble(vec![brick])
     }
 
+    /// Assemble already-opened bricks — the daemon's path, which opens
+    /// each brick itself so it can remember which path produced which
+    /// brick before the set's sort order takes over.
+    pub fn from_bricks(bricks: Vec<Brick<D>>) -> Result<BrickSet<D>> {
+        Self::assemble(bricks)
+    }
+
     /// Format one node's set and return it assembled. The holder is
     /// formatted **last**, rostering the whole set: a crash anywhere in
     /// here leaves either no holder (no pool — orphan non-holders are
     /// reformatted by the retry) or a holder whose roster names bricks
     /// that all exist. Never an anchor pointing at bricks that were still
     /// to come.
-    pub fn format(specs: Vec<(D, crate::brick::BrickParams)>) -> Result<BrickSet<D>> {
+    pub fn format(specs: Vec<(D, crate::store::brick::BrickParams)>) -> Result<BrickSet<D>> {
         let holders = specs.iter().filter(|(_, p)| p.wal_holder).count();
         if holders != 1 {
             return Err(FsError::BrickSetMismatch(
@@ -331,6 +338,34 @@ impl<D: Disk> BrickSet<D> {
         total
     }
 
+    /// The set's space in bytes, per tier and per brick — the report the
+    /// capacity figure is computed from. Bricks appear in the set's sorted
+    /// order; tiers ascend.
+    pub fn space_report(&self) -> SpaceReport {
+        let mut tiers: Vec<TierSpace> = Vec::new();
+        for brick in &self.bricks {
+            let space = brick.byte_space();
+            let entry = BrickSpace {
+                brick_uuid: brick.roster_entry().brick_uuid,
+                tier: brick.tier(),
+                wal_holder: brick.wal_holder(),
+                space,
+            };
+            match tiers.iter_mut().find(|t| t.tier == brick.tier()) {
+                Some(tier) => {
+                    tier.space.add(&space);
+                    tier.bricks.push(entry);
+                }
+                None => tiers.push(TierSpace {
+                    tier: brick.tier(),
+                    space,
+                    bricks: vec![entry],
+                }),
+            }
+        }
+        SpaceReport { tiers }
+    }
+
     /// Verify every brick's every block — scrub's store half, summed.
     pub fn scrub(&self) -> Result<(u64, Vec<BlockHash>)> {
         let mut verified = 0;
@@ -411,6 +446,30 @@ impl<D: Disk> BrickSet<D> {
     }
 }
 
+/// The set's space in bytes — see [`BrickSet::space_report`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpaceReport {
+    /// Ascending by tier; every tier the set carries appears.
+    pub tiers: Vec<TierSpace>,
+}
+
+/// One tier's space: the summed figures and each brick's own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TierSpace {
+    pub tier: u8,
+    pub space: ByteSpace,
+    pub bricks: Vec<BrickSpace>,
+}
+
+/// One brick's space, with enough identity to say which disk it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrickSpace {
+    pub brick_uuid: [u8; 16],
+    pub tier: u8,
+    pub wal_holder: bool,
+    pub space: ByteSpace,
+}
+
 /// One tier of a [`BrickSet`], writable — see [`BrickSet::tier_mut`].
 pub struct TierMut<'a, D: Disk> {
     set: &'a mut BrickSet<D>,
@@ -456,8 +515,8 @@ impl<D: Disk> BlockRead for TierRef<'_, D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::brick::BrickParams;
-    use crate::sim::SimDisk;
+    use crate::disk::sim::SimDisk;
+    use crate::store::brick::BrickParams;
 
     const KIB: u64 = 1024;
 
@@ -643,6 +702,38 @@ mod tests {
             BrickSet::open(disks).unwrap_err(),
             FsError::BrickSetMismatch(_)
         ));
+    }
+
+    /// The label "usable" cannot drift: the arithmetic is pinned to
+    /// numbers computed by hand from the geometry, not to itself.
+    #[test]
+    fn the_byte_arithmetic_is_pinned_to_hand_computed_numbers() {
+        let set = two_tier_set();
+        let report = set.space_report();
+        // A 16 KiB block spans 20 KiB on disk (64-byte header, padded to
+        // the next sector), so 12 fit a 256 KiB segment beside its header
+        // sector: 196608 payload bytes per segment. Every disk here ends
+        // up with 15 segments, one of them the collection reserve.
+        let per_brick = 14 * 196_608u64;
+        assert_eq!(report.tiers.len(), 2);
+        let tier0 = &report.tiers[0];
+        assert_eq!(tier0.tier, 0);
+        assert_eq!(tier0.bricks.len(), 2);
+        assert_eq!(tier0.space.usable_bytes, 2 * per_brick);
+        assert_eq!(
+            tier0.space.free_bytes,
+            2 * per_brick,
+            "a fresh set is all free"
+        );
+        assert_eq!(tier0.space.payload_bytes, 0);
+        let tier1 = &report.tiers[1];
+        assert_eq!(tier1.tier, 1);
+        assert_eq!(tier1.space.usable_bytes, per_brick);
+        assert!(!tier1.bricks[0].wal_holder);
+        assert!(
+            tier0.bricks.iter().any(|b| b.wal_holder),
+            "the holder sits on tier 0"
+        );
     }
 
     #[test]

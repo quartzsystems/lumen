@@ -42,10 +42,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use lumen_fs::file_disk::{is_block_device, FileDisk};
+use lumen_fs::disk::file::{is_block_device, FileDisk};
 use lumen_fs::{
-    Brick, BrickParams, BrickStats, ByteView, Disk, Effect, FsError, GcStats, Lease, PeerMessage,
-    Pool, ReplNode, ReplState, ScrubReport,
+    Brick, BrickParams, BrickSet, BrickStats, ByteView, Disk, Effect, FsError, GcStats, Lease,
+    PeerMessage, Pool, ReplNode, ReplState, ScrubReport, SpaceReport,
 };
 
 use crate::wire::{self, Handshake, HANDSHAKE_LEN, MAX_FRAME};
@@ -62,7 +62,10 @@ const CHECKPOINT_TICKS: u32 = 5;
 
 pub struct Config {
     pub node: u8,
-    pub brick: PathBuf,
+    /// Every brick of this node's set, one path per disk. The set's own
+    /// checks decide whether they belong together; the daemon just opens
+    /// what it is given and refuses to guess.
+    pub bricks: Vec<PathBuf>,
     /// Accept the peer here. Exactly one of `listen`/`dial` is set — the
     /// two ends of one link, decided by deployment rather than guessed.
     pub listen: Option<SocketAddr>,
@@ -80,6 +83,8 @@ pub struct Status {
     pub vdisks: Vec<(u64, u64)>,
     pub leases: Vec<(u64, Lease)>,
     pub space: BrickStats,
+    /// The same space said in bytes, per tier and per brick.
+    pub report: SpaceReport,
     /// `(sent, peer_confirmed_durable, applied_from_peer)`.
     pub stream: (u64, u64, u64),
 }
@@ -444,10 +449,8 @@ impl GuestHandle {
 
     /// Create a vdisk. Replicated like any other operation, so it exists
     /// on both members or the call refuses.
-    pub fn create_vdisk(&self, vdisk: u64, size_bytes: u64) -> Result<(), FsError> {
-        // Tier 0 until the control surface learns the tier argument
-        // (phase 4's byte-capacity slice) — the one tier every set has.
-        self.blocking(|engine| engine.create_vdisk(vdisk, size_bytes, 0))
+    pub fn create_vdisk(&self, vdisk: u64, size_bytes: u64, tier: u8) -> Result<(), FsError> {
+        self.blocking(|engine| engine.create_vdisk(vdisk, size_bytes, tier))
     }
 
     /// Destroy a vdisk. Refused while snapshots pin its history — the
@@ -635,6 +638,10 @@ pub struct Daemon {
     /// is possible at all: a block device that outlives the process
     /// serving it is a device whose next reader hangs.
     exports: Mutex<HashMap<u64, Box<dyn ExportControl>>>,
+    /// Which path produced which brick — the join `brick-list` makes
+    /// between the engine's uuids and the operator's device names. Fixed
+    /// for the daemon's life, like the set itself.
+    brick_paths: HashMap<[u8; 16], PathBuf>,
 }
 
 impl Daemon {
@@ -642,9 +649,28 @@ impl Daemon {
         if config.listen.is_some() == config.dial.is_some() {
             return Err("exactly one of listen/dial must be configured".into());
         }
-        let disk = FileDisk::open(&config.brick)
-            .map_err(|err| format!("cannot open {}: {err}", config.brick.display()))?;
-        let pool = Pool::open(Brick::open(disk).map_err(|err| err.to_string())?)
+        if config.bricks.is_empty() {
+            return Err("a daemon with no bricks has nothing to serve".into());
+        }
+        let mut bricks = Vec::with_capacity(config.bricks.len());
+        let mut brick_paths = HashMap::new();
+        for path in &config.bricks {
+            // The control surface reports these paths space-separated, so
+            // a path with whitespace would corrupt every listing it ever
+            // appeared in. Refused where it enters, not escaped downstream.
+            if path.to_string_lossy().chars().any(char::is_whitespace) {
+                return Err(format!(
+                    "brick path contains whitespace: {}",
+                    path.display()
+                ));
+            }
+            let disk = FileDisk::open(path)
+                .map_err(|err| format!("cannot open {}: {err}", path.display()))?;
+            let brick = Brick::open(disk).map_err(|err| format!("{}: {err}", path.display()))?;
+            brick_paths.insert(brick.roster_entry().brick_uuid, path.clone());
+            bricks.push(brick);
+        }
+        let pool = Pool::open_set(BrickSet::from_bricks(bricks).map_err(|err| err.to_string())?)
             .map_err(|err| err.to_string())?;
         let engine = ReplNode::new(pool, config.node);
 
@@ -774,6 +800,7 @@ impl Daemon {
             threads,
             peer_addr,
             exports: Mutex::new(HashMap::new()),
+            brick_paths,
         })
     }
 
@@ -793,7 +820,7 @@ impl Daemon {
 
     #[cfg(target_os = "linux")]
     fn start_export(&self, vdisk: u64, dev_id: u32) -> Result<Box<dyn ExportControl>, String> {
-        crate::ublk::start(self.guest(), vdisk, dev_id)
+        crate::export::ublk::start(self.guest(), vdisk, dev_id)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -897,8 +924,15 @@ impl Daemon {
             vdisks: engine.pool().vdisks(),
             leases: engine.pool().leases(),
             space: engine.pool().space(),
+            report: engine.pool().space_report(),
             stream: engine.stream_counters(),
         })
+    }
+
+    /// The path each brick was opened from, by brick uuid — what turns the
+    /// engine's identities into the device names an operator recognizes.
+    pub fn brick_path(&self, brick_uuid: &[u8; 16]) -> Option<&Path> {
+        self.brick_paths.get(brick_uuid).map(PathBuf::as_path)
     }
 
     pub fn checkpoint(&self) -> Result<(), FsError> {
@@ -936,23 +970,45 @@ impl Daemon {
 
 /// Format a brick for daemon use. `pool_uuid` must be shared by every
 /// member of the pool (the handshake enforces it); `brick_uuid` must be
-/// unique per brick. The vdisk is created unclaimed — the first attach
-/// claims the writer lease through replication, not through the format.
+/// unique per brick.
+///
+/// A node's bricks are formatted one invocation each, **holder last**:
+/// `roster` names the already-formatted non-holders (each printed its
+/// identity when it was formatted), the holder adds itself, and the
+/// anchor it writes rosters the whole set — so a crash anywhere in a
+/// node's format leaves no anchor naming bricks that do not exist, just
+/// orphans the retry reformats. `create_bytes` creates and sizes a
+/// regular file first (the test and smoke path); a block device is always
+/// formatted in place.
+/// `bootstrap_vdisk_bytes` keeps the smoke tool's bootstrap vdisk, holder
+/// only — a wizard-created pool has no place for it. The vdisk is created
+/// unclaimed — the first attach claims the writer lease through
+/// replication, not through the format.
+#[allow(clippy::too_many_arguments)]
 pub fn format_brick(
     path: &Path,
-    disk_bytes: u64,
-    vdisk_bytes: u64,
+    create_bytes: Option<u64>,
+    tier: u8,
+    wal_holder: bool,
+    roster: Vec<lumen_fs::RosterEntry>,
+    bootstrap_vdisk_bytes: Option<u64>,
     pool_uuid: [u8; 16],
     brick_uuid: [u8; 16],
 ) -> Result<(), String> {
-    if !is_block_device(path) {
+    if let Some(bytes) = create_bytes {
+        if is_block_device(path) {
+            return Err(format!(
+                "{} is a block device; --bytes is for files",
+                path.display()
+            ));
+        }
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
             .open(path)
             .map_err(|err| format!("cannot create {}: {err}", path.display()))?;
-        file.set_len(disk_bytes)
+        file.set_len(bytes)
             .map_err(|err| format!("cannot size {}: {err}", path.display()))?;
     }
     let disk = FileDisk::open(path).map_err(|err| err.to_string())?;
@@ -963,16 +1019,36 @@ pub fn format_brick(
         brick_uuid,
         block_size: 16 * 1024,
         segment_size: if big { 64 << 20 } else { 4 << 20 },
-        wal_size: if big { 64 << 20 } else { 8 << 20 },
-        // The one brick a node has today is definitionally its tier-0 WAL
-        // holder; the drive wizard's multi-brick format arrives with it.
-        tier: 0,
-        wal_holder: true,
+        wal_size: if wal_holder {
+            if big {
+                64 << 20
+            } else {
+                8 << 20
+            }
+        } else {
+            0
+        },
+        tier,
+        wal_holder,
     };
-    let brick = Brick::format(disk, params).map_err(|err| err.to_string())?;
-    let mut pool = Pool::create(brick).map_err(|err| err.to_string())?;
-    pool.create_vdisk(crate::nbd::VDISK, vdisk_bytes, 0)
-        .map_err(|err| err.to_string())?;
-    pool.checkpoint().map_err(|err| err.to_string())?;
+    let brick = if wal_holder {
+        let mut full = roster;
+        full.push(lumen_fs::RosterEntry { brick_uuid, tier });
+        Brick::format_rostered(disk, params, full).map_err(|err| err.to_string())?
+    } else {
+        if !roster.is_empty() {
+            return Err("only the WAL holder's format carries the roster".into());
+        }
+        Brick::format(disk, params).map_err(|err| err.to_string())?
+    };
+    if let Some(vdisk_bytes) = bootstrap_vdisk_bytes {
+        if !wal_holder {
+            return Err("the bootstrap vdisk needs the WAL holder".into());
+        }
+        let mut pool = Pool::create(brick).map_err(|err| err.to_string())?;
+        pool.create_vdisk(crate::export::nbd::VDISK, vdisk_bytes, tier)
+            .map_err(|err| err.to_string())?;
+        pool.checkpoint().map_err(|err| err.to_string())?;
+    }
     Ok(())
 }

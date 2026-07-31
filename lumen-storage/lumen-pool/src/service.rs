@@ -302,8 +302,10 @@ impl VmVolumes for PoolService {
         let here = members[0].clone();
 
         // Creation replicates, so one member is told and both have it.
+        // Tier 0 for every machine disk until the create dialog offers the
+        // choice — the compute seam deliberately says nothing about tiers.
         self.fleet
-            .create_vdisk(&here, vdisk, request.size_bytes)
+            .create_vdisk(&here, vdisk, request.size_bytes, 0)
             .await?;
 
         // The device is materialized where the machine is. If that fails,

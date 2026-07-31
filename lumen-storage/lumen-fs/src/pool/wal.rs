@@ -35,10 +35,10 @@
 //! first*, when the history after it never got a single frame to disk —
 //! and such a run is entirely unacknowledged by construction.
 
-use crate::brick::Brick;
 use crate::disk::Disk;
 use crate::error::{FsError, Result};
 use crate::hash::full_check;
+use crate::store::brick::Brick;
 
 const FRAME_MAGIC: &[u8; 8] = b"LFSWAL\0\0";
 
@@ -287,8 +287,8 @@ impl Wal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::brick::{Brick, BrickParams};
-    use crate::sim::SimDisk;
+    use crate::disk::sim::SimDisk;
+    use crate::store::brick::{Brick, BrickParams};
 
     const KIB: u64 = 1024;
 

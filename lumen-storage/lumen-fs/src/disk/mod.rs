@@ -16,6 +16,11 @@
 
 use crate::error::Result;
 
+/// The real thing: a file or block device, sized by seeking.
+pub mod file;
+/// The tortured thing: the deterministic crash-simulation disk.
+pub mod sim;
+
 pub trait Disk {
     /// Total size in bytes. Fixed for the life of the handle.
     fn size(&self) -> u64;

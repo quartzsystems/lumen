@@ -33,29 +33,22 @@
 //! while never returning corrupt data for any block. Unacknowledged blocks
 //! may survive or vanish; both are correct.
 
-pub mod brick;
-pub mod brick_set;
-pub mod bytes;
 pub mod disk;
 pub mod error;
-pub mod file_disk;
-pub mod format;
 pub mod hash;
-pub mod map;
 pub mod pool;
 pub mod repl;
-pub mod sim;
-pub mod slice;
-pub mod wal;
+pub mod store;
 
-pub use brick::{BlockRead, BlockWrite, Brick, BrickParams, BrickStats, GcStats};
-pub use brick_set::BrickSet;
-pub use bytes::ByteView;
+pub use disk::file::{is_block_device, FileDisk};
+pub use disk::sim::{SimDisk, SplitMix64};
 pub use disk::Disk;
 pub use error::{FsError, Result};
-pub use format::{RosterEntry, Superblock, ROSTER_CAP, SECTOR_SIZE, SUPERBLOCK_SLOTS};
 pub use hash::{hash_block, BlockHash};
+pub use pool::bytes::ByteView;
 pub use pool::{Lease, Pool, ScrubReport};
+pub use repl::slice::{slice_of, Homes, Reassignment, SliceMap, SliceMove, SLICES};
 pub use repl::{Effect, NodeId, PeerMessage, ReplNode, ReplOp, ReplState, SyncOffer};
-pub use sim::{SimDisk, SplitMix64};
-pub use slice::{slice_of, Homes, Reassignment, SliceMap, SliceMove, SLICES};
+pub use store::brick::{BlockRead, BlockWrite, Brick, BrickParams, BrickStats, ByteSpace, GcStats};
+pub use store::brick_set::{BrickSet, BrickSpace, SpaceReport, TierSpace};
+pub use store::format::{RosterEntry, Superblock, ROSTER_CAP, SECTOR_SIZE, SUPERBLOCK_SLOTS};

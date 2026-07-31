@@ -40,7 +40,7 @@ pub mod service;
 pub mod socket;
 pub mod state;
 
-pub use config::PoolConfig;
+pub use config::{PeerRole, PoolConfig};
 pub use error::{PoolError, Result};
 pub use fleet::{MockFleet, PoolFleet};
 /// Re-exported for whoever serves a peer's verb: [`execute`] takes one of
@@ -51,6 +51,6 @@ pub use peers::{execute, PeeredFleet, PoolAnswer, PoolPeers, PoolVerb};
 pub use service::PoolService;
 pub use socket::SocketFleet;
 pub use state::{
-    LeaseSeen, MemberStatus, MemberView, PoolHealth, PoolMember, PoolState, Replication,
-    SnapshotView, VdiskView,
+    pool_usable_bytes, BrickSeen, LeaseSeen, MemberStatus, MemberView, PoolHealth, PoolMember,
+    PoolState, Replication, SnapshotView, TierCapacitySeen, VdiskView,
 };

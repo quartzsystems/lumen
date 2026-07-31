@@ -43,7 +43,7 @@ use lumen_fsd::{Client, ReplState};
 
 use crate::error::{PoolError, Result};
 use crate::fleet::PoolFleet;
-use crate::state::{LeaseSeen, MemberStatus, Replication};
+use crate::state::{BrickSeen, LeaseSeen, MemberStatus, Replication, TierCapacitySeen};
 
 /// Every member's control address, this node first.
 pub struct SocketFleet {
@@ -125,6 +125,17 @@ impl PoolFleet for SocketFleet {
             accepts_writes: view.accepts_writes,
             segments_free: view.segments_free,
             segments_total: view.segments_total,
+            usable_bytes: view.usable_bytes,
+            free_bytes: view.free_bytes,
+            tiers: view
+                .tiers
+                .iter()
+                .map(|t| TierCapacitySeen {
+                    tier: t.tier,
+                    usable_bytes: t.usable_bytes,
+                    free_bytes: t.free_bytes,
+                })
+                .collect(),
             vdisks: view.vdisks,
             leases: view
                 .leases
@@ -148,9 +159,37 @@ impl PoolFleet for SocketFleet {
         self.on(member, |client| client.vdisks()).await
     }
 
-    async fn create_vdisk(&self, member: &str, vdisk: u64, size_bytes: u64) -> Result<()> {
-        self.on(member, move |client| client.create_vdisk(vdisk, size_bytes))
-            .await
+    async fn create_vdisk(
+        &self,
+        member: &str,
+        vdisk: u64,
+        size_bytes: u64,
+        tier: u8,
+    ) -> Result<()> {
+        self.on(member, move |client| {
+            client.create_vdisk(vdisk, size_bytes, tier)
+        })
+        .await
+    }
+
+    async fn brick_list(&self, member: &str) -> Result<Vec<BrickSeen>> {
+        self.on(member, move |client| {
+            client.brick_list().map(|bricks| {
+                bricks
+                    .into_iter()
+                    .map(|brick| BrickSeen {
+                        path: brick.path,
+                        uuid: brick.uuid,
+                        tier: brick.tier,
+                        wal_holder: brick.wal_holder,
+                        usable_bytes: brick.usable_bytes,
+                        free_bytes: brick.free_bytes,
+                        payload_bytes: brick.payload_bytes,
+                    })
+                    .collect()
+            })
+        })
+        .await
     }
 
     async fn delete_vdisk(&self, member: &str, vdisk: u64) -> Result<()> {

@@ -26,9 +26,9 @@
 
 use std::collections::BTreeMap;
 
-use crate::brick::{BlockRead, BlockWrite};
 use crate::error::{FsError, Result};
 use crate::hash::BlockHash;
+use crate::store::brick::{BlockRead, BlockWrite};
 
 const ENTRY_LEN: usize = 32;
 
@@ -226,8 +226,8 @@ fn walk_level<S: BlockRead + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::brick::{Brick, BrickParams};
-    use crate::sim::SimDisk;
+    use crate::disk::sim::SimDisk;
+    use crate::store::brick::{Brick, BrickParams};
 
     const KIB: u64 = 1024;
 

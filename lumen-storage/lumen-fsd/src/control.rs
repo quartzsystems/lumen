@@ -90,10 +90,16 @@ pub fn command(daemon: &Daemon, line: &str) -> String {
             }
             "vdisk-create" => {
                 let (vdisk, size) = (number(1)?, number(2)?);
+                // The tier is optional and 0 when unsaid — the one tier
+                // every set has, and what every caller before tiers meant.
+                let tier = match words.get(3) {
+                    Some(_) => number(3)? as u8,
+                    None => 0,
+                };
                 daemon
                     .guest()
-                    .create_vdisk(vdisk, size)
-                    .map(|()| format!("vdisk {vdisk} of {size} bytes"))
+                    .create_vdisk(vdisk, size, tier)
+                    .map(|()| format!("vdisk {vdisk} of {size} bytes on tier {tier}"))
                     .map_err(|err| err.to_string())?
             }
             "vdisk-delete" => {
@@ -251,10 +257,53 @@ pub fn command(daemon: &Daemon, line: &str) -> String {
                 let vdisk = number(1)?;
                 vdisk_content_hash(daemon, vdisk)?
             }
+            "brick-list" => {
+                let report = daemon.status().report;
+                let mut entries = Vec::new();
+                for tier in &report.tiers {
+                    for brick in &tier.bricks {
+                        // The path came off serve's own argv, where a
+                        // whitespace path was refused — so these records
+                        // stay parseable by splitting on spaces.
+                        let path = daemon
+                            .brick_path(&brick.brick_uuid)
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "?".into());
+                        entries.push(format!(
+                            "path={path},uuid={},tier={},wal={},usable={},free={},used={}",
+                            hex(&brick.brick_uuid),
+                            brick.tier,
+                            u8::from(brick.wal_holder),
+                            brick.space.usable_bytes,
+                            brick.space.free_bytes,
+                            brick.space.payload_bytes,
+                        ));
+                    }
+                }
+                entries.join(" ")
+            }
+            "capacity" => {
+                let report = daemon.status().report;
+                let entries: Vec<String> = report
+                    .tiers
+                    .iter()
+                    .map(|tier| {
+                        format!(
+                            "tier{0}.usable={1} tier{0}.free={2} tier{0}.used={3}",
+                            tier.tier,
+                            tier.space.usable_bytes,
+                            tier.space.free_bytes,
+                            tier.space.payload_bytes,
+                        )
+                    })
+                    .collect();
+                entries.join(" ")
+            }
             _ => {
                 return Err(
-                    "unknown command. node: status, fence-peer, checkpoint, gc, \
-                            scrub. vdisks: vdisks, vdisk-create <id> <bytes>, \
+                    "unknown command. node: status, capacity, brick-list, fence-peer, \
+                            checkpoint, gc, scrub. vdisks: vdisks, \
+                            vdisk-create <id> <bytes> [tier], \
                             vdisk-delete <id>, hash <id>. exports: export <id> <dev>, \
                             unexport <id>, exports. migration: lease <id>, \
                             handover <id> <to>, relinquish <id> <to>, \
@@ -316,8 +365,23 @@ fn status_line(daemon: &Daemon) -> String {
     if let Some(sync) = sync {
         line.push_str(&format!(" sync={sync}"));
     }
+    // The segment counts stay for continuity; the byte figures beside
+    // them are what the pool's capacity is computed from, summed and per
+    // tier — one status round trip carries the whole picture.
+    let mut usable = 0u64;
+    let mut free_bytes = 0u64;
+    let mut tier_fields = String::new();
+    for tier in &s.report.tiers {
+        usable += tier.space.usable_bytes;
+        free_bytes += tier.space.free_bytes;
+        tier_fields.push_str(&format!(
+            " tier{0}.usable={1} tier{0}.free={2}",
+            tier.tier, tier.space.usable_bytes, tier.space.free_bytes
+        ));
+    }
     line.push_str(&format!(
-        " era={} writes={} free={}/{} vdisks={} leases={} sent={} durable={} applied={}",
+        " era={} writes={} free={}/{} usable={usable} free_bytes={free_bytes}{tier_fields} \
+         vdisks={} leases={} sent={} durable={} applied={}",
         s.era,
         if s.accepts_writes { "open" } else { "held" },
         s.space.segments_free,
@@ -329,6 +393,10 @@ fn status_line(daemon: &Daemon) -> String {
         s.stream.2,
     ));
     line
+}
+
+fn hex(uuid: &[u8; 16]) -> String {
+    uuid.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// A deterministic content hash of a whole vdisk (a hash of per-chunk
@@ -380,11 +448,42 @@ pub struct StatusView {
     pub accepts_writes: bool,
     pub segments_free: u64,
     pub segments_total: u64,
+    /// This member's space in bytes, labelled usable — every segment
+    /// outside the collection reserve at full-block density, summed across
+    /// its bricks. Dedupe only makes it conservative.
+    pub usable_bytes: u64,
+    pub free_bytes: u64,
+    /// The same figures per tier, ascending — what a pool-wide capacity
+    /// takes its per-tier minimum over.
+    pub tiers: Vec<TierBytes>,
     pub vdisks: Vec<(u64, u64)>,
     pub leases: Vec<(u64, LeaseView)>,
     /// `(sent, peer_confirmed_durable, applied_from_peer)` — the counters
     /// that convicted the elided-flush bug, so they are worth carrying.
     pub stream: (u64, u64, u64),
+}
+
+/// One tier's byte figures as a member reports them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TierBytes {
+    pub tier: u8,
+    pub usable_bytes: u64,
+    pub free_bytes: u64,
+}
+
+/// One brick as `brick-list` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrickView {
+    /// The path the daemon opened it from — the device name an operator
+    /// recognizes.
+    pub path: String,
+    /// The brick's own identity, lowercase hex.
+    pub uuid: String,
+    pub tier: u8,
+    pub wal_holder: bool,
+    pub usable_bytes: u64,
+    pub free_bytes: u64,
+    pub payload_bytes: u64,
 }
 
 /// Parse `1:0@3->1,2:1@3` — the lease listing inside a status line.
@@ -440,11 +539,40 @@ fn parse_status(reply: &str) -> Option<StatusView> {
     let mut writes = None;
     let mut free = None;
     let mut total = None;
+    let mut usable_bytes = None;
+    let mut free_bytes = None;
+    let mut tiers: Vec<TierBytes> = Vec::new();
     let mut vdisks = None;
     let mut leases = None;
     let (mut sent, mut durable, mut applied) = (None, None, None);
     for token in reply.split_whitespace() {
         let (key, value) = token.split_once('=')?;
+        // Per-tier byte figures ride keys of the form tierN.usable /
+        // tierN.free — a tier number is data, so it lives in the key the
+        // same way it lives in the report.
+        if let Some(rest) = key.strip_prefix("tier") {
+            if let Some((tier, field)) = rest.split_once('.') {
+                let tier: u8 = tier.parse().ok()?;
+                let value: u64 = value.parse().ok()?;
+                let entry = match tiers.iter_mut().find(|t| t.tier == tier) {
+                    Some(entry) => entry,
+                    None => {
+                        tiers.push(TierBytes {
+                            tier,
+                            usable_bytes: 0,
+                            free_bytes: 0,
+                        });
+                        tiers.last_mut().unwrap()
+                    }
+                };
+                match field {
+                    "usable" => entry.usable_bytes = value,
+                    "free" => entry.free_bytes = value,
+                    _ => {}
+                }
+                continue;
+            }
+        }
         match key {
             "node" => node = Some(value.parse().ok()?),
             "state" => state = Some(value),
@@ -462,6 +590,8 @@ fn parse_status(reply: &str) -> Option<StatusView> {
                 free = Some(f.parse().ok()?);
                 total = Some(t.parse().ok()?);
             }
+            "usable" => usable_bytes = Some(value.parse().ok()?),
+            "free_bytes" => free_bytes = Some(value.parse().ok()?),
             "vdisks" => vdisks = Some(parse_sized(value)?),
             "leases" => leases = Some(parse_leases(value)?),
             "sent" => sent = Some(value.parse().ok()?),
@@ -471,6 +601,7 @@ fn parse_status(reply: &str) -> Option<StatusView> {
             _ => {}
         }
     }
+    tiers.sort_by_key(|t| t.tier);
     let state = match (state?, sync) {
         ("suspended", _) => ReplState::Suspended,
         ("synced", _) => ReplState::Synced,
@@ -488,6 +619,9 @@ fn parse_status(reply: &str) -> Option<StatusView> {
         accepts_writes: writes?,
         segments_free: free?,
         segments_total: total?,
+        usable_bytes: usable_bytes?,
+        free_bytes: free_bytes?,
+        tiers,
         vdisks: vdisks?,
         leases: leases?,
         stream: (sent?, durable?, applied?),
@@ -571,9 +705,52 @@ impl Client {
             .collect()
     }
 
-    pub fn create_vdisk(&mut self, vdisk: u64, size_bytes: u64) -> Result<(), String> {
-        self.ask(&format!("vdisk-create {vdisk} {size_bytes}"))
+    pub fn create_vdisk(&mut self, vdisk: u64, size_bytes: u64, tier: u8) -> Result<(), String> {
+        self.ask(&format!("vdisk-create {vdisk} {size_bytes} {tier}"))
             .map(|_| ())
+    }
+
+    /// Every brick of this member's set: which disk, which tier, and its
+    /// space in bytes.
+    pub fn brick_list(&mut self) -> Result<Vec<BrickView>, String> {
+        let reply = self.ask("brick-list")?;
+        reply
+            .split_whitespace()
+            .map(|record| {
+                let mut view = BrickView {
+                    path: String::new(),
+                    uuid: String::new(),
+                    tier: 0,
+                    wal_holder: false,
+                    usable_bytes: 0,
+                    free_bytes: 0,
+                    payload_bytes: 0,
+                };
+                for field in record.split(',') {
+                    let (key, value) = field
+                        .split_once('=')
+                        .ok_or_else(|| format!("malformed brick field: {field}"))?;
+                    let parse = |v: &str| {
+                        v.parse::<u64>()
+                            .map_err(|_| format!("bad brick number: {v}"))
+                    };
+                    match key {
+                        "path" => view.path = value.to_string(),
+                        "uuid" => view.uuid = value.to_string(),
+                        "tier" => view.tier = parse(value)? as u8,
+                        "wal" => view.wal_holder = parse(value)? != 0,
+                        "usable" => view.usable_bytes = parse(value)?,
+                        "free" => view.free_bytes = parse(value)?,
+                        "used" => view.payload_bytes = parse(value)?,
+                        _ => {}
+                    }
+                }
+                if view.path.is_empty() || view.uuid.is_empty() {
+                    return Err(format!("brick record missing identity: {record}"));
+                }
+                Ok(view)
+            })
+            .collect()
     }
 
     pub fn delete_vdisk(&mut self, vdisk: u64) -> Result<(), String> {
@@ -811,10 +988,13 @@ mod tests {
     fn a_status_line_reads_back_as_the_daemon_meant_it() {
         let mut client = responder(vec![
             "ok: node=1 state=synced era=3 writes=open free=29/30 \
+             usable=5111808 free_bytes=4915200 \
+             tier0.usable=3145728 tier0.free=2949120 \
+             tier1.usable=1966080 tier1.free=1966080 \
              vdisks=1:1073741824,2:536870912 leases=1:0@3,2:1@3->0 \
              sent=5 durable=5 applied=2",
             "ok: node=0 state=resyncing sync=target era=2 writes=held free=1/30 \
-             vdisks= leases= sent=0 durable=0 applied=0",
+             usable=100 free_bytes=0 vdisks= leases= sent=0 durable=0 applied=0",
         ]);
         let status = client.status().unwrap();
         assert_eq!(status.node, 1);
@@ -822,6 +1002,22 @@ mod tests {
         assert_eq!(status.era, 3);
         assert!(status.accepts_writes);
         assert_eq!((status.segments_free, status.segments_total), (29, 30));
+        assert_eq!((status.usable_bytes, status.free_bytes), (5111808, 4915200));
+        assert_eq!(
+            status.tiers,
+            vec![
+                TierBytes {
+                    tier: 0,
+                    usable_bytes: 3145728,
+                    free_bytes: 2949120
+                },
+                TierBytes {
+                    tier: 1,
+                    usable_bytes: 1966080,
+                    free_bytes: 1966080
+                },
+            ]
+        );
         assert_eq!(status.vdisks, vec![(1, 1073741824), (2, 536870912)]);
         assert_eq!(
             status.leases,
@@ -871,7 +1067,10 @@ mod tests {
             if let Some(sync) = sync {
                 line.push_str(&format!(" sync={sync}"));
             }
-            line.push_str(" era=1 writes=open free=1/2 vdisks= leases= sent=0 durable=0 applied=0");
+            line.push_str(
+                " era=1 writes=open free=1/2 usable=10 free_bytes=5 vdisks= leases= \
+                 sent=0 durable=0 applied=0",
+            );
             assert_eq!(
                 parse_status(&line).map(|s| s.state),
                 Some(state),

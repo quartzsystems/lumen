@@ -31,7 +31,7 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use lumen_fs::file_disk::{is_block_device, FileDisk};
+use lumen_fs::disk::file::{is_block_device, FileDisk};
 use lumen_fs::{
     hash_block, Brick, BrickParams, ByteView, Disk, FsError, Pool, Result, SplitMix64, SECTOR_SIZE,
 };

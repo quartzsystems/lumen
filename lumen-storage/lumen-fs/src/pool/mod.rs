@@ -47,15 +47,21 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::brick::{Brick, BrickStats, GcStats};
-use crate::brick_set::BrickSet;
+/// The byte-granular view a block device speaks.
+pub mod bytes;
+/// The COW radix trees mapping block index to content address.
+pub mod map;
+/// The write-ahead ring on the holder brick's aux area.
+pub mod wal;
+
 use crate::disk::Disk;
 use crate::error::{FsError, Result};
-use crate::format::Anchor;
 use crate::hash::{hash_block, BlockHash};
-use crate::map;
+use crate::pool::wal::Wal;
 use crate::repl::{NodeId, SnapshotOffer, VdiskOffer};
-use crate::wal::Wal;
+use crate::store::brick::{Brick, BrickStats, GcStats};
+use crate::store::brick_set::BrickSet;
+use crate::store::format::Anchor;
 
 /// What a scrub found. Empty vectors are the healthy answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1097,6 +1103,12 @@ impl<D: Disk> Pool<D> {
         self.store.tiers()
     }
 
+    /// The store's space in bytes, per tier and per brick — what the
+    /// capacity verbs report and the one usable figure is computed from.
+    pub fn space_report(&self) -> crate::store::brick_set::SpaceReport {
+        self.store.space_report()
+    }
+
     /// How the store's space stands, summed across bricks. A caller that
     /// only ever learns about pressure from [`FsError::Full`] learns too
     /// late: by then every write triggers a collection, and the pool
@@ -1492,8 +1504,8 @@ fn decode_manifest(buf: &[u8]) -> Result<DecodedManifest> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::brick::BrickParams;
-    use crate::sim::SimDisk;
+    use crate::disk::sim::SimDisk;
+    use crate::store::brick::BrickParams;
 
     const KIB: u64 = 1024;
     const BLOCK: usize = 4 * KIB as usize;

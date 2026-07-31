@@ -34,8 +34,9 @@
 //!
 //! [`PoolVerb`] is a **closed enum**, not a command string. The peer route
 //! that carries it is authenticated, but a member being able to ask a peer
-//! to run one of twelve named verbs is a different thing from being able to
-//! ask it to run whatever it likes, and only one of those can be reviewed.
+//! to run one of a fixed set of named verbs is a different thing from being
+//! able to ask it to run whatever it likes, and only one of those can be
+//! reviewed.
 //!
 //! [`execute`] is the single definition of what each verb *does*, used by
 //! whichever machine owns the daemon — this node calling its own, or a
@@ -51,7 +52,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{PoolError, Result};
 use crate::fleet::PoolFleet;
-use crate::state::{LeaseSeen, MemberStatus, Replication};
+use crate::state::{BrickSeen, LeaseSeen, MemberStatus, Replication, TierCapacitySeen};
 
 /// One thing a member's daemon can be asked to do. Closed on purpose: see
 /// the module note.
@@ -60,20 +61,59 @@ use crate::state::{LeaseSeen, MemberStatus, Replication};
 pub enum PoolVerb {
     Status,
     Vdisks,
-    CreateVdisk { vdisk: u64, size_bytes: u64 },
-    DeleteVdisk { vdisk: u64 },
-    Export { vdisk: u64 },
-    Unexport { vdisk: u64 },
+    /// Every brick of the member's set, with its space in bytes.
+    BrickList,
+    CreateVdisk {
+        vdisk: u64,
+        size_bytes: u64,
+        /// The device class the vdisk's data lives on. Defaulted so a verb
+        /// serialized before tiers existed still deserializes — as tier 0,
+        /// which is what every caller before tiers meant.
+        #[serde(default)]
+        tier: u8,
+    },
+    DeleteVdisk {
+        vdisk: u64,
+    },
+    Export {
+        vdisk: u64,
+    },
+    Unexport {
+        vdisk: u64,
+    },
     Exports,
-    Snapshot { vdisk: u64, snapshot: u64 },
-    Snapshots { vdisk: Option<u64> },
-    DeleteSnapshot { vdisk: u64, snapshot: u64 },
-    Rollback { vdisk: u64, snapshot: u64 },
-    Lease { vdisk: u64 },
-    Handover { vdisk: u64, to: u8 },
-    Relinquish { vdisk: u64, to: u8 },
-    Abort { vdisk: u64 },
-    Accept { vdisk: u64 },
+    Snapshot {
+        vdisk: u64,
+        snapshot: u64,
+    },
+    Snapshots {
+        vdisk: Option<u64>,
+    },
+    DeleteSnapshot {
+        vdisk: u64,
+        snapshot: u64,
+    },
+    Rollback {
+        vdisk: u64,
+        snapshot: u64,
+    },
+    Lease {
+        vdisk: u64,
+    },
+    Handover {
+        vdisk: u64,
+        to: u8,
+    },
+    Relinquish {
+        vdisk: u64,
+        to: u8,
+    },
+    Abort {
+        vdisk: u64,
+    },
+    Accept {
+        vdisk: u64,
+    },
 }
 
 /// What a verb answered. One variant per shape rather than a string, so a
@@ -89,6 +129,8 @@ pub enum PoolVerb {
 pub enum PoolAnswer {
     Status(MemberStatus),
     Vdisks(Vec<(u64, u64)>),
+    /// The member's bricks, from `brick-list`.
+    Bricks(Vec<BrickSeen>),
     Exports(Vec<(u64, String)>),
     /// `(vdisk, snapshot, size_bytes)`.
     Snapshots(Vec<(u64, u64, u64)>),
@@ -122,6 +164,13 @@ impl PoolAnswer {
         match self {
             PoolAnswer::Vdisks(vdisks) => Ok(vdisks),
             other => Err(other.wrong("a vdisk listing")),
+        }
+    }
+
+    pub fn into_bricks(self) -> Result<Vec<BrickSeen>> {
+        match self {
+            PoolAnswer::Bricks(bricks) => Ok(bricks),
+            other => Err(other.wrong("a brick listing")),
         }
     }
 
@@ -170,8 +219,27 @@ pub fn execute(client: &mut Client, verb: &PoolVerb) -> std::result::Result<Pool
     Ok(match *verb {
         PoolVerb::Status => PoolAnswer::Status(status_of(client)?),
         PoolVerb::Vdisks => PoolAnswer::Vdisks(client.vdisks()?),
-        PoolVerb::CreateVdisk { vdisk, size_bytes } => {
-            client.create_vdisk(vdisk, size_bytes)?;
+        PoolVerb::BrickList => PoolAnswer::Bricks(
+            client
+                .brick_list()?
+                .into_iter()
+                .map(|brick| BrickSeen {
+                    path: brick.path,
+                    uuid: brick.uuid,
+                    tier: brick.tier,
+                    wal_holder: brick.wal_holder,
+                    usable_bytes: brick.usable_bytes,
+                    free_bytes: brick.free_bytes,
+                    payload_bytes: brick.payload_bytes,
+                })
+                .collect(),
+        ),
+        PoolVerb::CreateVdisk {
+            vdisk,
+            size_bytes,
+            tier,
+        } => {
+            client.create_vdisk(vdisk, size_bytes, tier)?;
             PoolAnswer::Done
         }
         PoolVerb::DeleteVdisk { vdisk } => {
@@ -244,6 +312,17 @@ fn status_of(client: &mut Client) -> std::result::Result<MemberStatus, String> {
         accepts_writes: view.accepts_writes,
         segments_free: view.segments_free,
         segments_total: view.segments_total,
+        usable_bytes: view.usable_bytes,
+        free_bytes: view.free_bytes,
+        tiers: view
+            .tiers
+            .iter()
+            .map(|t| TierCapacitySeen {
+                tier: t.tier,
+                usable_bytes: t.usable_bytes,
+                free_bytes: t.free_bytes,
+            })
+            .collect(),
         vdisks: view.vdisks,
         leases: view
             .leases
@@ -362,10 +441,27 @@ impl PoolFleet for PeeredFleet {
         self.at(member, PoolVerb::Vdisks).await?.into_vdisks()
     }
 
-    async fn create_vdisk(&self, member: &str, vdisk: u64, size_bytes: u64) -> Result<()> {
-        self.at(member, PoolVerb::CreateVdisk { vdisk, size_bytes })
-            .await?
-            .into_done()
+    async fn create_vdisk(
+        &self,
+        member: &str,
+        vdisk: u64,
+        size_bytes: u64,
+        tier: u8,
+    ) -> Result<()> {
+        self.at(
+            member,
+            PoolVerb::CreateVdisk {
+                vdisk,
+                size_bytes,
+                tier,
+            },
+        )
+        .await?
+        .into_done()
+    }
+
+    async fn brick_list(&self, member: &str) -> Result<Vec<BrickSeen>> {
+        self.at(member, PoolVerb::BrickList).await?.into_bricks()
     }
 
     async fn delete_vdisk(&self, member: &str, vdisk: u64) -> Result<()> {
@@ -485,6 +581,9 @@ mod tests {
                     accepts_writes: true,
                     segments_free: 10,
                     segments_total: 20,
+                    usable_bytes: 0,
+                    free_bytes: 0,
+                    tiers: Vec::new(),
                     vdisks: Vec::new(),
                     leases: Vec::new(),
                     stream: (0, 0, 0),
@@ -599,9 +698,11 @@ mod tests {
         for verb in [
             PoolVerb::Status,
             PoolVerb::Vdisks,
+            PoolVerb::BrickList,
             PoolVerb::CreateVdisk {
                 vdisk: 1795,
                 size_bytes: 512 << 20,
+                tier: 1,
             },
             PoolVerb::DeleteVdisk { vdisk: 1795 },
             PoolVerb::Export { vdisk: 1795 },
@@ -642,6 +743,20 @@ mod tests {
                 accepts_writes: false,
                 segments_free: 1,
                 segments_total: 30,
+                usable_bytes: 5_505_024,
+                free_bytes: 196_608,
+                tiers: vec![
+                    TierCapacitySeen {
+                        tier: 0,
+                        usable_bytes: 3_538_944,
+                        free_bytes: 196_608,
+                    },
+                    TierCapacitySeen {
+                        tier: 1,
+                        usable_bytes: 1_966_080,
+                        free_bytes: 0,
+                    },
+                ],
                 vdisks: vec![(1795, 512 << 20)],
                 leases: vec![(
                     1795,
@@ -655,6 +770,16 @@ mod tests {
             }),
             PoolAnswer::Vdisks(vec![(1795, 512 << 20), (2, 8 << 20)]),
             PoolAnswer::Vdisks(Vec::new()),
+            PoolAnswer::Bricks(vec![BrickSeen {
+                path: "/dev/disk/by-id/nvme-eui.0001".into(),
+                uuid: "c1".repeat(16),
+                tier: 0,
+                wal_holder: true,
+                usable_bytes: 2_752_512,
+                free_bytes: 2_752_512,
+                payload_bytes: 0,
+            }]),
+            PoolAnswer::Bricks(Vec::new()),
             PoolAnswer::Exports(vec![(1795, "/dev/ublkb1795".into())]),
             PoolAnswer::Snapshots(vec![(1795, 7, 512 << 20)]),
             PoolAnswer::Device("/dev/ublkb1795".into()),

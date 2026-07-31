@@ -16,7 +16,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use lumen_fs::FsError;
-use lumen_fsd::{control, daemon::Attach, format_brick, nbd::VDISK, Config, Daemon};
+use lumen_fsd::{control, daemon::Attach, export::nbd::VDISK, format_brick, Config, Daemon};
 
 const DISK_BYTES: u64 = 64 << 20;
 const VDISK_BYTES: u64 = 8 << 20;
@@ -58,7 +58,7 @@ fn wait_until(what: &str, mut check: impl FnMut() -> bool) {
 fn listener_daemon(brick: &Scratch, node: u8) -> Daemon {
     Daemon::start(Config {
         node,
-        brick: brick.0.clone(),
+        bricks: vec![brick.0.clone()],
         listen: Some("127.0.0.1:0".parse().unwrap()),
         dial: None,
     })
@@ -68,19 +68,35 @@ fn listener_daemon(brick: &Scratch, node: u8) -> Daemon {
 fn dialer_daemon(brick: &Scratch, node: u8, peer: SocketAddr) -> Daemon {
     Daemon::start(Config {
         node,
-        brick: brick.0.clone(),
+        bricks: vec![brick.0.clone()],
         listen: None,
         dial: Some(peer),
     })
     .unwrap()
 }
 
+/// Format one node's single brick: its tier-0 WAL holder, with the smoke
+/// path's bootstrap vdisk.
+fn format_single(path: &std::path::Path, brick_uuid: [u8; 16]) {
+    format_brick(
+        path,
+        Some(DISK_BYTES),
+        0,
+        true,
+        Vec::new(),
+        Some(VDISK_BYTES),
+        POOL,
+        brick_uuid,
+    )
+    .unwrap();
+}
+
 /// Two fresh bricks of one pool, one synced pair of daemons.
 fn synced_pair(name: &str) -> (Daemon, Daemon, Scratch, Scratch) {
     let brick_a = Scratch::new(&format!("{name}-a"));
     let brick_b = Scratch::new(&format!("{name}-b"));
-    format_brick(&brick_a.0, DISK_BYTES, VDISK_BYTES, POOL, [0xB0; 16]).unwrap();
-    format_brick(&brick_b.0, DISK_BYTES, VDISK_BYTES, POOL, [0xB1; 16]).unwrap();
+    format_single(&brick_a.0, [0xB0; 16]);
+    format_single(&brick_b.0, [0xB1; 16]);
     let a = listener_daemon(&brick_a, 0);
     let b = dialer_daemon(&brick_b, 1, a.peer_addr().unwrap());
     wait_until("the pair to sync", || {
@@ -209,7 +225,7 @@ const SECOND: u64 = 2;
 #[test]
 fn a_vdisks_life_replicates_from_either_end() {
     let (a, b, _ba, _bb) = synced_pair("lifecycle");
-    a.guest().create_vdisk(SECOND, 4 << 20).unwrap();
+    a.guest().create_vdisk(SECOND, 4 << 20, 0).unwrap();
 
     // Creation is a replicated operation: the peer knows the vdisk exists
     // without being asked, and knows who holds its pen.
@@ -243,7 +259,7 @@ fn a_vdisks_life_replicates_from_either_end() {
 fn a_snapshot_reaches_the_peer_and_rolling_back_restores_what_it_held() {
     let (a, b, _ba, _bb) = synced_pair("snapshots");
     let guest = a.guest();
-    guest.create_vdisk(SECOND, 4 << 20).unwrap();
+    guest.create_vdisk(SECOND, 4 << 20, 0).unwrap();
     wait_until("the peer to learn the vdisk", || {
         b.guest().vdisk_size(SECOND).is_ok()
     });
@@ -298,7 +314,7 @@ fn a_live_migration_moves_the_pen_and_never_lends_it_twice() {
     let (a, b, _ba, _bb) = synced_pair("migration");
     let source = a.guest();
     let destination = b.guest();
-    source.create_vdisk(SECOND, 4 << 20).unwrap();
+    source.create_vdisk(SECOND, 4 << 20, 0).unwrap();
     wait_until("the peer to learn the vdisk", || {
         destination.vdisk_size(SECOND).is_ok()
     });
@@ -392,7 +408,7 @@ fn an_aborted_migration_leaves_the_disk_where_it_started() {
     let (a, b, _ba, _bb) = synced_pair("abort");
     let source = a.guest();
     let destination = b.guest();
-    source.create_vdisk(SECOND, 4 << 20).unwrap();
+    source.create_vdisk(SECOND, 4 << 20, 0).unwrap();
     wait_until("the peer to learn the vdisk", || {
         destination.vdisk_size(SECOND).is_ok()
     });
@@ -446,7 +462,7 @@ fn an_orchestrator_drives_a_whole_migration_over_the_control_protocol() {
 
     assert_eq!(
         source(&format!("vdisk-create {SECOND} 4194304")),
-        format!("ok: vdisk {SECOND} of 4194304 bytes")
+        format!("ok: vdisk {SECOND} of 4194304 bytes on tier 0")
     );
     wait_until("the peer to learn the vdisk", || {
         destination("vdisks").contains(&format!("{SECOND}=4194304"))
@@ -583,11 +599,43 @@ fn a_cancelled_handle_releases_parked_io_without_a_verdict() {
 }
 
 #[test]
+fn the_control_surface_says_its_space_in_bytes() {
+    let (a, b, _ba, _bb) = synced_pair("bytes");
+
+    let status = control::command(&a, "status");
+    assert!(status.contains(" usable="), "{status}");
+    assert!(status.contains(" free_bytes="), "{status}");
+    assert!(status.contains(" tier0.usable="), "{status}");
+
+    let capacity = control::command(&a, "capacity");
+    assert!(capacity.starts_with("ok: tier0.usable="), "{capacity}");
+
+    // One brick, and the listing knows which disk it is: the path serve
+    // opened, the tier, and that it holds the WAL.
+    let list = control::command(&a, "brick-list");
+    assert!(list.contains("path="), "{list}");
+    assert!(list.contains(",tier=0,wal=1,usable="), "{list}");
+
+    b.shutdown();
+    a.shutdown();
+}
+
+#[test]
 fn a_brick_from_a_different_pool_is_refused_at_the_door() {
     let brick_a = Scratch::new("refuse-a");
     let brick_c = Scratch::new("refuse-c");
-    format_brick(&brick_a.0, DISK_BYTES, VDISK_BYTES, POOL, [0xB0; 16]).unwrap();
-    format_brick(&brick_c.0, DISK_BYTES, VDISK_BYTES, [0x5A; 16], [0xB2; 16]).unwrap();
+    format_single(&brick_a.0, [0xB0; 16]);
+    format_brick(
+        &brick_c.0,
+        Some(DISK_BYTES),
+        0,
+        true,
+        Vec::new(),
+        Some(VDISK_BYTES),
+        [0x5A; 16],
+        [0xB2; 16],
+    )
+    .unwrap();
     let a = listener_daemon(&brick_a, 0);
     let c = dialer_daemon(&brick_c, 1, a.peer_addr().unwrap());
 

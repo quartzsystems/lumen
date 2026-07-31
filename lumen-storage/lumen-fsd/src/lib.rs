@@ -10,12 +10,12 @@
 //! engine noticing.
 //!
 //! ```text
-//!   wire.rs     PeerMessage ⇄ frames — the bytes the engine never owns
-//!   daemon.rs   the harness: engine under a lock, ordered effect drain,
-//!               session incarnations, suspension made real, maintenance
-//!   nbd.rs      the bootstrap guest export over the daemon's guest path
-//!   ublk/       the real guest export: a vdisk as /dev/ublkb<id>
-//!   control.rs  the operator/orchestrator surface, and its typed client
+//!   wire.rs      PeerMessage ⇄ frames — the bytes the engine never owns
+//!   daemon.rs    the harness: engine under a lock, ordered effect drain,
+//!                session incarnations, suspension made real, maintenance
+//!   export/nbd   the bootstrap guest export over the daemon's guest path
+//!   export/ublk  the real guest export: a vdisk as /dev/ublkb<id>
+//!   control.rs   the operator/orchestrator surface, and its typed client
 //! ```
 //!
 //! The library shape exists for the tests: two whole daemons can run
@@ -26,11 +26,10 @@
 
 pub mod control;
 pub mod daemon;
-pub mod nbd;
-pub mod ublk;
+pub mod export;
 pub mod wire;
 
-pub use control::{Client, LeaseView, StatusView};
+pub use control::{BrickView, Client, LeaseView, StatusView, TierBytes};
 pub use daemon::{format_brick, Config, Daemon, GuestHandle, Status};
 /// Re-exported because [`StatusView`] names it: a caller reading a member's
 /// status should not need a dependency on the engine crate to match on it.

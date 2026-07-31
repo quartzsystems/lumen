@@ -20,7 +20,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 
 use crate::error::{PoolError, Result};
-use crate::state::{LeaseSeen, MemberStatus, Replication};
+use crate::state::{BrickSeen, LeaseSeen, MemberStatus, Replication, TierCapacitySeen};
 
 /// What a member's daemon can be asked. Names are cluster node names; the
 /// `u8` ids are the node ids the engine's leases speak.
@@ -43,8 +43,13 @@ pub trait PoolFleet: Send + Sync {
     /// state, so any member answers the same.
     async fn vdisks(&self, member: &str) -> Result<Vec<(u64, u64)>>;
 
-    /// Create a vdisk. Replicated: one member is enough.
-    async fn create_vdisk(&self, member: &str, vdisk: u64, size_bytes: u64) -> Result<()>;
+    /// Create a vdisk on a tier. Replicated: one member is enough.
+    async fn create_vdisk(&self, member: &str, vdisk: u64, size_bytes: u64, tier: u8)
+        -> Result<()>;
+
+    /// Every brick of one member's set, with its space in bytes.
+    /// Per-member: each set is that machine's own disks.
+    async fn brick_list(&self, member: &str) -> Result<Vec<BrickSeen>>;
 
     /// Delete a vdisk. Replicated: one member is enough.
     async fn delete_vdisk(&self, member: &str, vdisk: u64) -> Result<()>;
@@ -262,6 +267,18 @@ impl PoolFleet for MockFleet {
             accepts_writes: pinned.is_none_or(|s| s.accepts_writes),
             segments_free: pinned.map_or(20, |s| s.segments_free),
             segments_total: pinned.map_or(30, |s| s.segments_total),
+            usable_bytes: pinned.map_or(30 << 30, |s| s.usable_bytes),
+            free_bytes: pinned.map_or(20 << 30, |s| s.free_bytes),
+            tiers: pinned.map_or_else(
+                || {
+                    vec![TierCapacitySeen {
+                        tier: 0,
+                        usable_bytes: 30 << 30,
+                        free_bytes: 20 << 30,
+                    }]
+                },
+                |s| s.tiers.clone(),
+            ),
             vdisks,
             leases,
             stream: pinned.map_or((0, 0, 0), |s| s.stream),
@@ -274,7 +291,13 @@ impl PoolFleet for MockFleet {
         Ok(inner.vdisks.iter().map(|(id, size)| (*id, *size)).collect())
     }
 
-    async fn create_vdisk(&self, member: &str, vdisk: u64, size_bytes: u64) -> Result<()> {
+    async fn create_vdisk(
+        &self,
+        member: &str,
+        vdisk: u64,
+        size_bytes: u64,
+        _tier: u8,
+    ) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
         let id = MockFleet::id_of(&inner, member)?;
         if inner.vdisks.contains_key(&vdisk) {
@@ -290,6 +313,36 @@ impl PoolFleet for MockFleet {
             },
         );
         Ok(())
+    }
+
+    async fn brick_list(&self, member: &str) -> Result<Vec<BrickSeen>> {
+        let inner = self.inner.lock().unwrap();
+        MockFleet::id_of(&inner, member)?;
+        // One mock brick per tier the member's pinned status reports —
+        // and a single tier-0 holder when nothing is pinned, the shape a
+        // fresh real member has.
+        let tiers = inner.statuses.get(member).map_or_else(
+            || {
+                vec![TierCapacitySeen {
+                    tier: 0,
+                    usable_bytes: 30 << 30,
+                    free_bytes: 20 << 30,
+                }]
+            },
+            |s| s.tiers.clone(),
+        );
+        Ok(tiers
+            .iter()
+            .map(|t| BrickSeen {
+                path: format!("/dev/disk/by-id/mock-{member}-tier{}", t.tier),
+                uuid: format!("{:032x}", t.tier),
+                tier: t.tier,
+                wal_holder: t.tier == 0,
+                usable_bytes: t.usable_bytes,
+                free_bytes: t.free_bytes,
+                payload_bytes: t.usable_bytes - t.free_bytes,
+            })
+            .collect())
     }
 
     async fn delete_vdisk(&self, member: &str, vdisk: u64) -> Result<()> {

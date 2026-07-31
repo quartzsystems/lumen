@@ -473,10 +473,20 @@ async fn the_pool_routes_need_a_session_like_every_operator_surface() {
 /// the same posture the shipped unit gives it, minus the fixed number.
 fn real_daemon_control(dir: &std::path::Path) -> std::net::SocketAddr {
     let brick = dir.join("peer-verb.brick");
-    lumen_fsd::format_brick(&brick, 64 << 20, 8 << 20, [0xC0; 16], [0xC1; 16]).unwrap();
+    lumen_fsd::format_brick(
+        &brick,
+        Some(64 << 20),
+        0,
+        true,
+        Vec::new(),
+        Some(8 << 20),
+        [0xC0; 16],
+        [0xC1; 16],
+    )
+    .unwrap();
     let daemon = lumen_fsd::Daemon::start(lumen_fsd::Config {
         node: 0,
-        brick,
+        bricks: vec![brick],
         listen: Some("127.0.0.1:0".parse().unwrap()),
         dial: None,
     })

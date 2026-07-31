@@ -54,6 +54,18 @@ pub struct MemberStatus {
     pub accepts_writes: bool,
     pub segments_free: u64,
     pub segments_total: u64,
+    /// This member's space in bytes, labelled usable: every segment
+    /// outside the collection reserve at full-block density, summed over
+    /// its bricks. Dedupe only makes the figure conservative — the one
+    /// direction a capacity number is allowed to be wrong in.
+    #[serde(default)]
+    pub usable_bytes: u64,
+    #[serde(default)]
+    pub free_bytes: u64,
+    /// The same figures per tier, ascending — what the pool-wide capacity
+    /// takes its per-tier minimum over.
+    #[serde(default)]
+    pub tiers: Vec<TierCapacitySeen>,
     /// Every vdisk the pool holds, as `(id, size_bytes)`. Replicated, so
     /// every answering member says the same.
     pub vdisks: Vec<(u64, u64)>,
@@ -79,6 +91,67 @@ impl MemberStatus {
         (self.segments_total > 0)
             .then(|| ((self.segments_free * 100) / self.segments_total).min(100) as u8)
     }
+}
+
+/// One tier's byte figures as one member reports them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TierCapacitySeen {
+    pub tier: u8,
+    pub usable_bytes: u64,
+    pub free_bytes: u64,
+}
+
+/// One brick as a member lists it: which disk, which tier, its space.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrickSeen {
+    /// The path the member's daemon opened it from.
+    pub path: String,
+    /// The brick's own identity, lowercase hex.
+    pub uuid: String,
+    pub tier: u8,
+    pub wal_holder: bool,
+    pub usable_bytes: u64,
+    pub free_bytes: u64,
+    pub payload_bytes: u64,
+}
+
+/// The one capacity figure, from every answering member's per-tier
+/// figures: RF=2 with both members holding everything makes the smaller
+/// member the truth, per tier — `min` and then the sum, never `Σ/2`,
+/// which overstates whenever members are unequal. `None` while any member
+/// is silent, because a figure computed from half a pool is a guess.
+pub fn pool_usable_bytes<'a>(
+    members: impl Iterator<Item = Option<&'a MemberStatus>>,
+) -> Option<u64> {
+    let mut statuses = Vec::new();
+    for member in members {
+        statuses.push(member?);
+    }
+    if statuses.is_empty() {
+        return None;
+    }
+    let mut tiers: Vec<u8> = statuses
+        .iter()
+        .flat_map(|s| s.tiers.iter().map(|t| t.tier))
+        .collect();
+    tiers.sort_unstable();
+    tiers.dedup();
+    let mut total = 0u64;
+    for tier in tiers {
+        // A member without the tier bounds it at zero: data that must
+        // live on both members cannot count space only one of them has.
+        total += statuses
+            .iter()
+            .map(|s| {
+                s.tiers
+                    .iter()
+                    .find(|t| t.tier == tier)
+                    .map_or(0, |t| t.usable_bytes)
+            })
+            .min()
+            .unwrap_or(0);
+    }
+    Some(total)
 }
 
 /// The replication state, as the console needs to name it.
@@ -204,6 +277,12 @@ pub struct PoolState {
     pub members: Vec<PoolMember>,
     pub vdisks: Vec<VdiskView>,
     pub health: PoolHealth,
+    /// The one capacity figure, labelled usable — see
+    /// [`pool_usable_bytes`]. `None` while any member is silent: a figure
+    /// computed from half a pool would be a guess, and the page says
+    /// "cannot tell" instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usable_bytes: Option<u64>,
 }
 
 impl PoolState {
@@ -213,6 +292,7 @@ impl PoolState {
             members: Vec::new(),
             vdisks: Vec::new(),
             health: PoolHealth::None,
+            usable_bytes: None,
         }
     }
 
@@ -222,10 +302,12 @@ impl PoolState {
     /// reported.
     pub fn assemble(members: Vec<PoolMember>, vdisks: Vec<VdiskView>) -> PoolState {
         let health = verdict(&members);
+        let usable_bytes = pool_usable_bytes(members.iter().map(|m| m.view.status()));
         PoolState {
             members,
             vdisks,
             health,
+            usable_bytes,
         }
     }
 
@@ -315,6 +397,13 @@ mod tests {
             accepts_writes: true,
             segments_free: 20,
             segments_total: 30,
+            usable_bytes: 1000,
+            free_bytes: 600,
+            tiers: vec![TierCapacitySeen {
+                tier: 0,
+                usable_bytes: 1000,
+                free_bytes: 600,
+            }],
             vdisks: Vec::new(),
             leases: Vec::new(),
             stream: (5, 5, 0),
@@ -462,5 +551,44 @@ mod tests {
         empty.segments_total = 0;
         empty.segments_free = 0;
         assert_eq!(empty.free_percent(), None, "no dividing by an empty brick");
+    }
+
+    /// The capacity formula, pinned: per-tier minimum then the sum — never
+    /// Σ/2, which overstates whenever members are unequal — a tier only one
+    /// member carries counts nothing, and a silent member means no figure
+    /// at all rather than a guess.
+    #[test]
+    fn the_usable_figure_is_the_smaller_members_truth_per_tier() {
+        let mut small = synced(0);
+        small.tiers = vec![TierCapacitySeen {
+            tier: 0,
+            usable_bytes: 1000,
+            free_bytes: 500,
+        }];
+        let mut big = synced(1);
+        big.tiers = vec![
+            TierCapacitySeen {
+                tier: 0,
+                usable_bytes: 4000,
+                free_bytes: 4000,
+            },
+            // A tier the other member lacks: RF=2 data cannot live on
+            // space only one member has.
+            TierCapacitySeen {
+                tier: 1,
+                usable_bytes: 9000,
+                free_bytes: 9000,
+            },
+        ];
+        assert_eq!(
+            pool_usable_bytes([Some(&small), Some(&big)].into_iter()),
+            Some(1000)
+        );
+        assert_eq!(
+            pool_usable_bytes([Some(&small), None].into_iter()),
+            None,
+            "half a pool is a guess, not a figure"
+        );
+        assert_eq!(pool_usable_bytes(std::iter::empty()), None);
     }
 }

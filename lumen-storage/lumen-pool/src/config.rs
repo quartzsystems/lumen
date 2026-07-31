@@ -13,10 +13,15 @@
 //! in it — a pool spans its cluster, so the members are the cluster's
 //! members, which the control plane already knows.
 //!
-//! Written by hand today. The workflow that creates a pool will write it,
-//! and that is phase 4's drive wizard, where choosing which disks become
-//! bricks belongs.
+//! [`PoolConfig::render`] is the writer the pool create workflow uses, and
+//! it round-trips through [`PoolConfig::parse`] by test — one shape,
+//! written and read by the same code. The file carries *addresses*: which
+//! paths, which node id, which way the peer link points. The facts —
+//! tiers, identities, the set's roster — live on the platters, and a conf
+//! naming a different set than the anchors roster is refused at the
+//! daemon's own open.
 
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -31,16 +36,29 @@ pub const FSD_CONF: &str = "/etc/lumen/fsd.conf";
 /// This node's pool daemon, as its configuration describes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolConfig {
-    /// The brick this node's daemon serves from.
-    pub brick: PathBuf,
+    /// The bricks this node's daemon serves from — one path per disk,
+    /// space-separated in the file so the unit's `$LUMEN_FSD_BRICK`
+    /// word-splits them straight into argv. Paths with whitespace are
+    /// refused where they enter (the daemon and the render alike).
+    pub bricks: Vec<PathBuf>,
     /// The engine node id the unit starts it with. Note this is *not* what
     /// the orchestration layer trusts — it asks the daemon, which cannot
     /// disagree with itself. It is here because the file carries it and
     /// silently dropping a field invites the next reader to assume it is
     /// absent.
     pub node: u8,
+    /// Which way this node's half of the peer link points.
+    pub peer: Option<PeerRole>,
     /// The daemon's control surface. Loopback.
     pub control: SocketAddr,
+}
+
+/// The peer link's two ends: one member listens, the other dials. The
+/// value is the flag the unit hands the daemon, verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerRole {
+    Listen(SocketAddr),
+    Dial(SocketAddr),
 }
 
 /// What went wrong reading it. A missing file is not one of these — that is
@@ -91,8 +109,9 @@ impl PoolConfig {
     /// would hide a broken deployment behind a console page that cheerfully
     /// says there is nothing to show.
     pub fn parse(text: &str) -> Result<PoolConfig, ConfigError> {
-        let mut brick = None;
+        let mut bricks: Option<Vec<PathBuf>> = None;
         let mut node = None;
+        let mut peer = None;
         let mut control = None;
         for line in text.lines() {
             let line = line.trim();
@@ -106,11 +125,44 @@ impl PoolConfig {
             // a path.
             let value = value.trim().trim_matches(['"', '\'']);
             match key.trim() {
-                "LUMEN_FSD_BRICK" => brick = Some(PathBuf::from(value)),
+                "LUMEN_FSD_BRICK" => {
+                    let paths: Vec<PathBuf> = value.split_whitespace().map(PathBuf::from).collect();
+                    if paths.is_empty() {
+                        return Err(ConfigError::Malformed(
+                            "LUMEN_FSD_BRICK names no paths".into(),
+                        ));
+                    }
+                    bricks = Some(paths);
+                }
                 "LUMEN_FSD_NODE" => {
                     node = Some(value.parse().map_err(|_| {
                         ConfigError::Malformed(format!("LUMEN_FSD_NODE is not a node id: {value}"))
                     })?)
+                }
+                "LUMEN_FSD_PEER" => {
+                    // The value is the daemon's own flag pair: `--listen
+                    // <addr>` or `--dial <addr>`. Parsed rather than carried
+                    // as prose, because a workflow that writes it must also
+                    // be able to read back what it wrote.
+                    let (flag, addr) = value.split_once(char::is_whitespace).ok_or_else(|| {
+                        ConfigError::Malformed(format!(
+                            "LUMEN_FSD_PEER wants '--listen <addr>' or '--dial <addr>', got: {value}"
+                        ))
+                    })?;
+                    let addr: SocketAddr = addr.trim().parse().map_err(|_| {
+                        ConfigError::Malformed(format!(
+                            "LUMEN_FSD_PEER address does not parse: {value}"
+                        ))
+                    })?;
+                    peer = Some(match flag {
+                        "--listen" => PeerRole::Listen(addr),
+                        "--dial" => PeerRole::Dial(addr),
+                        _ => {
+                            return Err(ConfigError::Malformed(format!(
+                                "LUMEN_FSD_PEER flag is neither --listen nor --dial: {value}"
+                            )))
+                        }
+                    });
                 }
                 "LUMEN_FSD_CONTROL" => {
                     control = Some(value.parse().map_err(|_| {
@@ -123,16 +175,61 @@ impl PoolConfig {
             }
         }
         Ok(PoolConfig {
-            brick: brick.ok_or_else(|| {
-                ConfigError::Malformed("no LUMEN_FSD_BRICK: this names the pool's brick".into())
+            bricks: bricks.ok_or_else(|| {
+                ConfigError::Malformed("no LUMEN_FSD_BRICK: this names the pool's bricks".into())
             })?,
             node: node.ok_or_else(|| {
                 ConfigError::Malformed("no LUMEN_FSD_NODE: this names the engine's node id".into())
             })?,
+            // Absent is legal: a one-node bring-up has no peer yet.
+            peer,
             // The unit hardcodes the control address, so a file without one
             // is ordinary rather than incomplete.
             control: control.unwrap_or_else(|| DEFAULT_CONTROL.parse().expect("a valid constant")),
         })
+    }
+
+    /// The file as the pool create workflow writes it. Round-trips through
+    /// [`PoolConfig::parse`] — the test that keeps writer and reader one
+    /// contract. A brick path containing whitespace is refused: the file's
+    /// own format could not carry it.
+    pub fn render(&self) -> Result<String, ConfigError> {
+        for path in &self.bricks {
+            if path.to_string_lossy().chars().any(char::is_whitespace) {
+                return Err(ConfigError::Malformed(format!(
+                    "brick path contains whitespace: {}",
+                    path.display()
+                )));
+            }
+        }
+        if self.bricks.is_empty() {
+            return Err(ConfigError::Malformed("a pool with no bricks".into()));
+        }
+        let mut out = String::new();
+        out.push_str(
+            "# Written by the pool create workflow. Do not edit: destroy and\n\
+             # recreate the pool instead.\n",
+        );
+        let paths: Vec<String> = self
+            .bricks
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        let _ = writeln!(out, "LUMEN_FSD_BRICK={}", paths.join(" "));
+        let _ = writeln!(out, "LUMEN_FSD_NODE={}", self.node);
+        match self.peer {
+            Some(PeerRole::Listen(addr)) => {
+                let _ = writeln!(out, "LUMEN_FSD_PEER=--listen {addr}");
+            }
+            Some(PeerRole::Dial(addr)) => {
+                let _ = writeln!(out, "LUMEN_FSD_PEER=--dial {addr}");
+            }
+            None => {}
+        }
+        if self.control.to_string() != DEFAULT_CONTROL {
+            let _ = writeln!(out, "LUMEN_FSD_CONTROL={}", self.control);
+        }
+        Ok(out)
     }
 }
 
@@ -142,17 +239,27 @@ mod tests {
 
     #[test]
     fn the_drop_in_the_unit_actually_reads_is_what_this_parses() {
-        // The shape packages/lumen-fsd.spec ships and a pool workflow will
-        // write: systemd EnvironmentFile syntax, comments and all.
+        // The shape packages/lumen-fsd.spec ships and the pool workflow
+        // writes: systemd EnvironmentFile syntax, comments and all.
         let config = PoolConfig::parse(
             "# written by the pool create workflow\n\
-             LUMEN_FSD_BRICK=/dev/disk/by-id/nvme-eui.0001\n\
+             LUMEN_FSD_BRICK=/dev/disk/by-id/nvme-eui.0001 /dev/disk/by-id/ata-slow.0002\n\
              LUMEN_FSD_NODE=1\n\
              LUMEN_FSD_PEER=--dial 10.10.0.1:7800\n",
         )
         .unwrap();
-        assert_eq!(config.brick, PathBuf::from("/dev/disk/by-id/nvme-eui.0001"));
+        assert_eq!(
+            config.bricks,
+            vec![
+                PathBuf::from("/dev/disk/by-id/nvme-eui.0001"),
+                PathBuf::from("/dev/disk/by-id/ata-slow.0002"),
+            ]
+        );
         assert_eq!(config.node, 1);
+        assert_eq!(
+            config.peer,
+            Some(PeerRole::Dial("10.10.0.1:7800".parse().unwrap()))
+        );
         // Not in the file, because the unit passes it: the default is the
         // unit's own constant, and loopback on purpose.
         assert_eq!(config.control.to_string(), DEFAULT_CONTROL);
@@ -163,8 +270,9 @@ mod tests {
         let config =
             PoolConfig::parse("LUMEN_FSD_BRICK=\"/var/lib/lumen/brick\"\nLUMEN_FSD_NODE='0'\n")
                 .unwrap();
-        assert_eq!(config.brick, PathBuf::from("/var/lib/lumen/brick"));
+        assert_eq!(config.bricks, vec![PathBuf::from("/var/lib/lumen/brick")]);
         assert_eq!(config.node, 0);
+        assert_eq!(config.peer, None, "a one-node bring-up has no peer yet");
     }
 
     #[test]
@@ -174,6 +282,55 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.control.to_string(), "127.0.0.1:7741");
+    }
+
+    /// The writer and the parser are one contract: what render says, parse
+    /// reads back identically — both peer directions, both control shapes.
+    #[test]
+    fn what_render_writes_parse_reads_back_exactly() {
+        for peer in [
+            Some(PeerRole::Listen("10.10.0.1:7800".parse().unwrap())),
+            Some(PeerRole::Dial("10.10.0.2:7800".parse().unwrap())),
+            None,
+        ] {
+            for control in [DEFAULT_CONTROL, "127.0.0.1:7741"] {
+                let config = PoolConfig {
+                    bricks: vec![
+                        PathBuf::from("/dev/disk/by-id/nvme-eui.0001"),
+                        PathBuf::from("/dev/disk/by-id/ata-slow.0002"),
+                    ],
+                    node: 1,
+                    peer,
+                    control: control.parse().unwrap(),
+                };
+                let text = config.render().unwrap();
+                assert_eq!(
+                    PoolConfig::parse(&text).unwrap(),
+                    config,
+                    "did not round-trip:\n{text}"
+                );
+            }
+        }
+    }
+
+    /// A path with whitespace could not survive the file's own format, so
+    /// the writer refuses it instead of writing a lie.
+    #[test]
+    fn render_refuses_what_the_format_cannot_carry() {
+        let config = PoolConfig {
+            bricks: vec![PathBuf::from("/dev/disk/by-id/has a space")],
+            node: 0,
+            peer: None,
+            control: DEFAULT_CONTROL.parse().unwrap(),
+        };
+        assert!(config.render().is_err());
+        let empty = PoolConfig {
+            bricks: Vec::new(),
+            node: 0,
+            peer: None,
+            control: DEFAULT_CONTROL.parse().unwrap(),
+        };
+        assert!(empty.render().is_err());
     }
 
     #[test]
@@ -195,6 +352,9 @@ mod tests {
             "LUMEN_FSD_BRICK=/b\n",
             "LUMEN_FSD_BRICK=/b\nLUMEN_FSD_NODE=not-a-number\n",
             "LUMEN_FSD_BRICK=/b\nLUMEN_FSD_NODE=0\nLUMEN_FSD_CONTROL=nonsense\n",
+            "LUMEN_FSD_BRICK=\nLUMEN_FSD_NODE=0\n",
+            "LUMEN_FSD_BRICK=/b\nLUMEN_FSD_NODE=0\nLUMEN_FSD_PEER=--sideways 1.2.3.4:7800\n",
+            "LUMEN_FSD_BRICK=/b\nLUMEN_FSD_NODE=0\nLUMEN_FSD_PEER=--dial nonsense\n",
         ] {
             assert!(
                 PoolConfig::parse(wrong).is_err(),

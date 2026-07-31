@@ -89,12 +89,15 @@
 //! The tie runs the same closing handshake; it simply has nothing to
 //! stop doing.
 
+/// Placement arithmetic: hash → slice → an ordered pair of members.
+pub mod slice;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::disk::Disk;
 use crate::error::{FsError, Result};
 use crate::hash::BlockHash;
-use crate::map;
+use crate::pool::map;
 use crate::pool::{Lease, Pool};
 
 pub type NodeId = u8;
@@ -769,7 +772,7 @@ impl<D: Disk> ReplNode<D> {
     /// Local collection, legal at any point in a resync on either end:
     /// the sync pins are part of the mark, so neither the offer nor a
     /// half-fetched fragment can be swept out from under the pull.
-    pub fn collect_garbage(&mut self) -> Result<crate::brick::GcStats> {
+    pub fn collect_garbage(&mut self) -> Result<crate::store::brick::GcStats> {
         self.pool.collect_garbage()
     }
 
@@ -1168,8 +1171,8 @@ impl<D: Disk> ReplNode<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::brick::{Brick, BrickParams};
-    use crate::sim::SimDisk;
+    use crate::disk::sim::SimDisk;
+    use crate::store::brick::{Brick, BrickParams};
 
     const KIB: u64 = 1024;
 

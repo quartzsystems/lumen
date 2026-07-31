@@ -16,14 +16,20 @@ After=corosync.service
 
 [Service]
 Type=exec
-# Configuration is a drop-in, not a compiled-in default: the brick path, the
-# node id, and the peer address are per-node facts, and a pool's second
+# Configuration is a drop-in, not a compiled-in default: the brick paths,
+# the node id, and the peer address are per-node facts, and a pool's second
 # member is not knowable at package time. The workflows that create a pool
 # write /etc/lumen/fsd.conf; until one exists the unit stays down, which is
 # what the preset also says.
+#
+# $VAR, not ${VAR}, for the bricks and the peer — systemd expands ${VAR} as
+# ONE argv word, and both values are word lists: several brick paths, and a
+# flag with its address. ${LUMEN_FSD_PEER} would hand the daemon a single
+# argument "--dial 10.10.0.1:7800", which its flag parser rightly refuses.
+# The node id is one word and keeps the strict form.
 EnvironmentFile=/etc/lumen/fsd.conf
-ExecStart=/usr/sbin/lumen-fsd serve ${LUMEN_FSD_BRICK} ${LUMEN_FSD_NODE} \
-    ${LUMEN_FSD_PEER} --control 127.0.0.1:7799
+ExecStart=/usr/sbin/lumen-fsd serve $LUMEN_FSD_BRICK --node ${LUMEN_FSD_NODE} \
+    $LUMEN_FSD_PEER --control 127.0.0.1:7799
 # Raw disks and io_uring, so: privileged, and not sandboxed into uselessness.
 # The sysctl drop-in (50-lumen-pool.conf) raises io_uring to privileged
 # callers only; this is the privileged caller it was raised for.

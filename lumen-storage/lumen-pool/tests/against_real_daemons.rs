@@ -69,12 +69,23 @@ fn control_on(daemon: Daemon) -> SocketAddr {
 fn real_pool(tag: &str) -> (SocketFleet, Scratch, Scratch) {
     let brick_a = scratch(&format!("{tag}-a"));
     let brick_b = scratch(&format!("{tag}-b"));
-    format_brick(&brick_a.0, DISK_BYTES, VDISK_BYTES, POOL_UUID, [0xA1; 16]).unwrap();
-    format_brick(&brick_b.0, DISK_BYTES, VDISK_BYTES, POOL_UUID, [0xB1; 16]).unwrap();
+    for (brick, uuid) in [(&brick_a, [0xA1; 16]), (&brick_b, [0xB1; 16])] {
+        format_brick(
+            &brick.0,
+            Some(DISK_BYTES),
+            0,
+            true,
+            Vec::new(),
+            Some(VDISK_BYTES),
+            POOL_UUID,
+            uuid,
+        )
+        .unwrap();
+    }
 
     let a = Daemon::start(Config {
         node: 0,
-        brick: brick_a.0.clone(),
+        bricks: vec![brick_a.0.clone()],
         listen: Some("127.0.0.1:0".parse().unwrap()),
         dial: None,
     })
@@ -82,7 +93,7 @@ fn real_pool(tag: &str) -> (SocketFleet, Scratch, Scratch) {
     let peer = a.peer_addr().unwrap();
     let b = Daemon::start(Config {
         node: 1,
-        brick: brick_b.0.clone(),
+        bricks: vec![brick_b.0.clone()],
         listen: None,
         dial: Some(peer),
     })
@@ -148,7 +159,7 @@ async fn a_real_daemon_describes_itself_and_the_fleet_reads_every_field() {
     // counters, which is the field that convicted the elided-flush bug.
     let vdisk = 2;
     fleet
-        .create_vdisk("lumen01", vdisk, VDISK_BYTES)
+        .create_vdisk("lumen01", vdisk, VDISK_BYTES, 0)
         .await
         .unwrap();
     wait_until("the vdisk to reach both members", || {
@@ -179,7 +190,7 @@ async fn a_vdisk_created_through_the_fleet_replicates_and_its_lease_moves() {
     // Wait for the pair to be in lockstep, or a create would be refused as
     // suspended — which is the engine's contract, not a flake.
     wait_until("the pair to sync", || {
-        futures_lite_block(fleet.create_vdisk("lumen01", 1795, 4 << 20)).is_ok()
+        futures_lite_block(fleet.create_vdisk("lumen01", 1795, 4 << 20, 0)).is_ok()
     });
 
     // Creation replicated: the peer knows without being told.
@@ -254,7 +265,7 @@ async fn the_seam_over_real_daemons_answers_for_paths_that_need_no_device() {
         futures_lite_block(fleet.node_id("lumen02")).is_ok()
     });
     wait_until("the pair to sync", || {
-        futures_lite_block(fleet.create_vdisk("lumen01", 1795, 4 << 20)).is_ok()
+        futures_lite_block(fleet.create_vdisk("lumen01", 1795, 4 << 20, 0)).is_ok()
     });
 
     let service = lumen_pool::PoolService::new(Arc::new(fleet), "pool0");

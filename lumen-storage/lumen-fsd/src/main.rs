@@ -1,14 +1,19 @@
-//! The daemon binary: format a brick, or serve one.
+//! The daemon binary: format a node's bricks, or serve them.
 //!
 //! ```text
-//!   lumen-fsd format <file> <disk-bytes> <vdisk-bytes> [pool-uuid-hex]
-//!   lumen-fsd serve  <file> <node-id> --listen <addr> [--nbd <addr>] [--control <addr>]
-//!   lumen-fsd serve  <file> <node-id> --dial   <addr> [--nbd <addr>] [--control <addr>]
+//!   lumen-fsd format <path> --tier <n> [--wal] [--roster <uuid>:<tier>]...
+//!                    [--bytes <n>] [--vdisk-bytes <n>] [--pool-uuid <hex>]
+//!   lumen-fsd serve  <brick>... --node <id> --listen <addr> [--nbd <addr>] [--control <addr>]
+//!   lumen-fsd serve  <brick>... --node <id> --dial   <addr> [--nbd <addr>] [--control <addr>]
 //! ```
 //!
-//! Two nodes, one pool: format the first brick without a uuid (one is
-//! minted and printed), format the second *with* that uuid — the peer
-//! handshake refuses anything else. One side `--listen`s, the other
+//! A node's bricks are formatted one invocation each, the WAL holder
+//! (`--wal`, always tier 0) **last**: each non-holder prints its identity,
+//! the holder's `--roster` names them all, and the anchor the holder
+//! writes is what lets `serve` refuse a wrong or partial set by name.
+//! Two nodes, one pool: the first format without `--pool-uuid` mints one
+//! and prints it, every other brick — both nodes — formats *with* it; the
+//! peer handshake refuses anything else. One side `--listen`s, the other
 //! `--dial`s.
 //!
 //! The control socket takes one line per request and answers one line:
@@ -24,23 +29,22 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use lumen_fs::hash_block;
-use lumen_fsd::{control, format_brick, nbd, Config, Daemon};
+use lumen_fsd::export::nbd;
+use lumen_fsd::{control, format_brick, Config, Daemon};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let outcome = match args.get(1).map(String::as_str) {
-        Some("format") if args.len() == 5 || args.len() == 6 => cmd_format(
-            &args[2],
-            &args[3],
-            &args[4],
-            args.get(5).map(String::as_str),
-        ),
-        Some("serve") if args.len() >= 5 => cmd_serve(&args[2..]),
+        Some("format") if args.len() >= 3 => cmd_format(&args[2..]),
+        Some("serve") if args.len() >= 4 => cmd_serve(&args[2..]),
         Some("ublk-del") if args.len() == 3 => cmd_ublk_del(&args[2]),
         _ => {
-            eprintln!("usage: lumen-fsd format <file> <disk-bytes> <vdisk-bytes> [pool-uuid-hex]");
-            eprintln!("       lumen-fsd serve  <file> <node-id> --listen <addr> [--nbd <addr>] [--ublk <dev-id>] [--control <addr>]");
-            eprintln!("       lumen-fsd serve  <file> <node-id> --dial   <addr> [--nbd <addr>] [--ublk <dev-id>] [--control <addr>]");
+            eprintln!(
+                "usage: lumen-fsd format <path> --tier <n> [--wal] [--roster <uuid>:<tier>]... \
+                 [--bytes <n>] [--vdisk-bytes <n>] [--pool-uuid <hex>]"
+            );
+            eprintln!("       lumen-fsd serve  <brick>... --node <id> --listen <addr> [--nbd <addr>] [--ublk <dev-id>] [--control <addr>]");
+            eprintln!("       lumen-fsd serve  <brick>... --node <id> --dial   <addr> [--nbd <addr>] [--ublk <dev-id>] [--control <addr>]");
             eprintln!("       lumen-fsd ublk-del <dev-id>   # clean up after an unclean death");
             return ExitCode::from(2);
         }
@@ -89,32 +93,81 @@ fn fresh_uuid(salt: &str) -> [u8; 16] {
     uuid
 }
 
-fn cmd_format(
-    path: &str,
-    disk_bytes: &str,
-    vdisk_bytes: &str,
-    pool_uuid: Option<&str>,
-) -> Result<(), String> {
-    let disk_bytes = parse_bytes(disk_bytes)?;
-    let vdisk_bytes = parse_bytes(vdisk_bytes)?;
-    let pool_uuid = match pool_uuid {
-        Some(text) => parse_uuid(text)?,
-        None => fresh_uuid("pool"),
-    };
+fn cmd_format(args: &[String]) -> Result<(), String> {
+    let path = &args[0];
+    if path.starts_with("--") {
+        return Err("the first argument is the path to format".into());
+    }
+    let mut tier: Option<u8> = None;
+    let mut wal_holder = false;
+    let mut roster: Vec<lumen_fs::RosterEntry> = Vec::new();
+    let mut create_bytes: Option<u64> = None;
+    let mut vdisk_bytes: Option<u64> = None;
+    let mut pool_uuid: Option<[u8; 16]> = None;
+    let mut rest = args[1..].iter();
+    while let Some(flag) = rest.next() {
+        if flag == "--wal" {
+            wal_holder = true;
+            continue;
+        }
+        let value = rest.next().ok_or_else(|| format!("{flag} needs a value"))?;
+        match flag.as_str() {
+            "--tier" => {
+                tier = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("not a tier number: {value}"))?,
+                )
+            }
+            "--roster" => {
+                let (uuid, entry_tier) = value
+                    .split_once(':')
+                    .ok_or_else(|| format!("--roster wants <uuid>:<tier>, got {value}"))?;
+                roster.push(lumen_fs::RosterEntry {
+                    brick_uuid: parse_uuid(uuid)?,
+                    tier: entry_tier
+                        .parse()
+                        .map_err(|_| format!("not a tier number: {entry_tier}"))?,
+                });
+            }
+            "--bytes" => create_bytes = Some(parse_bytes(value)?),
+            "--vdisk-bytes" => vdisk_bytes = Some(parse_bytes(value)?),
+            "--pool-uuid" => pool_uuid = Some(parse_uuid(value)?),
+            _ => return Err(format!("unknown flag {flag}")),
+        }
+    }
+    let tier = tier.ok_or("--tier is required: the platter remembers it forever")?;
+    if wal_holder && tier != 0 {
+        return Err("the WAL holder is always a tier-0 brick".into());
+    }
+    let pool_uuid = pool_uuid.unwrap_or_else(|| fresh_uuid("pool"));
     let brick_uuid = fresh_uuid("brick");
     format_brick(
         std::path::Path::new(path),
-        disk_bytes,
+        create_bytes,
+        tier,
+        wal_holder,
+        roster,
         vdisk_bytes,
         pool_uuid,
         brick_uuid,
     )?;
     println!(
-        "formatted {path}: vdisk {} of {vdisk_bytes} bytes, pool uuid {}",
-        nbd::VDISK,
+        "formatted {path}: tier {tier}{}, brick uuid {}, pool uuid {}",
+        if wal_holder { " (WAL holder)" } else { "" },
+        uuid_hex(&brick_uuid),
         uuid_hex(&pool_uuid)
     );
-    println!("format the peer's brick with that same uuid; the handshake enforces it");
+    if let Some(bytes) = vdisk_bytes {
+        println!("bootstrap vdisk {} of {bytes} bytes", nbd::VDISK);
+    }
+    if !wal_holder {
+        println!(
+            "name this brick in the holder's --roster as {}:{tier}",
+            uuid_hex(&brick_uuid)
+        );
+    }
+    println!("every brick of the pool formats with the same pool uuid; the handshake enforces it");
     Ok(())
 }
 
@@ -124,7 +177,7 @@ fn cmd_ublk_del(dev_id: &str) -> Result<(), String> {
         .map_err(|_| format!("not a device id: {dev_id}"))?;
     #[cfg(target_os = "linux")]
     {
-        lumen_fsd::ublk::delete_device(dev_id)?;
+        lumen_fsd::export::ublk::delete_device(dev_id)?;
         println!("ublk device {dev_id} stopped and deleted");
         Ok(())
     }
@@ -136,41 +189,59 @@ fn cmd_ublk_del(dev_id: &str) -> Result<(), String> {
 }
 
 fn cmd_serve(args: &[String]) -> Result<(), String> {
-    let brick = PathBuf::from(&args[0]);
-    let node: u8 = args[1]
-        .parse()
-        .map_err(|_| format!("not a node id: {}", args[1]))?;
+    // Leading positional arguments are brick paths — however many disks
+    // this node gave the pool; the first flag ends the list.
+    let bricks: Vec<PathBuf> = args
+        .iter()
+        .take_while(|arg| !arg.starts_with("--"))
+        .map(PathBuf::from)
+        .collect();
+    if bricks.is_empty() {
+        return Err("serve wants at least one brick path before the flags".into());
+    }
+    let mut node: Option<u8> = None;
     let mut listen = None;
     let mut dial = None;
     let mut nbd_addr = None;
     let mut control_addr = None;
     let mut ublk_dev: Option<u32> = None;
-    let mut rest = args[2..].iter();
+    let mut rest = args[bricks.len()..].iter();
     while let Some(flag) = rest.next() {
         let value = rest.next().ok_or_else(|| format!("{flag} needs a value"))?;
-        if flag == "--ublk" {
-            ublk_dev = Some(
-                value
-                    .parse()
-                    .map_err(|_| format!("not a device id: {value}"))?,
-            );
-            continue;
-        }
-        let addr: SocketAddr = value
-            .parse()
-            .map_err(|_| format!("not an address: {value}"))?;
         match flag.as_str() {
-            "--listen" => listen = Some(addr),
-            "--dial" => dial = Some(addr),
-            "--nbd" => nbd_addr = Some(addr),
-            "--control" => control_addr = Some(addr),
-            _ => return Err(format!("unknown flag {flag}")),
+            "--node" => {
+                node = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("not a node id: {value}"))?,
+                )
+            }
+            "--ublk" => {
+                ublk_dev = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("not a device id: {value}"))?,
+                )
+            }
+            _ => {
+                let addr: SocketAddr = value
+                    .parse()
+                    .map_err(|_| format!("not an address: {value}"))?;
+                match flag.as_str() {
+                    "--listen" => listen = Some(addr),
+                    "--dial" => dial = Some(addr),
+                    "--nbd" => nbd_addr = Some(addr),
+                    "--control" => control_addr = Some(addr),
+                    _ => return Err(format!("unknown flag {flag}")),
+                }
+            }
         }
     }
+    let node = node.ok_or("--node is required")?;
 
     let daemon = Daemon::start(Config {
         node,
-        brick,
+        bricks,
         listen,
         dial,
     })?;
