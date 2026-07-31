@@ -146,8 +146,7 @@ impl DrbdBackend for CliBackend {
         let outcome = self
             .exec
             .run(
-                ExecRequest::new("take a replicated volume down", DRBDADM)
-                    .args(["down", resource]),
+                ExecRequest::new("take a replicated volume down", DRBDADM).args(["down", resource]),
             )
             .await
             .map_err(DrbdError::Backend)?;
@@ -267,7 +266,8 @@ mod tests {
         let backend = CliBackend::new(exec.clone());
         exec.fail_next(1, "no resources defined!").await;
         backend.down("alpha-v0").await.unwrap();
-        exec.fail_next(1, "'alpha-v0' not defined in your config").await;
+        exec.fail_next(1, "'alpha-v0' not defined in your config")
+            .await;
         backend.down("alpha-v0").await.unwrap();
         // A real failure still fails.
         exec.fail_next(1, "State change failed").await;
