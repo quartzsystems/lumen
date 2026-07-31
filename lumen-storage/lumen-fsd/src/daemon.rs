@@ -124,6 +124,14 @@ struct Flushes {
     outcomes: HashMap<u64, bool>,
 }
 
+#[derive(Default)]
+struct Reads {
+    /// Fetch ticket → the payload arrived. Entries are removed by the
+    /// waiter; a `false` is a dead session, and the waiter's retry asks
+    /// whichever home is reachable then.
+    outcomes: HashMap<u64, bool>,
+}
+
 struct Shared {
     node_id: u8,
     /// The peer this single-link daemon last shook hands with. The engine
@@ -141,6 +149,8 @@ struct Shared {
     out_ready: Condvar,
     flushes: Mutex<Flushes>,
     flush_ready: Condvar,
+    reads: Mutex<Reads>,
+    read_ready: Condvar,
     /// The live peer socket, if any — held so a verdict or a replacement
     /// connection can kill it from outside its own threads.
     live_socket: Mutex<Option<TcpStream>>,
@@ -159,6 +169,7 @@ impl Shared {
         }
         let mut ob = self.outbound.lock().unwrap();
         let mut fl = self.flushes.lock().unwrap();
+        let mut rd = self.reads.lock().unwrap();
         for effect in effects {
             match effect {
                 // One queue because there is one peer: the single-link
@@ -171,6 +182,12 @@ impl Shared {
                 Effect::FlushFailed(ticket) => {
                     fl.outcomes.insert(ticket, false);
                 }
+                Effect::ReadDone(ticket) => {
+                    rd.outcomes.insert(ticket, true);
+                }
+                Effect::ReadFailed(ticket) => {
+                    rd.outcomes.insert(ticket, false);
+                }
             }
         }
     }
@@ -178,6 +195,7 @@ impl Shared {
     fn notify_all(&self) {
         self.out_ready.notify_all();
         self.flush_ready.notify_all();
+        self.read_ready.notify_all();
         self.changed.notify_all();
     }
 
@@ -330,10 +348,41 @@ pub struct GuestHandle {
 }
 
 impl GuestHandle {
-    /// Reads are always local and never block on the peer.
+    /// Read bytes — local when this member homes the blocks, a fetch and
+    /// a retry when it does not. The loop is the engine's contract: read,
+    /// hear `BlockElsewhere`, fetch that block, read again. A fetch that
+    /// dies with its session retries against whichever home is reachable
+    /// then; a fetch with no reachable home surfaces the engine's own
+    /// refusal.
     pub fn read(&self, vdisk: u64, offset: u64, len: u64) -> Result<Vec<u8>, FsError> {
-        self.shared
-            .with_engine(|engine| engine.read_bytes(vdisk, offset, len))
+        loop {
+            let outcome = self
+                .shared
+                .with_engine(|engine| engine.read_bytes(vdisk, offset, len));
+            let (tier, hash) = match outcome {
+                Err(FsError::BlockElsewhere { tier, hash }) => (tier, hash),
+                other => return other,
+            };
+            let ticket = self
+                .shared
+                .with_engine(|engine| engine.fetch_block(tier, hash))?;
+            let mut reads = self.shared.reads.lock().unwrap();
+            loop {
+                if let Some(arrived) = reads.outcomes.remove(&ticket) {
+                    // Arrived or not, the answer is another pass: a
+                    // landed payload serves the retry, a dead session's
+                    // retry re-fetches from the co-home.
+                    let _ = arrived;
+                    break;
+                }
+                if self.shared.shutdown.load(Ordering::SeqCst)
+                    || self.cancelled.load(Ordering::SeqCst)
+                {
+                    return Err(FsError::Suspended);
+                }
+                reads = self.shared.read_ready.wait_timeout(reads, TICK).unwrap().0;
+            }
+        }
     }
 
     /// Stop parking I/O on this handle and every clone of it: the export
@@ -717,6 +766,8 @@ impl Daemon {
             out_ready: Condvar::new(),
             flushes: Mutex::new(Flushes::default()),
             flush_ready: Condvar::new(),
+            reads: Mutex::new(Reads::default()),
+            read_ready: Condvar::new(),
             live_socket: Mutex::new(None),
             shutdown: AtomicBool::new(false),
         });

@@ -244,7 +244,7 @@ fn open_pool(path: &str) -> std::result::Result<Pool<FileDisk>, String> {
     Pool::open(Brick::open(disk).map_err(|err| err.to_string())?).map_err(|err| err.to_string())
 }
 
-fn read_watermark(pool: &Pool<FileDisk>) -> std::result::Result<u64, String> {
+fn read_watermark(pool: &mut Pool<FileDisk>) -> std::result::Result<u64, String> {
     let bytes = pool
         .read_bytes(VDISK, 0, 8)
         .map_err(|err| err.to_string())?;
@@ -260,7 +260,7 @@ fn cmd_workload(path: &str, seed: &str) -> std::result::Result<(), String> {
     if blocks < 2 {
         return Err("the vdisk needs at least two blocks for a burn-in".into());
     }
-    let mut done = read_watermark(&pool)?;
+    let mut done = read_watermark(&mut pool)?;
     // The free-segment level at which collecting is still worth asking
     // for; lowered when a collection turns out not to help.
     let mut collect_below = u64::MAX;
@@ -316,11 +316,11 @@ fn cmd_workload(path: &str, seed: &str) -> std::result::Result<(), String> {
 fn cmd_verify(path: &str, seed: &str, min_watermark: &str) -> std::result::Result<(), String> {
     let seed = parse_bytes(seed)?;
     let min_watermark = parse_bytes(min_watermark)?;
-    let pool = open_pool(path)?;
+    let mut pool = open_pool(path)?;
     let block_size = pool.block_size() as u64;
     let size = pool.vdisk_size(VDISK).map_err(|err| err.to_string())?;
     let blocks = size / block_size;
-    let watermark = read_watermark(&pool)?;
+    let watermark = read_watermark(&mut pool)?;
 
     // The watermark is the pool's own account of what it owes, so a check
     // that trusts it can be talked down: a pool that comes back at a far

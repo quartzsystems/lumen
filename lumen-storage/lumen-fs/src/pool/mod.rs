@@ -58,6 +58,7 @@ use crate::disk::Disk;
 use crate::error::{FsError, Result};
 use crate::hash::{hash_block, BlockHash};
 use crate::pool::wal::Wal;
+use crate::repl::slice::SliceMap;
 use crate::repl::{NodeId, SnapshotOffer, VdiskOffer};
 use crate::store::brick::{Brick, BrickStats, GcStats};
 use crate::store::brick_set::BrickSet;
@@ -150,6 +151,21 @@ pub struct Pool<D: Disk> {
     /// purpose: a crash ends the sessions that needed them, and the next
     /// sessions pin their own.
     session_pins: BTreeMap<NodeId, SessionPins>,
+    /// Which member this pool is, and which slices it homes. `None` is
+    /// "hold everything" — the single-node tools, and every pool from
+    /// before placement existed. Handed in at open (WAL replay's validity
+    /// checks consult it) and volatile until the manifest carries it
+    /// (phase 5's reassignment slice).
+    placement: Option<Placement>,
+}
+
+/// This node's seat in the slice map: who it is, and therefore which data
+/// blocks its bricks are homes for. Map nodes and manifests are exempt —
+/// metadata lives on every member.
+#[derive(Debug, Clone)]
+struct Placement {
+    node: NodeId,
+    map: SliceMap,
 }
 
 /// One peer session's claims against garbage collection: the roots of a
@@ -304,10 +320,26 @@ impl<D: Disk> Pool<D> {
         Self::open_set(store)
     }
 
+    /// Open a pool over its brick set with a placement seat: `node` is who
+    /// this member is, `map` which slices it homes. The placement must be
+    /// present *at open*, not set afterwards, because WAL replay's
+    /// validity checks run here — a replayed map write naming a block this
+    /// member never stores is legitimate exactly when the placement says
+    /// so, and without it replay would silently drop the entry and this
+    /// member's map trees would diverge from every peer's forever.
+    pub fn open_set_placed(store: BrickSet<D>, node: NodeId, map: SliceMap) -> Result<Pool<D>> {
+        Self::open_set_inner(store, Some(Placement { node, map }))
+    }
+
     /// Open a pool over its brick set: every brick has already recovered
     /// its extent store; the holder's anchor names the manifest and where
-    /// WAL replay begins.
+    /// WAL replay begins. No placement: this member holds everything —
+    /// the single-node tools and the pre-placement pools.
     pub fn open_set(store: BrickSet<D>) -> Result<Pool<D>> {
+        Self::open_set_inner(store, None)
+    }
+
+    fn open_set_inner(store: BrickSet<D>, placement: Option<Placement>) -> Result<Pool<D>> {
         let anchor = store
             .wal_brick()
             .read_best_anchor()?
@@ -362,6 +394,7 @@ impl<D: Disk> Pool<D> {
             anchor_generation: anchor.generation,
             era: anchor.era,
             session_pins: BTreeMap::new(),
+            placement,
         };
 
         // Replay: apply each entry only while everything it references
@@ -384,6 +417,31 @@ impl<D: Disk> Pool<D> {
         }
         pool.wal.set_epoch(max_epoch + 1);
         Ok(pool)
+    }
+
+    /// Whether this member's bricks are a home for a data block — always,
+    /// until a placement says otherwise. Metadata (map nodes, manifests)
+    /// never consults this: it lives on every member.
+    fn holds_data(&self, hash: &BlockHash) -> bool {
+        match &self.placement {
+            Some(placement) => placement.map.holds(placement.node, hash),
+            None => true,
+        }
+    }
+
+    /// This node's seat and map, if placement has arrived.
+    pub fn placement(&self) -> Option<(NodeId, &SliceMap)> {
+        self.placement
+            .as_ref()
+            .map(|placement| (placement.node, &placement.map))
+    }
+
+    /// Hand the pool its seat after open. Prefer the placed constructors —
+    /// a placement set after WAL replay cannot repair what replay already
+    /// dropped — but a freshly *created* pool has no WAL to replay, and
+    /// the harness builds its members this way.
+    pub fn set_placement(&mut self, node: NodeId, map: SliceMap) {
+        self.placement = Some(Placement { node, map });
     }
 
     /// Apply one replayed entry if its references hold. `false` ends replay.
@@ -413,7 +471,12 @@ impl<D: Disk> Pool<D> {
                     Some(state) => (self.capacity_of(state), state.tier),
                     None => return false,
                 };
-                if *index >= capacity || !self.store.contains(tier, hash) {
+                // A home must hold what it maps; a non-home never stored
+                // the block and maps it anyway — dropping the entry here
+                // is the sleeper that would fork this member's map trees
+                // from every peer's.
+                if *index >= capacity || (self.holds_data(hash) && !self.store.contains(tier, hash))
+                {
                     return false;
                 }
                 self.vdisks
@@ -858,6 +921,7 @@ impl<D: Disk> Pool<D> {
         match hash {
             Some(hash) => match self.store.get(tier, &hash)? {
                 Some(payload) => Ok(Some(payload)),
+                None if !self.holds_data(&hash) => Err(FsError::BlockElsewhere { tier, hash }),
                 None => Err(FsError::Corrupt("a mapped block is missing from the store")),
             },
             None => Ok(None),
@@ -898,8 +962,14 @@ impl<D: Disk> Pool<D> {
         match hash {
             Some(hash) => match self.store.get(state.tier, &hash)? {
                 Some(payload) => Ok(Some(payload)),
-                // The map promised a block the store cannot produce: that
-                // is corruption to repair, never a quiet zero-fill.
+                // Absent on a non-home is the ordinary answer — the bytes
+                // live at the named address on the slice's homes, and the
+                // caller's next move is a fetch. Absent on a home is
+                // corruption to repair, never a quiet zero-fill.
+                None if !self.holds_data(&hash) => Err(FsError::BlockElsewhere {
+                    tier: state.tier,
+                    hash,
+                }),
                 None => Err(FsError::Corrupt("a mapped block is missing from the store")),
             },
             None => Ok(None),
@@ -1048,7 +1118,10 @@ impl<D: Disk> Pool<D> {
     /// and every map reference against the store. Repair is phase 2's
     /// business; a truthful report is this one's. A missing *map node* is
     /// an error rather than a report line — with the tree's shape gone,
-    /// there is no honest way to say which blocks are missing.
+    /// there is no honest way to say which blocks are missing. A data
+    /// block this member does not home is not missing — it is at its
+    /// homes, and calling it missing here would page someone for the
+    /// design working as designed.
     pub fn scrub(&self) -> Result<ScrubReport> {
         let (blocks_verified, corrupt) = self.store.scrub()?;
         let mut missing = Vec::new();
@@ -1058,7 +1131,7 @@ impl<D: Disk> Pool<D> {
             let state = &self.vdisks[&id];
             for (index, value) in &state.dirty {
                 if let Some(hash) = value {
-                    if !self.store.contains(state.tier, hash) {
+                    if self.holds_data(hash) && !self.store.contains(state.tier, hash) {
                         missing.push((id, *index));
                     }
                 }
@@ -1078,7 +1151,9 @@ impl<D: Disk> Pool<D> {
                 for (index, hash) in tree_refs {
                     // A dirty entry supersedes the tree at this index; only
                     // the reference a read would actually follow counts.
-                    if !state.dirty.contains_key(&index) && !self.store.contains(state.tier, &hash)
+                    if !state.dirty.contains_key(&index)
+                        && self.holds_data(&hash)
+                        && !self.store.contains(state.tier, &hash)
                     {
                         missing.push((id, index));
                     }
@@ -1102,7 +1177,7 @@ impl<D: Disk> Pool<D> {
                     },
                 )?;
                 for (index, hash) in tree_refs {
-                    if !self.store.contains(tier, &hash) {
+                    if self.holds_data(&hash) && !self.store.contains(tier, &hash) {
                         missing.push((*vdisk, index));
                     }
                 }
@@ -1288,7 +1363,9 @@ impl<D: Disk> Pool<D> {
     /// A map write whose payload is already in the store — the replicated
     /// form of [`Pool::write_block`]. Refusing an absent block is what
     /// keeps a reordered or truncated stream from mapping a promise the
-    /// store cannot keep.
+    /// store cannot keep — on a *home*. A non-home maps the block without
+    /// holding it: the map entry is metadata, and metadata lives here
+    /// even when the bytes do not.
     pub fn write_block_prehashed(&mut self, vdisk: u64, index: u64, hash: BlockHash) -> Result<()> {
         let state = self
             .vdisks
@@ -1299,7 +1376,7 @@ impl<D: Disk> Pool<D> {
         if index >= capacity {
             return Err(FsError::OutOfRange { index, capacity });
         }
-        if !self.store.contains(tier, &hash) {
+        if self.holds_data(&hash) && !self.store.contains(tier, &hash) {
             return Err(FsError::Corrupt(
                 "a replicated write names a block the store does not hold",
             ));
@@ -1418,6 +1495,22 @@ impl<D: Disk> Pool<D> {
         }
         self.era = era;
         self.checkpoint()
+    }
+
+    /// Keep exactly these vdisks; drop the rest with their snapshots and
+    /// leases, and anchor the result. The rejoin cleanup: per-vdisk
+    /// adoption never removes anything, so a vdisk deleted while this
+    /// member was away survives every offer — until the union of what the
+    /// live members still carry says it should not.
+    pub fn retain_vdisks(&mut self, keep: &HashSet<u64>) -> Result<()> {
+        let before = self.vdisks.len();
+        self.vdisks.retain(|id, _| keep.contains(id));
+        self.snapshots.retain(|(vdisk, _), _| keep.contains(vdisk));
+        self.leases.retain(|vdisk, _| keep.contains(vdisk));
+        if self.vdisks.len() != before {
+            self.checkpoint()?;
+        }
+        Ok(())
     }
 
     /// One vdisk's size in bytes.

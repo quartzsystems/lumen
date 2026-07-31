@@ -86,6 +86,20 @@ pub enum FsError {
     /// Fail loud at open — a set assembled from the wrong disks must never
     /// get as far as serving reads.
     BrickSetMismatch(&'static str),
+    /// The block is real and mapped, but this node is not one of its
+    /// slice's homes — its bytes live on the named address at another
+    /// member, and the caller's next move is a fetch, not a retry. This is
+    /// an *answer*, not a failure: a non-home read path sees one of these
+    /// on every cold block.
+    BlockElsewhere {
+        tier: u8,
+        hash: crate::hash::BlockHash,
+    },
+    /// A write's slice has no reachable home: this node is not one, and
+    /// no home member's session can take the payload. Refused by name —
+    /// a write acknowledged with zero durable copies would be the lie the
+    /// whole acknowledgement rule exists to prevent.
+    SliceUnreachable(u8),
 }
 
 impl fmt::Display for FsError {
@@ -157,6 +171,12 @@ impl fmt::Display for FsError {
             }
             FsError::BrickSetMismatch(why) => {
                 write!(f, "these bricks are not one node's set: {why}")
+            }
+            FsError::BlockElsewhere { tier, .. } => {
+                write!(f, "the block lives on another member's tier {tier} bricks")
+            }
+            FsError::SliceUnreachable(slice) => {
+                write!(f, "no home of slice {slice} is reachable to take the write")
             }
         }
     }

@@ -284,6 +284,14 @@ pub enum PeerMessage {
     SyncNeed(Vec<(u8, BlockHash)>),
     /// The blocks, tier and payload — each self-identifies by its hash.
     SyncData(Vec<(u8, Vec<u8>)>),
+    /// Blocks wanted right now, outside any resync: a non-home guest read,
+    /// or a home repairing. Served from the store exactly like `SyncNeed`;
+    /// answered with `ReadData`.
+    Read(Vec<(u8, BlockHash)>),
+    /// The fetched blocks, tier and payload — each self-identifies by its
+    /// hash. A home stores what arrives (that is the repair); a non-home
+    /// serves the waiting read and keeps nothing.
+    ReadData(Vec<(u8, Vec<u8>)>),
     /// The pull is complete; the target asks leave to adopt. This is the
     /// source's cue to stop acknowledging alone: adoption hands the
     /// target the source's era, and a single-copy acknowledgement issued
@@ -311,6 +319,14 @@ pub enum Effect {
     /// writes were discarded by an adoption. The guest sees an error, not
     /// a lie.
     FlushFailed(u64),
+    /// The fetch with this ticket landed: the block is readable now — from
+    /// the store if this member homes it (the repair path), or from the
+    /// serve-once buffer if it does not.
+    ReadDone(u64),
+    /// The fetch with this ticket cannot complete: the session it rode
+    /// died. The caller retries, and the retry picks whichever home is
+    /// reachable then — an error the guest can survive, never a hang.
+    ReadFailed(u64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -463,6 +479,17 @@ pub struct ReplNode<D: Disk> {
     peers: BTreeMap<NodeId, PeerSession>,
     parked: Vec<ParkedFlush>,
     next_ticket: u64,
+    /// Fetched payloads for blocks this member does not store, held for
+    /// exactly one read each — taken on consumption, because a kept copy
+    /// would be a third replica that collection and scrub would have to
+    /// account for. "A non-home fetches on demand and keeps nothing."
+    fetched: HashMap<(u8, BlockHash), Vec<u8>>,
+    /// Outstanding fetches: ticket → what was asked of whom.
+    pending_reads: HashMap<u64, (u8, BlockHash, NodeId)>,
+    /// Every vdisk named by any offer this multi-source rejoin has seen —
+    /// what survives the final cleanup. A vdisk no live member offers was
+    /// deleted while this node was away.
+    offered_vdisks: HashSet<u64>,
 }
 
 impl<D: Disk> ReplNode<D> {
@@ -474,7 +501,20 @@ impl<D: Disk> ReplNode<D> {
             peers: BTreeMap::new(),
             parked: Vec::new(),
             next_ticket: 1,
+            fetched: HashMap::new(),
+            pending_reads: HashMap::new(),
+            offered_vdisks: HashSet::new(),
         }
+    }
+
+    /// Hand this node its seat: which member it is was known at birth;
+    /// which slices that member homes arrives here. Everything before this
+    /// call treats the node as a home for every block — the two-member
+    /// degenerate map made implicit.
+    pub fn set_placement(&mut self, members: &[NodeId]) -> Result<()> {
+        let map = crate::repl::slice::SliceMap::for_members(1, members)?;
+        self.pool.set_placement(self.node, map);
+        Ok(())
     }
 
     /// The node's relationship to its pool, derived from the sessions: a
@@ -588,6 +628,18 @@ impl<D: Disk> ReplNode<D> {
         // The offer pins and any payloads delivered ahead of ops that will
         // now never arrive: garbage, correctly, once unpinned.
         self.pool.drop_session_pins(peer);
+        // Fetches riding the dead session fail rather than hang; the
+        // retry asks whichever home is reachable then.
+        let failed: Vec<u64> = self
+            .pending_reads
+            .iter()
+            .filter(|(_, (_, _, target))| *target == peer)
+            .map(|(ticket, _)| *ticket)
+            .collect();
+        for ticket in failed {
+            self.pending_reads.remove(&ticket);
+            self.emit(Effect::ReadFailed(ticket));
+        }
     }
 
     /// The floor a fence-verdict era must clear from this node's vantage:
@@ -794,9 +846,19 @@ impl<D: Disk> ReplNode<D> {
     }
 
     /// Fan an op batch out to every streaming session, each under its own
-    /// numbering. Every op requires every recipient's durability today;
-    /// slice 24 narrows a data write's requirement to its block's homes.
+    /// numbering. Every op here is metadata, and metadata durability is
+    /// owed by every live member — the requirement that keeps "replicated
+    /// everywhere" a promise rather than a distribution detail.
     fn send_ops(&mut self, ops: Vec<ReplOp>) {
+        self.send_ops_requiring(ops, None);
+    }
+
+    /// The general fan-out: ops go to every streaming session (numbering
+    /// must stay dense on every stream), while `required` — when given —
+    /// names the only peers whose durability a flush must wait on for
+    /// these ops. A data write passes its block's homes; everything else
+    /// requires everyone.
+    fn send_ops_requiring(&mut self, ops: Vec<ReplOp>, required: Option<&[NodeId]>) {
         if ops.is_empty() {
             return;
         }
@@ -810,7 +872,9 @@ impl<D: Disk> ReplNode<D> {
             let session = self.peers.get_mut(&peer).expect("collected above");
             let first_rseq = session.next_rseq;
             session.next_rseq += ops.len() as u64;
-            session.required_rseq = session.next_rseq - 1;
+            if required.is_none_or(|homes| homes.contains(&peer)) {
+                session.required_rseq = session.next_rseq - 1;
+            }
             self.emit(Effect::Send(
                 peer,
                 PeerMessage::Apply {
@@ -867,21 +931,50 @@ impl<D: Disk> ReplNode<D> {
     pub fn write_block(&mut self, vdisk: u64, index: u64, payload: &[u8]) -> Result<()> {
         self.writable(vdisk)?;
         let tier = self.pool.vdisk_tier(vdisk)?;
-        let hash = self.pool.put_block(tier, payload)?;
-        self.with_wal_room(|pool| pool.write_block_prehashed(vdisk, index, hash))?;
-        let recipients: Vec<NodeId> = self
-            .peers
+        let hash = crate::hash::hash_block(payload);
+        // Where the block lives is the hash's decision, not the writer's:
+        // its slice's homes store it, everyone else only maps it. Without
+        // a placement every member is a home — the two-member degenerate.
+        let homes: Vec<NodeId> = match self.pool.placement() {
+            Some((_, map)) => map.homes_of(&hash).to_vec(),
+            None => {
+                let mut everyone: Vec<NodeId> = self.peers.keys().copied().collect();
+                everyone.push(self.node);
+                everyone
+            }
+        };
+        // At least one home must be able to take the payload *now*: this
+        // node itself, or a home whose session streams. Zero reachable
+        // homes would be a write acknowledged with zero durable copies.
+        let local_home = homes.contains(&self.node);
+        let remote_homes: Vec<NodeId> = homes
             .iter()
-            .filter(|(_, s)| s.stream_active())
-            .map(|(id, _)| *id)
+            .copied()
+            .filter(|home| {
+                *home != self.node
+                    && self
+                        .peers
+                        .get(home)
+                        .is_some_and(|session| session.stream_active())
+            })
             .collect();
-        for peer in recipients {
+        if !local_home && remote_homes.is_empty() {
+            return Err(FsError::SliceUnreachable(slice::slice_of(&hash) as u8));
+        }
+        if local_home {
+            self.pool.put_block(tier, payload)?;
+        }
+        self.with_wal_room(|pool| pool.write_block_prehashed(vdisk, index, hash))?;
+        for peer in &remote_homes {
             self.emit(Effect::Send(
-                peer,
+                *peer,
                 PeerMessage::Payloads(vec![(tier, payload.to_vec())]),
             ));
         }
-        self.send_ops(vec![ReplOp::Write { vdisk, index, hash }]);
+        self.send_ops_requiring(
+            vec![ReplOp::Write { vdisk, index, hash }],
+            Some(&remote_homes),
+        );
         Ok(())
     }
 
@@ -1005,20 +1098,74 @@ impl<D: Disk> ReplNode<D> {
     }
 
     // -----------------------------------------------------------------
-    // Reads — always local, always allowed. What is readable here is
-    // exactly what this node would serve after a failover.
+    // Reads — local when this member homes the block, a fetch when it
+    // does not. What is readable here without a peer is exactly what this
+    // node would serve after a failover.
 
-    pub fn read_block(&self, vdisk: u64, index: u64) -> Result<Option<Vec<u8>>> {
-        self.pool.read_block(vdisk, index)
+    /// Read one block. A block this member does not store surfaces as
+    /// [`FsError::BlockElsewhere`] unless a fetch already brought it —
+    /// the serve-once buffer is consumed here, which is what "keeps
+    /// nothing" means in code. The caller's loop is: read, fetch on
+    /// `BlockElsewhere`, read again.
+    pub fn read_block(&mut self, vdisk: u64, index: u64) -> Result<Option<Vec<u8>>> {
+        match self.pool.read_block(vdisk, index) {
+            Err(FsError::BlockElsewhere { tier, hash }) => {
+                match self.fetched.remove(&(tier, hash)) {
+                    Some(payload) => Ok(Some(payload)),
+                    None => Err(FsError::BlockElsewhere { tier, hash }),
+                }
+            }
+            other => other,
+        }
     }
 
     pub fn read_snapshot_block(
-        &self,
+        &mut self,
         vdisk: u64,
         snapshot: u64,
         index: u64,
     ) -> Result<Option<Vec<u8>>> {
-        self.pool.read_snapshot_block(vdisk, snapshot, index)
+        match self.pool.read_snapshot_block(vdisk, snapshot, index) {
+            Err(FsError::BlockElsewhere { tier, hash }) => {
+                match self.fetched.remove(&(tier, hash)) {
+                    Some(payload) => Ok(Some(payload)),
+                    None => Err(FsError::BlockElsewhere { tier, hash }),
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// Ask a home for a block this member does not store. The returned
+    /// ticket completes as [`Effect::ReadDone`] when the payload arrives
+    /// — the next [`ReplNode::read_block`] will serve it — or
+    /// [`Effect::ReadFailed`] if the session dies first, in which case
+    /// the caller retries and the retry asks whichever home is reachable
+    /// then. Preference order is the map's: `homes[0]` first, its
+    /// co-home when the first is not streaming.
+    pub fn fetch_block(&mut self, tier: u8, hash: BlockHash) -> Result<u64> {
+        let homes = match self.pool.placement() {
+            Some((_, map)) => map.homes_of(&hash),
+            None => {
+                return Err(FsError::Corrupt(
+                    "a fetch on a member that holds everything",
+                ))
+            }
+        };
+        let target = homes.iter().copied().find(|home| {
+            *home != self.node
+                && self.peers.get(home).is_some_and(|session| {
+                    session.state == ReplState::Synced || session.stream_active()
+                })
+        });
+        let Some(target) = target else {
+            return Err(FsError::SliceUnreachable(slice::slice_of(&hash) as u8));
+        };
+        let ticket = self.next_ticket;
+        self.next_ticket += 1;
+        self.pending_reads.insert(ticket, (tier, hash, target));
+        self.emit(Effect::Send(target, PeerMessage::Read(vec![(tier, hash)])));
+        Ok(ticket)
     }
 
     /// Local maintenance; each node runs its own on its own schedule.
@@ -1058,7 +1205,19 @@ impl<D: Disk> ReplNode<D> {
             }
             PeerMessage::Payloads(payloads) => {
                 for (tier, payload) in payloads {
-                    let hash = self.pool.put_block(tier, &payload)?;
+                    let hash = crate::hash::hash_block(&payload);
+                    // A payload lands only on a home — the sender routes
+                    // by the same map, so anything else is a stray, and a
+                    // stray stored here would be the third copy the
+                    // accounting never expects.
+                    if self
+                        .pool
+                        .placement()
+                        .is_some_and(|(node, map)| !map.holds(node, &hash))
+                    {
+                        continue;
+                    }
+                    self.pool.put_block(tier, &payload)?;
                     // Pinned until the op that references it lands: a
                     // collection between the payload and its op would
                     // otherwise sweep the block and kill the op's replay.
@@ -1105,6 +1264,49 @@ impl<D: Disk> ReplNode<D> {
                     }
                 }
                 self.emit(Effect::Send(from, PeerMessage::SyncData(payloads)));
+                Ok(())
+            }
+            PeerMessage::Read(hashes) => {
+                let mut payloads = Vec::with_capacity(hashes.len());
+                for (tier, hash) in hashes {
+                    match self.pool.block_payload(tier, &hash)? {
+                        Some(payload) => payloads.push((tier, payload)),
+                        None => {
+                            return Err(FsError::Corrupt(
+                                "the peer asked for a block this store does not hold",
+                            ))
+                        }
+                    }
+                }
+                self.emit(Effect::Send(from, PeerMessage::ReadData(payloads)));
+                Ok(())
+            }
+            PeerMessage::ReadData(payloads) => {
+                for (tier, payload) in payloads {
+                    let hash = crate::hash::hash_block(&payload);
+                    // A home stores what arrives — that is the repair and
+                    // the refill; a non-home serves the read and keeps
+                    // nothing beyond the one consumption.
+                    if self
+                        .pool
+                        .placement()
+                        .is_some_and(|(node, map)| map.holds(node, &hash))
+                    {
+                        self.pool.put_block(tier, &payload)?;
+                    } else {
+                        self.fetched.insert((tier, hash), payload);
+                    }
+                    let done: Vec<u64> = self
+                        .pending_reads
+                        .iter()
+                        .filter(|(_, (t, h, _))| *t == tier && *h == hash)
+                        .map(|(ticket, _)| *ticket)
+                        .collect();
+                    for ticket in done {
+                        self.pending_reads.remove(&ticket);
+                        self.emit(Effect::ReadDone(ticket));
+                    }
+                }
                 Ok(())
             }
             PeerMessage::SyncData(payloads) => self.on_sync_data(from, payloads),
@@ -1164,6 +1366,13 @@ impl<D: Disk> ReplNode<D> {
             session.state = ReplState::Resyncing { source: false };
             session.serving_source = false;
             session.stream_live = false;
+            // A fresh rejoin wave starts a fresh record of what the live
+            // members still offer; a wave already running keeps its own.
+            if !self.peers.iter().any(|(id, s)| {
+                *id != peer_node && s.state == (ReplState::Resyncing { source: false })
+            }) {
+                self.offered_vdisks.clear();
+            }
             self.emit(Effect::Send(peer_node, PeerMessage::SyncStart));
         }
         Ok(())
@@ -1223,6 +1432,23 @@ impl<D: Disk> ReplNode<D> {
             };
             if !self.session(from).pull.seen.insert((hash, kind, data_tier)) {
                 continue;
+            }
+            // Data blocks slice; map nodes do not. A data block this
+            // member does not home is not fetched at all, and one whose
+            // co-home is a different member is that member's session's
+            // job — every pull walks every tree (metadata is everywhere),
+            // and each fetches exactly the subset its own source homes,
+            // so between the pulls a rejoining home refills completely.
+            if kind == 0 {
+                if let Some((node, map)) = self.pool.placement() {
+                    let homes = map.homes_of(&hash);
+                    if !homes.contains(&node) {
+                        continue;
+                    }
+                    if !homes.contains(&from) {
+                        continue;
+                    }
+                }
             }
             // A node lives on tier 0; a kind-0 entry is data on its
             // vdisk's tier. That pair is the whole address.
@@ -1299,6 +1525,12 @@ impl<D: Disk> ReplNode<D> {
         // blocks the store holds.
         let pins = offer_pins(&offer, self.pool.block_size());
         self.pool.pin_sync(from, pins);
+        // What this wave's live members still carry — the survivors of
+        // the post-adoption cleanup. Accumulated across every offer,
+        // because no single member speaks for the set.
+        for (id, _, _, _) in &offer.vdisks {
+            self.offered_vdisks.insert(*id);
+        }
         let entries = map::entries_per_node(self.pool.block_size());
         let block_size = self.pool.block_size() as u64;
         // A root of a depth-d tree is kind d: its children are kind d-1,
@@ -1394,13 +1626,67 @@ impl<D: Disk> ReplNode<D> {
                 "finishing a pull that never had a manifest",
             ))?;
         let era = offer.era;
-        self.pool.adopt_sync(
-            era,
-            &offer.vdisks,
-            &offer.snapshots,
-            &offer.leases,
-            AdoptScope::Whole,
-        )?;
+        if self.pool.placement().is_some() {
+            // Per-vdisk adoption: every op for a vdisk originates at its
+            // lease holder, so only the holder's offer speaks for it —
+            // another source's copy is missing whatever the holder wrote
+            // since that source's checkpoint. Vdisks held by no live
+            // pulling source (this node's own from before it died, a
+            // fenced member's, none at all) are identical on every synced
+            // member and adopted from whichever offer arrives.
+            let other_pulling: Vec<NodeId> = self
+                .peers
+                .iter()
+                .filter(|(id, s)| {
+                    **id != from && s.state == (ReplState::Resyncing { source: false })
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            let holder_of = |vdisk: u64| {
+                offer
+                    .leases
+                    .iter()
+                    .find(|(id, _)| *id == vdisk)
+                    .map(|(_, lease)| lease.holder)
+            };
+            let adopt: Vec<u64> = offer
+                .vdisks
+                .iter()
+                .map(|(id, _, _, _)| *id)
+                .filter(|id| match holder_of(*id) {
+                    Some(holder) => holder == from || !other_pulling.contains(&holder),
+                    None => true,
+                })
+                .collect();
+            let vdisks: Vec<VdiskOffer> = offer
+                .vdisks
+                .iter()
+                .filter(|(id, _, _, _)| adopt.contains(id))
+                .copied()
+                .collect();
+            let snapshots: Vec<SnapshotOffer> = offer
+                .snapshots
+                .iter()
+                .filter(|(vdisk, _, _, _)| adopt.contains(vdisk))
+                .copied()
+                .collect();
+            let leases: Vec<(u64, Lease)> = offer
+                .leases
+                .iter()
+                .filter(|(vdisk, _)| adopt.contains(vdisk))
+                .copied()
+                .collect();
+            self.pool
+                .adopt_sync(era, &vdisks, &snapshots, &leases, AdoptScope::Named)?;
+        } else {
+            self.pool.adopt_sync(
+                era,
+                &offer.vdisks,
+                &offer.snapshots,
+                &offer.leases,
+                AdoptScope::Whole,
+            )?;
+        }
         // The leases came over inside the adoption: the source's view of
         // who may write is part of the state being adopted, not a separate
         // negotiation.
@@ -1430,6 +1716,18 @@ impl<D: Disk> ReplNode<D> {
         let parked = std::mem::take(&mut self.parked);
         for flush in parked {
             self.emit(Effect::FlushFailed(flush.ticket));
+        }
+        // The wave's last adoption reconciles deletions: Named adoption
+        // never removes, so a vdisk no live member offered — deleted
+        // while this node was away — is dropped by the survivors' union.
+        if self.pool.placement().is_some()
+            && !self
+                .peers
+                .values()
+                .any(|s| s.state == (ReplState::Resyncing { source: false }))
+        {
+            let keep = std::mem::take(&mut self.offered_vdisks);
+            self.pool.retain_vdisks(&keep)?;
         }
         self.emit(Effect::Send(from, PeerMessage::SyncDone { era }));
         Ok(())

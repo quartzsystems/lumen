@@ -44,16 +44,21 @@ fn byte_bounds(size: u64, block_size: u64, offset: u64, len: u64) -> Result<()> 
 }
 
 /// Byte-granular I/O over anything that reads and writes vdisk blocks.
+///
+/// Reads take `&mut self` since phase 5: a replicated node's read may
+/// consume a fetched block's serve-once buffer, and the RMW edge of a
+/// write reads. On a member that does not home a block, either surfaces
+/// [`crate::FsError::BlockElsewhere`] — the caller fetches and retries.
 pub trait ByteView {
     fn block_size(&self) -> u32;
     fn vdisk_size(&self, vdisk: u64) -> Result<u64>;
-    fn read_block(&self, vdisk: u64, index: u64) -> Result<Option<Vec<u8>>>;
+    fn read_block(&mut self, vdisk: u64, index: u64) -> Result<Option<Vec<u8>>>;
     fn write_block(&mut self, vdisk: u64, index: u64, payload: &[u8]) -> Result<()>;
     fn trim_block(&mut self, vdisk: u64, index: u64) -> Result<()>;
 
     /// Read a byte range. Always returns exactly `len` bytes; what was
     /// never written is zeros.
-    fn read_bytes(&self, vdisk: u64, offset: u64, len: u64) -> Result<Vec<u8>> {
+    fn read_bytes(&mut self, vdisk: u64, offset: u64, len: u64) -> Result<Vec<u8>> {
         let size = self.vdisk_size(vdisk)?;
         let block_size = self.block_size() as u64;
         byte_bounds(size, block_size, offset, len)?;
@@ -135,7 +140,7 @@ impl<D: Disk> ByteView for Pool<D> {
     fn vdisk_size(&self, vdisk: u64) -> Result<u64> {
         Pool::vdisk_size(self, vdisk)
     }
-    fn read_block(&self, vdisk: u64, index: u64) -> Result<Option<Vec<u8>>> {
+    fn read_block(&mut self, vdisk: u64, index: u64) -> Result<Option<Vec<u8>>> {
         Pool::read_block(self, vdisk, index)
     }
     fn write_block(&mut self, vdisk: u64, index: u64, payload: &[u8]) -> Result<()> {
@@ -146,8 +151,8 @@ impl<D: Disk> ByteView for Pool<D> {
     }
 }
 
-/// The daemon's guest path: reads stay local, mutations replicate. Same
-/// byte semantics, because they are the same code.
+/// The daemon's guest path: reads local or fetched, mutations replicate.
+/// Same byte semantics, because they are the same code.
 impl<D: Disk> ByteView for ReplNode<D> {
     fn block_size(&self) -> u32 {
         self.pool().block_size()
@@ -155,7 +160,7 @@ impl<D: Disk> ByteView for ReplNode<D> {
     fn vdisk_size(&self, vdisk: u64) -> Result<u64> {
         self.pool().vdisk_size(vdisk)
     }
-    fn read_block(&self, vdisk: u64, index: u64) -> Result<Option<Vec<u8>>> {
+    fn read_block(&mut self, vdisk: u64, index: u64) -> Result<Option<Vec<u8>>> {
         ReplNode::read_block(self, vdisk, index)
     }
     fn write_block(&mut self, vdisk: u64, index: u64, payload: &[u8]) -> Result<()> {
@@ -200,7 +205,7 @@ mod tests {
 
     #[test]
     fn a_fresh_vdisk_reads_as_zeros_everywhere() {
-        let pool = pool(1);
+        let mut pool = pool(1);
         assert_eq!(pool.read_bytes(1, 0, 100).unwrap(), vec![0u8; 100]);
         let tail = pool.read_bytes(1, VDISK_SIZE - 10, 10).unwrap();
         assert_eq!(tail, vec![0u8; 10]);
@@ -315,7 +320,7 @@ mod tests {
             }
 
             pool.checkpoint().unwrap();
-            let pool = Pool::open(Brick::open(pool.into_brick().into_disk()).unwrap()).unwrap();
+            let mut pool = Pool::open(Brick::open(pool.into_brick().into_disk()).unwrap()).unwrap();
             assert_eq!(
                 pool.read_bytes(1, 0, VDISK_SIZE).unwrap(),
                 shadow,

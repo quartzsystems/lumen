@@ -271,6 +271,25 @@ pub fn encode(message: &PeerMessage) -> Vec<u8> {
             out.push(12);
             put_u64(&mut out, *era);
         }
+        // The fetch pair — phase 5's non-home reads. A two-member daemon
+        // never emits them (everyone homes everything), so the handshake
+        // magic waits for the mesh to bump it.
+        PeerMessage::Read(hashes) => {
+            out.push(13);
+            put_u32(&mut out, hashes.len() as u32);
+            for (tier, hash) in hashes {
+                out.push(*tier);
+                out.extend_from_slice(hash.as_bytes());
+            }
+        }
+        PeerMessage::ReadData(payloads) => {
+            out.push(14);
+            put_u32(&mut out, payloads.len() as u32);
+            for (tier, payload) in payloads {
+                out.push(*tier);
+                put_bytes(&mut out, payload);
+            }
+        }
     }
     out
 }
@@ -480,6 +499,24 @@ pub fn decode(buf: &[u8]) -> Result<PeerMessage, WireError> {
             final_rseq: r.u64()?,
         },
         12 => PeerMessage::SyncDone { era: r.u64()? },
+        13 => {
+            let count = r.count(33)?;
+            let mut hashes = Vec::with_capacity(count);
+            for _ in 0..count {
+                let tier = r.u8()?;
+                hashes.push((tier, r.hash()?));
+            }
+            PeerMessage::Read(hashes)
+        }
+        14 => {
+            let count = r.count(5)?;
+            let mut payloads = Vec::with_capacity(count);
+            for _ in 0..count {
+                let tier = r.u8()?;
+                payloads.push((tier, r.bytes()?));
+            }
+            PeerMessage::ReadData(payloads)
+        }
         tag => return Err(WireError::BadTag(tag)),
     };
     if r.remaining() != 0 {
@@ -602,6 +639,9 @@ mod tests {
         round_trip(PeerMessage::SyncReady);
         round_trip(PeerMessage::SyncAdopt { final_rseq: 77 });
         round_trip(PeerMessage::SyncDone { era: 6 });
+        round_trip(PeerMessage::Read(vec![(0, hash(0x77)), (1, hash(0x78))]));
+        round_trip(PeerMessage::Read(vec![]));
+        round_trip(PeerMessage::ReadData(vec![(0, vec![9, 9, 9]), (2, vec![])]));
     }
 
     #[test]
@@ -619,7 +659,7 @@ mod tests {
         long.push(0);
         assert_eq!(decode(&long).unwrap_err(), WireError::Trailing);
         // Unknown tags: refused.
-        assert_eq!(decode(&[13]).unwrap_err(), WireError::BadTag(13));
+        assert_eq!(decode(&[15]).unwrap_err(), WireError::BadTag(15));
         assert_eq!(decode(&[0]).unwrap_err(), WireError::BadTag(0));
     }
 

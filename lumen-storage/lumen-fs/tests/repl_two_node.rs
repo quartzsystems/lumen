@@ -120,6 +120,11 @@ fn drain_effects(
                 Effect::FlushFailed(ticket) => {
                     guests.failed[side].insert(ticket);
                 }
+                // No placement at two members: every block is local and
+                // nothing ever fetches. Reaching here is a harness bug.
+                Effect::ReadDone(_) | Effect::ReadFailed(_) => {
+                    unreachable!("a fetch effect on an unplaced pair")
+                }
             }
         }
     }
@@ -177,8 +182,10 @@ fn crash_and_restart(node: ReplNode<SimDisk>, id: u8) -> ReplNode<SimDisk> {
     ReplNode::new(Pool::open(Brick::open(disk).unwrap()).unwrap(), id)
 }
 
-/// Every index either node would serve, compared byte for byte.
-fn assert_identical(a: &ReplNode<SimDisk>, b: &ReplNode<SimDisk>) {
+/// Every index either node would serve, compared byte for byte. `&mut`
+/// because a read may consume a fetched block's serve-once buffer — at
+/// two members everything is local and nothing is consumed.
+fn assert_identical(a: &mut ReplNode<SimDisk>, b: &mut ReplNode<SimDisk>) {
     for index in 0..CAPACITY {
         assert_eq!(
             a.read_block(VDISK, index).unwrap(),
@@ -246,7 +253,7 @@ fn an_acknowledged_write_survives_its_writers_death() {
     assert_eq!(b.state(), ReplState::Synced);
     assert_eq!(a.read_block(VDISK, 0).unwrap().unwrap(), b"must survive");
     assert_eq!(a.read_block(VDISK, 1).unwrap().unwrap(), b"written alone");
-    assert_identical(&a, &b);
+    assert_identical(&mut a, &mut b);
 
     // Lockstep continues, with B the writer now.
     b.write_block(VDISK, 2, b"after the storm").unwrap();
@@ -301,6 +308,9 @@ fn pump_one(node: &mut ReplNode<SimDisk>, guests: &mut Guests, side: usize) {
                 guests.failed[side].insert(ticket);
             }
             Effect::Send(..) => {}
+            Effect::ReadDone(_) | Effect::ReadFailed(_) => {
+                unreachable!("a fetch effect on an unplaced pair")
+            }
         }
     }
 }
@@ -343,7 +353,7 @@ fn a_partition_without_a_verdict_suspends_and_never_diverges() {
     assert_eq!(b.state(), ReplState::Synced);
     assert!(guests.done[0].contains(&parked));
     assert_eq!(b.read_block(VDISK, 6).unwrap().unwrap(), b"caught mid-air");
-    assert_identical(&a, &b);
+    assert_identical(&mut a, &mut b);
 }
 
 #[test]
@@ -382,7 +392,7 @@ fn an_unacknowledged_write_dies_with_its_fenced_writer() {
         a.read_block(VDISK, 10).unwrap().unwrap(),
         b"the survivor's history"
     );
-    assert_identical(&a, &b);
+    assert_identical(&mut a, &mut b);
 }
 
 #[test]
@@ -439,8 +449,8 @@ fn a_live_migration_hands_the_pen_over_without_ever_dropping_it() {
 
     // Everything written on either side of the move is on both nodes, and
     // the move itself survives a crash of the node that now holds it.
-    assert_identical(&a, &b);
-    let b = crash_and_restart(b, 1);
+    assert_identical(&mut a, &mut b);
+    let mut b = crash_and_restart(b, 1);
     assert_eq!(b.lease(VDISK).unwrap().holder, 1, "the lease was forgotten");
     assert_eq!(
         b.read_block(VDISK, 2).unwrap().unwrap(),
@@ -521,7 +531,7 @@ fn a_failover_takes_a_lease_the_dead_node_still_held() {
             .unwrap_err(),
         FsError::NotWriter(VDISK)
     );
-    assert_identical(&a, &b);
+    assert_identical(&mut a, &mut b);
 }
 
 #[test]
@@ -605,7 +615,7 @@ fn a_resync_interrupted_partway_resumes_without_adopting_a_hole() {
                 "seed {seed}: block {index} came back holed"
             );
         }
-        assert_identical(&a, &b);
+        assert_identical(&mut a, &mut b);
         // And the pool agrees with itself about every reference it holds.
         let report = a.pool().scrub().unwrap();
         assert_eq!(report.corrupt, vec![], "seed {seed}");
@@ -692,7 +702,7 @@ fn a_survivor_keeps_serving_guests_while_its_peer_resyncs() {
     for index in 0..CAP2 {
         let generation = if index < acked_mid_resync { 2 } else { 1 };
         let expected = payload(index, generation);
-        for node in [&a, &b] {
+        for node in [&mut a, &mut b] {
             assert_eq!(
                 node.read_block(VDISK2, index).unwrap().as_deref(),
                 Some(expected.as_slice()),
@@ -700,8 +710,8 @@ fn a_survivor_keeps_serving_guests_while_its_peer_resyncs() {
             );
         }
     }
-    assert_identical(&a, &b);
-    for node in [&a, &b] {
+    assert_identical(&mut a, &mut b);
+    for node in [&mut a, &mut b] {
         let report = node.pool().scrub().unwrap();
         assert_eq!(report.corrupt, vec![]);
         assert_eq!(report.missing, vec![]);
@@ -752,7 +762,7 @@ fn an_equal_era_source_still_suspends_its_guests_for_the_diff() {
     assert_eq!(a.state(), ReplState::Synced);
     assert_eq!(b.state(), ReplState::Synced);
     assert!(guests.done[0].contains(&parked));
-    assert_identical(&a, &b);
+    assert_identical(&mut a, &mut b);
 }
 
 #[test]
@@ -823,7 +833,7 @@ fn a_source_that_dies_mid_stream_cannot_tie_with_the_survivors_next_era() {
         a.pool().vdisk_size(VDISK2).is_err(),
         "the dead lineage's vdisk survived adoption"
     );
-    assert_identical(&a, &b);
+    assert_identical(&mut a, &mut b);
 }
 
 #[test]
@@ -858,7 +868,7 @@ fn a_collection_on_either_end_cannot_eat_a_resync_in_flight() {
     assert_eq!(b.state(), ReplState::Synced);
     for index in 0..CAP2 {
         let expected = payload(index, 2);
-        for node in [&a, &b] {
+        for node in [&mut a, &mut b] {
             assert_eq!(
                 node.read_block(VDISK2, index).unwrap().as_deref(),
                 Some(expected.as_slice()),
@@ -866,8 +876,8 @@ fn a_collection_on_either_end_cannot_eat_a_resync_in_flight() {
             );
         }
     }
-    assert_identical(&a, &b);
-    for node in [&a, &b] {
+    assert_identical(&mut a, &mut b);
+    for node in [&mut a, &mut b] {
         let report = node.pool().scrub().unwrap();
         assert_eq!(report.corrupt, vec![]);
         assert_eq!(report.missing, vec![]);
@@ -894,7 +904,7 @@ fn snapshots_and_rollback_replicate_in_lockstep() {
     pump(&mut a, &mut b, &mut net, &mut guests);
     assert_eq!(a.read_block(VDISK, 2).unwrap().unwrap(), b"worth keeping");
     assert_eq!(b.read_block(VDISK, 2).unwrap().unwrap(), b"worth keeping");
-    assert_identical(&a, &b);
+    assert_identical(&mut a, &mut b);
 }
 
 /// The macro-event history: failovers, partitions, crashes, snapshots —
@@ -1027,7 +1037,7 @@ fn run_history(seed: u64) {
         // acknowledged writes are always fully pumped, and unacknowledged
         // ones always die with their writer's adoption — so every acked
         // index must read back byte-identical, everywhere.
-        assert_identical(&a, &b);
+        assert_identical(&mut a, &mut b);
         for (index, data) in &acked {
             assert_eq!(
                 a.read_block(VDISK, *index).unwrap().as_ref(),
