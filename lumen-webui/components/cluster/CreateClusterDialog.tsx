@@ -639,6 +639,9 @@ export const STEP_LABEL: Record<string, string> = {
   fence: "Create fence device",
   record: "Record the cluster",
   unwind: "Unwind",
+  // The pool workflows' steps ride the same renderer.
+  restart: "Restart control plane",
+  teardown: "Tear down",
 };
 
 export function ProgressRow({ step }: { step: StepProgress }) {

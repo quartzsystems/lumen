@@ -22,6 +22,13 @@ export interface PoolMemberStatus {
   accepts_writes: boolean;
   segments_free: number;
   segments_total: number;
+  /// This member's space in bytes, labelled usable — every segment outside
+  /// the collection reserve at full-block density. Dedupe only makes it
+  /// conservative.
+  usable_bytes: number;
+  free_bytes: number;
+  /// The same figures per tier, ascending.
+  tiers: { tier: number; usable_bytes: number; free_bytes: number }[];
   vdisks: [number, number][];
   leases: [number, PoolLease][];
   stream: [number, number, number];
@@ -68,6 +75,9 @@ export interface PooledStorageView {
   members: PoolMember[];
   vdisks: PoolVdisk[];
   health: PoolHealth;
+  /// The one capacity figure: per-tier minimum over the members, summed.
+  /// Absent while any member is silent — half a pool would be a guess.
+  usable_bytes?: number;
 }
 
 export interface PooledStorageResponse {
@@ -100,6 +110,53 @@ export const rollbackPoolDisk = (disk: string, snapshot: number): Promise<void> 
     method: "POST",
     body: JSON.stringify({ snapshot, i_understand_this_may_lose_data: true }),
   });
+
+// --- the create/destroy workflows -------------------------------------------
+
+import type { StepProgress, WorkflowPhase } from "@/lib/clusterClient";
+
+/// A pool job as `/storage/pool/pending` reports it — the cluster create's
+/// step shape, so `ProgressRow` renders both.
+export interface PoolProgress {
+  action: "create" | "destroy";
+  phase: WorkflowPhase;
+  error?: string;
+  steps: StepProgress[];
+}
+
+export interface LumenBrickChoice {
+  /// The kernel name as the picker reported it (`sdb`); each member
+  /// resolves its own to a stable path before anything is formatted.
+  disk: string;
+  tier: number;
+}
+
+export interface LumenBrickSeat {
+  node: string;
+  bricks: LumenBrickChoice[];
+}
+
+export const createLumenPool = (
+  seats: LumenBrickSeat[],
+): Promise<PoolProgress> =>
+  apiFetch<PoolProgress>("/storage/pool", {
+    method: "POST",
+    body: JSON.stringify({
+      seats,
+      i_understand_this_erases_the_disks: true,
+    }),
+  });
+
+export const destroyLumenPool = (): Promise<PoolProgress> =>
+  apiFetch<PoolProgress>("/storage/pool", {
+    method: "DELETE",
+    body: JSON.stringify({ i_understand_this_may_lose_data: true }),
+  });
+
+/// 404 until a job has been started — and again after the coordinator's
+/// own restart, when the observed pool takes over as the truth.
+export const fetchPoolPending = (): Promise<PoolProgress> =>
+  apiFetch<PoolProgress>("/storage/pool/pending");
 
 // --- display helpers ---------------------------------------------------------
 

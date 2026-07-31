@@ -1,16 +1,22 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { AlertTriangle, Camera, Trash2 } from "lucide-react";
+import { AlertTriangle, Camera, Plus, Trash2 } from "lucide-react";
+import { ProgressRow } from "@/components/cluster/CreateClusterDialog";
 import { DataTable, Dash, type Column } from "@/components/console/DataTable";
+import { CreateLumenPoolDialog } from "@/components/storage/CreateLumenPoolDialog";
 import { Button } from "@/components/ui/Button";
 import { ModalHeader, ModalShell } from "@/components/ui/Modal";
 import { CheckRow } from "@/components/ui/formkit";
 import { ApiError } from "@/lib/authClient";
 import { useConsole } from "@/lib/ConsoleContext";
+import { fetchEnvironment } from "@/lib/clusterClient";
+import { fetchReplicatedVolumes } from "@/lib/drbdClient";
 import {
   deletePoolSnapshot,
+  destroyLumenPool,
   fetchPooledStorage,
+  fetchPoolPending,
   POOL_HEALTH_LABEL,
   POOL_HEALTH_TONE,
   replicationLabel,
@@ -18,6 +24,7 @@ import {
   takePoolSnapshot,
   type PooledStorageView,
   type PoolMember,
+  type PoolProgress,
   type PoolVdisk,
 } from "@/lib/poolClient";
 import { formatBytes } from "@/lib/vmClient";
@@ -39,6 +46,12 @@ export function PooledStorageSection() {
   const [broken, setBroken] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [snapshotting, setSnapshotting] = useState<PoolVdisk | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [destroying, setDestroying] = useState(false);
+  /// Whether the empty-state create card may render: this node is in a
+  /// cluster and the cluster runs no DRBD volumes — the engine
+  /// exclusivity presented, not just enforced server-side.
+  const [eligible, setEligible] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -56,13 +69,35 @@ export function PooledStorageSection() {
     void load();
   }, [load]);
 
+  // Read once: whether a create is even offerable here. Both facts change
+  // only through workflows that reload this page anyway.
   useEffect(() => {
-    // Polling pauses while the dialog is open, so a refresh cannot move
-    // the snapshot list out from under the operator mid-choice.
-    if (snapshotting) return;
+    void (async () => {
+      try {
+        const [environment, replicated] = await Promise.all([
+          fetchEnvironment(),
+          fetchReplicatedVolumes(),
+        ]);
+        const clustered = environment.clusters.some((cluster) =>
+          cluster.nodes.some((node) => node.local),
+        );
+        const hasVolumes = replicated.clusters.some(
+          (cluster) => cluster.volumes.length > 0,
+        );
+        setEligible(clustered && !hasVolumes);
+      } catch {
+        // No card, and nothing lost: the pool view above still renders.
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    // Polling pauses while a dialog is open, so a refresh cannot move
+    // what the operator is pointing at mid-choice.
+    if (snapshotting || creating || destroying) return;
     const timer = setInterval(() => void load(), POLL_MS);
     return () => clearInterval(timer);
-  }, [load, snapshotting]);
+  }, [load, snapshotting, creating, destroying]);
 
   // Keep the dialog's row current across reloads: it shows the snapshot
   // list, which its own actions change.
@@ -72,7 +107,41 @@ export function PooledStorageSection() {
     if (fresh && fresh !== snapshotting) setSnapshotting(fresh);
   }, [pool, snapshotting]);
 
-  if (!pool && !broken && !error) return null;
+  if (!pool && !broken && !error) {
+    // No pool here. On a clustered node with no replicated volumes that is
+    // an invitation, not an absence — the drive wizard's front door. Where
+    // DRBD volumes exist the card does not render: a cluster runs one
+    // engine, and the exclusivity is presented rather than just enforced.
+    if (!eligible) return null;
+    return (
+      <section className="flex flex-col gap-2">
+        <div className="callout">
+          <div className="flex items-center gap-3 w-full">
+            <div className="text-[13px] text-[var(--qz-fg-2)]">
+              <strong>Pooled storage</strong> — turn the cluster&apos;s data
+              disks into one deduplicated pool, serving every machine disk on
+              every member at once.
+            </div>
+            <span className="ml-auto">
+              <Button kind="primary" size="sm" icon={Plus} onClick={() => setCreating(true)}>
+                Create
+              </Button>
+            </span>
+          </div>
+        </div>
+        {creating && (
+          <CreateLumenPoolDialog
+            onClose={() => setCreating(false)}
+            onCreated={() => {
+              setToast("The pool is up on every member.");
+              setCreating(false);
+              void load();
+            }}
+          />
+        )}
+      </section>
+    );
+  }
 
   return (
     <section className="flex flex-col gap-2">
@@ -85,12 +154,36 @@ export function PooledStorageSection() {
             {POOL_HEALTH_LABEL[pool.health]}
           </span>
         )}
+        {pool?.usable_bytes !== undefined && (
+          <span
+            className="text-[12px] text-[var(--qz-fg-3)]"
+            title="Per-tier minimum over the members, before dedupe — dedupe only makes it bigger."
+          >
+            {formatBytes(pool.usable_bytes)} usable
+          </span>
+        )}
+        {pool && (
+          <span className="ml-auto" title="Destroy the pool: every brick wiped">
+            <Button kind="ghost" size="sm" icon={Trash2} onClick={() => setDestroying(true)} />
+          </span>
+        )}
       </div>
 
       {(error ?? broken) && (
         <div className="callout callout-crit">
           <AlertTriangle size={17} className="flex-shrink-0 text-[var(--qz-danger)] mt-[1px]" />
           <div className="text-[13px] text-[var(--qz-fg-2)]">{error ?? broken}</div>
+          {broken && !error && (
+            <span className="ml-auto">
+              <button
+                type="button"
+                className="btn btn-danger btn-sm"
+                onClick={() => setDestroying(true)}
+              >
+                Tear down the broken pool
+              </button>
+            </span>
+          )}
         </div>
       )}
 
@@ -133,7 +226,160 @@ export function PooledStorageSection() {
           }}
         />
       )}
+
+      {destroying && (
+        <DestroyLumenPoolDialog
+          vdisks={pool?.vdisks.length ?? 0}
+          broken={broken}
+          onClose={() => setDestroying(false)}
+          onDestroyed={() => {
+            setToast("The pool is gone; every brick was wiped.");
+            setDestroying(false);
+            void load();
+          }}
+        />
+      )}
     </section>
+  );
+}
+
+/// Destroying the pool: refused server-side while any machine disk exists
+/// or any member is silent; allowed on a broken deployment, because that
+/// is the way out of Broken. The ending mirrors the create's — the
+/// coordinator restarts itself, the feed dies, and the observed absence
+/// finishes the story.
+function DestroyLumenPoolDialog({
+  vdisks,
+  broken,
+  onClose,
+  onDestroyed,
+}: {
+  vdisks: number;
+  broken: string | null;
+  onClose: () => void;
+  onDestroyed: () => void;
+}) {
+  const [acked, setAcked] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [failed, setFailed] = useState<string | null>(null);
+  const [progress, setProgress] = useState<PoolProgress | null>(null);
+  const [adopting, setAdopting] = useState(false);
+  const [done, setDone] = useState(false);
+
+  const submit = async () => {
+    setBusy(true);
+    setFailed(null);
+    try {
+      setProgress(await destroyLumenPool());
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) return;
+      setFailed(err instanceof Error ? err.message : "The destroy was refused.");
+      setBusy(false);
+    }
+  };
+
+  const running = progress?.phase === "running" && !adopting;
+  useEffect(() => {
+    if (!running) return;
+    const timer = setInterval(() => {
+      void (async () => {
+        try {
+          const fresh = await fetchPoolPending();
+          setProgress(fresh);
+          if (fresh.phase === "complete") setAdopting(true);
+          if (fresh.phase === "failed") setBusy(false);
+        } catch {
+          // The coordinator's own restart takes the feed with it.
+          setAdopting(true);
+        }
+      })();
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [running]);
+  useEffect(() => {
+    if (!adopting || done) return;
+    const timer = setInterval(() => {
+      void (async () => {
+        try {
+          const response = await fetchPooledStorage();
+          if (!response.pool && !response.error) {
+            setDone(true);
+            setBusy(false);
+            onDestroyed();
+          }
+        } catch {
+          // Still restarting.
+        }
+      })();
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [adopting, done, onDestroyed]);
+
+  const guard = busy ? () => {} : onClose;
+  return (
+    <ModalShell onClose={guard} maxWidth={560}>
+      <ModalHeader
+        title="Destroy the pool"
+        subtitle="Every brick is wiped, every member's daemon stops, and the disks return to the free list."
+        onClose={guard}
+      />
+      <div className="flex flex-col gap-4">
+        {!progress && (
+          <>
+            <div className="text-[13px] text-[var(--qz-fg-2)]">
+              {broken
+                ? "This pool's configuration exists but cannot be assembled. Tearing it down is the way out: whatever the drop-in names is cleared, and the node stops claiming a pool."
+                : vdisks > 0
+                  ? `The pool still holds ${vdisks} disk${vdisks === 1 ? "" : "s"}. The destroy will be refused until the machines that use them are deleted — this is not a shortcut past them.`
+                  : "The pool holds no machine disks, so nothing is lost but the pool itself."}
+            </div>
+            {failed && <div className="callout callout-crit">{failed}</div>}
+            <CheckRow checked={acked} onChange={() => setAcked(!acked)}>
+              I understand this may lose data.
+            </CheckRow>
+            <div className="flex justify-end gap-2">
+              <button type="button" className="btn btn-ghost btn-sm" onClick={onClose}>
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="btn btn-danger btn-sm"
+                disabled={!acked || busy}
+                onClick={() => void submit()}
+              >
+                {busy ? "Destroying…" : "Destroy the pool"}
+              </button>
+            </div>
+          </>
+        )}
+        {progress && (
+          <>
+            {progress.phase === "failed" && (
+              <div className="callout callout-crit">
+                {progress.error ?? "The destroy failed."}
+              </div>
+            )}
+            <ul className="m-0 p-0 flex flex-col gap-[6px]" style={{ listStyle: "none" }}>
+              {progress.steps.map((step, index) => (
+                <ProgressRow key={`${step.step}-${step.node ?? ""}-${index}`} step={step} />
+              ))}
+            </ul>
+            {adopting && !done && (
+              <div className="text-[13px] text-[var(--qz-fg-3)]">
+                The control plane is restarting without the pool…
+              </div>
+            )}
+            {(done || progress.phase === "failed") && (
+              <div className="flex justify-end">
+                <button type="button" className="btn btn-primary" onClick={onClose}>
+                  Close
+                </button>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </ModalShell>
   );
 }
 
@@ -201,6 +447,16 @@ const memberColumns: Column<PoolMember>[] = [
     render: (member) => {
       if (!("Answered" in member.view)) return <Dash />;
       const status = member.view.Answered;
+      // Bytes, now that the members say them; the segment fallback covers
+      // a member mid-update that does not yet.
+      if (status.usable_bytes > 0) {
+        const percent = Math.round((status.free_bytes * 100) / status.usable_bytes);
+        return (
+          <span className={`qz-mono ${percent < 15 ? "text-[var(--qz-danger)]" : ""}`}>
+            {formatBytes(status.free_bytes)} of {formatBytes(status.usable_bytes)}
+          </span>
+        );
+      }
       if (status.segments_total === 0) return <Dash />;
       const percent = Math.round((status.segments_free * 100) / status.segments_total);
       return (
