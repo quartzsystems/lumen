@@ -116,6 +116,25 @@ impl SliceMap {
         self.version
     }
 
+    /// The raw assignment, slice by slice — what the manifest persists
+    /// and the wire ships. A map is not recomputable from arithmetic
+    /// alone (`reassigned` chains from its predecessor), so the pairs
+    /// themselves are the durable fact.
+    pub fn to_pairs(&self) -> Vec<Homes> {
+        self.slices.clone()
+    }
+
+    /// Rebuild a map from persisted pairs, validated — bytes from a
+    /// manifest or a peer are claims, not facts, until the shape checks.
+    pub fn from_pairs(version: u64, pairs: Vec<Homes>) -> Result<SliceMap> {
+        let map = SliceMap {
+            version,
+            slices: pairs,
+        };
+        map.validate()?;
+        Ok(map)
+    }
+
     pub fn homes(&self, slice: usize) -> Homes {
         self.slices[slice]
     }

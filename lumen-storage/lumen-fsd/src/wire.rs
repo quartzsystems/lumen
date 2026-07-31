@@ -21,10 +21,11 @@
 use lumen_fs::{BlockHash, Lease, PeerMessage, ReplOp, SyncOffer};
 
 /// Protocol magic + version. Bump the last byte to break compatibility
-/// loudly instead of misparsing quietly — version 2 is phase 4's tiers: a
-/// tier byte on every payload and sync address, and the tier inventory in
-/// the hello. A phase-3 daemon is refused at the handshake, by name.
-pub const HANDSHAKE_MAGIC: [u8; 8] = *b"LFSPEER\x02";
+/// loudly instead of misparsing quietly — version 3 is phase 5's
+/// placement: the map version in the hello, the map itself as a message,
+/// and the fetch pair for non-home reads. A phase-4 daemon is refused at
+/// the handshake, by name.
+pub const HANDSHAKE_MAGIC: [u8; 8] = *b"LFSPEER\x03";
 
 /// The largest frame either side will send or accept. Sync data batches
 /// are 64 blocks of at most the pool block size; this is generous headroom
@@ -192,10 +193,16 @@ fn put_op(out: &mut Vec<u8>, op: &ReplOp) {
 pub fn encode(message: &PeerMessage) -> Vec<u8> {
     let mut out = Vec::new();
     match message {
-        PeerMessage::Hello { era, node, tiers } => {
+        PeerMessage::Hello {
+            era,
+            node,
+            tiers,
+            map_version,
+        } => {
             out.push(1);
             put_u64(&mut out, *era);
             out.push(*node);
+            put_u64(&mut out, *map_version);
             out.push(tiers.len() as u8);
             out.extend_from_slice(tiers);
         }
@@ -288,6 +295,15 @@ pub fn encode(message: &PeerMessage) -> Vec<u8> {
             for (tier, payload) in payloads {
                 out.push(*tier);
                 put_bytes(&mut out, payload);
+            }
+        }
+        PeerMessage::MapIs { version, pairs } => {
+            out.push(15);
+            put_u64(&mut out, *version);
+            put_u32(&mut out, pairs.len() as u32);
+            for homes in pairs {
+                out.push(homes[0]);
+                out.push(homes[1]);
             }
         }
     }
@@ -427,9 +443,15 @@ pub fn decode(buf: &[u8]) -> Result<PeerMessage, WireError> {
         1 => {
             let era = r.u64()?;
             let node = r.u8()?;
+            let map_version = r.u64()?;
             let tier_count = r.u8()? as usize;
             let tiers = r.take(tier_count)?.to_vec();
-            PeerMessage::Hello { era, node, tiers }
+            PeerMessage::Hello {
+                era,
+                node,
+                tiers,
+                map_version,
+            }
         }
         2 => {
             let count = r.count(5)?;
@@ -517,6 +539,15 @@ pub fn decode(buf: &[u8]) -> Result<PeerMessage, WireError> {
             }
             PeerMessage::ReadData(payloads)
         }
+        15 => {
+            let version = r.u64()?;
+            let count = r.count(2)?;
+            let mut pairs = Vec::with_capacity(count);
+            for _ in 0..count {
+                pairs.push([r.u8()?, r.u8()?]);
+            }
+            PeerMessage::MapIs { version, pairs }
+        }
         tag => return Err(WireError::BadTag(tag)),
     };
     if r.remaining() != 0 {
@@ -548,11 +579,13 @@ mod tests {
             era: u64::MAX,
             node: 1,
             tiers: vec![0, 1, 2],
+            map_version: 9,
         });
         round_trip(PeerMessage::Hello {
             era: 1,
             node: 0,
             tiers: vec![0],
+            map_version: 0,
         });
         round_trip(PeerMessage::Payloads(vec![]));
         round_trip(PeerMessage::Payloads(vec![
@@ -642,6 +675,10 @@ mod tests {
         round_trip(PeerMessage::Read(vec![(0, hash(0x77)), (1, hash(0x78))]));
         round_trip(PeerMessage::Read(vec![]));
         round_trip(PeerMessage::ReadData(vec![(0, vec![9, 9, 9]), (2, vec![])]));
+        round_trip(PeerMessage::MapIs {
+            version: 7,
+            pairs: (0..=255u8).map(|s| [s % 3, (s % 3 + 1) % 3]).collect(),
+        });
     }
 
     #[test]
@@ -659,7 +696,7 @@ mod tests {
         long.push(0);
         assert_eq!(decode(&long).unwrap_err(), WireError::Trailing);
         // Unknown tags: refused.
-        assert_eq!(decode(&[15]).unwrap_err(), WireError::BadTag(15));
+        assert_eq!(decode(&[16]).unwrap_err(), WireError::BadTag(16));
         assert_eq!(decode(&[0]).unwrap_err(), WireError::BadTag(0));
     }
 

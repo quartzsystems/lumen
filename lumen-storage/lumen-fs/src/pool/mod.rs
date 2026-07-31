@@ -79,11 +79,19 @@ const MANIFEST_HEADER_LEN: usize = 24; // magic 8 + version 4 + three counts
 const MANIFEST_ENTRY_LEN: usize = 56; // id 8 + size 8 + tier 1 + pad 7 + root 32
 const MANIFEST_SNAPSHOT_LEN: usize = 56; // vdisk 8 + snapshot 8 + size 8 + root 32
 const MANIFEST_LEASE_LEN: usize = 24; // vdisk 8 + holder 1 + handing 1 + pad 6 + era 8
-/// Version 2 added the writer leases; version 3 the per-vdisk tier. There
-/// is no upgrade path and none is owed: nothing carrying real data has
-/// ever run an earlier version, and a pool that says one is refused by
-/// name rather than misread — the same posture the superblock takes.
+/// Version 4's tail: the slice map — its version and 256 home pairs. The
+/// map is not recomputable (`reassigned` chains from its predecessor), so
+/// the committed assignment is durable state like everything else here.
+const MANIFEST_MAP_LEN: usize = 8 + 2 * crate::repl::slice::SLICES;
+/// Version 2 added the writer leases; version 3 the per-vdisk tier;
+/// version 4 appends the slice map. Version 3 is the one deliberate
+/// decode-compat exception to the refuse-by-name posture: it is live on
+/// real hardware (the two-member pair), an unplaced pool still *writes*
+/// it — so the deployed pair's manifests stay byte-identical and an old
+/// binary can still read them — and a v3 manifest is exactly a v4 with no
+/// map. Anything older is refused by name, as ever.
 const MANIFEST_VERSION: u32 = 3;
+const MANIFEST_VERSION_PLACED: u32 = 4;
 
 /// Nobody — the encoded stand-in for "no node", since every real
 /// [`NodeId`] is a valid `u8`.
@@ -154,9 +162,15 @@ pub struct Pool<D: Disk> {
     /// Which member this pool is, and which slices it homes. `None` is
     /// "hold everything" — the single-node tools, and every pool from
     /// before placement existed. Handed in at open (WAL replay's validity
-    /// checks consult it) and volatile until the manifest carries it
-    /// (phase 5's reassignment slice).
+    /// checks consult it); the committed map persists in the manifest.
     placement: Option<Placement>,
+    /// A reassignment in flight: the map the pool is moving *to*. While
+    /// present, storage answers for the union of both maps — a write may
+    /// land under either — and reads route by the committed map alone,
+    /// whose homes are guaranteed to hold. Volatile on purpose: the layer
+    /// that ordered the reassignment re-delivers it after a crash, and
+    /// the moves are Merkle-idempotent to re-run.
+    pending_map: Option<SliceMap>,
 }
 
 /// This node's seat in the slice map: who it is, and therefore which data
@@ -339,7 +353,7 @@ impl<D: Disk> Pool<D> {
         Self::open_set_inner(store, None)
     }
 
-    fn open_set_inner(store: BrickSet<D>, placement: Option<Placement>) -> Result<Pool<D>> {
+    fn open_set_inner(store: BrickSet<D>, mut placement: Option<Placement>) -> Result<Pool<D>> {
         let anchor = store
             .wal_brick()
             .read_best_anchor()?
@@ -362,6 +376,20 @@ impl<D: Disk> Pool<D> {
             }
             for (vdisk, lease) in decoded.leases {
                 leases.insert(vdisk, lease);
+            }
+            // The anchored map is the committed truth; whatever the caller
+            // handed in was only a seed for a virgin pool. But a map with
+            // no seat is unusable — the manifest is identical on every
+            // member, so *which member this is* can only come from above.
+            if let Some(map) = decoded.map {
+                match placement.as_mut() {
+                    Some(placement) => placement.map = map,
+                    None => {
+                        return Err(FsError::Corrupt(
+                            "a placed pool must be opened with its seat",
+                        ))
+                    }
+                }
             }
         }
 
@@ -395,6 +423,7 @@ impl<D: Disk> Pool<D> {
             era: anchor.era,
             session_pins: BTreeMap::new(),
             placement,
+            pending_map: None,
         };
 
         // Replay: apply each entry only while everything it references
@@ -419,10 +448,30 @@ impl<D: Disk> Pool<D> {
         Ok(pool)
     }
 
-    /// Whether this member's bricks are a home for a data block — always,
-    /// until a placement says otherwise. Metadata (map nodes, manifests)
-    /// never consults this: it lives on every member.
+    /// Whether this member's bricks *store* a data block — a home under
+    /// the committed map or, mid-reassignment, under the pending one: a
+    /// write may land under either, and what arrived under either must
+    /// survive a collection until the commit decides. Metadata (map
+    /// nodes, manifests) never consults this: it lives on every member.
     fn holds_data(&self, hash: &BlockHash) -> bool {
+        match &self.placement {
+            Some(placement) => {
+                placement.map.holds(placement.node, hash)
+                    || self
+                        .pending_map
+                        .as_ref()
+                        .is_some_and(|map| map.holds(placement.node, hash))
+            }
+            None => true,
+        }
+    }
+
+    /// Whether this member's bricks are *guaranteed to hold* a data block
+    /// — a home under the committed map alone. The read path routes by
+    /// this: a pending home mid-move may not have pulled the block yet,
+    /// and treating its absence as corruption would page someone for a
+    /// move in progress.
+    fn serves_data(&self, hash: &BlockHash) -> bool {
         match &self.placement {
             Some(placement) => placement.map.holds(placement.node, hash),
             None => true,
@@ -436,12 +485,103 @@ impl<D: Disk> Pool<D> {
             .map(|placement| (placement.node, &placement.map))
     }
 
+    /// The map a reassignment is moving to, while one is in flight.
+    pub fn pending_map(&self) -> Option<&SliceMap> {
+        self.pending_map.as_ref()
+    }
+
+    /// Where a write's payload belongs right now: the committed homes,
+    /// plus — mid-reassignment — the pending ones. Deduplicated, order
+    /// preserving the committed map's read preference.
+    pub fn write_homes_of(&self, hash: &BlockHash) -> Option<Vec<NodeId>> {
+        let placement = self.placement.as_ref()?;
+        let mut homes: Vec<NodeId> = placement.map.homes_of(hash).to_vec();
+        if let Some(pending) = &self.pending_map {
+            for home in pending.homes_of(hash) {
+                if !homes.contains(&home) {
+                    homes.push(home);
+                }
+            }
+        }
+        Some(homes)
+    }
+
     /// Hand the pool its seat after open. Prefer the placed constructors —
     /// a placement set after WAL replay cannot repair what replay already
     /// dropped — but a freshly *created* pool has no WAL to replay, and
     /// the harness builds its members this way.
     pub fn set_placement(&mut self, node: NodeId, map: SliceMap) {
         self.placement = Some(Placement { node, map });
+    }
+
+    /// Open a reassignment toward `members` at `version`: the pending map
+    /// is computed (never received — the arithmetic chains from the
+    /// committed map and every member computes the same answer), storage
+    /// widens to the union, and the moves come back for the caller to
+    /// run. Idempotent at the same version — re-delivery after a crash
+    /// recomputes the identical map. A reassignment that would orphan a
+    /// slice — both homes gone at once, RF=2 exhausted — is refused here,
+    /// by name, before anything widens.
+    pub fn prepare_reassign(
+        &mut self,
+        version: u64,
+        members: &[NodeId],
+    ) -> Result<Vec<crate::repl::slice::SliceMove>> {
+        let placement = self.placement.as_ref().ok_or(FsError::Placement(
+            "an unplaced pool has nothing to reassign",
+        ))?;
+        if let Some(pending) = &self.pending_map {
+            if pending.version() > version {
+                return Err(FsError::Placement(
+                    "a reassignment is already pending at a newer version",
+                ));
+            }
+        }
+        let reassignment = placement.map.reassigned(version, members)?;
+        if !reassignment.orphaned.is_empty() {
+            return Err(FsError::Placement(
+                "the change would orphan slices whose homes are all leaving; refused rather \
+                 than papered over with homes that hold nothing",
+            ));
+        }
+        self.pending_map = Some(reassignment.map);
+        Ok(reassignment.moves)
+    }
+
+    /// The commit: the pending map becomes the committed one, anchored.
+    /// The caller confirms every member's moves are complete first — after
+    /// this, a collection is free to drop the displaced copies, and a
+    /// fetch routes by the new homes.
+    pub fn commit_reassign(&mut self) -> Result<()> {
+        let pending = self
+            .pending_map
+            .take()
+            .ok_or(FsError::Placement("no reassignment is pending to commit"))?;
+        let placement = self
+            .placement
+            .as_mut()
+            .ok_or(FsError::Placement("an unplaced pool has nothing to commit"))?;
+        placement.map = pending;
+        self.checkpoint()
+    }
+
+    /// Adopt a newer committed map whole, from a member that lived
+    /// through reassignments this one slept through. The map is not
+    /// recomputable — `reassigned` chains from its predecessor — so the
+    /// pairs come over the wire and persist here before streaming resumes.
+    pub fn adopt_map(&mut self, map: SliceMap) -> Result<()> {
+        let placement = self
+            .placement
+            .as_mut()
+            .ok_or(FsError::Placement("an unplaced pool cannot adopt a map"))?;
+        if map.version() <= placement.map.version() {
+            return Err(FsError::Placement(
+                "a map adoption must move the version forward",
+            ));
+        }
+        placement.map = map;
+        self.pending_map = None;
+        self.checkpoint()
     }
 
     /// Apply one replayed entry if its references hold. `false` ends replay.
@@ -685,7 +825,14 @@ impl<D: Disk> Pool<D> {
         // Every vdisk may carry a lease, so the ceiling counts one each
         // whether or not they exist yet — discovering the manifest is full
         // at the moment a migration needs a lease would be a poor time.
+        // A placed pool's manifest also carries the map, always.
+        let map_len = if self.placement.is_some() {
+            MANIFEST_MAP_LEN
+        } else {
+            0
+        };
         MANIFEST_HEADER_LEN
+            + map_len
             + vdisk_count * (MANIFEST_ENTRY_LEN + MANIFEST_LEASE_LEN)
             + snapshot_count * MANIFEST_SNAPSHOT_LEN
             <= self.store.block_size() as usize
@@ -921,7 +1068,7 @@ impl<D: Disk> Pool<D> {
         match hash {
             Some(hash) => match self.store.get(tier, &hash)? {
                 Some(payload) => Ok(Some(payload)),
-                None if !self.holds_data(&hash) => Err(FsError::BlockElsewhere { tier, hash }),
+                None if !self.serves_data(&hash) => Err(FsError::BlockElsewhere { tier, hash }),
                 None => Err(FsError::Corrupt("a mapped block is missing from the store")),
             },
             None => Ok(None),
@@ -966,7 +1113,7 @@ impl<D: Disk> Pool<D> {
                 // live at the named address on the slice's homes, and the
                 // caller's next move is a fetch. Absent on a home is
                 // corruption to repair, never a quiet zero-fill.
-                None if !self.holds_data(&hash) => Err(FsError::BlockElsewhere {
+                None if !self.serves_data(&hash) => Err(FsError::BlockElsewhere {
                     tier: state.tier,
                     hash,
                 }),
@@ -1010,12 +1157,21 @@ impl<D: Disk> Pool<D> {
             self.vdisks.get_mut(id).unwrap().root = root;
         }
 
-        let manifest_hash = if self.vdisks.is_empty() && self.snapshots.is_empty() {
-            [0u8; 32]
-        } else {
-            let manifest = encode_manifest(&ids, &self.vdisks, &self.snapshots, &self.leases);
-            *self.store.put(0, &manifest)?.as_bytes()
-        };
+        // A placed pool always writes its manifest — the map inside is
+        // durable state even when no vdisk exists yet.
+        let manifest_hash =
+            if self.vdisks.is_empty() && self.snapshots.is_empty() && self.placement.is_none() {
+                [0u8; 32]
+            } else {
+                let manifest = encode_manifest(
+                    &ids,
+                    &self.vdisks,
+                    &self.snapshots,
+                    &self.leases,
+                    self.placement.as_ref().map(|placement| &placement.map),
+                );
+                *self.store.put(0, &manifest)?.as_bytes()
+            };
         self.store.flush()?;
 
         self.wal.retire_to_cursor();
@@ -1063,7 +1219,7 @@ impl<D: Disk> Pool<D> {
         // Liveness is per tier — the same hash on two tiers is two blocks,
         // and marking one must not keep the other.
         let mut live: HashSet<(u8, BlockHash)> = HashSet::new();
-        if !(self.vdisks.is_empty() && self.snapshots.is_empty()) {
+        if !(self.vdisks.is_empty() && self.snapshots.is_empty() && self.placement.is_none()) {
             // The same bytes the checkpoint just anchored, so the same hash
             // — recomputed rather than remembered, one source of truth.
             live.insert((
@@ -1073,6 +1229,7 @@ impl<D: Disk> Pool<D> {
                     &self.vdisks,
                     &self.snapshots,
                     &self.leases,
+                    self.placement.as_ref().map(|placement| &placement.map),
                 )),
             ));
         }
@@ -1092,6 +1249,7 @@ impl<D: Disk> Pool<D> {
                 self.vdisks[vdisk].tier,
             )
         }));
+        let mut walked: Vec<(u8, BlockHash)> = Vec::new();
         for (root, depth, data_tier) in roots {
             if let Some(root) = root {
                 map::walk(
@@ -1103,10 +1261,24 @@ impl<D: Disk> Pool<D> {
                             live.insert((0, hash));
                         }
                         map::MapItem::Block { hash, .. } => {
-                            live.insert((data_tier, hash));
+                            walked.push((data_tier, hash));
                         }
                     },
                 )?;
+            }
+        }
+        // A referenced data block is live *here* only while this member
+        // homes it — under the committed map or, mid-reassignment, the
+        // pending one. This filter is the displacement drop, and its gate
+        // is the commit: metadata references every block from every
+        // member forever, so without it a member reassigned away from a
+        // slice would carry that slice's copies to the end of time. It is
+        // also why the drop cannot run early — until the commit, a
+        // pending home may still be pulling from the copy this filter
+        // would have swept.
+        for (data_tier, hash) in walked {
+            if self.holds_data(&hash) {
+                live.insert((data_tier, hash));
             }
         }
         // A resync in flight holds state neither manifest references yet.
@@ -1131,7 +1303,7 @@ impl<D: Disk> Pool<D> {
             let state = &self.vdisks[&id];
             for (index, value) in &state.dirty {
                 if let Some(hash) = value {
-                    if self.holds_data(hash) && !self.store.contains(state.tier, hash) {
+                    if self.serves_data(hash) && !self.store.contains(state.tier, hash) {
                         missing.push((id, *index));
                     }
                 }
@@ -1152,7 +1324,7 @@ impl<D: Disk> Pool<D> {
                     // A dirty entry supersedes the tree at this index; only
                     // the reference a read would actually follow counts.
                     if !state.dirty.contains_key(&index)
-                        && self.holds_data(&hash)
+                        && self.serves_data(&hash)
                         && !self.store.contains(state.tier, &hash)
                     {
                         missing.push((id, index));
@@ -1177,7 +1349,7 @@ impl<D: Disk> Pool<D> {
                     },
                 )?;
                 for (index, hash) in tree_refs {
-                    if self.holds_data(&hash) && !self.store.contains(tier, &hash) {
+                    if self.serves_data(&hash) && !self.store.contains(tier, &hash) {
                         missing.push((*vdisk, index));
                     }
                 }
@@ -1572,16 +1744,24 @@ fn encode_manifest(
     vdisks: &HashMap<u64, VdiskState>,
     snapshots: &BTreeMap<(u64, u64), SnapshotState>,
     leases: &BTreeMap<u64, Lease>,
+    map: Option<&SliceMap>,
 ) -> Vec<u8> {
+    let map_len = if map.is_some() { MANIFEST_MAP_LEN } else { 0 };
+    let version = if map.is_some() {
+        MANIFEST_VERSION_PLACED
+    } else {
+        MANIFEST_VERSION
+    };
     let mut buf = vec![
         0u8;
         MANIFEST_HEADER_LEN
             + ids.len() * MANIFEST_ENTRY_LEN
             + snapshots.len() * MANIFEST_SNAPSHOT_LEN
             + leases.len() * MANIFEST_LEASE_LEN
+            + map_len
     ];
     buf[0..8].copy_from_slice(MANIFEST_MAGIC);
-    buf[8..12].copy_from_slice(&MANIFEST_VERSION.to_le_bytes());
+    buf[8..12].copy_from_slice(&version.to_le_bytes());
     buf[12..16].copy_from_slice(&(ids.len() as u32).to_le_bytes());
     buf[16..20].copy_from_slice(&(snapshots.len() as u32).to_le_bytes());
     buf[20..24].copy_from_slice(&(leases.len() as u32).to_le_bytes());
@@ -1609,6 +1789,15 @@ fn encode_manifest(
         buf[at + 16..at + 24].copy_from_slice(&lease.era.to_le_bytes());
         at += MANIFEST_LEASE_LEN;
     }
+    if let Some(map) = map {
+        buf[at..at + 8].copy_from_slice(&map.version().to_le_bytes());
+        at += 8;
+        for homes in map.to_pairs() {
+            buf[at] = homes[0];
+            buf[at + 1] = homes[1];
+            at += 2;
+        }
+    }
     buf
 }
 
@@ -1616,17 +1805,24 @@ struct DecodedManifest {
     vdisks: Vec<(u64, VdiskState)>,
     snapshots: Vec<((u64, u64), SnapshotState)>,
     leases: Vec<(u64, Lease)>,
+    map: Option<SliceMap>,
 }
 
 fn decode_manifest(buf: &[u8]) -> Result<DecodedManifest> {
     if buf.len() < MANIFEST_HEADER_LEN || &buf[0..8] != MANIFEST_MAGIC {
         return Err(FsError::Corrupt("the manifest block has the wrong shape"));
     }
-    if u32::from_le_bytes(buf[8..12].try_into().unwrap()) != MANIFEST_VERSION {
+    let version = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+    if version != MANIFEST_VERSION && version != MANIFEST_VERSION_PLACED {
         return Err(FsError::Corrupt(
             "the manifest block is a version this build does not speak",
         ));
     }
+    let map_len = if version == MANIFEST_VERSION_PLACED {
+        MANIFEST_MAP_LEN
+    } else {
+        0
+    };
     let vdisk_count = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
     let snapshot_count = u32::from_le_bytes(buf[16..20].try_into().unwrap()) as usize;
     let lease_count = u32::from_le_bytes(buf[20..24].try_into().unwrap()) as usize;
@@ -1635,6 +1831,7 @@ fn decode_manifest(buf: &[u8]) -> Result<DecodedManifest> {
             + vdisk_count * MANIFEST_ENTRY_LEN
             + snapshot_count * MANIFEST_SNAPSHOT_LEN
             + lease_count * MANIFEST_LEASE_LEN
+            + map_len
     {
         return Err(FsError::Corrupt(
             "the manifest block is shorter than its counts",
@@ -1681,10 +1878,23 @@ fn decode_manifest(buf: &[u8]) -> Result<DecodedManifest> {
         ));
         at += MANIFEST_LEASE_LEN;
     }
+    let map = if version == MANIFEST_VERSION_PLACED {
+        let map_version = u64::from_le_bytes(buf[at..at + 8].try_into().unwrap());
+        at += 8;
+        let mut pairs = Vec::with_capacity(crate::repl::slice::SLICES);
+        for _ in 0..crate::repl::slice::SLICES {
+            pairs.push([buf[at], buf[at + 1]]);
+            at += 2;
+        }
+        Some(SliceMap::from_pairs(map_version, pairs)?)
+    } else {
+        None
+    };
     Ok(DecodedManifest {
         vdisks,
         snapshots,
         leases,
+        map,
     })
 }
 

@@ -263,6 +263,11 @@ pub enum PeerMessage {
         era: u64,
         node: NodeId,
         tiers: Vec<u8>,
+        /// The committed slice map's version, 0 when unplaced. Versions
+        /// must agree before roles are even elected: a member that slept
+        /// through reassignments cannot compute the current map (the
+        /// arithmetic chains), so the higher side ships it whole.
+        map_version: u64,
     },
     /// Data blocks ahead of the ops that reference them, each on the tier
     /// its op will reference it at.
@@ -284,9 +289,16 @@ pub enum PeerMessage {
     SyncNeed(Vec<(u8, BlockHash)>),
     /// The blocks, tier and payload — each self-identifies by its hash.
     SyncData(Vec<(u8, Vec<u8>)>),
+    /// The committed map, whole — version and every pair — for a member
+    /// whose hello showed it behind. Persisted before streaming resumes;
+    /// the receiver re-hellos under the new version.
+    MapIs {
+        version: u64,
+        pairs: Vec<slice::Homes>,
+    },
     /// Blocks wanted right now, outside any resync: a non-home guest read,
-    /// or a home repairing. Served from the store exactly like `SyncNeed`;
-    /// answered with `ReadData`.
+    /// a home repairing, or a reassignment move landing. Served from the
+    /// store exactly like `SyncNeed`; answered with `ReadData`.
     Read(Vec<(u8, BlockHash)>),
     /// The fetched blocks, tier and payload — each self-identifies by its
     /// hash. A home stores what arrives (that is the repair); a non-home
@@ -490,6 +502,11 @@ pub struct ReplNode<D: Disk> {
     /// what survives the final cleanup. A vdisk no live member offers was
     /// deleted while this node was away.
     offered_vdisks: HashSet<u64>,
+    /// Reassignment moves requested and not yet landed: `(tier, hash)` →
+    /// the source asked. Cleared per entry when the block arrives, per
+    /// peer when a source's session dies (the next step re-requests from
+    /// whoever holds it then).
+    reassign_inflight: HashMap<(u8, BlockHash), NodeId>,
 }
 
 impl<D: Disk> ReplNode<D> {
@@ -504,6 +521,7 @@ impl<D: Disk> ReplNode<D> {
             fetched: HashMap::new(),
             pending_reads: HashMap::new(),
             offered_vdisks: HashSet::new(),
+            reassign_inflight: HashMap::new(),
         }
     }
 
@@ -596,8 +614,18 @@ impl<D: Disk> ReplNode<D> {
                 era: self.pool.era(),
                 node: self.node,
                 tiers: self.pool.tiers(),
+                map_version: self.map_version(),
             },
         ));
+    }
+
+    /// The committed map's version; 0 for an unplaced pool, whose peers
+    /// are equally unplaced by construction.
+    fn map_version(&self) -> u64 {
+        self.pool
+            .placement()
+            .map(|(_, map)| map.version())
+            .unwrap_or(0)
     }
 
     /// The link to this peer is gone. Whatever was in flight is gone with
@@ -640,6 +668,9 @@ impl<D: Disk> ReplNode<D> {
             self.pending_reads.remove(&ticket);
             self.emit(Effect::ReadFailed(ticket));
         }
+        // Reassignment requests to the dead source re-issue at the next
+        // step, from whichever kept home is reachable then.
+        self.reassign_inflight.retain(|_, source| *source != peer);
     }
 
     /// The floor a fence-verdict era must clear from this node's vantage:
@@ -814,6 +845,154 @@ impl<D: Disk> ReplNode<D> {
     }
 
     // -----------------------------------------------------------------
+    // Reassignment — growing, shrinking, and re-protecting are one call
+    // for the arithmetic and one machine for the moves.
+
+    /// Open a reassignment toward `members` at `version`. From here until
+    /// the commit, writes land on the union of old and new homes, and the
+    /// moves this member owes itself are fetched by [`step_reassign`].
+    /// Idempotent at the same version — the layer above re-delivers after
+    /// a crash, and the arithmetic recomputes the identical map.
+    pub fn prepare_reassign(&mut self, version: u64, members: &[NodeId]) -> Result<()> {
+        self.pool.prepare_reassign(version, members)?;
+        Ok(())
+    }
+
+    /// The version a pending reassignment is moving to, if one is open.
+    pub fn reassign_pending(&self) -> Option<u64> {
+        self.pool.pending_map().map(|map| map.version())
+    }
+
+    /// Drive this member's incoming moves: walk the checkpointed trees,
+    /// find every data block the pending map homes here that the bricks
+    /// do not hold, and ask a kept home for a batch of them. Returns how
+    /// many blocks are still owed (absent and not yet requested count
+    /// alike) — zero means this member's moves are complete. Idempotent
+    /// and crash-safe: every call recomputes from durable state, and a
+    /// re-request of a block that arrived meanwhile is a dedupe no-op.
+    pub fn step_reassign(&mut self) -> Result<usize> {
+        let wants = self.reassign_wants()?;
+        let owed = wants.len();
+        let mut batches: BTreeMap<NodeId, Vec<(u8, BlockHash)>> = BTreeMap::new();
+        for (tier, hash, source) in wants {
+            if self.reassign_inflight.contains_key(&(tier, hash)) {
+                continue;
+            }
+            let streaming = self
+                .peers
+                .get(&source)
+                .is_some_and(|session| session.stream_active());
+            if !streaming {
+                continue;
+            }
+            let batch = batches.entry(source).or_default();
+            if batch.len() < SYNC_BATCH {
+                batch.push((tier, hash));
+                self.reassign_inflight.insert((tier, hash), source);
+            }
+        }
+        for (source, batch) in batches {
+            self.emit(Effect::Send(source, PeerMessage::Read(batch)));
+        }
+        Ok(owed)
+    }
+
+    /// Commit the reassignment: refused while this member still owes
+    /// itself blocks — the caller confirms *every* member reports zero
+    /// before committing any, because the commit is what licenses each
+    /// member's collector to drop the displaced copies the others may
+    /// still be pulling from.
+    pub fn commit_reassign(&mut self) -> Result<()> {
+        if !self.reassign_wants()?.is_empty() {
+            return Err(FsError::Placement(
+                "moves are still owed; a commit now would license dropping their sources",
+            ));
+        }
+        self.pool.commit_reassign()
+    }
+
+    /// Every data block the pending map homes here that the store lacks,
+    /// with the kept home to ask: `(tier, hash, source)`. Settled state
+    /// only — the walk runs after a checkpoint, and the live stream keeps
+    /// new writes union-homed on its own.
+    fn reassign_wants(&mut self) -> Result<Vec<(u8, BlockHash, NodeId)>> {
+        if self.pool.pending_map().is_none() {
+            return Err(FsError::Placement("no reassignment is pending"));
+        }
+        self.pool.checkpoint()?;
+        let (_, vdisks, snapshots) = self.pool.sync_manifest();
+        let entries = map::entries_per_node(self.pool.block_size());
+        let block_size = self.pool.block_size() as u64;
+        let mut roots: Vec<(BlockHash, u32, u8)> = Vec::new();
+        for (_, size_bytes, tier, root) in &vdisks {
+            if let Some(root) = root {
+                roots.push((
+                    *root,
+                    map::depth_for(size_bytes.div_ceil(block_size), entries),
+                    *tier,
+                ));
+            }
+        }
+        for (vdisk, _, size_bytes, root) in &snapshots {
+            if let Some(root) = root {
+                let tier = vdisks
+                    .iter()
+                    .find(|(id, _, _, _)| id == vdisk)
+                    .map(|(_, _, tier, _)| *tier)
+                    .unwrap_or(0);
+                roots.push((
+                    *root,
+                    map::depth_for(size_bytes.div_ceil(block_size), entries),
+                    tier,
+                ));
+            }
+        }
+        let mut wants = Vec::new();
+        let mut seen: HashSet<(BlockHash, u32)> = HashSet::new();
+        let mut pending: Vec<(BlockHash, u32, u8)> = roots;
+        while let Some((hash, kind, data_tier)) = pending.pop() {
+            if !seen.insert((hash, kind)) {
+                continue;
+            }
+            if kind > 0 {
+                let payload = self
+                    .pool
+                    .block_payload(0, &hash)?
+                    .ok_or(FsError::Corrupt("a map node vanished mid-walk"))?;
+                for child in map::children(&payload) {
+                    pending.push((child, kind - 1, data_tier));
+                }
+                continue;
+            }
+            let (node, map) = self.pool.placement().expect("pending implies placed");
+            let committed_homes = map.homes_of(&hash);
+            let pending_homes = self
+                .pool
+                .pending_map()
+                .expect("checked above")
+                .homes_of(&hash);
+            // A move incoming to this member: homed under the pending map,
+            // not under the committed one. The source is a kept home —
+            // reassigned() never moves both homes of a slice, so one
+            // committed home always survives into the pending map.
+            if !pending_homes.contains(&node) || committed_homes.contains(&node) {
+                continue;
+            }
+            if self.pool.has_block(data_tier, &hash) {
+                continue;
+            }
+            let source = committed_homes
+                .iter()
+                .copied()
+                .find(|home| pending_homes.contains(home))
+                .or_else(|| committed_homes.first().copied())
+                .ok_or(FsError::Placement("a slice with no source to pull from"))?;
+            wants.push((data_tier, hash, source));
+        }
+        Ok(wants)
+    }
+
+    // -----------------------------------------------------------------
     // The guest-facing write path.
 
     /// Whether a guest write would be accepted right now — what a daemon
@@ -933,10 +1112,12 @@ impl<D: Disk> ReplNode<D> {
         let tier = self.pool.vdisk_tier(vdisk)?;
         let hash = crate::hash::hash_block(payload);
         // Where the block lives is the hash's decision, not the writer's:
-        // its slice's homes store it, everyone else only maps it. Without
-        // a placement every member is a home — the two-member degenerate.
-        let homes: Vec<NodeId> = match self.pool.placement() {
-            Some((_, map)) => map.homes_of(&hash).to_vec(),
+        // its slice's homes store it — the committed ones plus, during a
+        // reassignment, the pending ones, so nothing written mid-move can
+        // land only on homes the commit is about to retire. Without a
+        // placement every member is a home — the two-member degenerate.
+        let homes: Vec<NodeId> = match self.pool.write_homes_of(&hash) {
+            Some(homes) => homes,
             None => {
                 let mut everyone: Vec<NodeId> = self.peers.keys().copied().collect();
                 everyone.push(self.node);
@@ -1191,7 +1372,30 @@ impl<D: Disk> ReplNode<D> {
             ));
         }
         match message {
-            PeerMessage::Hello { era, node, tiers } => self.on_hello(era, node, tiers),
+            PeerMessage::Hello {
+                era,
+                node,
+                tiers,
+                map_version,
+            } => self.on_hello(era, node, tiers, map_version),
+            PeerMessage::MapIs { version, pairs } => {
+                // Bytes from a peer are claims until the shape checks.
+                // Every current member ships the same map, so the second
+                // arrival finds it already adopted — that is agreement,
+                // not an error — and one from behind our own version is a
+                // lagging peer whose next hello will get *our* MapIs.
+                let mine = self.map_version();
+                if version > mine {
+                    let map = slice::SliceMap::from_pairs(version, pairs)?;
+                    self.pool.adopt_map(map)?;
+                }
+                if version >= mine {
+                    // Re-hello under the agreed version: the election that
+                    // was deferred can run now, on agreeing maps.
+                    self.connect(from);
+                }
+                Ok(())
+            }
             // A pulling target buffers the source's live stream rather than
             // applying it: its own state is about to be replaced by the
             // adoption, and anything applied before that would be applied
@@ -1206,15 +1410,16 @@ impl<D: Disk> ReplNode<D> {
             PeerMessage::Payloads(payloads) => {
                 for (tier, payload) in payloads {
                     let hash = crate::hash::hash_block(&payload);
-                    // A payload lands only on a home — the sender routes
-                    // by the same map, so anything else is a stray, and a
-                    // stray stored here would be the third copy the
-                    // accounting never expects.
-                    if self
+                    // A payload lands only on a home — committed or, mid-
+                    // reassignment, pending; the sender routes by the same
+                    // union. Anything else is a stray, and a stray stored
+                    // here would be the third copy the accounting never
+                    // expects.
+                    let stores = self
                         .pool
-                        .placement()
-                        .is_some_and(|(node, map)| !map.holds(node, &hash))
-                    {
+                        .write_homes_of(&hash)
+                        .is_none_or(|homes| homes.contains(&self.node));
+                    if !stores {
                         continue;
                     }
                     self.pool.put_block(tier, &payload)?;
@@ -1284,15 +1489,18 @@ impl<D: Disk> ReplNode<D> {
             PeerMessage::ReadData(payloads) => {
                 for (tier, payload) in payloads {
                     let hash = crate::hash::hash_block(&payload);
-                    // A home stores what arrives — that is the repair and
-                    // the refill; a non-home serves the read and keeps
-                    // nothing beyond the one consumption.
-                    if self
+                    // A home stores what arrives — that is the repair, the
+                    // refill, and a reassignment move landing (homes are
+                    // the union of committed and pending); a non-home
+                    // serves the read and keeps nothing beyond the one
+                    // consumption.
+                    let stores = self
                         .pool
-                        .placement()
-                        .is_some_and(|(node, map)| map.holds(node, &hash))
-                    {
+                        .write_homes_of(&hash)
+                        .is_some_and(|homes| homes.contains(&self.node));
+                    if stores {
                         self.pool.put_block(tier, &payload)?;
+                        self.reassign_inflight.remove(&(tier, hash));
                     } else {
                         self.fetched.insert((tier, hash), payload);
                     }
@@ -1330,7 +1538,39 @@ impl<D: Disk> ReplNode<D> {
         }
     }
 
-    fn on_hello(&mut self, peer_era: u64, peer_node: NodeId, peer_tiers: Vec<u8>) -> Result<()> {
+    fn on_hello(
+        &mut self,
+        peer_era: u64,
+        peer_node: NodeId,
+        peer_tiers: Vec<u8>,
+        peer_map_version: u64,
+    ) -> Result<()> {
+        // The maps must agree before roles are elected: a member behind on
+        // the map cannot compute the current one (the arithmetic chains
+        // from its predecessor), so the higher side ships it whole and the
+        // lower side re-hellos once it has persisted the adoption.
+        let my_map_version = self.map_version();
+        if peer_map_version < my_map_version {
+            let (_, map) = self.pool.placement().expect("a version implies a map");
+            let pairs = map.to_pairs();
+            let version = map.version();
+            self.session(peer_node);
+            self.emit(Effect::Send(
+                peer_node,
+                PeerMessage::MapIs { version, pairs },
+            ));
+            // And a fresh hello behind it: the peer elects roles only on
+            // *receiving* a hello, and the one that provoked this reply
+            // was spent learning it was behind.
+            self.connect(peer_node);
+            return Ok(());
+        }
+        if peer_map_version > my_map_version {
+            // The peer saw our hello lower and is sending the map; the
+            // session waits for it.
+            self.session(peer_node);
+            return Ok(());
+        }
         // Both sides compute the same answer from the same pair: higher
         // era is the source; equal eras fall to the lower node id — a tie
         // means both hold every acknowledged write, and the diff is cheap.
@@ -1439,13 +1679,11 @@ impl<D: Disk> ReplNode<D> {
             // job — every pull walks every tree (metadata is everywhere),
             // and each fetches exactly the subset its own source homes,
             // so between the pulls a rejoining home refills completely.
+            // Homes are the union of committed and pending maps: a pull
+            // overlapping a reassignment fetches for both.
             if kind == 0 {
-                if let Some((node, map)) = self.pool.placement() {
-                    let homes = map.homes_of(&hash);
-                    if !homes.contains(&node) {
-                        continue;
-                    }
-                    if !homes.contains(&from) {
+                if let Some(homes) = self.pool.write_homes_of(&hash) {
+                    if !homes.contains(&self.node) || !homes.contains(&from) {
                         continue;
                     }
                 }

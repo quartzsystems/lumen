@@ -52,9 +52,13 @@ fn params(id: u8) -> BrickParams {
 }
 
 fn fresh_node(seed: u64, id: u8) -> ReplNode<SimDisk> {
+    fresh_node_of(seed, id, &MEMBERS)
+}
+
+fn fresh_node_of(seed: u64, id: u8, members: &[u8]) -> ReplNode<SimDisk> {
     let brick = Brick::format(SimDisk::new(8 * KIB * KIB, seed), params(id)).unwrap();
     let mut node = ReplNode::new(Pool::create(brick).unwrap(), id);
-    node.set_placement(&MEMBERS).unwrap();
+    node.set_placement(members).unwrap();
     node
 }
 
@@ -582,6 +586,371 @@ fn a_vdisk_deleted_while_a_member_was_away_stays_deleted() {
         nodes[2].pool().vdisk_size(VDISK_B).is_err(),
         "a deleted vdisk resurrected on the returning member"
     );
+}
+
+/// Run every member's incoming moves to completion, pumping between
+/// steps — the workflow's loop, worn by the harness.
+fn run_moves(
+    nodes: &mut [ReplNode<SimDisk>; 3],
+    net: &mut Net,
+    guests: &mut Guests,
+    who: &[usize],
+) {
+    for _ in 0..64 {
+        let mut owed = 0;
+        for member in who {
+            owed += nodes[*member].step_reassign().unwrap();
+        }
+        pump(nodes, net, guests);
+        if owed == 0 {
+            return;
+        }
+    }
+    panic!("sixty-four move rounds and blocks are still owed");
+}
+
+fn assert_exact_homes(
+    nodes: &mut [ReplNode<SimDisk>; 3],
+    members: &[u8],
+    map: &SliceMap,
+    written: &[(u64, u8)],
+) {
+    for (index, generation) in written {
+        let data = payload(*index, *generation);
+        let hash = lumen_fs::hash_block(&data);
+        let homes = map.homes_of(&hash);
+        for member in members {
+            assert_eq!(
+                nodes[*member as usize].pool().has_block(0, &hash),
+                homes.contains(member),
+                "block {index} gen {generation} misplaced on member {member}"
+            );
+        }
+    }
+}
+
+#[test]
+fn growing_to_a_third_member_rebalances_and_serves_throughout() {
+    // Two members, then a third: the 2→3 scale-out at the engine level.
+    let mut nodes = [
+        fresh_node_of(60, 0, &[0, 1]),
+        fresh_node_of(61, 1, &[0, 1]),
+        fresh_node_of(62, 2, &[0, 1]),
+    ];
+    let mut net = Net::default();
+    net.kill(2);
+    let mut guests = Guests::new();
+    nodes[0].connect(1);
+    nodes[1].connect(0);
+    pump(&mut nodes, &mut net, &mut guests);
+    nodes[0]
+        .create_vdisk(VDISK, CAPACITY * BLOCK as u64, 0)
+        .unwrap();
+    for index in 0..CAPACITY {
+        nodes[0]
+            .write_block(VDISK, index, &payload(index, 1))
+            .unwrap();
+    }
+    nodes[0].flush().unwrap();
+    pump(&mut nodes, &mut net, &mut guests);
+
+    // The newcomer arrives, resyncs metadata, and the reassignment opens.
+    net.revive(2);
+    for other in [0u8, 1u8] {
+        nodes[2].connect(other);
+        nodes[other as usize].connect(2);
+    }
+    pump(&mut nodes, &mut net, &mut guests);
+    for node in &nodes {
+        assert_eq!(node.state(), ReplState::Synced);
+    }
+    for node in &mut nodes {
+        node.prepare_reassign(2, &[0, 1, 2]).unwrap();
+    }
+    // A guest writes mid-move: the union regime must land it somewhere
+    // the commit will not orphan.
+    nodes[0].step_reassign().unwrap();
+    let owed_before = nodes[2].step_reassign().unwrap();
+    assert!(owed_before > 0, "the newcomer owes itself nothing to pull");
+    pump(&mut nodes, &mut net, &mut guests);
+    for index in 0..4 {
+        nodes[0]
+            .write_block(VDISK, index, &payload(index, 2))
+            .unwrap();
+    }
+    nodes[0].flush().unwrap();
+    pump(&mut nodes, &mut net, &mut guests);
+    run_moves(&mut nodes, &mut net, &mut guests, &[0, 1, 2]);
+    for node in &mut nodes {
+        node.commit_reassign().unwrap();
+    }
+
+    // The new map governs: version 2 everywhere, and after a collection
+    // every block sits on exactly its new homes — including the ones
+    // written mid-move.
+    let grown = SliceMap::for_members(1, &[0, 1])
+        .unwrap()
+        .reassigned(2, &[0, 1, 2])
+        .unwrap()
+        .map;
+    for node in &mut nodes {
+        assert_eq!(node.pool().placement().unwrap().1.version(), 2);
+        node.collect_garbage().unwrap();
+        let report = node.pool().scrub().unwrap();
+        assert_eq!(report.corrupt, vec![]);
+        assert_eq!(report.missing, vec![]);
+    }
+    let written: Vec<(u64, u8)> = (0..CAPACITY)
+        .map(|index| (index, if index < 4 { 2 } else { 1 }))
+        .collect();
+    assert_exact_homes(&mut nodes, &MEMBERS, &grown, &written);
+    for member in 0..3 {
+        for (index, generation) in &written {
+            let found = read_anywhere(&mut nodes, &mut net, &mut guests, member, VDISK, *index);
+            assert_eq!(
+                found.as_deref(),
+                Some(payload(*index, *generation).as_slice())
+            );
+        }
+    }
+
+    // The committed map survives a crash: the manifest carries it, and it
+    // wins over whatever stale seed the reopener supplies.
+    let mut disk = {
+        let node = std::mem::replace(&mut nodes[2], fresh_node(999, 2));
+        node.into_pool().into_brick().into_disk()
+    };
+    net.kill(2);
+    disk.crash();
+    let set = BrickSet::single(Brick::open(disk).unwrap()).unwrap();
+    let stale_seed = SliceMap::for_members(1, &[0, 1]).unwrap();
+    let reopened = Pool::open_set_placed(set, 2, stale_seed).unwrap();
+    assert_eq!(
+        reopened.placement().unwrap().1.version(),
+        2,
+        "the anchored map lost to a stale seed"
+    );
+}
+
+#[test]
+fn a_leaving_members_copies_drop_only_after_the_commit() {
+    let (mut nodes, mut net, mut guests) = synced_trio(70);
+    for index in 0..CAPACITY {
+        nodes[0]
+            .write_block(VDISK, index, &payload(index, 1))
+            .unwrap();
+    }
+    nodes[0].flush().unwrap();
+    pump(&mut nodes, &mut net, &mut guests);
+
+    // A block member 2 homes today and will not tomorrow.
+    let displaced = (0..CAPACITY)
+        .find(|index| {
+            let hash = lumen_fs::hash_block(&payload(*index, 1));
+            let now = SliceMap::for_members(1, &MEMBERS).unwrap();
+            now.holds(2, &hash)
+        })
+        .expect("sixty blocks and none on member 2");
+    let displaced_hash = lumen_fs::hash_block(&payload(displaced, 1));
+
+    for node in &mut nodes {
+        node.prepare_reassign(2, &[0, 1]).unwrap();
+    }
+    // Before the commit, a collection must keep the displaced copy: a
+    // pending home may still be pulling from it.
+    nodes[2].collect_garbage().unwrap();
+    assert!(
+        nodes[2].pool().has_block(0, &displaced_hash),
+        "a pre-commit collection swept a displaced block"
+    );
+    run_moves(&mut nodes, &mut net, &mut guests, &[0, 1, 2]);
+    for node in &mut nodes {
+        node.commit_reassign().unwrap();
+    }
+    nodes[2].collect_garbage().unwrap();
+    assert!(
+        !nodes[2].pool().has_block(0, &displaced_hash),
+        "the commit did not license the displacement drop"
+    );
+    // Both remaining members hold everything; the leaver serves by fetch.
+    for index in 0..CAPACITY {
+        let hash = lumen_fs::hash_block(&payload(index, 1));
+        assert!(nodes[0].pool().has_block(0, &hash));
+        assert!(nodes[1].pool().has_block(0, &hash));
+        let found = read_anywhere(&mut nodes, &mut net, &mut guests, 2, VDISK, index);
+        assert_eq!(found.as_deref(), Some(payload(index, 1).as_slice()));
+    }
+}
+
+#[test]
+fn re_protection_heals_a_death_and_the_revenant_adopts_the_map_it_missed() {
+    let (mut nodes, mut net, mut guests) = synced_trio(80);
+    for index in 0..CAPACITY {
+        nodes[0]
+            .write_block(VDISK, index, &payload(index, 1))
+            .unwrap();
+    }
+    nodes[0].flush().unwrap();
+    pump(&mut nodes, &mut net, &mut guests);
+
+    // Member 2 dies; the survivors re-protect: every slice back to two
+    // copies instead of running degraded until repair — the thing neither
+    // two nodes nor DRBD can ever do.
+    let disk = {
+        let node = std::mem::replace(&mut nodes[2], fresh_node(999, 2));
+        node.into_pool().into_brick().into_disk()
+    };
+    fence(&mut nodes, &mut net, 2, &[0, 1]);
+    for member in [0, 1] {
+        nodes[member].prepare_reassign(2, &[0, 1]).unwrap();
+    }
+    run_moves(&mut nodes, &mut net, &mut guests, &[0, 1]);
+    for member in [0, 1] {
+        nodes[member].commit_reassign().unwrap();
+    }
+    for index in 0..CAPACITY {
+        let hash = lumen_fs::hash_block(&payload(index, 1));
+        assert!(
+            nodes[0].pool().has_block(0, &hash) && nodes[1].pool().has_block(0, &hash),
+            "block {index} is not back to two copies"
+        );
+    }
+
+    // The revenant returns two map versions behind; the hello refuses to
+    // elect roles across the gap, the map ships whole, and the resync
+    // runs under the version it adopted.
+    nodes[2] = reopen_placed(disk, 2);
+    net.revive(2);
+    for other in [0u8, 1u8] {
+        nodes[2].connect(other);
+        nodes[other as usize].connect(2);
+    }
+    pump(&mut nodes, &mut net, &mut guests);
+    for node in &nodes {
+        assert_eq!(node.state(), ReplState::Synced);
+    }
+    assert_eq!(
+        nodes[2].pool().placement().unwrap().1.version(),
+        2,
+        "the revenant never adopted the map it missed"
+    );
+    // Under map v2 it homes nothing; a collection proves it keeps nothing,
+    // and every read still answers by fetch.
+    nodes[2].collect_garbage().unwrap();
+    for index in 0..CAPACITY {
+        let found = read_anywhere(&mut nodes, &mut net, &mut guests, 2, VDISK, index);
+        assert_eq!(found.as_deref(), Some(payload(index, 1).as_slice()));
+    }
+
+    // And the pool grows back to three, full circle.
+    for node in &mut nodes {
+        node.prepare_reassign(3, &[0, 1, 2]).unwrap();
+    }
+    run_moves(&mut nodes, &mut net, &mut guests, &[0, 1, 2]);
+    for node in &mut nodes {
+        node.commit_reassign().unwrap();
+    }
+    let full = nodes[0].pool().placement().unwrap().1.clone();
+    for node in &mut nodes {
+        node.collect_garbage().unwrap();
+    }
+    let written: Vec<(u64, u8)> = (0..CAPACITY).map(|index| (index, 1)).collect();
+    assert_exact_homes(&mut nodes, &MEMBERS, &full, &written);
+}
+
+#[test]
+fn a_joiner_dying_mid_move_costs_nothing_and_the_retry_lands() {
+    let (mut nodes, mut net, mut guests) = synced_trio(90);
+    for index in 0..CAPACITY {
+        nodes[0]
+            .write_block(VDISK, index, &payload(index, 1))
+            .unwrap();
+    }
+    nodes[0].flush().unwrap();
+    pump(&mut nodes, &mut net, &mut guests);
+
+    // Shrink to [0,1] and grow back — so member 2 is mid-JOIN when it
+    // dies: it owes itself blocks it has not pulled.
+    for node in &mut nodes {
+        node.prepare_reassign(2, &[0, 1]).unwrap();
+    }
+    run_moves(&mut nodes, &mut net, &mut guests, &[0, 1, 2]);
+    for node in &mut nodes {
+        node.commit_reassign().unwrap();
+        node.collect_garbage().unwrap();
+    }
+    for node in &mut nodes {
+        node.prepare_reassign(3, &[0, 1, 2]).unwrap();
+    }
+    let owed = nodes[2].step_reassign().unwrap();
+    assert!(
+        owed > 0,
+        "the joiner owes itself nothing — the test is inert"
+    );
+    pump(&mut nodes, &mut net, &mut guests);
+
+    // The joiner dies mid-move. Nothing is owed to anyone: the committed
+    // map still governs, its homes still hold everything, and no one
+    // committed a map whose homes are missing.
+    let disk = {
+        let node = std::mem::replace(&mut nodes[2], fresh_node(999, 2));
+        node.into_pool().into_brick().into_disk()
+    };
+    fence(&mut nodes, &mut net, 2, &[0, 1]);
+    for index in 0..CAPACITY {
+        for member in [0usize, 1] {
+            let found = read_anywhere(&mut nodes, &mut net, &mut guests, member, VDISK, index);
+            assert_eq!(found.as_deref(), Some(payload(index, 1).as_slice()));
+        }
+    }
+
+    // It returns; the reassignment is re-delivered (the layer above owns
+    // that), the moves re-run idempotently, and the commit lands.
+    nodes[2] = reopen_placed(disk, 2);
+    net.revive(2);
+    for other in [0u8, 1u8] {
+        nodes[2].connect(other);
+        nodes[other as usize].connect(2);
+    }
+    pump(&mut nodes, &mut net, &mut guests);
+    for node in &nodes {
+        assert_eq!(node.state(), ReplState::Synced);
+    }
+    for node in &mut nodes {
+        match node.reassign_pending() {
+            Some(3) => {}
+            _ => node.prepare_reassign(3, &[0, 1, 2]).unwrap(),
+        }
+    }
+    run_moves(&mut nodes, &mut net, &mut guests, &[0, 1, 2]);
+    for node in &mut nodes {
+        node.commit_reassign().unwrap();
+        node.collect_garbage().unwrap();
+    }
+    let full = nodes[0].pool().placement().unwrap().1.clone();
+    let written: Vec<(u64, u8)> = (0..CAPACITY).map(|index| (index, 1)).collect();
+    assert_exact_homes(&mut nodes, &MEMBERS, &full, &written);
+    for member in 0..3 {
+        for index in 0..CAPACITY {
+            let found = read_anywhere(&mut nodes, &mut net, &mut guests, member, VDISK, index);
+            assert_eq!(found.as_deref(), Some(payload(index, 1).as_slice()));
+        }
+    }
+}
+
+#[test]
+fn a_change_that_would_orphan_slices_is_refused_by_name() {
+    let (mut nodes, _net, _guests) = synced_trio(95);
+    // Every slice's homes are among {0,1,2}; a set naming none of them
+    // strands every slice at once — RF=2 exhausted, refused rather than
+    // papered over with homes that hold nothing.
+    let err = nodes[0].prepare_reassign(2, &[3, 4]).unwrap_err();
+    assert!(
+        matches!(err, FsError::Placement(_)),
+        "an orphaning change was accepted: {err}"
+    );
+    // A commit with nothing pending is equally refused.
+    assert!(nodes[0].commit_reassign().is_err());
 }
 
 /// The macro-event fuzz: acked writes, single-member deaths healed before
