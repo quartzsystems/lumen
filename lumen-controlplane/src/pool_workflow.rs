@@ -89,8 +89,25 @@ impl PoolJobHandle {
         )
     }
 
-    fn begin(&self, progress: PoolProgress) {
-        *self.inner.lock().unwrap() = Some(progress);
+    /// Take the job slot, atomically: the check and the claim are one
+    /// locked act. Found by a race on real hardware — two creates a few
+    /// milliseconds apart both passed a separate `busy()` check (the
+    /// preflight between check and begin takes seconds), both ran, and
+    /// each member kept whichever format landed last: two half-pools that
+    /// refused each other's handshake by pool identity.
+    fn try_begin(&self, progress: PoolProgress) -> bool {
+        let mut slot = self.inner.lock().unwrap();
+        if matches!(
+            slot.as_ref(),
+            Some(PoolProgress {
+                phase: WorkflowPhase::Running,
+                ..
+            })
+        ) {
+            return false;
+        }
+        *slot = Some(progress);
+        true
     }
 
     fn set_step(&self, step: &str, node: &str, state: StepState, detail: Option<String>) {
@@ -795,12 +812,16 @@ pub async fn create_pool(
     for plan in &plans {
         steps.push(step("restart", &plan.name));
     }
-    state.pool_job.begin(PoolProgress {
+    if !state.pool_job.try_begin(PoolProgress {
         action: "create".into(),
         phase: WorkflowPhase::Running,
         error: None,
         steps,
-    });
+    }) {
+        return Err(ClusterError::Conflict(
+            "A pool job is already running. Wait for it to finish.".into(),
+        ));
+    }
 
     let task_state = state.clone();
     tokio::spawn(async move {
@@ -1056,12 +1077,16 @@ pub async fn destroy_pool(
     for member in &members {
         steps.push(step("restart", member));
     }
-    state.pool_job.begin(PoolProgress {
+    if !state.pool_job.try_begin(PoolProgress {
         action: "destroy".into(),
         phase: WorkflowPhase::Running,
         error: None,
         steps,
-    });
+    }) {
+        return Err(ClusterError::Conflict(
+            "A pool job is already running. Wait for it to finish.".into(),
+        ));
+    }
 
     let task_state = state.clone();
     tokio::spawn(async move {

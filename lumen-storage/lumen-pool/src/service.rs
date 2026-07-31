@@ -435,10 +435,15 @@ impl VmVolumes for PoolService {
     /// there, and inside a window that export is penless: reads serve,
     /// writes refuse until the pen arrives.
     ///
-    /// `Accepted` hands the pen over from the source and then waits for the
-    /// destination to see it. Where it goes is read from the open window
-    /// rather than passed in — the window is the record of its own
-    /// destination, so there is no second place to disagree.
+    /// `Accepted` hands the pen over from the source, waits for the
+    /// destination to see it, and then takes the source's own device down —
+    /// the mirror of what `Aborted` does to the destination's. Where the pen
+    /// goes is read from the open window rather than passed in — the window
+    /// is the record of its own destination, so there is no second place to
+    /// disagree. A source export left standing is not a second writer (it is
+    /// penless), but it is the export that would refuse the machine's way
+    /// back — found on real hardware when the return migration was refused
+    /// with "already exported".
     ///
     /// **The recorded gap.** An HA restart does not pass through here: the
     /// sweep defines and starts the machine on a survivor, and nothing has
@@ -495,7 +500,7 @@ impl VmVolumes for PoolService {
                     .unwrap_or_else(|| here.clone());
                 for attempt in 0..HANDOVER_TRIES {
                     match self.fleet.accept(&destination, vdisk).await {
-                        Ok(()) => return Ok(()),
+                        Ok(()) => break,
                         Err(err) if attempt + 1 == HANDOVER_TRIES => {
                             return Err(PoolError::Backend(format!(
                                 "the pen for \"{device}\" was handed to {destination} but never \
@@ -506,6 +511,12 @@ impl VmVolumes for PoolService {
                         Err(_) => tokio::time::sleep(HANDOVER_PAUSE).await,
                     }
                 }
+                // The machine writes on the destination now. The source's
+                // penless export cannot take a second writer, but it is a
+                // device nobody will use again — and the export that would
+                // refuse the machine's way back. Aborted takes the far
+                // side's device down; this is its mirror.
+                self.fleet.unexport(&here, vdisk).await?;
                 Ok(())
             }
             MigrationWindow::Aborted => {

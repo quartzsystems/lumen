@@ -24,6 +24,7 @@ const INSTALL: &str = "/usr/bin/install";
 const RM: &str = "/usr/bin/rm";
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
 const WIPEFS: &str = "/usr/sbin/wipefs";
+const DD: &str = "/usr/bin/dd";
 
 /// Formatting reads and writes a whole disk's opening sectors and zeroes
 /// its anchor slots; a shelf of disks takes its time.
@@ -141,15 +142,34 @@ impl PoolDeploy {
         .await
     }
 
-    /// Wipe a brick's signatures. Deliberately **not** the storage
-    /// domain's guarded wipe: the scanner reports a brick as claimed
-    /// (which is what keeps the pickers honest), so the guarded path would
-    /// refuse the one wipe the destroy workflow is *for*. The guard here
-    /// is the workflow above — daemon stopped first, vdisks checked first.
+    /// Wipe a brick's identity. Deliberately **not** the storage domain's
+    /// guarded wipe: the scanner reports a brick as claimed (which is what
+    /// keeps the pickers honest), so the guarded path would refuse the one
+    /// wipe the destroy workflow is *for*. The guard here is the workflow
+    /// above — daemon stopped first, vdisks checked first.
+    ///
+    /// Zeroing the opening sectors is the real act — found on hardware:
+    /// `wipefs` erases only signatures it recognizes, and a LumenFS
+    /// superblock is not one of them, so a wipefs-only wipe left the disk
+    /// still claiming to be a brick. The first sixteen KiB carry both
+    /// superblock slots and both anchor slots; zeros there are what "not a
+    /// brick" durably means. `wipefs -a` still runs after, for anything
+    /// else a disk may once have been.
     pub async fn wipe_brick(&self, path: &str) -> Result<(), String> {
         self.run(
+            &format!("zeroing {path}'s brick identity failed"),
+            ExecRequest::new("zero a retired brick's identity sectors", DD).args([
+                "if=/dev/zero",
+                &format!("of={path}"),
+                "bs=4096",
+                "count=4",
+                "conv=fsync",
+            ]),
+        )
+        .await?;
+        self.run(
             &format!("wiping {path} failed"),
-            ExecRequest::new("wipe a retired brick's signatures", WIPEFS).args(["-a", path]),
+            ExecRequest::new("wipe a retired brick's other signatures", WIPEFS).args(["-a", path]),
         )
         .await
     }
@@ -320,6 +340,21 @@ mod tests {
                 .await
         );
         assert!(exec.ran_with(RM, &["-f", FSD_CONF]).await);
+        // The zeroing is the real wipe — wipefs alone cannot see a
+        // LumenFS superblock; the hardware proved it.
+        assert!(
+            exec.ran_with(
+                DD,
+                &[
+                    "if=/dev/zero",
+                    "of=/dev/disk/by-id/nvme-eui.0001",
+                    "bs=4096",
+                    "count=4",
+                    "conv=fsync",
+                ]
+            )
+            .await
+        );
         assert!(
             exec.ran_with(WIPEFS, &["-a", "/dev/disk/by-id/nvme-eui.0001"])
                 .await
@@ -337,11 +372,11 @@ mod tests {
     #[tokio::test]
     async fn a_failed_command_carries_its_description_and_the_stderr() {
         let (exec, deploy) = deploy();
-        exec.fail_next(1, "wipefs: probing initialization failed")
+        exec.fail_next(1, "dd: error writing '/dev/sdz': No space left")
             .await;
         let err = deploy.wipe_brick("/dev/sdz").await.unwrap_err();
-        assert!(err.contains("wiping /dev/sdz failed"), "{err}");
-        assert!(err.contains("probing initialization failed"), "{err}");
+        assert!(err.contains("zeroing /dev/sdz"), "{err}");
+        assert!(err.contains("No space left"), "{err}");
     }
 
     #[test]

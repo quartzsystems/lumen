@@ -719,6 +719,98 @@ real machines (the fleet and peer route are proven against real daemons
 in-process; the two-controlplane run needs a pool wired under the
 appliances' own control planes, which is the deployment phase 4 builds).
 
+**Phase 4 built that deployment, and its exit test collected the debt
+(complete, 2026-07-30).** Tier is on the platter now: superblock v2
+carries the brick's tier and a WAL-holder flag, the anchor carries a
+roster of every brick its node serves, and decode checks the version
+*before* the checksum so a v1 brick is refused by name rather than
+misread as blank. v2 is reformat-only — Cody's call: no decode compat,
+no in-place upgrade, because the wizard rebuilds a pool from bare disks
+anyway and the only v1 pool in existence was our own test rig. The disk
+scanner tries the same decode against sector 0 of every candidate disk,
+so the Disks page, the ZFS pickers, and the wizard tell one ownership
+story from one definition — a disk is a ZFS pool's or a LumenFS brick's,
+never both, and the boot pool is nobody's to take.
+
+A node serves a `BrickSet` rather than a brick: sorted by (tier, uuid),
+exactly one WAL holder, dedupe strictly per tier — a block's tier is part
+of its home — and allocation to the most-free brick of that tier with
+ties broken by lowest uuid, a pure function of durable state that every
+replay reaches again. A set that does not match its own roster is refused
+by name, as is a set with no tier-0 brick for the WAL to live on.
+Capacity is finally said in bytes: per tier, pool-usable is the **min
+over members** — never a sum divided by anything — and `None` while any
+member is silent, because a guess is not a figure. The label is *usable*,
+captioned that dedupe only makes it bigger.
+
+Creation moved from the hand-written conf to the wizard and its
+workflow. The coordinator computes the whole plan up front — pool and
+brick uuids minted once and passed to every format, node ids from the
+sorted member names, listener and dialer assigned — then per-member
+prepare runs sequentially: wipe, format each brick, write the conf from
+`PoolConfig::render()` (round-trip-tested against its own parser),
+enable the daemon, verify it answers on loopback. Any failure unwinds
+the prepared members in reverse before a single control plane has
+restarted. Adoption is restart choreography: peers first, each polled
+back to Present; the coordinator marks the job Complete and restarts
+itself **last**, and the console switches from the progress feed to the
+observed pool when the feed's own server goes down — truth over feed.
+Consent never travels a peer route. Destroy refuses while any vdisk
+exists or any member cannot be asked (silence could hide a vdisk), with
+one escape: a Broken pool destroys with the acknowledgement, because
+that is the repair path out of Broken.
+
+The exit run on lumen1/lumen2 drove destroy and create through the real
+API, verified the conf, unit, and status on the hosts against what the
+workflow claims to write, exercised the refusals (a v1 brick and a boot
+disk both named in a failed create; destroy answering 409 while a vdisk
+existed), and paid the owed migration: a machine on a pool vdisk moved
+lumen1 → lumen2 → lumen1 through the two appliances' own control planes,
+each leg landing in seconds with the writer lease and the export
+following the machine and both consoles agreeing. What the run added to
+the ledger, every entry a thing no simulation had said:
+
+- **`wipefs` cannot see a LumenFS superblock**, so "wipe then format"
+  left the old pool's identity on the platter until the wipe learned to
+  zero the first 16 KiB with `dd` before asking `wipefs` for the rest.
+- **Two concurrent creates split the pool's identity** — each member
+  formatted under a different coordinator's minted uuid, and the daemons
+  politely refused each other's handshakes forever. The job slot is now
+  claimed atomically (`try_begin`); the second create answers Conflict
+  instead of racing.
+- **The `Accepted` window arm never took the source's device down.** The
+  first migration landed and the return leg was refused with "already
+  exported": the handover moved the pen but left the source's penless
+  export standing — not a second writer, but exactly the export that
+  refuses the machine's way back. `Accepted` now unexports the source
+  after the destination confirms the pen, the mirror of what `Aborted`
+  does to the destination — and the seam test that had asserted only the
+  lease's movement now asserts the device's too.
+- **Destroying what is already gone is already done**: a stale DRBD
+  record from an earlier hand-torn cluster could never be deleted because
+  `drbdadm down` on a resource with no config is an error the CLI now
+  recognises as success.
+- The daemon's one-at-a-time control socket **wedges on a half-open
+  connection** (a killed client mid-exchange). Real, reproduced, and a
+  follow-on: the control surface needs read deadlines.
+- The migration URI's libvirt listener is the deliberate loose end
+  docs/storage.md records: the firewalld service ships but the TCP
+  listener is an operator's own security decision. It was enabled by
+  hand on both machines (`auth_tcp = "none"`, reachable only on the
+  Core-zone interfaces) for the exit test — packaging an opinionated
+  default remains open.
+- A machine deleted without purging its disks leaves a pooled volume
+  **no operator surface can currently reap** — the replicated-volume
+  delete route only lists DRBD clusters. Follow-on for the console.
+
+Phase 4's stated non-goals, decisions rather than surprises: no live
+brick-add (create and destroy only; the anchor roster is already shaped
+so growth can land without a format change), no WAL-brick relocation
+(retiring the WAL disk is evacuate-and-reformat via peer resync), no
+tier spill (a write to a full tier fails; it never silently lands on
+another tier), and no per-tier slice maps yet — that is phase 5's
+placement arithmetic, already begun below.
+
 **Phase 5 has begun with placement, which is pure arithmetic and so goes
 first.** `slice.rs` is the whole of "which members hold a block": hash →
 slice → an ordered pair of members, 256 slices per tier, a slice being one

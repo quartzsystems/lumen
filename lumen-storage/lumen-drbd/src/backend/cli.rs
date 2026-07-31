@@ -139,12 +139,30 @@ impl DrbdBackend for CliBackend {
     }
 
     async fn down(&self, resource: &str) -> Result<()> {
-        self.drbdadm(
-            "take a replicated volume down",
-            &format!("taking {resource} down failed"),
-            &["down", resource],
-        )
-        .await
+        // A resource drbdadm has never heard of is already down. Found on
+        // real hardware: a stale volume record whose replicas were cleaned
+        // by hand could never be destroyed, because the teardown's first
+        // step failed on the absence the teardown exists to produce.
+        let outcome = self
+            .exec
+            .run(
+                ExecRequest::new("take a replicated volume down", DRBDADM)
+                    .args(["down", resource]),
+            )
+            .await
+            .map_err(DrbdError::Backend)?;
+        if !outcome.ok() {
+            let failure = outcome.failure();
+            if failure.contains("no resources defined")
+                || failure.contains("not defined in your config")
+            {
+                return Ok(());
+            }
+            return Err(DrbdError::Conflict(format!(
+                "taking {resource} down failed: {failure}"
+            )));
+        }
+        Ok(())
     }
 
     async fn skip_initial_sync(&self, resource: &str) -> Result<()> {
@@ -239,6 +257,22 @@ impl DrbdBackend for CliBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Found on real hardware: `drbdadm down` on a resource it has never
+    /// heard of must read as already-down, or a stale volume record whose
+    /// replicas were hand-cleaned can never be destroyed.
+    #[tokio::test]
+    async fn taking_down_what_is_already_gone_is_already_done() {
+        let exec = lumen_sys::exec::MockExec::working();
+        let backend = CliBackend::new(exec.clone());
+        exec.fail_next(1, "no resources defined!").await;
+        backend.down("alpha-v0").await.unwrap();
+        exec.fail_next(1, "'alpha-v0' not defined in your config").await;
+        backend.down("alpha-v0").await.unwrap();
+        // A real failure still fails.
+        exec.fail_next(1, "State change failed").await;
+        assert!(backend.down("alpha-v0").await.is_err());
+    }
 
     /// The resource file carries the replication secret, so it rides stdin
     /// with a locked-down mode — never an argument.

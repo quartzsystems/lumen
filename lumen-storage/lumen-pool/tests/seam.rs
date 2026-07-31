@@ -197,6 +197,17 @@ async fn a_migration_opens_a_window_hands_the_pen_over_and_lands() {
         Some((1, None)),
         "the pen did not move, or the window stayed open"
     );
+    // And the source's device came down with the handover — the export
+    // left standing is what would refuse the machine's way back.
+    assert!(
+        fleet.exported_on(HERE).is_empty(),
+        "the source kept a device for a machine that left"
+    );
+    assert_eq!(
+        fleet.exported_on(THERE),
+        vec![vdisk],
+        "the destination serves it now"
+    );
 }
 
 #[tokio::test]

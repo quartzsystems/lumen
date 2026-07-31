@@ -592,12 +592,13 @@ impl DrbdService {
         };
         note(self.backend.down(&payload.resource).await);
         note(self.backend.remove_resource_file(&payload.resource).await);
-        note(
-            self.storage
-                .destroy_volume(&payload.zvol)
-                .await
-                .map_err(DrbdError::from),
-        );
+        // A teardown's job is absence, and finding absence is success: a
+        // zvol already gone — a half-cleaned volume, a re-run after a
+        // partial failure — must not keep the record alive forever.
+        note(match self.storage.destroy_volume(&payload.zvol).await {
+            Err(err) if err.to_string().contains("does not exist") => Ok(()),
+            other => other.map_err(DrbdError::from),
+        });
         match first_error {
             None => Ok(()),
             Some(err) => Err(err),
