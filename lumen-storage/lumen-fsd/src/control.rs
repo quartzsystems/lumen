@@ -35,6 +35,13 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(300);
 // ---------------------------------------------------------------------------
 // The server side.
 
+/// How long a connected client may sit silent before its turn ends. The
+/// surface serves one connection at a time, so a half-open socket — a
+/// killed client mid-exchange — used to wedge it for everyone; this was
+/// found on real hardware, where exactly that happened. The deadline
+/// bounds the *silence between verbs*, never a verb's own work.
+const IDLE_DEADLINE: Duration = Duration::from_secs(60);
+
 /// Serve the control surface until the listener dies. One connection at a
 /// time, and one verb at a time within it: these are administrative acts,
 /// and serializing them means an operator and an orchestrator can never
@@ -42,6 +49,10 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(300);
 pub fn serve(listener: TcpListener, daemon: &Daemon) {
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else { continue };
+        // A dead client's connection must end, not hold the line: reads
+        // and writes both time out, and the loop moves to the next caller.
+        let _ = stream.set_read_timeout(Some(IDLE_DEADLINE));
+        let _ = stream.set_write_timeout(Some(IDLE_DEADLINE));
         let Ok(clone) = stream.try_clone() else {
             continue;
         };

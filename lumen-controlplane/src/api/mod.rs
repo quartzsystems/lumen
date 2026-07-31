@@ -386,6 +386,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(storage::lumen_pool_pending),
         )
         .route(
+            "/api/storage/pool/disks/{name}",
+            delete(storage::delete_pooled_disk),
+        )
+        .route(
             "/api/storage/pool/disks/{name}/snapshots",
             post(storage::snapshot_pooled_disk),
         )

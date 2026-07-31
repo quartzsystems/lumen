@@ -40,7 +40,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use lumen_cluster::join::{StepProgress, StepState, WorkflowPhase};
-use lumen_drbd::VmVolumes;
 use lumen_virt::DomainState;
 use serde::{Deserialize, Serialize};
 
@@ -361,8 +360,10 @@ async fn choose_target(
     if machine.devices.is_empty() {
         return Err("This machine has no disks, so nothing names where it could run.".to_string());
     }
+    // The node's own engine answers, whichever one that is — asking DRBD
+    // by name on a pooled node refuses every /dev/ublkb device.
     let members = state
-        .drbd
+        .virt
         .common_members(&machine.devices)
         .await
         .map_err(|err| format!("Where this machine can run could not be worked out: {err}"))?;
@@ -372,7 +373,11 @@ async fn choose_target(
 
     let mut candidates: Vec<&String> = members
         .iter()
-        .filter(|m| *m != node && eligible.contains(*m) && current.contains(*m))
+        .filter(|m| {
+            *m != node
+                && eligible.contains(*m)
+                && current.as_ref().is_none_or(|current| current.contains(*m))
+        })
         .collect();
     if candidates.is_empty() {
         let known = members
@@ -420,15 +425,25 @@ async fn eligible_members(state: &Arc<AppState>, node: &str) -> Result<Vec<Strin
         .collect())
 }
 
-/// Nodes whose replica of **every** one of these devices reads `UpToDate`.
+/// Nodes whose DRBD replica of every DRBD-backed device reads `UpToDate`
+/// — `None` when DRBD has nothing to say about any of them.
 ///
-/// A volume this node cannot see the state of contributes nothing, which
-/// makes the answer conservative by construction: an unreadable DRBD means no
-/// candidate is confirmed current, and the drain says so rather than moving a
-/// machine onto a replica it knows nothing about.
-async fn current_replicas(state: &Arc<AppState>, devices: &[String]) -> Vec<String> {
+/// This is DRBD's currency question and it constrains only DRBD's own
+/// devices: a `/dev/drbd` volume DRBD cannot account for vetoes every
+/// candidate (conservative — a machine must not land on a replica nobody
+/// can vouch for), while a device belonging to another engine is that
+/// engine's business, already answered by `common_members` — the pool
+/// resyncs a stale member itself and refuses service until it has.
+async fn current_replicas(state: &Arc<AppState>, devices: &[String]) -> Option<Vec<String>> {
+    let drbd_backed: Vec<&String> = devices
+        .iter()
+        .filter(|device| device.starts_with("/dev/drbd"))
+        .collect();
+    if drbd_backed.is_empty() {
+        return None;
+    }
     let Ok(volumes) = state.drbd.volumes().await else {
-        return Vec::new();
+        return Some(Vec::new());
     };
     let all: Vec<&lumen_drbd::VolumeView> = volumes
         .clusters
@@ -437,9 +452,9 @@ async fn current_replicas(state: &Arc<AppState>, devices: &[String]) -> Vec<Stri
         .collect();
 
     let mut current: Option<Vec<String>> = None;
-    for device in devices {
-        let Some(volume) = all.iter().find(|volume| &volume.device == device) else {
-            return Vec::new();
+    for device in drbd_backed {
+        let Some(volume) = all.iter().find(|volume| volume.device == **device) else {
+            return Some(Vec::new());
         };
         let up_to_date: Vec<String> = volume
             .replicas
@@ -455,7 +470,7 @@ async fn current_replicas(state: &Arc<AppState>, devices: &[String]) -> Vec<Stri
                 .collect(),
         });
     }
-    current.unwrap_or_default()
+    Some(current.unwrap_or_default())
 }
 
 /// The migration destination: the target's seat on its cluster's Core

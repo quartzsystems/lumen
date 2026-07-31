@@ -1638,6 +1638,19 @@ impl VirtService {
         Ok(self.machine(vmid).await?.observed.xml)
     }
 
+    /// Where a set of replicated devices can run, answered by **this
+    /// node's own storage engine** — the seam VirtService was built on.
+    /// The HA sweep and the maintenance drain ask through here rather
+    /// than any one engine directly: on a pooled node, asking DRBD about
+    /// a `/dev/ublkb` device is a refusal wearing an answer's clothes,
+    /// and a machine that could restart anywhere would restart nowhere.
+    pub async fn common_members(&self, devices: &[String]) -> Result<Vec<String>> {
+        self.volumes
+            .common_members(devices)
+            .await
+            .map_err(VirtError::from)
+    }
+
     /// Define-and-start a machine from a replicated definition — the HA
     /// manager's one verb, after the machine's node is confirmed lost. The
     /// document is defined verbatim: its disks are `/dev/drbd` devices that

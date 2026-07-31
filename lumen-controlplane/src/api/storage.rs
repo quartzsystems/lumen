@@ -544,6 +544,50 @@ pub async fn delete_pooled_snapshot(
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
+struct PoolDiskDeleteRequest {
+    #[serde(default)]
+    i_understand_this_may_lose_data: bool,
+}
+
+/// DELETE /api/storage/pool/disks/{name} — reap an orphaned pooled
+/// volume: one kept when its machine was deleted without a purge, which
+/// until now no operator surface could remove (the replicated-volume
+/// delete route only ever listed DRBD clusters — a recorded gap from the
+/// phase-4 exit test). Refused while any defined machine still
+/// references the device: detaching or deleting the machine is the
+/// honest way to free a disk it still names.
+pub async fn delete_pooled_disk(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    raw: Body,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let request: PoolDiskDeleteRequest = required_body(raw)?;
+    if !request.i_understand_this_may_lose_data {
+        return Err(ApiError::BadRequest(format!(
+            "Deleting {name} discards its contents — confirm you understand data may be lost."
+        )));
+    }
+    let device = pooled_device(&name)?;
+    let vmid = lumen_pool::DiskName::parse(&name)
+        .map(|disk| disk.vmid)
+        .ok_or_else(|| ApiError::NotFound(format!("{name} is not a pooled machine disk")))?;
+    if let Ok(machine) = state.virt.get(vmid as u32).await {
+        if machine.disks.iter().any(|disk| disk.source == device) {
+            return Err(ApiError::Conflict(format!(
+                "\"{}\" still uses {name}. Detach the disk or delete the machine instead — \
+                 this route reaps volumes nothing references.",
+                machine.name
+            )));
+        }
+    }
+    use lumen_drbd::VmVolumes;
+    pool_service(&state)?.destroy_disk(&device).await?;
+    Ok(Json(serde_json::json!({ "deleted": true })))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PoolRollbackRequest {
     snapshot: u64,
     #[serde(default)]

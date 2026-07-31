@@ -948,6 +948,27 @@ grow heals it, and the wart is the price of having no second membership
 record to disagree. The console's grow dialog is a follow-on; the API
 carries the workflow today.
 
+**The program closed with its debts, not just its features (2026-07-31).**
+Phase 6 is descoped by the fact it planned for: there is no DRBD
+deployment to migrate (see the phase list). Closing the ledger surfaced
+one real defect and paid two recorded follow-ons. The defect: the HA
+sweep and the maintenance drain asked **DRBD by name** for placement
+eligibility (`state.drbd.common_members`) instead of the engine the node
+runs — on a pooled cluster, every HA machine was unrestartable and every
+drain refused, because DRBD answers a `/dev/ublkb` device with a
+refusal. Both now ask through `VirtService::common_members`, the same
+seam the machines run on, and DRBD's replica-currency check constrains
+only the devices DRBD can actually see. The follow-ons: the daemon's
+one-at-a-time control surface now times out a silent connection (the
+half-open wedge the phase-4 exit test hit on real hardware), and an
+orphaned pooled volume — kept when its machine was deleted without a
+purge — finally has a reap surface: `DELETE
+/api/storage/pool/disks/{name}`, refused while any defined machine
+still references the device. What remains open is exactly what the
+ledger says: the three-box burn-in, the preview label that only
+scrub-clean time on real hardware can lift, the console's grow dialog,
+and the virtproxyd enablement decision.
+
 ## Burning it in
 
 The simulation decides when a disk loses power. Real hardware decides for
@@ -1344,7 +1365,14 @@ until phase 6 says otherwise.
    background rebalance, re-protection, vdisks larger than a node.
 6. **Migration.** DRBD volume → vdisk, offline first, then a mirrored
    cutover; the DRBD path stays supported for existing clusters until
-   there are none.
+   there are none. *Descoped (Cody, 2026-07-31): there are none.* No
+   deployment ever carried DRBD volumes into production — the only
+   machines running Lumen are the test pair, reinstalled fresh with a
+   pool — so migration tooling would ship with a user population of
+   zero. The decision is recorded rather than the phase quietly skipped:
+   if a DRBD cluster ever materializes, this phase is where its path
+   lives, and DRBD itself remains in the tree as the shipped alternative
+   until removed by its own decision.
 
 ## Stated costs
 

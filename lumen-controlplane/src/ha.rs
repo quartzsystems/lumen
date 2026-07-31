@@ -28,7 +28,6 @@
 //! handed machines mid-update.
 
 use crate::AppState;
-use lumen_drbd::VmVolumes;
 
 /// One pass: find lost-and-clean members, restart their HA machines here if
 /// this node is the elected survivor. Called on an interval from `main`;
@@ -111,7 +110,10 @@ pub async fn sweep(state: &AppState) {
         if devices.is_empty() {
             continue;
         }
-        let members = match state.drbd.common_members(&devices).await {
+        // Asked through the node's own storage engine, never DRBD by
+        // name: on a pooled node the disks are /dev/ublkb devices, and
+        // asking the wrong engine made every HA machine unrestartable.
+        let members = match state.virt.common_members(&devices).await {
             Ok(members) => members,
             Err(err) => {
                 tracing::warn!(vmid, "an HA machine cannot restart anywhere: {err}");

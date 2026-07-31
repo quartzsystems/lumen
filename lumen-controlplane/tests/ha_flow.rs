@@ -170,11 +170,15 @@ fn harness(tag: &str, cluster_backend: ClusterMockBackend) -> Harness {
         storage.clone(),
     ));
     let virt_backend = Arc::new(lumen_virt::backend::mock::MockBackend::appliance());
+    // The DRBD service IS the seam, exactly as main.rs wires an unpooled
+    // node — the HA sweep asks eligibility through VirtService now, and a
+    // fixture that handed it a standalone mock would test a machine no
+    // deployment runs.
     let virt = Arc::new(VirtService::new(
         virt_backend.clone(),
         storage.clone(),
         network.clone(),
-        Arc::new(lumen_drbd::MockVmVolumes::standalone()),
+        drbd.clone(),
     ));
     let state = Arc::new(AppState {
         config,
