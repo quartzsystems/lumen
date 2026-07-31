@@ -655,6 +655,53 @@ async fn a_destroy_needs_the_acknowledgement_before_anything_else() {
 }
 
 #[tokio::test]
+async fn a_grow_needs_the_acknowledgement_before_anything_else() {
+    let (_fleet, pool) = pooled();
+    let (router, _dir) = router_with("grow-ack", pool);
+    let cookie = sign_in(&router).await;
+    let (status, body) = request(
+        &router,
+        Method::POST,
+        "/api/storage/pool/members",
+        Some(&cookie),
+        None,
+        Some(serde_json::json!({
+            "member": "orchid",
+            "bricks": [{ "disk": "sdb", "tier": 0 }],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["errors"]
+            .to_string()
+            .contains("unacknowledged_destructive_operation"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn a_grow_on_a_poolless_node_is_refused_by_name() {
+    let (router, _dir) = router_with("grow-absent", PoolPresence::Absent);
+    let cookie = sign_in(&router).await;
+    let (status, body) = request(
+        &router,
+        Method::POST,
+        "/api/storage/pool/members",
+        Some(&cookie),
+        None,
+        Some(serde_json::json!({
+            "member": "orchid",
+            "bricks": [{ "disk": "sdb", "tier": 0 }],
+            "i_understand_this_erases_the_disks": true,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.to_string().contains("serves no pool"), "{body}");
+}
+
+#[tokio::test]
 async fn a_destroy_on_a_poolless_node_names_the_absence() {
     let (router, _dir) = router_with("destroy-absent", PoolPresence::Absent);
     let cookie = sign_in(&router).await;

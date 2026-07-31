@@ -647,6 +647,18 @@ pub async fn pool_prepare(
     ))
 }
 
+/// POST /api/peer/pool/reconf — a serving member takes the grow's conf
+/// change: one more dial, the grown member list, a daemon restart. The
+/// member patches its own conf; its brick paths never cross the wire.
+pub async fn pool_reconf(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+    Json(reconf): Json<crate::pool_workflow::PoolReconf>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    crate::pool_workflow::local_reconf(&state, &reconf).await?;
+    Ok(Json(serde_json::json!({ "reconfigured": true })))
+}
+
 /// POST /api/peer/pool/teardown — stop carrying a pool: daemon down,
 /// bricks wiped, drop-in removed. The destroy workflow and the create
 /// workflow's unwind share this one definition.

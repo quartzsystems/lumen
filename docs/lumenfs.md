@@ -885,6 +885,69 @@ Sequencing is engine-first: the placement and replication core lands in
 workflows, and the console untouched, so nothing destabilizes while DRBD
 carries production and each piece stays abandonable.
 
+**Phase 5's protocol is in (complete, 2026-07-31), and it went engine
+out.** The two-node core became per-peer sessions — every peer its own
+state, its own dense op stream, its own resync, sends carrying their
+addressee — with the acknowledgement rule restated as per-peer *needs* no
+event may blanket-drain: a data write waits on its block's homes, every
+other op waits on every live member, and a need from a dead session
+settles only by that peer's adoption or its fence verdict. The verdict
+carries its era now, because two survivors computing `max+1` from their
+own vantages can mint two different numbers and the next hello would read
+the difference as a fence that never happened. The restructure's own
+light found two holes the two-node suite had never lit — a payload swept
+by a collection in the gap before its op, and one global resync pull any
+hello could clobber — both closed and pinned.
+
+Then the map arrived: data placed by hash on exactly its slice's two
+homes, metadata everywhere, non-homes fetching on demand and keeping
+nothing (the serve-once buffer is consumed on read, and the tests assert
+block counts do not move). The rejoin became **concurrent and
+per-vdisk** — a returning member pulls from every live peer at once and
+adopts each vdisk from *its lease holder's* offer — because the
+serialized design, walked honestly, ends with an equal-era tie-break
+discarding a live writer's acknowledged history. Membership then learned
+to change under a serving pool: the committed map persists in manifest
+v4 (v3 stays decodable — it is live on real machines — and an unplaced
+pool still writes it), a reassignment opens as a pending map every write
+straddles (old ∪ new homes) and every collection respects, the moves are
+Merkle-idempotent fetches from homes the arithmetic guarantees survive,
+and the commit is what licenses the displacement drop — the new GC rule
+without which a reassigned-away member would carry its old slices
+forever. A member behind on the map cannot even elect resync roles: the
+hello refuses across the gap and the higher side ships the map whole,
+with a second hello behind it, because the first was spent teaching.
+
+The daemon meshed — links keyed by handshake, one listener and
+lower-id dials, per-member verdicts and the reassignment as three
+control verbs — and the mesh test promptly caught a write's
+read-modify-write edge needing the same fetch loop a read already had.
+The pool layer's capacity figure became seat arithmetic: each member
+bounds the pool at `bytes × 256 / seats`, which *is* min-over-members at
+two and genuinely exceeds any one node at three. Create accepts two or
+three seats (more is refused by name — the map arithmetic is proven to
+eight, the protocol to three), new pools are created **placed** so
+growth needs no reformat, and growing is its own operator act — `POST
+/api/storage/pool/members`, a newcomer prepared, every serving member
+taking one new dial, reassign, rebalance, commit, restart — rather than
+a rider on the cluster's node-add, because the newcomer's disks are a
+choice nothing can infer.
+
+Validated under the simulation and against real daemons in-process
+(three on real sockets: placement, fetched reads, a per-member verdict,
+a rejoin, and a shrink driven entirely over control verbs), plus the
+two-member regression on lumen1/lumen2 — the standing pool destroyed and
+recreated through the new path, coming back placed (`map=1 seats=256`)
+with the same usable figure. **Owed, recorded, and waiting on hardware:
+the three-box burn-in.** There is no third machine yet; the day one
+exists, the exit test is the grow workflow against it, then the full
+canary suite at three. Also recorded: between a cluster node-add and the
+pool grow, the observed view lists the new cluster member as a silent
+pool member (identity is derived from the cluster on purpose) — the
+grow heals it, and the wart is the price of having no second membership
+record to disagree. The console's grow dialog is a follow-on; the API
+carries the workflow today.
+
 ## Burning it in
 
 The simulation decides when a disk loses power. Real hardware decides for

@@ -90,6 +90,10 @@ pub struct MemberStatus {
     /// console's cue that a rebalance is running.
     #[serde(default)]
     pub reassign_pending: Option<u64>,
+    /// The pool identity, lowercase hex — what a grow workflow formats a
+    /// newcomer's bricks with. Absent from a pre-mesh daemon.
+    #[serde(default)]
+    pub pool_uuid: Option<String>,
 }
 
 impl MemberStatus {
@@ -222,6 +226,8 @@ impl Replication {
 
 /// How a member answered, or that it did not.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// The answered variant is the payload — see PoolAnswer's identical note.
+#[allow(clippy::large_enum_variant)]
 pub enum MemberView {
     Answered(MemberStatus),
     /// The daemon could not be reached, or said something unintelligible.
@@ -452,6 +458,7 @@ mod tests {
             map_version: None,
             seats: None,
             reassign_pending: None,
+            pool_uuid: None,
         }
     }
 

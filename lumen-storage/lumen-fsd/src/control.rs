@@ -442,6 +442,7 @@ fn status_line(daemon: &Daemon) -> String {
     if let Some(seats) = s.seats {
         line.push_str(&format!(" seats={seats}"));
     }
+    line.push_str(&format!(" pool={}", hex(&s.pool_uuid)));
     if let Some(version) = s.reassign_pending {
         line.push_str(&format!(" reassign={version}"));
     }
@@ -525,6 +526,9 @@ pub struct StatusView {
     pub map_version: Option<u64>,
     /// How many of the 256 slices this member homes; `None` when unplaced.
     pub seats: Option<u64>,
+    /// The pool identity, lowercase hex — what a grow workflow formats a
+    /// newcomer's bricks with. Absent from a pre-mesh daemon.
+    pub pool_uuid: Option<String>,
     /// The version a reassignment is moving to, while one is open.
     pub reassign_pending: Option<u64>,
 }
@@ -615,6 +619,7 @@ fn parse_status(reply: &str) -> Option<StatusView> {
     let mut era_target = None;
     let mut map_version = None;
     let mut seats = None;
+    let mut pool_uuid = None;
     let mut reassign_pending = None;
     for token in reply.split_whitespace() {
         let (key, value) = token.split_once('=')?;
@@ -694,6 +699,7 @@ fn parse_status(reply: &str) -> Option<StatusView> {
             "era_target" => era_target = Some(value.parse().ok()?),
             "map" => map_version = Some(value.parse().ok()?),
             "seats" => seats = Some(value.parse().ok()?),
+            "pool" => pool_uuid = Some(value.to_string()),
             "reassign" => reassign_pending = Some(value.parse().ok()?),
             // An unknown key is a newer daemon, not a broken one.
             _ => {}
@@ -728,6 +734,7 @@ fn parse_status(reply: &str) -> Option<StatusView> {
         era_target,
         map_version,
         seats,
+        pool_uuid,
         reassign_pending,
     })
 }

@@ -642,6 +642,12 @@ export const STEP_LABEL: Record<string, string> = {
   // The pool workflows' steps ride the same renderer.
   restart: "Restart control plane",
   teardown: "Tear down",
+  // The grow workflow's own: serving members take the newcomer's dial,
+  // the map opens, the blocks move, and the commit makes it real.
+  reconf: "Take the new member's link",
+  reassign: "Open the new layout",
+  rebalance: "Move blocks to the new member",
+  commit: "Commit the new layout",
 };
 
 export function ProgressRow({ step }: { step: StepProgress }) {

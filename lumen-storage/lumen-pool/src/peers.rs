@@ -145,6 +145,9 @@ pub enum PoolVerb {
 /// originally covered was the one shape internal tagging happens to allow.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "answer", content = "value", rename_all = "kebab-case")]
+// The status variant is the payload — a wire enum boxed to please a size
+// lint would trade one allocation per answer for nothing a caller sees.
+#[allow(clippy::large_enum_variant)]
 pub enum PoolAnswer {
     Status(MemberStatus),
     Vdisks(Vec<(u64, u64)>),
@@ -200,6 +203,13 @@ impl PoolAnswer {
         match self {
             PoolAnswer::Exports(exports) => Ok(exports),
             other => Err(other.wrong("an export listing")),
+        }
+    }
+
+    pub fn into_reassigning(self) -> Result<Option<(u64, u64)>> {
+        match self {
+            PoolAnswer::Reassigning(progress) => Ok(progress),
+            other => Err(other.wrong("a reassignment's progress")),
         }
     }
 
@@ -385,6 +395,7 @@ fn status_of(client: &mut Client) -> std::result::Result<MemberStatus, String> {
         map_version: view.map_version,
         seats: view.seats,
         reassign_pending: view.reassign_pending,
+        pool_uuid: view.pool_uuid,
     })
 }
 
@@ -637,6 +648,7 @@ mod tests {
                     map_version: None,
                     seats: None,
                     reassign_pending: None,
+                    pool_uuid: None,
                 }),
                 _ => PoolAnswer::Done,
             })
@@ -828,6 +840,7 @@ mod tests {
                 map_version: Some(2),
                 seats: Some(171),
                 reassign_pending: Some(3),
+                pool_uuid: Some("ab".repeat(16)),
             }),
             PoolAnswer::Vdisks(vec![(1795, 512 << 20), (2, 8 << 20)]),
             PoolAnswer::Vdisks(Vec::new()),

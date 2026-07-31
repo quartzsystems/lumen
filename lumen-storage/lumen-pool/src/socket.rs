@@ -156,6 +156,7 @@ impl PoolFleet for SocketFleet {
             map_version: view.map_version,
             seats: view.seats,
             reassign_pending: view.reassign_pending,
+            pool_uuid: view.pool_uuid,
         })
     }
 

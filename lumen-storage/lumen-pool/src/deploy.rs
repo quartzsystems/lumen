@@ -128,6 +128,17 @@ impl PoolDeploy {
         .await
     }
 
+    /// Restart it — the grow workflow's way of handing a member its new
+    /// conf: the daemon reopens the same bricks under the new peer set,
+    /// says hello, and resyncs whatever the restart window missed.
+    pub async fn restart_daemon(&self) -> Result<(), String> {
+        self.run(
+            "restarting the pool daemon failed",
+            ExecRequest::new("restart the pool daemon", SYSTEMCTL).args(["restart", "lumen-fsd"]),
+        )
+        .await
+    }
+
     /// Stop and disable it — teardown's first act, so nothing is serving
     /// from the bricks about to be wiped.
     pub async fn disable_daemon(&self) -> Result<(), String> {

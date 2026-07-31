@@ -380,6 +380,41 @@ impl crate::pool_workflow::PoolWorkflowPeers for HttpPeerChannel {
         Ok(())
     }
 
+    async fn pool_reconf(
+        &self,
+        node: &EnvironmentNode,
+        reconf: &crate::pool_workflow::PoolReconf,
+    ) -> Result<(), ClusterError> {
+        let _: serde_json::Value = self
+            .call(
+                &node.address,
+                "/api/peer/pool/reconf",
+                reconf,
+                self.ca_client_config()?,
+                Some(self.peer_ticket()?),
+                // A conf write plus a daemon restart and its reopen.
+                SLOW_CALL_DEADLINE,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn pool_verb(
+        &self,
+        node: &EnvironmentNode,
+        verb: &lumen_pool::PoolVerb,
+    ) -> Result<lumen_pool::PoolAnswer, ClusterError> {
+        self.call(
+            &node.address,
+            "/api/peer/pool/verb",
+            verb,
+            self.ca_client_config()?,
+            Some(self.peer_ticket()?),
+            SLOW_CALL_DEADLINE,
+        )
+        .await
+    }
+
     async fn restart_controlplane(&self, node: &EnvironmentNode) -> Result<(), ClusterError> {
         let _: serde_json::Value = self
             .call(

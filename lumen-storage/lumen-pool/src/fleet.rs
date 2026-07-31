@@ -286,6 +286,7 @@ impl PoolFleet for MockFleet {
             map_version: pinned.and_then(|s| s.map_version),
             seats: pinned.and_then(|s| s.seats),
             reassign_pending: pinned.and_then(|s| s.reassign_pending),
+            pool_uuid: pinned.and_then(|s| s.pool_uuid.clone()),
         })
     }
 

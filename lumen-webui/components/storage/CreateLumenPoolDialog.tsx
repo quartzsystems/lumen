@@ -128,9 +128,11 @@ export function CreateLumenPoolDialog({
   const disksReady = seats.length > 0 && seats.every(seatValid);
 
   // The one figure, estimated from the chosen disks the same way the
-  // server will state it: per-tier minimum over the members, summed —
-  // RF=2 with both members holding everything makes the smaller member
-  // the truth. "About", because the format charges its own overheads.
+  // server will state it: each member bounds the pool at its bytes times
+  // the member count over two — every block lives on two of the members,
+  // so at two this is the smaller member's truth and at three it exceeds
+  // any one node. "About", because the format charges its own overheads
+  // and the real seat split is off by a slice or two.
   const usableEstimate = useMemo(() => {
     if (!disksReady || !members) return null;
     const sizeOf = (node: string, disk: string) =>
@@ -140,10 +142,13 @@ export function CreateLumenPoolDialog({
     let total = 0;
     for (const tier of tiers) {
       total += Math.min(
-        ...seats.map((seat) =>
-          seat.bricks
-            .filter((brick) => brick.tier === tier)
-            .reduce((sum, brick) => sum + sizeOf(seat.node, brick.disk), 0),
+        ...seats.map(
+          (seat) =>
+            (seat.bricks
+              .filter((brick) => brick.tier === tier)
+              .reduce((sum, brick) => sum + sizeOf(seat.node, brick.disk), 0) *
+              seats.length) /
+            2,
         ),
       );
     }

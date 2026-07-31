@@ -53,6 +53,24 @@ pub async fn create_lumen_pool(
 
 /// DELETE /api/storage/pool — destroy it: every brick wiped, every
 /// drop-in removed, every control plane restarted out of it.
+/// POST /api/storage/pool/members — grow the pool by one member: the
+/// 2→3 scale-out's storage half, its disk choices the operator's own.
+pub async fn grow_lumen_pool(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    raw: Body,
+) -> Result<
+    (
+        axum::http::StatusCode,
+        Json<crate::pool_workflow::PoolProgress>,
+    ),
+    ApiError,
+> {
+    let request: crate::pool_workflow::LumenPoolGrow = required_body(raw)?;
+    let progress = crate::pool_workflow::grow_pool(&state, request).await?;
+    Ok((axum::http::StatusCode::ACCEPTED, Json(progress)))
+}
+
 pub async fn destroy_lumen_pool(
     _session: Session,
     State(state): State<Arc<AppState>>,

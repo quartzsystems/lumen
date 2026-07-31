@@ -421,6 +421,7 @@ async fn a_fenced_survivor_reads_as_degraded_rather_than_unknown() {
                 map_version: None,
                 seats: None,
                 reassign_pending: None,
+                pool_uuid: None,
             },
         );
     }

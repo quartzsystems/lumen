@@ -103,6 +103,9 @@ pub struct Status {
     /// How many of the 256 slices this member homes under the committed
     /// map — what a pool-wide capacity divides each member's bytes by.
     pub seats: Option<u64>,
+    /// The pool identity the bricks were formatted into — what a grow
+    /// workflow formats a newcomer's bricks with.
+    pub pool_uuid: [u8; 16],
     /// The version a reassignment is moving to, while one is open.
     pub reassign_pending: Option<u64>,
 }
@@ -1095,6 +1098,7 @@ impl Daemon {
                 .pool()
                 .placement()
                 .map(|(node, map)| map.seats(node) as u64),
+            pool_uuid: engine.pool().pool_uuid(),
             reassign_pending: engine.reassign_pending(),
             accepts_writes: engine.accepts_writes(),
             vdisks: engine.pool().vdisks(),

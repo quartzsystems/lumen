@@ -299,6 +299,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         // restart that adopts either. Consent never travels these.
         .route("/api/peer/pool/preflight", post(peer::pool_preflight))
         .route("/api/peer/pool/prepare", post(peer::pool_prepare))
+        .route("/api/peer/pool/reconf", post(peer::pool_reconf))
         .route("/api/peer/pool/teardown", post(peer::pool_teardown))
         .route(
             "/api/peer/controlplane/restart",
@@ -379,6 +380,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/storage/pool", get(storage::pooled_storage))
         .route("/api/storage/pool", post(storage::create_lumen_pool))
         .route("/api/storage/pool", delete(storage::destroy_lumen_pool))
+        .route("/api/storage/pool/members", post(storage::grow_lumen_pool))
         .route(
             "/api/storage/pool/pending",
             get(storage::lumen_pool_pending),

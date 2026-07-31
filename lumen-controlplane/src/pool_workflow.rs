@@ -225,6 +225,30 @@ pub struct LumenPoolCreate {
     pub i_understand_this_erases_the_disks: bool,
 }
 
+/// Grow the pool by one member: the 2→3 scale-out's storage half. A
+/// separate operator act rather than a rider on the cluster's node-add,
+/// because the newcomer's disks are a choice nothing can infer.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LumenPoolGrow {
+    /// The joining cluster member's name. Called `member` rather than
+    /// `node` because `node` is the request layer's reserved routing
+    /// field, stripped before a body reaches any handler.
+    pub member: String,
+    pub bricks: Vec<BrickChoice>,
+    #[serde(default)]
+    pub i_understand_this_erases_the_disks: bool,
+}
+
+/// A serving member's conf update: one more dial, the grown member list.
+/// The member patches its *own* conf — its brick paths are its own
+/// knowledge — and restarts its daemon under the result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolReconf {
+    pub add_dial: std::net::SocketAddr,
+    pub members: Vec<u8>,
+}
+
 // ---------------------------------------------------------------------------
 // The peer seam.
 
@@ -240,6 +264,20 @@ pub trait PoolWorkflowPeers: Send + Sync {
         prepare: &PoolPrepare,
     ) -> Result<PoolPrepared, ClusterError>;
     async fn pool_teardown(&self, node: &EnvironmentNode) -> Result<(), ClusterError>;
+    /// Rewrite a serving member's conf — the grow workflow adding a dial
+    /// toward the newcomer — and restart its daemon under the new one.
+    async fn pool_reconf(
+        &self,
+        node: &EnvironmentNode,
+        reconf: &PoolReconf,
+    ) -> Result<(), ClusterError>;
+    /// Run one closed-enum verb against the member's own daemon — the
+    /// same relay the observed view rides.
+    async fn pool_verb(
+        &self,
+        node: &EnvironmentNode,
+        verb: &lumen_pool::PoolVerb,
+    ) -> Result<lumen_pool::PoolAnswer, ClusterError>;
     /// Reply-then-restart: the far handler answers first and restarts
     /// itself after, detached.
     async fn restart_controlplane(&self, node: &EnvironmentNode) -> Result<(), ClusterError>;
@@ -264,6 +302,20 @@ impl PoolWorkflowPeers for crate::inventory::NoPeers {
         Err(no_channel(node))
     }
     async fn pool_teardown(&self, node: &EnvironmentNode) -> Result<(), ClusterError> {
+        Err(no_channel(node))
+    }
+    async fn pool_reconf(
+        &self,
+        node: &EnvironmentNode,
+        _reconf: &PoolReconf,
+    ) -> Result<(), ClusterError> {
+        Err(no_channel(node))
+    }
+    async fn pool_verb(
+        &self,
+        node: &EnvironmentNode,
+        _verb: &lumen_pool::PoolVerb,
+    ) -> Result<lumen_pool::PoolAnswer, ClusterError> {
         Err(no_channel(node))
     }
     async fn restart_controlplane(&self, node: &EnvironmentNode) -> Result<(), ClusterError> {
@@ -657,9 +709,11 @@ pub fn validate_create(
         }
     }
 
-    // The engine replicates between exactly two members today; three is
-    // phase 5's reassignment.
-    if members.len() != 2 {
+    // Two or three members: three is the protocol's tested shape; more is
+    // arithmetic without a protocol yet — the slice map is proven to
+    // eight, the replication core to three, and a pool should never run
+    // where only the arithmetic has been.
+    if !(2..=3).contains(&members.len()) {
         errors.push(invalid(
             if members.len() < 2 {
                 ValidationCode::TooFewNodes
@@ -668,8 +722,7 @@ pub fn validate_create(
             },
             None,
             format!(
-                "A pool replicates between exactly two members today; \"{cluster_name}\" \
-                 has {}.",
+                "A pool runs on two or three members; \"{cluster_name}\" has {}.",
                 members.len()
             ),
         ));
@@ -1190,6 +1243,420 @@ async fn run_destroy(
     job.finish(WorkflowPhase::Complete, None);
     if let Err(err) = state.pool_deploy.restart_controlplane().await {
         tracing::warn!("the coordinator could not restart itself after the destroy: {err}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Grow: one more member — the 2→3 scale-out's storage half.
+
+/// How long the rebalance may take before the workflow calls it stuck.
+/// Moves are a full share of the pool's bytes over the Core network.
+const REBALANCE_DEADLINE: Duration = Duration::from_secs(3600);
+
+/// Rewrite this member's own conf with the grow's changes and restart its
+/// daemon under it — the peer route's local half.
+pub async fn local_reconf(state: &AppState, reconf: &PoolReconf) -> Result<(), ClusterError> {
+    let mut config = lumen_pool::PoolConfig::load()
+        .map_err(|err| ClusterError::Conflict(format!("this node's pool conf: {err}")))?
+        .ok_or_else(|| {
+            ClusterError::Conflict("this node serves no pool; nothing to reconfigure.".into())
+        })?;
+    let dial = lumen_pool::PeerRole::Dial(reconf.add_dial);
+    if !config.peers.contains(&dial) {
+        config.peers.push(dial);
+    }
+    config.members = reconf.members.clone();
+    state
+        .pool_deploy
+        .write_conf(&config)
+        .await
+        .map_err(ClusterError::Conflict)?;
+    state
+        .pool_deploy
+        .restart_daemon()
+        .await
+        .map_err(ClusterError::Conflict)?;
+    Ok(())
+}
+
+/// Run one verb against this node's own daemon — the local half of what
+/// [`PoolWorkflowPeers::pool_verb`] does for a remote member.
+async fn local_verb(
+    control: std::net::SocketAddr,
+    verb: lumen_pool::PoolVerb,
+) -> Result<lumen_pool::PoolAnswer, ClusterError> {
+    tokio::task::spawn_blocking(move || {
+        let mut client = lumen_pool::Client::connect(control)
+            .map_err(|err| ClusterError::Conflict(format!("this node's pool daemon: {err}")))?;
+        lumen_pool::execute(&mut client, &verb).map_err(ClusterError::Conflict)
+    })
+    .await
+    .map_err(|err| ClusterError::Conflict(format!("the verb task died: {err}")))?
+}
+
+pub async fn grow_pool(
+    state: &Arc<AppState>,
+    request: LumenPoolGrow,
+) -> Result<PoolProgress, ClusterError> {
+    if !request.i_understand_this_erases_the_disks {
+        return Err(ClusterError::invalid(ValidationError::new(
+            ValidationCode::UnacknowledgedDestructiveOperation,
+            Some("i_understand_this_erases_the_disks"),
+            format!(
+                "Growing the pool formats every chosen disk on \"{}\" — confirm you understand \
+                 they will be erased.",
+                request.member
+            ),
+        )));
+    }
+    let control = match &state.pool {
+        crate::pool::PoolPresence::Present { control, .. } => *control,
+        _ => {
+            return Err(ClusterError::Conflict(
+                "This node serves no pool; grow runs from a serving member.".into(),
+            ))
+        }
+    };
+    let membership = state
+        .cluster
+        .environment_record()?
+        .ok_or_else(|| ClusterError::Conflict("This node has not joined an environment.".into()))?;
+    let local = state.cluster.node().to_string();
+    let cluster_name = membership
+        .node(&local)
+        .and_then(|n| n.cluster.clone())
+        .ok_or_else(|| ClusterError::Conflict("This node is in no cluster.".into()))?;
+    let record = membership
+        .clusters
+        .iter()
+        .find(|c| c.definition.name == cluster_name)
+        .ok_or_else(|| {
+            ClusterError::Conflict(format!("\"{cluster_name}\" has no cluster record."))
+        })?;
+    let newcomer = membership.node(&request.member).cloned().ok_or_else(|| {
+        ClusterError::Conflict(format!(
+            "\"{}\" is not in the environment record; add the node to the cluster first.",
+            request.member
+        ))
+    })?;
+    if newcomer.cluster.as_deref() != Some(cluster_name.as_str()) {
+        return Err(ClusterError::Conflict(format!(
+            "\"{}\" is not a member of \"{cluster_name}\"; add the node to the cluster first.",
+            request.member
+        )));
+    }
+    if request.member == local {
+        return Err(ClusterError::Conflict(
+            "This node already serves the pool.".into(),
+        ));
+    }
+    if state.pool_peers.pool_present(&newcomer).await? {
+        return Err(ClusterError::Conflict(format!(
+            "\"{}\" already serves this pool.",
+            request.member
+        )));
+    }
+    if request.bricks.is_empty() || !request.bricks.iter().any(|b| b.tier == 0) {
+        return Err(ClusterError::Conflict(format!(
+            "\"{}\" needs at least one brick and a tier-0 one — the WAL lives there.",
+            request.member
+        )));
+    }
+
+    // The serving members and their engine ids, asked rather than derived:
+    // ids were dealt by sorted name at create, but a grown pool's ids are
+    // history, and history is what the daemons remember.
+    let status = local_verb(control, lumen_pool::PoolVerb::Status)
+        .await?
+        .into_status()
+        .map_err(|err| ClusterError::Conflict(err.to_string()))?;
+    let pool_uuid = status.pool_uuid.clone().ok_or_else(|| {
+        ClusterError::Conflict("The daemon predates the mesh and reports no pool identity.".into())
+    })?;
+    let map_version = status.map_version.ok_or_else(|| {
+        ClusterError::Conflict(
+            "The pool is unplaced (created before placement); growing it needs a placed pool — \
+             recreate through the wizard first."
+                .into(),
+        )
+    })?;
+    let mut serving: Vec<(String, u8)> = vec![(local.clone(), status.node)];
+    for member in record
+        .definition
+        .nodes
+        .iter()
+        .filter(|n| n.name != local && n.name != request.member)
+        .map(|n| n.name.clone())
+    {
+        let Some(node) = membership.node(&member).cloned() else {
+            continue;
+        };
+        let answer = state
+            .pool_peers
+            .pool_verb(&node, &lumen_pool::PoolVerb::Status)
+            .await?
+            .into_status()
+            .map_err(|err| ClusterError::Conflict(err.to_string()))?;
+        serving.push((member, answer.node));
+    }
+    let new_id = serving.iter().map(|(_, id)| *id).max().unwrap_or(0) + 1;
+    let mut members_after: Vec<u8> = serving.iter().map(|(_, id)| *id).collect();
+    members_after.push(new_id);
+    members_after.sort_unstable();
+
+    // The newcomer's Core address: it listens, everyone serving dials it —
+    // the one arrangement that leaves the serving members' existing links
+    // untouched.
+    let newcomer_core = record
+        .networks
+        .core
+        .members
+        .iter()
+        .find(|m| m.node == request.member)
+        .ok_or_else(|| ClusterError::Conflict(format!("\"{}\" has no Core seat.", request.member)))?
+        .address;
+    let newcomer_addr = std::net::SocketAddr::from((newcomer_core, PEER_PORT));
+    let mut holder_named = false;
+    let mut bricks = request.bricks.clone();
+    bricks.sort_by(|a, b| (a.tier, a.disk.clone()).cmp(&(b.tier, b.disk.clone())));
+    let planned: Vec<BrickPlan> = bricks
+        .iter()
+        .map(|brick| {
+            let wal_holder = !holder_named && brick.tier == 0;
+            holder_named |= wal_holder;
+            BrickPlan {
+                disk: brick.disk.clone(),
+                tier: brick.tier,
+                wal_holder,
+                brick_uuid: lumen_pool::mint_brick_uuid(&format!(
+                    "{}/{}",
+                    request.member, brick.disk
+                )),
+            }
+        })
+        .collect();
+    let prepare = PoolPrepare {
+        node_id: new_id,
+        pool_uuid,
+        bricks: planned,
+        peers: vec![PeerRole::Listen(newcomer_addr)],
+        members: members_after.clone(),
+        control: lumen_pool::DEFAULT_CONTROL
+            .parse()
+            .expect("a valid constant"),
+    };
+
+    let mut steps = vec![step("prepare", &request.member)];
+    for (member, _) in &serving {
+        steps.push(step("reconf", member));
+    }
+    steps.push(step("reassign", &cluster_name));
+    steps.push(step("rebalance", &cluster_name));
+    steps.push(step("commit", &cluster_name));
+    steps.push(step("restart", &local));
+    if !state.pool_job.try_begin(PoolProgress {
+        action: "grow".into(),
+        phase: WorkflowPhase::Running,
+        error: None,
+        steps,
+    }) {
+        return Err(ClusterError::Conflict(
+            "A pool job is already running. Wait for it to finish.".into(),
+        ));
+    }
+    let run_state = Arc::clone(state);
+    tokio::spawn(async move {
+        run_grow(
+            &run_state,
+            membership,
+            local,
+            cluster_name,
+            control,
+            request.member,
+            prepare,
+            serving,
+            members_after,
+            map_version + 1,
+            newcomer_addr,
+        )
+        .await;
+    });
+    Ok(state.pool_job.snapshot().expect("just begun"))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_grow(
+    state: &Arc<AppState>,
+    membership: EnvironmentMembership,
+    local: String,
+    cluster: String,
+    control: std::net::SocketAddr,
+    newcomer: String,
+    prepare: PoolPrepare,
+    serving: Vec<(String, u8)>,
+    members_after: Vec<u8>,
+    new_version: u64,
+    newcomer_addr: std::net::SocketAddr,
+) {
+    let job = state.pool_job.clone();
+    let fail =
+        |step: &str, member: &str, err: String, job: &crate::pool_workflow::PoolJobHandle| {
+            job.set_step(step, member, StepState::Failed, Some(err.clone()));
+            job.finish(WorkflowPhase::Failed, Some(err));
+        };
+
+    // 1. The newcomer becomes a member: wiped, formatted, conf'd, serving.
+    job.set_step("prepare", &newcomer, StepState::Running, None);
+    let Some(node) = membership.node(&newcomer).cloned() else {
+        fail(
+            "prepare",
+            &newcomer,
+            format!("\"{newcomer}\" left the record mid-grow."),
+            &job,
+        );
+        return;
+    };
+    if let Err(err) = state.pool_peers.pool_prepare(&node, &prepare).await {
+        // Nothing serving changed yet: tear the newcomer back down.
+        let _ = state.pool_peers.pool_teardown(&node).await;
+        fail("prepare", &newcomer, err.to_string(), &job);
+        return;
+    }
+    job.set_step("prepare", &newcomer, StepState::Done, None);
+
+    // 2. Every serving member dials the newcomer and carries the grown
+    // member list — daemon restarts, one member at a time.
+    let reconf = PoolReconf {
+        add_dial: newcomer_addr,
+        members: members_after.clone(),
+    };
+    for (member, _) in &serving {
+        job.set_step("reconf", member, StepState::Running, None);
+        let outcome = if member == &local {
+            local_reconf(state, &reconf).await
+        } else {
+            match membership.node(member).cloned() {
+                Some(node) => state.pool_peers.pool_reconf(&node, &reconf).await,
+                None => Err(ClusterError::NotFound(format!(
+                    "\"{member}\" is not in the environment record."
+                ))),
+            }
+        };
+        if let Err(err) = outcome {
+            fail("reconf", member, err.to_string(), &job);
+            return;
+        }
+        job.set_step("reconf", member, StepState::Done, None);
+    }
+
+    // 3. The reassignment opens on every member — serving and newcomer
+    // alike; each computes the same map from the same arithmetic.
+    job.set_step("reassign", &cluster, StepState::Running, None);
+    let verb = lumen_pool::PoolVerb::Reassign {
+        version: new_version,
+        members: members_after.clone(),
+    };
+    let mut everyone: Vec<String> = serving.iter().map(|(m, _)| m.clone()).collect();
+    everyone.push(newcomer.clone());
+    for member in &everyone {
+        let outcome = if member == &local {
+            local_verb(control, verb.clone()).await.map(|_| ())
+        } else {
+            match membership.node(member).cloned() {
+                Some(node) => state.pool_peers.pool_verb(&node, &verb).await.map(|_| ()),
+                None => Err(ClusterError::NotFound(format!(
+                    "\"{member}\" is not in the environment record."
+                ))),
+            }
+        };
+        if let Err(err) = outcome {
+            fail("reassign", &cluster, format!("\"{member}\": {err}"), &job);
+            return;
+        }
+    }
+    job.set_step("reassign", &cluster, StepState::Done, None);
+
+    // 4. Wait for every member to owe nothing. Idempotent to re-ask; a
+    // member mid-restart just answers on the next poll.
+    job.set_step("rebalance", &cluster, StepState::Running, None);
+    let deadline = std::time::Instant::now() + REBALANCE_DEADLINE;
+    'rebalance: loop {
+        if std::time::Instant::now() > deadline {
+            fail(
+                "rebalance",
+                &cluster,
+                "The rebalance did not finish within an hour; the pool keeps moving blocks — \
+                 retry the grow to resume watching it."
+                    .into(),
+                &job,
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        for member in &everyone {
+            let answer = if member == &local {
+                local_verb(control, lumen_pool::PoolVerb::ReassignStatus).await
+            } else {
+                match membership.node(member).cloned() {
+                    Some(node) => {
+                        state
+                            .pool_peers
+                            .pool_verb(&node, &lumen_pool::PoolVerb::ReassignStatus)
+                            .await
+                    }
+                    None => continue 'rebalance,
+                }
+            };
+            match answer.map(|a| a.into_reassigning()) {
+                Ok(Ok(Some((_, 0)))) => continue,
+                Ok(Ok(_)) | Err(_) => continue 'rebalance,
+                Ok(Err(_)) => continue 'rebalance,
+            }
+        }
+        break;
+    }
+    job.set_step("rebalance", &cluster, StepState::Done, None);
+
+    // 5. Commit everywhere — the point past which collectors may forget.
+    job.set_step("commit", &cluster, StepState::Running, None);
+    for member in &everyone {
+        let outcome = if member == &local {
+            local_verb(control, lumen_pool::PoolVerb::CommitReassign)
+                .await
+                .map(|_| ())
+        } else {
+            match membership.node(member).cloned() {
+                Some(node) => state
+                    .pool_peers
+                    .pool_verb(&node, &lumen_pool::PoolVerb::CommitReassign)
+                    .await
+                    .map(|_| ()),
+                None => Err(ClusterError::NotFound(format!(
+                    "\"{member}\" is not in the environment record."
+                ))),
+            }
+        };
+        if let Err(err) = outcome {
+            fail("commit", &cluster, format!("\"{member}\": {err}"), &job);
+            return;
+        }
+    }
+    job.set_step("commit", &cluster, StepState::Done, None);
+
+    // 6. Control planes adopt the grown membership: peers first, the
+    // coordinator marking Complete before restarting itself last.
+    for member in everyone.iter().filter(|m| *m != &local) {
+        if let Some(node) = membership.node(member).cloned() {
+            if let Err(err) = adopt_member(state, &node, true).await {
+                fail("restart", &local, format!("\"{member}\": {err}"), &job);
+                return;
+            }
+        }
+    }
+    job.set_step("restart", &local, StepState::Done, None);
+    job.finish(WorkflowPhase::Complete, None);
+    if let Err(err) = state.pool_deploy.restart_controlplane().await {
+        tracing::warn!("the coordinator could not restart itself after the grow: {err}");
     }
 }
 
