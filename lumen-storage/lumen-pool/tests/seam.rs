@@ -417,6 +417,10 @@ async fn a_fenced_survivor_reads_as_degraded_rather_than_unknown() {
                 vdisks: Vec::new(),
                 leases: Vec::new(),
                 stream: (12, 12, 0),
+                peers: Vec::new(),
+                map_version: None,
+                seats: None,
+                reassign_pending: None,
             },
         );
     }

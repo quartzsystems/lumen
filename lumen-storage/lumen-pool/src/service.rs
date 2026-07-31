@@ -491,13 +491,23 @@ impl VmVolumes for PoolService {
                 };
                 self.fleet.relinquish(&here, vdisk, to).await?;
                 // Wait for the far side to agree, so a caller told the
-                // migration finished is told the truth.
-                let destination = disk
-                    .members
-                    .iter()
-                    .find(|member| *member != &here)
-                    .cloned()
-                    .unwrap_or_else(|| here.clone());
+                // migration finished is told the truth. The window already
+                // recorded *which* member the pen went to; at two members
+                // "the one that isn't me" was the same answer, at three it
+                // is an arbitrary wrong peer — so the name comes from the
+                // recorded id, never from elimination.
+                let mut destination = None;
+                for member in disk.members.iter().filter(|member| *member != &here) {
+                    if self.fleet.node_id(member).await? == to {
+                        destination = Some(member.clone());
+                        break;
+                    }
+                }
+                let destination = destination.ok_or_else(|| {
+                    PoolError::Backend(format!(
+                        "the window on \"{device}\" names node {to}, which is no member of it"
+                    ))
+                })?;
                 for attempt in 0..HANDOVER_TRIES {
                     match self.fleet.accept(&destination, vdisk).await {
                         Ok(()) => break,
@@ -520,11 +530,24 @@ impl VmVolumes for PoolService {
                 Ok(())
             }
             MigrationWindow::Aborted => {
+                // Who the window aimed at, read before the abort closes
+                // it: only that member's device is unwanted — a third
+                // member was never part of this migration, and unexporting
+                // it would tear down a device an HA restart may be using.
+                let aimed = match self.fleet.lease(&here, vdisk).await? {
+                    Some((_, Some(to))) => Some(to),
+                    _ => None,
+                };
                 self.fleet.abort(&here, vdisk).await?;
-                // The device on the far side is no longer wanted. Its
-                // failure must not mask the migration's own, so it is
-                // logged rather than raised.
+                // The device on the abandoned destination is no longer
+                // wanted. Its failure must not mask the migration's own,
+                // so it is logged rather than raised.
                 for member in disk.members.iter().filter(|member| *member != &here) {
+                    if let Some(to) = aimed {
+                        if self.fleet.node_id(member).await.ok() != Some(to) {
+                            continue;
+                        }
+                    }
                     if let Err(err) = self.fleet.unexport(member, vdisk).await {
                         tracing::warn!(
                             %device, %member, %err,

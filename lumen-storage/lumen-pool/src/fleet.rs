@@ -282,6 +282,10 @@ impl PoolFleet for MockFleet {
             vdisks,
             leases,
             stream: pinned.map_or((0, 0, 0), |s| s.stream),
+            peers: pinned.map_or_else(Vec::new, |s| s.peers.clone()),
+            map_version: pinned.and_then(|s| s.map_version),
+            seats: pinned.and_then(|s| s.seats),
+            reassign_pending: pinned.and_then(|s| s.reassign_pending),
         })
     }
 

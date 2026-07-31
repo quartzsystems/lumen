@@ -307,9 +307,10 @@ mod tests {
         let config = PoolConfig {
             bricks: vec![PathBuf::from("/dev/disk/by-id/nvme-eui.0001")],
             node: 0,
-            peer: Some(crate::config::PeerRole::Listen(
+            peers: vec![crate::config::PeerRole::Listen(
                 "10.10.0.1:7800".parse().unwrap(),
-            )),
+            )],
+            members: vec![0, 1],
             control: crate::config::DEFAULT_CONTROL.parse().unwrap(),
         };
         deploy.write_conf(&config).await.unwrap();
@@ -321,7 +322,7 @@ mod tests {
         );
         let stdin = ran[0].stdin.as_deref().unwrap();
         assert!(stdin.contains("LUMEN_FSD_BRICK=/dev/disk/by-id/nvme-eui.0001"));
-        assert!(stdin.contains("LUMEN_FSD_PEER=--listen 10.10.0.1:7800"));
+        assert!(stdin.contains("LUMEN_FSD_PEER=--listen 10.10.0.1:7800 --members 0,1"));
     }
 
     #[tokio::test]

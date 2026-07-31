@@ -47,16 +47,21 @@ pub struct PoolConfig {
     /// silently dropping a field invites the next reader to assume it is
     /// absent.
     pub node: u8,
-    /// Which way this node's half of the peer link points.
-    pub peer: Option<PeerRole>,
+    /// This node's ends of the mesh: at most one listener, one dial per
+    /// lower-id member.
+    pub peers: Vec<PeerRole>,
+    /// The pool's member ids, for placement. Empty is the pre-placement
+    /// legacy: the daemon opens unplaced and every member holds
+    /// everything. Written for every pool the workflow creates now.
+    pub members: Vec<u8>,
     /// The daemon's control surface. Loopback.
     pub control: SocketAddr,
 }
 
-/// The peer link's two ends: one member listens, the other dials. The
-/// value is the flag the unit hands the daemon, verbatim. Serialized
-/// because the create workflow's prepare payload carries one to each
-/// member.
+/// One end of a peer link: listen for higher-id members, dial a lower-id
+/// one. The conf carries these as the daemon's own flags, verbatim.
+/// Serialized because the create workflow's prepare payload carries a
+/// member's set to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "role", content = "addr", rename_all = "kebab-case")]
 pub enum PeerRole {
@@ -114,7 +119,8 @@ impl PoolConfig {
     pub fn parse(text: &str) -> Result<PoolConfig, ConfigError> {
         let mut bricks: Option<Vec<PathBuf>> = None;
         let mut node = None;
-        let mut peer = None;
+        let mut peers: Vec<PeerRole> = Vec::new();
+        let mut members: Vec<u8> = Vec::new();
         let mut control = None;
         for line in text.lines() {
             let line = line.trim();
@@ -143,29 +149,65 @@ impl PoolConfig {
                     })?)
                 }
                 "LUMEN_FSD_PEER" => {
-                    // The value is the daemon's own flag pair: `--listen
-                    // <addr>` or `--dial <addr>`. Parsed rather than carried
-                    // as prose, because a workflow that writes it must also
+                    // The value is the daemon's own peer-topology flags,
+                    // verbatim: `[--listen <addr>] [--dial <addr>]...
+                    // [--members <id,id,...>]` — the unit word-splits it
+                    // straight into argv. Parsed rather than carried as
+                    // prose, because a workflow that writes it must also
                     // be able to read back what it wrote.
-                    let (flag, addr) = value.split_once(char::is_whitespace).ok_or_else(|| {
-                        ConfigError::Malformed(format!(
-                            "LUMEN_FSD_PEER wants '--listen <addr>' or '--dial <addr>', got: {value}"
-                        ))
-                    })?;
-                    let addr: SocketAddr = addr.trim().parse().map_err(|_| {
-                        ConfigError::Malformed(format!(
-                            "LUMEN_FSD_PEER address does not parse: {value}"
-                        ))
-                    })?;
-                    peer = Some(match flag {
-                        "--listen" => PeerRole::Listen(addr),
-                        "--dial" => PeerRole::Dial(addr),
-                        _ => {
-                            return Err(ConfigError::Malformed(format!(
-                                "LUMEN_FSD_PEER flag is neither --listen nor --dial: {value}"
-                            )))
+                    let tokens: Vec<&str> = value.split_whitespace().collect();
+                    let mut at = 0;
+                    while at < tokens.len() {
+                        let flag = tokens[at];
+                        let arg = tokens.get(at + 1).ok_or_else(|| {
+                            ConfigError::Malformed(format!(
+                                "LUMEN_FSD_PEER flag {flag} has no value: {value}"
+                            ))
+                        })?;
+                        match flag {
+                            "--listen" | "--dial" => {
+                                let addr: SocketAddr = arg.parse().map_err(|_| {
+                                    ConfigError::Malformed(format!(
+                                        "LUMEN_FSD_PEER address does not parse: {arg}"
+                                    ))
+                                })?;
+                                peers.push(if flag == "--listen" {
+                                    PeerRole::Listen(addr)
+                                } else {
+                                    PeerRole::Dial(addr)
+                                });
+                            }
+                            "--members" => {
+                                members = arg
+                                    .split(',')
+                                    .map(|id| {
+                                        id.parse().map_err(|_| {
+                                            ConfigError::Malformed(format!(
+                                                "LUMEN_FSD_PEER member id does not parse: {id}"
+                                            ))
+                                        })
+                                    })
+                                    .collect::<Result<Vec<u8>, _>>()?;
+                            }
+                            _ => {
+                                return Err(ConfigError::Malformed(format!(
+                                    "LUMEN_FSD_PEER flag is not one of --listen/--dial/--members: \
+                                     {flag}"
+                                )))
+                            }
                         }
-                    });
+                        at += 2;
+                    }
+                    if peers
+                        .iter()
+                        .filter(|role| matches!(role, PeerRole::Listen(_)))
+                        .count()
+                        > 1
+                    {
+                        return Err(ConfigError::Malformed(
+                            "LUMEN_FSD_PEER names two listeners; a daemon has one door".into(),
+                        ));
+                    }
                 }
                 "LUMEN_FSD_CONTROL" => {
                     control = Some(value.parse().map_err(|_| {
@@ -184,8 +226,10 @@ impl PoolConfig {
             node: node.ok_or_else(|| {
                 ConfigError::Malformed("no LUMEN_FSD_NODE: this names the engine's node id".into())
             })?,
-            // Absent is legal: a one-node bring-up has no peer yet.
-            peer,
+            // Empty is legal: a one-node bring-up has no peers yet, and a
+            // pre-placement pool names no members.
+            peers,
+            members,
             // The unit hardcodes the control address, so a file without one
             // is ordinary rather than incomplete.
             control: control.unwrap_or_else(|| DEFAULT_CONTROL.parse().expect("a valid constant")),
@@ -220,14 +264,25 @@ impl PoolConfig {
             .collect();
         let _ = writeln!(out, "LUMEN_FSD_BRICK={}", paths.join(" "));
         let _ = writeln!(out, "LUMEN_FSD_NODE={}", self.node);
-        match self.peer {
-            Some(PeerRole::Listen(addr)) => {
-                let _ = writeln!(out, "LUMEN_FSD_PEER=--listen {addr}");
+        if !self.peers.is_empty() || !self.members.is_empty() {
+            // Canonical order — listener first, dials after, members last
+            // — so writer and reader converge on one spelling.
+            let mut flags: Vec<String> = Vec::new();
+            for role in &self.peers {
+                if let PeerRole::Listen(addr) = role {
+                    flags.push(format!("--listen {addr}"));
+                }
             }
-            Some(PeerRole::Dial(addr)) => {
-                let _ = writeln!(out, "LUMEN_FSD_PEER=--dial {addr}");
+            for role in &self.peers {
+                if let PeerRole::Dial(addr) = role {
+                    flags.push(format!("--dial {addr}"));
+                }
             }
-            None => {}
+            if !self.members.is_empty() {
+                let ids: Vec<String> = self.members.iter().map(u8::to_string).collect();
+                flags.push(format!("--members {}", ids.join(",")));
+            }
+            let _ = writeln!(out, "LUMEN_FSD_PEER={}", flags.join(" "));
         }
         if self.control.to_string() != DEFAULT_CONTROL {
             let _ = writeln!(out, "LUMEN_FSD_CONTROL={}", self.control);
@@ -260,9 +315,10 @@ mod tests {
         );
         assert_eq!(config.node, 1);
         assert_eq!(
-            config.peer,
-            Some(PeerRole::Dial("10.10.0.1:7800".parse().unwrap()))
+            config.peers,
+            vec![PeerRole::Dial("10.10.0.1:7800".parse().unwrap())]
         );
+        assert_eq!(config.members, Vec::<u8>::new());
         // Not in the file, because the unit passes it: the default is the
         // unit's own constant, and loopback on purpose.
         assert_eq!(config.control.to_string(), DEFAULT_CONTROL);
@@ -275,7 +331,7 @@ mod tests {
                 .unwrap();
         assert_eq!(config.bricks, vec![PathBuf::from("/var/lib/lumen/brick")]);
         assert_eq!(config.node, 0);
-        assert_eq!(config.peer, None, "a one-node bring-up has no peer yet");
+        assert!(config.peers.is_empty(), "a one-node bring-up has no peers");
     }
 
     #[test]
@@ -288,13 +344,20 @@ mod tests {
     }
 
     /// The writer and the parser are one contract: what render says, parse
-    /// reads back identically — both peer directions, both control shapes.
+    /// reads back identically — every mesh shape, both control shapes.
     #[test]
     fn what_render_writes_parse_reads_back_exactly() {
-        for peer in [
-            Some(PeerRole::Listen("10.10.0.1:7800".parse().unwrap())),
-            Some(PeerRole::Dial("10.10.0.2:7800".parse().unwrap())),
-            None,
+        let listen = PeerRole::Listen("10.10.0.1:7800".parse().unwrap());
+        let dial_a = PeerRole::Dial("10.10.0.2:7800".parse().unwrap());
+        let dial_b = PeerRole::Dial("10.10.0.3:7800".parse().unwrap());
+        for (peers, members) in [
+            (vec![listen], vec![0u8, 1]),
+            (vec![dial_a], vec![0, 1]),
+            // The mesh's middle seat: listening for the higher id,
+            // dialing the lower.
+            (vec![listen, dial_a], vec![0, 1, 2]),
+            (vec![dial_a, dial_b], vec![0, 1, 2]),
+            (Vec::new(), Vec::new()),
         ] {
             for control in [DEFAULT_CONTROL, "127.0.0.1:7741"] {
                 let config = PoolConfig {
@@ -303,7 +366,8 @@ mod tests {
                         PathBuf::from("/dev/disk/by-id/ata-slow.0002"),
                     ],
                     node: 1,
-                    peer,
+                    peers: peers.clone(),
+                    members: members.clone(),
                     control: control.parse().unwrap(),
                 };
                 let text = config.render().unwrap();
@@ -314,6 +378,12 @@ mod tests {
                 );
             }
         }
+        // Two listeners is a malformed file, not a topology.
+        assert!(PoolConfig::parse(
+            "LUMEN_FSD_BRICK=/b\nLUMEN_FSD_NODE=0\n\
+             LUMEN_FSD_PEER=--listen 10.10.0.1:7800 --listen 10.10.0.2:7800\n"
+        )
+        .is_err());
     }
 
     /// A path with whitespace could not survive the file's own format, so
@@ -323,14 +393,16 @@ mod tests {
         let config = PoolConfig {
             bricks: vec![PathBuf::from("/dev/disk/by-id/has a space")],
             node: 0,
-            peer: None,
+            peers: Vec::new(),
+            members: Vec::new(),
             control: DEFAULT_CONTROL.parse().unwrap(),
         };
         assert!(config.render().is_err());
         let empty = PoolConfig {
             bricks: Vec::new(),
             node: 0,
-            peer: None,
+            peers: Vec::new(),
+            members: Vec::new(),
             control: DEFAULT_CONTROL.parse().unwrap(),
         };
         assert!(empty.render().is_err());

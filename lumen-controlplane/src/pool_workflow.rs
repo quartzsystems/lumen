@@ -184,7 +184,14 @@ pub struct PoolPrepare {
     pub node_id: u8,
     pub pool_uuid: String,
     pub bricks: Vec<BrickPlan>,
-    pub peer: Option<PeerRole>,
+    /// This member's ends of the mesh: at most one listener, one dial per
+    /// lower-id member.
+    #[serde(default)]
+    pub peers: Vec<PeerRole>,
+    /// The pool's member ids, for placement — written into the conf so
+    /// the daemon opens placed.
+    #[serde(default)]
+    pub members: Vec<u8>,
     /// The daemon's control surface — the unit's loopback constant, and an
     /// ephemeral port in the tests that stand a real daemon in for it.
     pub control: std::net::SocketAddr,
@@ -379,7 +386,8 @@ pub async fn local_prepare(
     let config = PoolConfig {
         bricks: resolved.iter().map(|(_, path)| path.into()).collect(),
         node: prepare.node_id,
-        peer: prepare.peer,
+        peers: prepare.peers.clone(),
+        members: prepare.members.clone(),
         control: prepare.control,
     };
     state
@@ -694,14 +702,21 @@ fn plan_members(
     let mut names: Vec<String> = request.seats.iter().map(|s| s.node.clone()).collect();
     names.sort();
     let pool_uuid = lumen_pool::mint_pool_uuid();
-    let listener_core = record
-        .networks
-        .core
-        .members
-        .iter()
-        .find(|m| m.node == names[0])
-        .ok_or_else(|| ClusterError::Conflict(format!("\"{}\" has no Core seat.", names[0])))?
-        .address;
+    // Every member's own Core address: the mesh convention gives each
+    // seat its own listener, and each dials every lower-id member.
+    let mut cores = Vec::new();
+    for name in &names {
+        let core = record
+            .networks
+            .core
+            .members
+            .iter()
+            .find(|m| m.node == *name)
+            .ok_or_else(|| ClusterError::Conflict(format!("\"{name}\" has no Core seat.")))?
+            .address;
+        cores.push(core);
+    }
+    let member_ids: Vec<u8> = (0..names.len() as u8).collect();
 
     let mut plans = Vec::new();
     for (index, name) in names.iter().enumerate() {
@@ -726,18 +741,29 @@ fn plan_members(
                 brick_uuid: lumen_pool::mint_brick_uuid(&format!("{name}/{}", brick.disk)),
             });
         }
-        let peer = if index == 0 {
-            PeerRole::Listen(std::net::SocketAddr::from((listener_core, PEER_PORT)))
-        } else {
-            PeerRole::Dial(std::net::SocketAddr::from((listener_core, PEER_PORT)))
-        };
+        // The mesh: a listener wherever a higher-id member will dial in,
+        // and one dial per lower-id member. At two members this is
+        // exactly the old listener/dialer pair.
+        let mut peers = Vec::new();
+        if index + 1 < names.len() {
+            peers.push(PeerRole::Listen(std::net::SocketAddr::from((
+                cores[index],
+                PEER_PORT,
+            ))));
+        }
+        for lower in cores.iter().take(index) {
+            peers.push(PeerRole::Dial(std::net::SocketAddr::from((
+                *lower, PEER_PORT,
+            ))));
+        }
         plans.push(MemberPlan {
             name: name.clone(),
             prepare: PoolPrepare {
                 node_id: index as u8,
                 pool_uuid: pool_uuid.clone(),
                 bricks: planned,
-                peer: Some(peer),
+                peers,
+                members: member_ids.clone(),
                 control: lumen_pool::DEFAULT_CONTROL
                     .parse()
                     .expect("a valid constant"),
@@ -1387,13 +1413,14 @@ mod tests {
         assert_eq!(plans[0].name, "lumen01");
         assert_eq!(plans[0].prepare.node_id, 0);
         assert_eq!(
-            plans[0].prepare.peer,
-            Some(PeerRole::Listen("10.10.0.1:7800".parse().unwrap()))
+            plans[0].prepare.peers,
+            vec![PeerRole::Listen("10.10.0.1:7800".parse().unwrap())]
         );
         assert_eq!(
-            plans[1].prepare.peer,
-            Some(PeerRole::Dial("10.10.0.1:7800".parse().unwrap()))
+            plans[1].prepare.peers,
+            vec![PeerRole::Dial("10.10.0.1:7800".parse().unwrap())]
         );
+        assert_eq!(plans[0].prepare.members, vec![0, 1]);
         assert_eq!(plans[0].prepare.pool_uuid, plans[1].prepare.pool_uuid);
         // lumen02's bricks sort (tier, disk): sdb tier 0 first, and it —
         // not the tier-1 disk — holds the WAL.

@@ -100,6 +100,9 @@ pub struct Status {
     pub era_target: u64,
     /// The committed slice map's version; `None` when unplaced.
     pub map_version: Option<u64>,
+    /// How many of the 256 slices this member homes under the committed
+    /// map — what a pool-wide capacity divides each member's bytes by.
+    pub seats: Option<u64>,
     /// The version a reassignment is moving to, while one is open.
     pub reassign_pending: Option<u64>,
 }
@@ -1088,6 +1091,10 @@ impl Daemon {
             era: engine.pool().era(),
             era_target: engine.era_target(),
             map_version: engine.pool().placement().map(|(_, map)| map.version()),
+            seats: engine
+                .pool()
+                .placement()
+                .map(|(node, map)| map.seats(node) as u64),
             reassign_pending: engine.reassign_pending(),
             accepts_writes: engine.accepts_writes(),
             vdisks: engine.pool().vdisks(),

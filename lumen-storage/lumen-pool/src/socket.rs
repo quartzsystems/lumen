@@ -152,6 +152,10 @@ impl PoolFleet for SocketFleet {
                 })
                 .collect(),
             stream: view.stream,
+            peers: view.peers,
+            map_version: view.map_version,
+            seats: view.seats,
+            reassign_pending: view.reassign_pending,
         })
     }
 

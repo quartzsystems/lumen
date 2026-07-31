@@ -439,6 +439,9 @@ fn status_line(daemon: &Daemon) -> String {
     if let Some(version) = s.map_version {
         line.push_str(&format!(" map={version}"));
     }
+    if let Some(seats) = s.seats {
+        line.push_str(&format!(" seats={seats}"));
+    }
     if let Some(version) = s.reassign_pending {
         line.push_str(&format!(" reassign={version}"));
     }
@@ -520,6 +523,8 @@ pub struct StatusView {
     pub era_target: Option<u64>,
     /// The committed slice map's version; `None` when unplaced.
     pub map_version: Option<u64>,
+    /// How many of the 256 slices this member homes; `None` when unplaced.
+    pub seats: Option<u64>,
     /// The version a reassignment is moving to, while one is open.
     pub reassign_pending: Option<u64>,
 }
@@ -609,6 +614,7 @@ fn parse_status(reply: &str) -> Option<StatusView> {
     let mut peers: Vec<(u8, u64, u64, u64)> = Vec::new();
     let mut era_target = None;
     let mut map_version = None;
+    let mut seats = None;
     let mut reassign_pending = None;
     for token in reply.split_whitespace() {
         let (key, value) = token.split_once('=')?;
@@ -687,6 +693,7 @@ fn parse_status(reply: &str) -> Option<StatusView> {
             "applied" => applied = Some(value.parse().ok()?),
             "era_target" => era_target = Some(value.parse().ok()?),
             "map" => map_version = Some(value.parse().ok()?),
+            "seats" => seats = Some(value.parse().ok()?),
             "reassign" => reassign_pending = Some(value.parse().ok()?),
             // An unknown key is a newer daemon, not a broken one.
             _ => {}
@@ -720,6 +727,7 @@ fn parse_status(reply: &str) -> Option<StatusView> {
         peers,
         era_target,
         map_version,
+        seats,
         reassign_pending,
     })
 }

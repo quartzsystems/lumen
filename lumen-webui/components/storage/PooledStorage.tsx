@@ -157,9 +157,19 @@ export function PooledStorageSection() {
         {pool?.usable_bytes !== undefined && (
           <span
             className="text-[12px] text-[var(--qz-fg-3)]"
-            title="Per-tier minimum over the members, before dedupe — dedupe only makes it bigger."
+            title="From every member's space and its share of the 256 slices, before dedupe — dedupe only makes it bigger."
           >
             {formatBytes(pool.usable_bytes)} usable
+          </span>
+        )}
+        {pool?.members.some(
+          (m) => "Answered" in m.view && m.view.Answered.reassign_pending != null,
+        ) && (
+          <span
+            className="badge badge-info"
+            title="The pool is moving data to its new member layout; capacity and placement settle when it completes."
+          >
+            Rebalancing
           </span>
         )}
         {pool && (

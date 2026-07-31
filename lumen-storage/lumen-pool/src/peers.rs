@@ -114,6 +114,25 @@ pub enum PoolVerb {
     Accept {
         vdisk: u64,
     },
+    /// The cluster's verdict, mesh form: this member is to continue
+    /// without `node`, at the era the verdict layer computed from every
+    /// survivor's reported floor. The computation lives beside the quorum
+    /// knowledge — here, above the daemons — never in the engine.
+    FenceMember {
+        node: u8,
+        era: u64,
+    },
+    /// Open a reassignment toward `members` at `version`; the member's
+    /// own maintenance drives the moves.
+    Reassign {
+        version: u64,
+        members: Vec<u8>,
+    },
+    /// `(pending version, blocks still owed)` — the rebalance progress a
+    /// workflow polls before it may commit anywhere.
+    ReassignStatus,
+    /// Commit — only after every member reports zero owed.
+    CommitReassign,
 }
 
 /// What a verb answered. One variant per shape rather than a string, so a
@@ -138,6 +157,9 @@ pub enum PoolAnswer {
     Device(String),
     /// A lease, or nobody holding one.
     Lease(Option<LeaseSeen>),
+    /// A reassignment's progress: `Some((version, owed))` while one is
+    /// open, `None` when nothing is.
+    Reassigning(Option<(u64, u64)>),
     /// The verb did what it said and had nothing to report.
     Done,
 }
@@ -294,6 +316,26 @@ pub fn execute(client: &mut Client, verb: &PoolVerb) -> std::result::Result<Pool
             client.accept(vdisk)?;
             PoolAnswer::Done
         }
+        PoolVerb::FenceMember { node, era } => {
+            client.fence_member(node, era)?;
+            PoolAnswer::Done
+        }
+        PoolVerb::Reassign {
+            version,
+            ref members,
+        } => {
+            client.reassign(version, members)?;
+            PoolAnswer::Done
+        }
+        PoolVerb::ReassignStatus => PoolAnswer::Reassigning(
+            client
+                .reassign_status()?
+                .map(|(version, owed)| (version, owed as u64)),
+        ),
+        PoolVerb::CommitReassign => {
+            client.commit_reassign()?;
+            PoolAnswer::Done
+        }
     })
 }
 
@@ -339,6 +381,10 @@ fn status_of(client: &mut Client) -> std::result::Result<MemberStatus, String> {
             })
             .collect(),
         stream: view.stream,
+        peers: view.peers,
+        map_version: view.map_version,
+        seats: view.seats,
+        reassign_pending: view.reassign_pending,
     })
 }
 
@@ -587,6 +633,10 @@ mod tests {
                     vdisks: Vec::new(),
                     leases: Vec::new(),
                     stream: (0, 0, 0),
+                    peers: Vec::new(),
+                    map_version: None,
+                    seats: None,
+                    reassign_pending: None,
                 }),
                 _ => PoolAnswer::Done,
             })
@@ -727,6 +777,13 @@ mod tests {
             PoolVerb::Relinquish { vdisk: 1795, to: 1 },
             PoolVerb::Abort { vdisk: 1795 },
             PoolVerb::Accept { vdisk: 1795 },
+            PoolVerb::FenceMember { node: 2, era: 5 },
+            PoolVerb::Reassign {
+                version: 3,
+                members: vec![0, 1, 2],
+            },
+            PoolVerb::ReassignStatus,
+            PoolVerb::CommitReassign,
         ] {
             let json = serde_json::to_string(&verb).unwrap();
             assert_eq!(serde_json::from_str::<PoolVerb>(&json).unwrap(), verb);
@@ -767,6 +824,10 @@ mod tests {
                     },
                 )],
                 stream: (9, 9, 3),
+                peers: vec![(1, 9, 9, 3), (2, 4, 4, 4)],
+                map_version: Some(2),
+                seats: Some(171),
+                reassign_pending: Some(3),
             }),
             PoolAnswer::Vdisks(vec![(1795, 512 << 20), (2, 8 << 20)]),
             PoolAnswer::Vdisks(Vec::new()),
@@ -789,6 +850,8 @@ mod tests {
                 handing_to: None,
             })),
             PoolAnswer::Lease(None),
+            PoolAnswer::Reassigning(Some((3, 41))),
+            PoolAnswer::Reassigning(None),
             PoolAnswer::Done,
         ] {
             let json = serde_json::to_string(&answer)

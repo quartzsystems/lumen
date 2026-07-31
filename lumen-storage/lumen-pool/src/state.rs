@@ -71,8 +71,25 @@ pub struct MemberStatus {
     pub vdisks: Vec<(u64, u64)>,
     /// The leases this member knows about, by vdisk.
     pub leases: Vec<(u64, LeaseSeen)>,
-    /// `(sent, peer_confirmed_durable, applied_from_peer)`.
+    /// `(sent, peer_confirmed_durable, applied_from_peer)` — the busiest
+    /// stream's triple.
     pub stream: (u64, u64, u64),
+    /// The same per peer, `(peer, sent, durable, applied)` — the mesh's
+    /// honest form. Empty from a pre-mesh daemon.
+    #[serde(default)]
+    pub peers: Vec<(u8, u64, u64, u64)>,
+    /// The committed slice map's version; `None` when unplaced (the
+    /// two-member legacy, where every member holds everything).
+    #[serde(default)]
+    pub map_version: Option<u64>,
+    /// How many of the 256 slices this member homes — what the pool-wide
+    /// capacity divides its bytes by. `None` when unplaced.
+    #[serde(default)]
+    pub seats: Option<u64>,
+    /// The version a reassignment is moving to, while one is open — the
+    /// console's cue that a rebalance is running.
+    #[serde(default)]
+    pub reassign_pending: Option<u64>,
 }
 
 impl MemberStatus {
@@ -115,11 +132,20 @@ pub struct BrickSeen {
     pub payload_bytes: u64,
 }
 
+/// How many slices the map deals — lumen-fs's `slice.rs` arithmetic, and
+/// the divisor that turns one member's bytes into a pool-wide bound.
+const SLICES: u64 = 256;
+
 /// The one capacity figure, from every answering member's per-tier
-/// figures: RF=2 with both members holding everything makes the smaller
-/// member the truth, per tier — `min` and then the sum, never `Σ/2`,
-/// which overstates whenever members are unequal. `None` while any member
-/// is silent, because a figure computed from half a pool is a guess.
+/// figures. On a placed pool each member homes `seats` of the 256 slices,
+/// so a member with `bytes` of space bounds the pool's logical bytes at
+/// `bytes × 256 / seats` — the binding member is the one that fills
+/// first, and the pool's figure is the smallest bound. At two members
+/// every seat count is 256 and this **is** min-over-members; at three it
+/// genuinely exceeds any one node, which is the whole point of slicing.
+/// Members reporting no seats (unplaced, pre-mesh) fall back to the
+/// min-over-members truth. `None` while any member is silent, because a
+/// figure computed from half a pool is a guess.
 pub fn pool_usable_bytes<'a>(
     members: impl Iterator<Item = Option<&'a MemberStatus>>,
 ) -> Option<u64> {
@@ -130,6 +156,7 @@ pub fn pool_usable_bytes<'a>(
     if statuses.is_empty() {
         return None;
     }
+    let placed = statuses.iter().all(|s| s.seats.is_some());
     let mut tiers: Vec<u8> = statuses
         .iter()
         .flat_map(|s| s.tiers.iter().map(|t| t.tier))
@@ -138,18 +165,32 @@ pub fn pool_usable_bytes<'a>(
     tiers.dedup();
     let mut total = 0u64;
     for tier in tiers {
-        // A member without the tier bounds it at zero: data that must
-        // live on both members cannot count space only one of them has.
-        total += statuses
+        let bound = statuses
             .iter()
-            .map(|s| {
-                s.tiers
+            .filter_map(|s| {
+                let bytes = s
+                    .tiers
                     .iter()
                     .find(|t| t.tier == tier)
-                    .map_or(0, |t| t.usable_bytes)
+                    .map_or(0, |t| t.usable_bytes);
+                if placed {
+                    // A zero-seat member (mid-join, or reassigned away)
+                    // stores nothing on this map and bounds nothing.
+                    match s.seats {
+                        Some(0) => None,
+                        Some(seats) => Some(bytes.saturating_mul(SLICES) / seats),
+                        None => unreachable!("placed checked above"),
+                    }
+                } else {
+                    // A member without the tier bounds it at zero: data
+                    // that must live on every member cannot count space
+                    // only one of them has.
+                    Some(bytes)
+                }
             })
             .min()
             .unwrap_or(0);
+        total += bound;
     }
     Some(total)
 }
@@ -407,6 +448,10 @@ mod tests {
             vdisks: Vec::new(),
             leases: Vec::new(),
             stream: (5, 5, 0),
+            peers: Vec::new(),
+            map_version: None,
+            seats: None,
+            reassign_pending: None,
         }
     }
 
@@ -590,5 +635,41 @@ mod tests {
             "half a pool is a guess, not a figure"
         );
         assert_eq!(pool_usable_bytes(std::iter::empty()), None);
+    }
+
+    #[test]
+    fn a_placed_pools_usable_exceeds_any_one_member_and_two_degenerates() {
+        // Three equal members at 171/171/170 seats: each bounds the pool
+        // at bytes × 256 / seats, and the figure genuinely exceeds any
+        // one member — the point of slicing.
+        let mut members: Vec<MemberStatus> = (0..3).map(synced).collect();
+        for (member, seats) in members.iter_mut().zip([171u64, 171, 170]) {
+            member.seats = Some(seats);
+            member.map_version = Some(1);
+        }
+        let placed = pool_usable_bytes(members.iter().map(Some)).unwrap();
+        assert_eq!(placed, 1000 * 256 / 171);
+        assert!(placed > 1000, "three members did not exceed one");
+
+        // Two members at 256 seats each: the formula IS min-over-members.
+        let mut pair: Vec<MemberStatus> = (0..2).map(synced).collect();
+        for member in &mut pair {
+            member.seats = Some(256);
+        }
+        pair[1].tiers[0].usable_bytes = 4000;
+        assert_eq!(pool_usable_bytes(pair.iter().map(Some)), Some(1000));
+
+        // A zero-seat member (mid-join) bounds nothing.
+        let mut with_joiner: Vec<MemberStatus> = (0..3).map(synced).collect();
+        for member in &mut with_joiner {
+            member.seats = Some(256);
+        }
+        with_joiner[2].seats = Some(0);
+        with_joiner[2].tiers[0].usable_bytes = 1;
+        assert_eq!(
+            pool_usable_bytes(with_joiner.iter().map(Some)),
+            Some(1000),
+            "a member holding no slices bounded the pool"
+        );
     }
 }

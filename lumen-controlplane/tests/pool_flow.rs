@@ -508,7 +508,8 @@ fn real_daemon_control(dir: &std::path::Path) -> std::net::SocketAddr {
         node: 0,
         bricks: vec![brick],
         listen: Some("127.0.0.1:0".parse().unwrap()),
-        dial: None,
+        dials: Vec::new(),
+        members: Vec::new(),
     })
     .unwrap();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -761,7 +762,8 @@ async fn a_peer_prepare_formats_writes_the_drop_in_and_hears_the_daemon_answer()
                 { "disk": "sdb", "tier": 0, "wal_holder": true, "brick_uuid": "bb".repeat(16) },
                 { "disk": "sdc", "tier": 1, "wal_holder": false, "brick_uuid": "cc".repeat(16) },
             ],
-            "peer": { "role": "dial", "addr": "10.10.0.1:7800" },
+            "peers": [{ "role": "dial", "addr": "10.10.0.1:7800" }],
+            "members": [0, 1],
             "control": control.to_string(),
         })),
     )

@@ -32,6 +32,16 @@ export interface PoolMemberStatus {
   vdisks: [number, number][];
   leases: [number, PoolLease][];
   stream: [number, number, number];
+  /// Per-peer stream counters, `(peer, sent, durable, applied)` — the
+  /// mesh's honest form. Empty from a pre-mesh daemon.
+  peers?: [number, number, number, number][];
+  /// The committed slice map's version; absent when unplaced (the
+  /// two-member legacy, where every member holds everything).
+  map_version?: number | null;
+  /// How many of the 256 slices this member homes.
+  seats?: number | null;
+  /// The version a rebalance is moving to, while one is running.
+  reassign_pending?: number | null;
 }
 
 export interface PoolLease {
