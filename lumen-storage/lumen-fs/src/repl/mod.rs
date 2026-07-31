@@ -1,11 +1,23 @@
-//! Two-node synchronous replication: the phase-2 core of docs/lumenfs.md,
-//! as a sans-IO state machine the simulation can torture.
+//! Synchronous replication among a pool's members — phase 2's two-node
+//! core, restructured around per-peer sessions for phase 5, as a sans-IO
+//! state machine the simulation can torture.
 //!
 //! One [`ReplNode`] wraps one node's [`Pool`]. It never touches a socket or
 //! a clock: the daemon (later) and the test harness (now) deliver peer
 //! messages to [`ReplNode::handle`], tell it about links and verdicts
-//! ([`ReplNode::peer_lost`], [`ReplNode::set_peer_fenced`]), and drain its
-//! [`Effect`]s — messages to send, guest flushes to acknowledge or fail.
+//! ([`ReplNode::peer_lost`], [`ReplNode::set_member_fenced`]), and drain
+//! its [`Effect`]s — messages to send (each named with its addressee),
+//! guest flushes to acknowledge or fail.
+//!
+//! ## One node, many sessions
+//!
+//! Every peer relationship is its own [`PeerSession`]: its own state, its
+//! own dense op stream (`Apply` numbering is per ordered pair of nodes),
+//! its own resync. The op stream fans out — **every op goes to every
+//! streaming peer** (metadata is replicated to every member; the recorded
+//! phase-5 decision) — while each session's numbering stays contiguous, so
+//! the "skipped or repeated" check needs no change. What differs per peer
+//! is only *which durability gates a guest flush*, below.
 //!
 //! ## What replicates, and why so little
 //!
@@ -17,31 +29,47 @@
 //!
 //! ## The acknowledgement rule
 //!
-//! A guest flush completes only when everything before it is durable on
-//! **both** nodes (the peer's `Durable` answer), or when a fence verdict
-//! says there is only one node left to ask. That is DRBD protocol C's
-//! guarantee, restated: writes are not promises until both replicas hold
-//! them or the cluster has vouched the peer is dead.
+//! A guest flush completes only when the node is serving and every *need*
+//! it parked with is settled. A need names a peer, that peer's session
+//! generation, and the last op sequence whose durability that peer owes.
+//! At two members every op needs the one peer, which is DRBD protocol C
+//! restated; at three, a data write will need only its block's homes
+//! (phase-5 slice 24) while every other op needs every live member — the
+//! rule that keeps "metadata everywhere" a durability property. A need is
+//! settled by that peer's `Durable` (same session generation only — a
+//! sequence number from a dead session must never be satisfied by a new
+//! session's counting), or excused wholesale by the peer's `SyncDone`
+//! (adoption covers everything) or its fence verdict (the cluster vouched
+//! there is no one left to ask). Nothing else settles anything: no blanket
+//! drains.
 //!
 //! ## States, and who decides them
 //!
+//! Each session runs the phase-2 diagram; the node serves guests only when
+//! every known peer is accounted for:
+//!
 //! ```text
-//!   Synced ──peer_lost──▶ Suspended ──set_peer_fenced──▶ Degraded
-//!     ▲                       │  ▲                           │
-//!     │                    (writes refuse,        (era bumped past every
-//!     │                     flushes park)          witnessed era; writes
-//!     │                                            go on alone)
-//!     └── Resyncing ◀──Hello exchange on reconnect──────────┘
+//!   Synced ──peer_lost──▶ Suspended ──set_member_fenced──▶ (fenced)
+//!     ▲                       │  ▲                             │
+//!     │                    (that peer unaccounted:   (era bumped to the
+//!     │                     writes refuse,            verdict's number;
+//!     │                     flushes park)             writes go on without
+//!     │                                               that member)
+//!     └── Resyncing ◀──Hello exchange on reconnect────────────┘
 //!          (the target refuses writes; a source with era superiority
 //!           keeps serving guests and streams its ops as it goes)
 //! ```
 //!
-//! The engine never decides death. `set_peer_fenced` is the cluster's
+//! The engine never decides death. `set_member_fenced` is the cluster's
 //! verdict (Pacemaker's fence confirmation, docs/cluster.md) arriving from
 //! above; without it a partitioned node suspends forever — integrity over
-//! availability, always. The era (anchored, see format.rs) is what makes
-//! the verdict durable: the survivor bumps it before writing anything new,
-//! so whichever node returns with the lower era knows to adopt.
+//! availability, always. The verdict **carries the era**: two survivors
+//! bumping independently could mint different numbers, and the next hello
+//! would read the difference as a fence verdict and discard acknowledged
+//! writes — so the layer that holds quorum state computes one number from
+//! every survivor's reported floor ([`ReplNode::era_target`]) and every
+//! survivor adopts it. At two members the sole survivor's own floor *is*
+//! that computation.
 //!
 //! ## Resync is a Merkle diff, and the guests never notice
 //!
@@ -64,10 +92,11 @@
 //! at the same checkpoint the offer was cut from. Two consequences carry
 //! the correctness: the offered roots are pinned against garbage
 //! collection on both ends (the source's own checkpoints orphan them; the
-//! target's fetched fragment is referenced by nothing yet), and a fence
-//! verdict bumps the era past every era this node has *witnessed*, not
-//! just its own — a survivor fenced mid-pull would otherwise mint a second
-//! copy of the era it was adopting, and two divergent lineages would tie.
+//! target's fetched fragment is referenced by nothing yet) — **per
+//! session**, because a node can source one peer's pull while pulling from
+//! another — and a fence verdict's era clears every era this node has
+//! *witnessed*, not just its own, so a survivor fenced mid-pull cannot
+//! mint a second copy of the era it was adopting.
 //!
 //! The resync ends with a handshake, and the handshake is load-bearing.
 //! Adoption hands the target the source's era, and from that instant the
@@ -88,17 +117,28 @@
 //! without a verdict there is no honest way to acknowledge single-copy.
 //! The tie runs the same closing handshake; it simply has nothing to
 //! stop doing.
+//!
+//! ## Two windows this restructure closed
+//!
+//! Both were reachable at two nodes and neither simulation had looked:
+//! a payload delivered ahead of its op was invisible to garbage
+//! collection until the op mapped it — a collection in that gap swept it
+//! and the op then died at the "store must hold it" check — so arrived
+//! payloads are now pinned per session until their op lands. And the
+//! resync pins, pull, and backlog were single global slots that any hello
+//! clobbered; they live in the session now, where a second peer's arrival
+//! cannot reach them.
 
 /// Placement arithmetic: hash → slice → an ordered pair of members.
 pub mod slice;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use crate::disk::Disk;
 use crate::error::{FsError, Result};
 use crate::hash::BlockHash;
 use crate::pool::map;
-use crate::pool::{Lease, Pool};
+use crate::pool::{AdoptScope, Lease, Pool};
 
 pub type NodeId = u8;
 
@@ -217,8 +257,8 @@ pub enum PeerMessage {
     /// Who I am, which era my state belongs to, and which tiers my brick
     /// set carries. Opens every connection; both sides derive the same
     /// source/target roles from the pair, and the tier inventory is what
-    /// lets a vdisk create refuse a tier the peer cannot hold instead of
-    /// failing the peer's replay.
+    /// lets a vdisk create refuse a tier a peer cannot hold instead of
+    /// failing that peer's replay.
     Hello {
         era: u64,
         node: NodeId,
@@ -228,7 +268,8 @@ pub enum PeerMessage {
     /// its op will reference it at.
     Payloads(Vec<(u8, Vec<u8>)>),
     /// Ops in stream order. `first_rseq` numbers the first op; the rest
-    /// follow sequentially — a gap means the transport lied.
+    /// follow sequentially — a gap means the transport lied. Numbering is
+    /// per ordered pair of nodes: each session counts its own stream.
     Apply { first_rseq: u64, ops: Vec<ReplOp> },
     /// Make everything up to `up_to` durable and say so.
     Flush { up_to: u64 },
@@ -260,7 +301,10 @@ pub enum PeerMessage {
 /// What the node wants the outside world to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
-    Send(PeerMessage),
+    /// Put this message on the wire to this peer — and only this peer;
+    /// the addressee is part of the effect because the node speaks to
+    /// each member down that member's own session.
+    Send(NodeId, PeerMessage),
     /// The guest flush with this ticket is fully acknowledged.
     FlushDone(u64),
     /// The guest flush with this ticket can never complete honestly — its
@@ -312,41 +356,113 @@ struct SyncPull {
     manifest: Option<SyncOffer>,
 }
 
-pub struct ReplNode<D: Disk> {
-    pool: Pool<D>,
-    node: NodeId,
+/// Everything this node knows about one peer: the relationship's state,
+/// both directions of its op stream, and whatever resync is in flight on
+/// it. A session outlives its connections — `era_seen` and the fenced
+/// flag persist across links — but its stream numbering does not: every
+/// hello opens a new generation.
+#[derive(Debug)]
+struct PeerSession {
     state: ReplState,
-    effects: VecDeque<Effect>,
-    /// Numbering for ops sent (writer side).
+    /// Which incarnation of this session's stream the counters below
+    /// belong to. Bumped by every hello and every lost link, and recorded
+    /// into parked flush needs so a sequence number from a dead stream can
+    /// never be satisfied by a new stream's counting.
+    generation: u64,
+    /// Numbering for ops sent to this peer (writer side).
     next_rseq: u64,
-    /// Peer-confirmed durability (writer side).
+    /// This peer's confirmed durability (writer side).
     durable_rseq: u64,
-    /// Last op applied (applier side).
+    /// The highest rseq sent to this peer whose op requires this peer's
+    /// durability before a guest flush covering it may complete. Every op
+    /// requires every recipient today; slice 24 narrows data writes to
+    /// their homes.
+    required_rseq: u64,
+    /// Last op applied from this peer (applier side).
     applied_rseq: u64,
-    /// Guest flushes waiting on the peer: `(ticket, needs_rseq)`.
-    parked: Vec<(u64, u64)>,
-    next_ticket: u64,
-    pull: SyncPull,
-    /// Sourcing this resync with era superiority: guests keep writing here,
-    /// acknowledged single-copy under the verdict that made the era.
-    serving_source: bool,
-    /// The offer has been cut; every op from here on streams to the target.
-    /// Distinct from `serving_source` because writes accepted *before* the
-    /// offer's checkpoint are inside the offer — streaming them too would
-    /// deliver them twice, and half the ops are not idempotent.
-    stream_live: bool,
-    /// The highest era any peer has ever claimed to this node — the floor
-    /// a fence-verdict bump must clear. Volatile: the narrow hole (hear an
-    /// era, crash before adopting it, then survive a verdict) is recorded
-    /// in docs/lumenfs.md rather than closed.
-    peer_era_seen: u64,
-    /// The tiers the peer's brick set carried at its last hello — what a
+    /// The tiers this peer's brick set carried at its last hello — what a
     /// vdisk create checks before promising a tier the peer cannot hold.
-    peer_tiers: Vec<u8>,
-    /// The target's buffer of the source's live stream, replayed in
+    tiers: Vec<u8>,
+    /// The highest era this peer has ever claimed to this node — one
+    /// component of the floor a fence-verdict era must clear. Volatile:
+    /// the narrow hole (hear an era, crash before adopting it, then
+    /// survive a verdict) is recorded in docs/lumenfs.md rather than
+    /// closed.
+    era_seen: u64,
+    /// The cluster vouched this member dead. Cleared by its next hello —
+    /// a verdict is an event about a past, not a permanent sentence.
+    fenced: bool,
+    /// The target's buffer of this source's live stream, replayed in
     /// arrival order after adoption. Bounding it is flow control, which
     /// belongs to the daemon that owns the socket.
     backlog: Vec<PeerMessage>,
+    /// This session's pull, when this node is its resync target.
+    pull: SyncPull,
+    /// Sourcing this session's resync with era superiority: guests keep
+    /// writing here, acknowledged single-copy under the verdict that made
+    /// the era.
+    serving_source: bool,
+    /// The offer has been cut; every op from here on streams to this
+    /// peer. Distinct from `serving_source` because writes accepted
+    /// *before* the offer's checkpoint are inside the offer — streaming
+    /// them too would deliver them twice, and half the ops are not
+    /// idempotent.
+    stream_live: bool,
+}
+
+impl PeerSession {
+    fn new() -> PeerSession {
+        PeerSession {
+            state: ReplState::Suspended,
+            generation: 0,
+            next_rseq: 1,
+            durable_rseq: 0,
+            required_rseq: 0,
+            applied_rseq: 0,
+            tiers: Vec::new(),
+            era_seen: 0,
+            fenced: false,
+            backlog: Vec::new(),
+            pull: SyncPull::default(),
+            serving_source: false,
+            stream_live: false,
+        }
+    }
+
+    /// Whether ops leave for this peer: in lockstep always, and while
+    /// sourcing its resync only once the offer is cut — anything earlier
+    /// is inside the offer, and an op delivered both ways applies twice.
+    fn stream_active(&self) -> bool {
+        self.state == ReplState::Synced || self.stream_live
+    }
+
+    /// Whether this peer is accounted for from a guest's point of view:
+    /// its durability is either in lockstep, excused by a verdict, or
+    /// covered by the single-copy regime a verdict authorized.
+    fn accounted_for(&self) -> bool {
+        self.fenced
+            || self.state == ReplState::Synced
+            || (self.state == (ReplState::Resyncing { source: true }) && self.serving_source)
+    }
+}
+
+/// One guest flush waiting on its peers: settled when every need is gone
+/// and the node is serving.
+#[derive(Debug)]
+struct ParkedFlush {
+    ticket: u64,
+    /// `(peer, session generation, rseq)` — the last op each peer owes
+    /// durability for, under the stream that sent it.
+    needs: Vec<(NodeId, u64, u64)>,
+}
+
+pub struct ReplNode<D: Disk> {
+    pool: Pool<D>,
+    node: NodeId,
+    effects: VecDeque<Effect>,
+    peers: BTreeMap<NodeId, PeerSession>,
+    parked: Vec<ParkedFlush>,
+    next_ticket: u64,
 }
 
 impl<D: Disk> ReplNode<D> {
@@ -354,31 +470,51 @@ impl<D: Disk> ReplNode<D> {
         ReplNode {
             pool,
             node,
-            state: ReplState::Suspended,
             effects: VecDeque::new(),
-            next_rseq: 1,
-            durable_rseq: 0,
-            applied_rseq: 0,
+            peers: BTreeMap::new(),
             parked: Vec::new(),
             next_ticket: 1,
-            pull: SyncPull::default(),
-            serving_source: false,
-            stream_live: false,
-            peer_era_seen: 0,
-            peer_tiers: Vec::new(),
-            backlog: Vec::new(),
         }
     }
 
+    /// The node's relationship to its pool, derived from the sessions: a
+    /// resync in flight names itself, a fleet of verdicts is Degraded, a
+    /// live lockstep is Synced, and anything less is Suspended. With one
+    /// peer this is exactly the phase-2 state; with more it is the row a
+    /// status line summarizes, while each session keeps its own truth.
     pub fn state(&self) -> ReplState {
-        self.state
+        if let Some(session) = self
+            .peers
+            .values()
+            .find(|s| matches!(s.state, ReplState::Resyncing { .. }))
+        {
+            return session.state;
+        }
+        if !self.peers.is_empty() && self.peers.values().all(|s| s.fenced) {
+            return ReplState::Degraded;
+        }
+        if !self.peers.is_empty()
+            && self
+                .peers
+                .values()
+                .all(|s| s.fenced || s.state == ReplState::Synced)
+        {
+            return ReplState::Synced;
+        }
+        ReplState::Suspended
     }
 
-    /// The stream position, for observability: ops sent, ops the peer has
-    /// confirmed durable, ops applied from the peer. A survivor's claim of
-    /// honesty is checkable from outside only if these are visible.
+    /// The stream position, for observability: ops sent, ops confirmed
+    /// durable, ops applied. A survivor's claim of honesty is checkable
+    /// from outside only if these are visible. With one peer these are
+    /// that session's counters; with more they summarize the busiest
+    /// stream (per-peer counters are the daemon's status surface).
     pub fn stream_counters(&self) -> (u64, u64, u64) {
-        (self.next_rseq - 1, self.durable_rseq, self.applied_rseq)
+        self.peers
+            .values()
+            .map(|s| (s.next_rseq - 1, s.durable_rseq, s.applied_rseq))
+            .max()
+            .unwrap_or((0, 0, 0))
     }
 
     pub fn node(&self) -> NodeId {
@@ -403,64 +539,106 @@ impl<D: Disk> ReplNode<D> {
         self.effects.push_back(effect);
     }
 
+    fn session(&mut self, peer: NodeId) -> &mut PeerSession {
+        self.peers.entry(peer).or_insert_with(PeerSession::new)
+    }
+
     // -----------------------------------------------------------------
     // Links and verdicts — the outside world's facts.
 
-    /// The link is up; say hello. Role assignment happens when the peer's
-    /// own hello arrives.
-    pub fn connect(&mut self) {
-        self.emit(Effect::Send(PeerMessage::Hello {
-            era: self.pool.era(),
-            node: self.node,
-            tiers: self.pool.tiers(),
-        }));
+    /// The link to this peer is up; say hello. Role assignment happens
+    /// when the peer's own hello arrives.
+    pub fn connect(&mut self, peer: NodeId) {
+        self.session(peer);
+        self.emit(Effect::Send(
+            peer,
+            PeerMessage::Hello {
+                era: self.pool.era(),
+                node: self.node,
+                tiers: self.pool.tiers(),
+            },
+        ));
     }
 
-    /// The link is gone. Whatever was in flight is gone with it; flushes
-    /// stay parked until a verdict or a reconciliation decides their fate.
+    /// The link to this peer is gone. Whatever was in flight is gone with
+    /// it; flushes stay parked until a verdict or a reconciliation decides
+    /// their fate.
     ///
-    /// Queued peer messages are dropped here, and that is load-bearing
-    /// rather than tidy. A message written for a connection that has died
-    /// must not be delivered over the next one: a reply to a request from
-    /// a session that no longer exists can arrive inside a fresh session
-    /// and be mistaken for an answer to it. This is the engine's half of
-    /// the contract; the daemon's half is to never carry bytes across
-    /// connection incarnations. Guest-facing effects are not messages and
-    /// survive — a parked flush is still owed an answer.
-    pub fn peer_lost(&mut self) {
+    /// Queued messages to this peer are dropped here, and that is
+    /// load-bearing rather than tidy. A message written for a connection
+    /// that has died must not be delivered over the next one: a reply to a
+    /// request from a session that no longer exists can arrive inside a
+    /// fresh session and be mistaken for an answer to it. This is the
+    /// engine's half of the contract; the daemon's half is to never carry
+    /// bytes across connection incarnations. Guest-facing effects are not
+    /// messages and survive — a parked flush is still owed an answer.
+    pub fn peer_lost(&mut self, peer: NodeId) {
         self.effects
-            .retain(|effect| !matches!(effect, Effect::Send(_)));
-        self.state = ReplState::Suspended;
-        self.pull = SyncPull::default();
+            .retain(|effect| !matches!(effect, Effect::Send(to, _) if *to == peer));
+        let session = self.session(peer);
+        session.state = ReplState::Suspended;
+        session.generation += 1;
+        session.pull = SyncPull::default();
         // A buffered stream from a dead session must never replay into the
         // next one: the next offer already contains those writes, and the
         // next stream will reuse their sequence numbers.
-        self.backlog.clear();
-        self.serving_source = false;
-        self.stream_live = false;
-        self.pool.unpin_sync();
+        session.backlog.clear();
+        session.serving_source = false;
+        session.stream_live = false;
+        // The offer pins and any payloads delivered ahead of ops that will
+        // now never arrive: garbage, correctly, once unpinned.
+        self.pool.drop_session_pins(peer);
     }
 
-    /// The cluster's verdict: the peer has been fenced. Not this crate's
-    /// decision — it arrives from the machinery that owns quorum and
-    /// fencing (docs/cluster.md), and it is the only thing that turns
-    /// suspension into solitary progress. The era bump is anchored before
-    /// any new state exists under it, and every parked flush completes:
-    /// single-copy durable is what acknowledged means now.
-    pub fn set_peer_fenced(&mut self) -> Result<()> {
-        if self.state != ReplState::Suspended {
+    /// The floor a fence-verdict era must clear from this node's vantage:
+    /// past its own era and past every era any peer has ever claimed to
+    /// it. The layer that issues verdicts takes the max of every
+    /// survivor's floor, so all of them adopt one number — two survivors
+    /// computing independently could mint different eras, and the next
+    /// hello would read the difference as a verdict that never happened.
+    pub fn era_target(&self) -> u64 {
+        self.peers
+            .values()
+            .map(|s| s.era_seen)
+            .fold(self.pool.era(), u64::max)
+            + 1
+    }
+
+    /// The cluster's verdict: this member has been fenced, and the pool
+    /// continues at `era`. Not this crate's decision — it arrives from the
+    /// machinery that owns quorum and fencing (docs/cluster.md), and it is
+    /// the only thing that turns suspension into progress without the
+    /// member. The era bump is anchored before any new state exists under
+    /// it, and the fenced member's needs come off every parked flush:
+    /// its durability is no longer anyone's to owe.
+    pub fn set_member_fenced(&mut self, peer: NodeId, era: u64) -> Result<()> {
+        let floor = self.era_target();
+        let session = self.session(peer);
+        if session.state != ReplState::Suspended {
             return Err(FsError::Corrupt(
                 "a fence verdict arrived for a peer that is not lost",
             ));
         }
-        self.pool.bump_era(self.peer_era_seen)?;
+        if session.fenced {
+            return Err(FsError::Corrupt(
+                "a fence verdict arrived for a member already fenced",
+            ));
+        }
+        if era < floor {
+            return Err(FsError::Corrupt(
+                "a fence verdict's era is below what this node has witnessed",
+            ));
+        }
+        session.fenced = true;
+        self.pool.bump_era_to(era)?;
         // The bump retired every lease of the era it closed — including
-        // this node's own. The dead peer's leases must stay retired, so a
-        // failover can claim them; but a guest already running *here* must
-        // not lose its pen to its peer's death, so leases this node held
-        // are re-issued under the new era. A handover window open toward
-        // the dead node closes in the same stroke, which is the abort that
-        // migration was owed.
+        // this node's own. The dead member's leases must stay retired, so
+        // a failover can claim them; but a guest already running *here*
+        // must not lose its pen to another member's death, so leases this
+        // node held are re-issued under the new era — on the stream, so
+        // any peer still in lockstep applies the same conclusion. A
+        // handover window open toward the dead node closes in the same
+        // stroke, which is the abort that migration was owed.
         let mine: Vec<u64> = self
             .pool
             .leases()
@@ -469,21 +647,44 @@ impl<D: Disk> ReplNode<D> {
             .map(|(vdisk, _)| vdisk)
             .collect();
         for vdisk in mine {
-            self.pool.claim_lease(vdisk, self.node)?;
+            let node = self.node;
+            self.pool.claim_lease(vdisk, node)?;
+            if let Some(lease) = self.pool.lease(vdisk) {
+                self.send_ops(vec![ReplOp::SetLease { vdisk, lease }]);
+            }
         }
-        let parked = std::mem::take(&mut self.parked);
-        for (ticket, _) in parked {
-            self.emit(Effect::FlushDone(ticket));
-        }
-        self.state = ReplState::Degraded;
+        self.excuse_needs(peer);
         Ok(())
     }
 
+    /// Whether this member currently stands fenced from this node's view.
+    pub fn is_fenced(&self, peer: NodeId) -> bool {
+        self.peers.get(&peer).is_some_and(|s| s.fenced)
+    }
+
+    // -----------------------------------------------------------------
+    // Leases.
+
     /// Take the writer role for a vdisk. Legitimate while degraded — the
     /// HA restart after a fence — or while synced, where it replicates as
-    /// an explicit claim. (The migration-window handover under a live
-    /// guest is phase 3.)
+    /// an explicit claim.
+    ///
+    /// An era-stale lease is claimable only when its holder is fenced, or
+    /// is this node. A stale record naming a *live* member is a member
+    /// that may still be writing — the era retired the lease's authority,
+    /// not the machine — and claiming out from under it would be the
+    /// second writer this design exists to prevent.
     pub fn claim_writer(&mut self, vdisk: u64) -> Result<()> {
+        if let Some(lease) = self.pool.lease(vdisk) {
+            let stale = lease.era < self.pool.era();
+            let holder_live = lease.holder != self.node && !self.is_fenced(lease.holder);
+            if stale && holder_live {
+                return Err(FsError::LeaseHeld {
+                    vdisk,
+                    holder: lease.holder,
+                });
+            }
+        }
         self.lease_change(vdisk, |pool, node| pool.claim_lease(vdisk, node))
     }
 
@@ -515,7 +716,7 @@ impl<D: Disk> ReplNode<D> {
     /// there would let a caller treat an unfinished handover as a finished
     /// one.
     pub fn accept_handover(&mut self, vdisk: u64) -> Result<()> {
-        match self.state {
+        match self.state() {
             ReplState::Synced | ReplState::Degraded | ReplState::Resyncing { .. } => {}
             _ => return Err(FsError::Suspended),
         }
@@ -537,8 +738,8 @@ impl<D: Disk> ReplNode<D> {
     }
 
     /// Apply a lease change locally and replicate whatever it settled on.
-    /// The peer is sent the resulting lease rather than the request, so the
-    /// two sides cannot reach different conclusions from the same words.
+    /// The peers are sent the resulting lease rather than the request, so
+    /// no two nodes can reach different conclusions from the same words.
     fn lease_change(
         &mut self,
         vdisk: u64,
@@ -571,16 +772,14 @@ impl<D: Disk> ReplNode<D> {
         self.serving()
     }
 
-    /// Whether guests may be served mutations here at all: in lockstep,
-    /// alone under a verdict, or sourcing a resync under the era that
-    /// verdict minted — the one resync role that owes its guests
-    /// continuity.
+    /// Whether guests may be served mutations here at all: every known
+    /// peer accounted for — in lockstep, fenced, or being sourced under a
+    /// verdict's era — and at least one fact on the table. A node that has
+    /// never met a peer and never heard a verdict does not know its
+    /// standing, and a node that does not know its standing promises
+    /// nothing.
     fn serving(&self) -> bool {
-        match self.state {
-            ReplState::Synced | ReplState::Degraded => true,
-            ReplState::Resyncing { source: true } => self.serving_source,
-            _ => false,
-        }
+        !self.peers.is_empty() && self.peers.values().all(|s| s.accounted_for())
     }
 
     fn writable(&self, vdisk: u64) -> Result<()> {
@@ -594,23 +793,36 @@ impl<D: Disk> ReplNode<D> {
         }
     }
 
-    /// Whether ops leave the building: in lockstep always, and while
-    /// sourcing a resync only once the offer is cut — anything earlier is
-    /// inside the offer, and an op delivered both ways applies twice.
-    fn stream_active(&self) -> bool {
-        self.state == ReplState::Synced || self.stream_live
-    }
-
+    /// Fan an op batch out to every streaming session, each under its own
+    /// numbering. Every op requires every recipient's durability today;
+    /// slice 24 narrows a data write's requirement to its block's homes.
     fn send_ops(&mut self, ops: Vec<ReplOp>) {
-        if self.stream_active() {
-            let first_rseq = self.next_rseq;
-            self.next_rseq += ops.len() as u64;
-            self.emit(Effect::Send(PeerMessage::Apply { first_rseq, ops }));
+        if ops.is_empty() {
+            return;
+        }
+        let recipients: Vec<NodeId> = self
+            .peers
+            .iter()
+            .filter(|(_, s)| s.stream_active())
+            .map(|(id, _)| *id)
+            .collect();
+        for peer in recipients {
+            let session = self.peers.get_mut(&peer).expect("collected above");
+            let first_rseq = session.next_rseq;
+            session.next_rseq += ops.len() as u64;
+            session.required_rseq = session.next_rseq - 1;
+            self.emit(Effect::Send(
+                peer,
+                PeerMessage::Apply {
+                    first_rseq,
+                    ops: ops.clone(),
+                },
+            ));
         }
     }
 
     /// Local WAL pressure is local business: checkpoint and go again,
-    /// exactly as the NBD tool does. The peer's ring is its own.
+    /// exactly as the NBD tool does. The peers' rings are their own.
     fn with_wal_room(&mut self, mut op: impl FnMut(&mut Pool<D>) -> Result<()>) -> Result<()> {
         match op(&mut self.pool) {
             Err(FsError::WalFull) => {
@@ -625,11 +837,15 @@ impl<D: Disk> ReplNode<D> {
         if !self.serving() {
             return Err(FsError::Suspended);
         }
-        // The op is about to stream to a peer that must apply it; a tier
-        // its brick set cannot hold would fail its replay into divergence,
-        // so the promise is refused here, where the caller can hear it.
-        if self.stream_active() && !self.peer_tiers.contains(&tier) {
-            return Err(FsError::TierNotOnPeer(tier));
+        // The op is about to stream to peers that must apply it; a tier
+        // some brick set cannot hold would fail that peer's replay into
+        // divergence, so the promise is refused here, where the caller
+        // can hear it — checked against every streaming session, because
+        // any one of them is a replay that must succeed.
+        for session in self.peers.values() {
+            if session.stream_active() && !session.tiers.contains(&tier) {
+                return Err(FsError::TierNotOnPeer(tier));
+            }
         }
         self.with_wal_room(|pool| pool.create_vdisk(id, size_bytes, tier))?;
         // Whoever made it holds it, and that has to be durable before
@@ -653,13 +869,19 @@ impl<D: Disk> ReplNode<D> {
         let tier = self.pool.vdisk_tier(vdisk)?;
         let hash = self.pool.put_block(tier, payload)?;
         self.with_wal_room(|pool| pool.write_block_prehashed(vdisk, index, hash))?;
-        if self.stream_active() {
-            self.emit(Effect::Send(PeerMessage::Payloads(vec![(
-                tier,
-                payload.to_vec(),
-            )])));
-            self.send_ops(vec![ReplOp::Write { vdisk, index, hash }]);
+        let recipients: Vec<NodeId> = self
+            .peers
+            .iter()
+            .filter(|(_, s)| s.stream_active())
+            .map(|(id, _)| *id)
+            .collect();
+        for peer in recipients {
+            self.emit(Effect::Send(
+                peer,
+                PeerMessage::Payloads(vec![(tier, payload.to_vec())]),
+            ));
         }
+        self.send_ops(vec![ReplOp::Write { vdisk, index, hash }]);
         Ok(())
     }
 
@@ -719,32 +941,67 @@ impl<D: Disk> ReplNode<D> {
     }
 
     /// The guest's durability barrier. Local durability happens now; the
-    /// returned ticket completes (an [`Effect::FlushDone`]) when the peer
-    /// is durable too, immediately when this node is alone under a verdict
-    /// — Degraded, or sourcing a resync in the era the verdict minted —
-    /// or parks when suspended, which is DRBD's suspended I/O wearing
-    /// sans-IO clothes.
+    /// returned ticket completes (an [`Effect::FlushDone`]) when every
+    /// need is settled and the node is serving — immediately when nothing
+    /// is owed, or parked until the peers' answers, a verdict, or an
+    /// adoption decides its fate.
     pub fn flush(&mut self) -> Result<u64> {
         self.pool.flush()?;
         let ticket = self.next_ticket;
         self.next_ticket += 1;
-        let needs = self.next_rseq - 1;
-        match self.state {
-            ReplState::Degraded => self.emit(Effect::FlushDone(ticket)),
-            ReplState::Resyncing { source: true } if self.serving_source => {
-                self.emit(Effect::FlushDone(ticket))
+        let mut needs = Vec::new();
+        for (peer, session) in &self.peers {
+            if session.fenced {
+                continue;
             }
-            ReplState::Synced => {
-                if self.durable_rseq >= needs {
-                    self.emit(Effect::FlushDone(ticket));
-                } else {
-                    self.parked.push((ticket, needs));
-                    self.emit(Effect::Send(PeerMessage::Flush { up_to: needs }));
-                }
+            // A source serving under a verdict's era owes its guests
+            // continuity, not this target's durability — the verdict
+            // already authorized single-copy acknowledgement.
+            if session.state == (ReplState::Resyncing { source: true }) && session.serving_source {
+                continue;
             }
-            _ => self.parked.push((ticket, needs)),
+            if session.required_rseq > session.durable_rseq {
+                needs.push((*peer, session.generation, session.required_rseq));
+            }
         }
+        // Ask the peers that can be asked now; the rest are excused or
+        // settled by resync and verdict machinery.
+        for (peer, _, rseq) in &needs {
+            if self.peers[peer].state == ReplState::Synced {
+                self.emit(Effect::Send(*peer, PeerMessage::Flush { up_to: *rseq }));
+            }
+        }
+        self.parked.push(ParkedFlush { ticket, needs });
+        self.settle_parked();
         Ok(ticket)
+    }
+
+    /// Complete every parked flush whose needs are gone, in ticket order —
+    /// but only while serving: a node that does not know its standing
+    /// completes nothing, which is how a fresh flush on a suspended node
+    /// parks even when nothing is numbered against it.
+    fn settle_parked(&mut self) {
+        if !self.serving() {
+            return;
+        }
+        let mut still_parked = Vec::new();
+        for flush in std::mem::take(&mut self.parked) {
+            if flush.needs.is_empty() {
+                self.effects.push_back(Effect::FlushDone(flush.ticket));
+            } else {
+                still_parked.push(flush);
+            }
+        }
+        self.parked = still_parked;
+    }
+
+    /// This peer's durability is no longer owed — a verdict said there is
+    /// no one to ask, or an adoption covered everything it ever missed.
+    fn excuse_needs(&mut self, peer: NodeId) {
+        for flush in &mut self.parked {
+            flush.needs.retain(|(p, _, _)| *p != peer);
+        }
+        self.settle_parked();
     }
 
     // -----------------------------------------------------------------
@@ -770,16 +1027,22 @@ impl<D: Disk> ReplNode<D> {
     }
 
     /// Local collection, legal at any point in a resync on either end:
-    /// the sync pins are part of the mark, so neither the offer nor a
-    /// half-fetched fragment can be swept out from under the pull.
+    /// the per-session pins are part of the mark, so neither an offer nor
+    /// a half-fetched fragment nor a payload waiting on its op can be
+    /// swept out from under any session.
     pub fn collect_garbage(&mut self) -> Result<crate::store::brick::GcStats> {
         self.pool.collect_garbage()
     }
 
     // -----------------------------------------------------------------
-    // The peer's messages.
+    // The peers' messages.
 
-    pub fn handle(&mut self, message: PeerMessage) -> Result<()> {
+    pub fn handle(&mut self, from: NodeId, message: PeerMessage) -> Result<()> {
+        if !matches!(message, PeerMessage::Hello { .. }) && !self.peers.contains_key(&from) {
+            return Err(FsError::Corrupt(
+                "a message arrived from a peer that never said hello",
+            ));
+        }
         match message {
             PeerMessage::Hello { era, node, tiers } => self.on_hello(era, node, tiers),
             // A pulling target buffers the source's live stream rather than
@@ -788,42 +1051,47 @@ impl<D: Disk> ReplNode<D> {
             // to a history that is going away. The replay after adoption is
             // what lands the target on the source's *live* state.
             PeerMessage::Payloads(_) | PeerMessage::Apply { .. }
-                if self.state == (ReplState::Resyncing { source: false }) =>
+                if self.peers[&from].state == (ReplState::Resyncing { source: false }) =>
             {
-                self.backlog.push(message);
+                self.session(from).backlog.push(message);
                 Ok(())
             }
             PeerMessage::Payloads(payloads) => {
                 for (tier, payload) in payloads {
-                    self.pool.put_block(tier, &payload)?;
+                    let hash = self.pool.put_block(tier, &payload)?;
+                    // Pinned until the op that references it lands: a
+                    // collection between the payload and its op would
+                    // otherwise sweep the block and kill the op's replay.
+                    self.pool.pin_inflight(from, tier, hash);
                 }
                 Ok(())
             }
-            PeerMessage::Apply { first_rseq, ops } => self.on_apply(first_rseq, ops),
+            PeerMessage::Apply { first_rseq, ops } => self.on_apply(from, first_rseq, ops),
             PeerMessage::Flush { up_to } => {
-                if self.applied_rseq < up_to {
+                if self.peers[&from].applied_rseq < up_to {
                     return Err(FsError::Corrupt(
                         "a flush asks for ops the stream never delivered",
                     ));
                 }
                 self.pool.flush()?;
-                self.emit(Effect::Send(PeerMessage::Durable { up_to }));
+                self.emit(Effect::Send(from, PeerMessage::Durable { up_to }));
                 Ok(())
             }
             PeerMessage::Durable { up_to } => {
-                self.durable_rseq = self.durable_rseq.max(up_to);
-                let durable = self.durable_rseq;
-                let (done, parked): (Vec<_>, Vec<_>) = std::mem::take(&mut self.parked)
-                    .into_iter()
-                    .partition(|(_, needs)| *needs <= durable);
-                self.parked = parked;
-                for (ticket, _) in done {
-                    self.emit(Effect::FlushDone(ticket));
+                let session = self.session(from);
+                session.durable_rseq = session.durable_rseq.max(up_to);
+                let durable = session.durable_rseq;
+                let generation = session.generation;
+                for flush in &mut self.parked {
+                    flush.needs.retain(|(p, generation_then, rseq)| {
+                        !(*p == from && *generation_then == generation && *rseq <= durable)
+                    });
                 }
+                self.settle_parked();
                 Ok(())
             }
-            PeerMessage::SyncStart => self.on_sync_start(),
-            PeerMessage::SyncManifest(offer) => self.on_sync_manifest(offer),
+            PeerMessage::SyncStart => self.on_sync_start(from),
+            PeerMessage::SyncManifest(offer) => self.on_sync_manifest(from, offer),
             PeerMessage::SyncNeed(hashes) => {
                 let mut payloads = Vec::with_capacity(hashes.len());
                 for (tier, hash) in hashes {
@@ -836,67 +1104,73 @@ impl<D: Disk> ReplNode<D> {
                         }
                     }
                 }
-                self.emit(Effect::Send(PeerMessage::SyncData(payloads)));
+                self.emit(Effect::Send(from, PeerMessage::SyncData(payloads)));
                 Ok(())
             }
-            PeerMessage::SyncData(payloads) => self.on_sync_data(payloads),
-            PeerMessage::SyncReady => self.on_sync_ready(),
-            PeerMessage::SyncAdopt { final_rseq } => self.on_sync_adopt(final_rseq),
+            PeerMessage::SyncData(payloads) => self.on_sync_data(from, payloads),
+            PeerMessage::SyncReady => self.on_sync_ready(from),
+            PeerMessage::SyncAdopt { final_rseq } => self.on_sync_adopt(from, final_rseq),
             PeerMessage::SyncDone { era: _ } => {
                 // The target adopted this node's state and replayed the
                 // stream; lockstep continues on the numbering the stream
                 // already established — resetting it here would orphan the
-                // ops sent while sourcing. Every flush that was waiting out
-                // the divergence is now two-node durable by adoption.
-                self.state = ReplState::Synced;
-                self.serving_source = false;
-                self.stream_live = false;
-                self.pool.unpin_sync();
-                let parked = std::mem::take(&mut self.parked);
-                for (ticket, _) in parked {
-                    self.emit(Effect::FlushDone(ticket));
-                }
+                // ops sent while sourcing. Every need this peer was owed
+                // is covered by the adoption; anything still parked waits
+                // only on the *other* peers.
+                let session = self.session(from);
+                session.state = ReplState::Synced;
+                session.serving_source = false;
+                session.stream_live = false;
+                self.pool.unpin_sync(from);
+                self.excuse_needs(from);
                 Ok(())
             }
         }
-    }
-
-    fn reset_stream(&mut self) {
-        self.next_rseq = 1;
-        self.durable_rseq = 0;
-        self.applied_rseq = 0;
-        self.pull = SyncPull::default();
     }
 
     fn on_hello(&mut self, peer_era: u64, peer_node: NodeId, peer_tiers: Vec<u8>) -> Result<()> {
         // Both sides compute the same answer from the same pair: higher
         // era is the source; equal eras fall to the lower node id — a tie
         // means both hold every acknowledged write, and the diff is cheap.
-        self.peer_era_seen = self.peer_era_seen.max(peer_era);
-        self.peer_tiers = peer_tiers;
+        let my_era = self.pool.era();
+        let my_node = self.node;
+        self.pool.drop_session_pins(peer_node);
+        let session = self.session(peer_node);
+        session.era_seen = session.era_seen.max(peer_era);
+        session.tiers = peer_tiers;
+        // A member that says hello is not fenced; a verdict is an event,
+        // not a sentence, and the returning node is about to be reconciled
+        // by the resync this hello opens.
+        session.fenced = false;
         // A hello opens a session; nothing numbered under an earlier one
         // may be mistaken for part of this one.
-        self.reset_stream();
-        self.pool.unpin_sync();
-        let my_era = self.pool.era();
-        let source = my_era > peer_era || (my_era == peer_era && self.node < peer_node);
+        session.generation += 1;
+        session.next_rseq = 1;
+        session.durable_rseq = 0;
+        session.required_rseq = 0;
+        session.applied_rseq = 0;
+        session.pull = SyncPull::default();
+        session.backlog.clear();
+        let source = my_era > peer_era || (my_era == peer_era && my_node < peer_node);
         if source {
-            self.state = ReplState::Resyncing { source: true };
+            session.state = ReplState::Resyncing { source: true };
             // Era superiority is a fence verdict made durable, and the
             // verdict is what lets this node keep acknowledging alone
             // while the stale peer catches up. A tie has no verdict, so
             // the tie's source suspends its guests as it always has.
-            self.serving_source = my_era > peer_era;
+            session.serving_source = my_era > peer_era;
+            session.stream_live = false;
         } else {
-            self.state = ReplState::Resyncing { source: false };
-            self.serving_source = false;
-            self.emit(Effect::Send(PeerMessage::SyncStart));
+            session.state = ReplState::Resyncing { source: false };
+            session.serving_source = false;
+            session.stream_live = false;
+            self.emit(Effect::Send(peer_node, PeerMessage::SyncStart));
         }
         Ok(())
     }
 
-    fn on_sync_start(&mut self) -> Result<()> {
-        if self.state != (ReplState::Resyncing { source: true }) {
+    fn on_sync_start(&mut self, from: NodeId) -> Result<()> {
+        if self.peers[&from].state != (ReplState::Resyncing { source: true }) {
             return Err(FsError::Corrupt(
                 "asked to source a sync while not sourcing",
             ));
@@ -915,18 +1189,19 @@ impl<D: Disk> ReplNode<D> {
         // serving source keeps checkpointing and collecting, and without
         // the pins its next collection could free blocks the target has
         // yet to ask for.
-        self.pool
-            .pin_sync(offer_pins(&offer, self.pool.block_size()));
+        let pins = offer_pins(&offer, self.pool.block_size());
+        self.pool.pin_sync(from, pins);
         // From exactly this checkpoint onward, ops stream. Earlier writes
         // are inside the offer; later ones are on the wire; nothing is in
         // both places.
-        self.stream_live = self.serving_source;
-        self.emit(Effect::Send(PeerMessage::SyncManifest(offer)));
+        let serving = self.peers[&from].serving_source;
+        self.session(from).stream_live = serving;
+        self.emit(Effect::Send(from, PeerMessage::SyncManifest(offer)));
         Ok(())
     }
 
-    /// Resolve everything queued: walk down through what this node already
-    /// holds, and list what it does not.
+    /// Resolve everything queued in this session's pull: walk down through
+    /// what this node already holds, and list what it does not.
     ///
     /// The walk descends into subtrees it already has rather than assuming
     /// them complete. That assumption looks safe — content addressing does
@@ -937,9 +1212,16 @@ impl<D: Disk> ReplNode<D> {
     /// here, and buys back the guarantee. What is still skipped, which is
     /// the point of a Merkle diff, is *transferring* any subtree already
     /// held.
-    fn resolve_pending(&mut self) -> Result<()> {
-        while let Some((hash, kind, data_tier)) = self.pull.pending.pop() {
-            if !self.pull.seen.insert((hash, kind, data_tier)) {
+    fn resolve_pending(&mut self, from: NodeId) -> Result<()> {
+        loop {
+            let entry = {
+                let session = self.session(from);
+                session.pull.pending.pop()
+            };
+            let Some((hash, kind, data_tier)) = entry else {
+                return Ok(());
+            };
+            if !self.session(from).pull.seen.insert((hash, kind, data_tier)) {
                 continue;
             }
             // A node lives on tier 0; a kind-0 entry is data on its
@@ -951,41 +1233,54 @@ impl<D: Disk> ReplNode<D> {
                         .pool
                         .block_payload(0, &hash)?
                         .ok_or(FsError::Corrupt("a held block vanished mid-resync"))?;
+                    let session = self.session(from);
                     for child in map::children(&payload) {
-                        self.pull.pending.push((child, kind - 1, data_tier));
+                        session.pull.pending.push((child, kind - 1, data_tier));
                     }
                 }
                 continue;
             }
-            let entry = self.pull.wanted.entry((hash, store_tier)).or_default();
+            let session = self.session(from);
+            let entry = session.pull.wanted.entry((hash, store_tier)).or_default();
             if entry.is_empty() {
-                self.pull.unrequested.push((store_tier, hash));
+                session.pull.unrequested.push((store_tier, hash));
             }
             if !entry.contains(&(kind, data_tier)) {
                 entry.push((kind, data_tier));
             }
         }
-        Ok(())
     }
 
-    fn pull_complete(&self) -> bool {
-        self.pull.pending.is_empty()
-            && self.pull.wanted.is_empty()
-            && self.pull.unrequested.is_empty()
+    fn request_more(&mut self, from: NodeId) {
+        let batch = {
+            let session = self.session(from);
+            if session.pull.outstanding > 0 || session.pull.unrequested.is_empty() {
+                return;
+            }
+            let take = session.pull.unrequested.len().min(SYNC_BATCH);
+            let batch: Vec<(u8, BlockHash)> = session.pull.unrequested.drain(..take).collect();
+            session.pull.outstanding = batch.len();
+            batch
+        };
+        self.emit(Effect::Send(from, PeerMessage::SyncNeed(batch)));
     }
 
-    fn request_more(&mut self) {
-        if self.pull.outstanding > 0 || self.pull.unrequested.is_empty() {
-            return;
+    fn after_pull_progress(&mut self, from: NodeId) {
+        let complete = {
+            let session = self.session(from);
+            session.pull.pending.is_empty()
+                && session.pull.wanted.is_empty()
+                && session.pull.unrequested.is_empty()
+        };
+        if complete {
+            self.emit(Effect::Send(from, PeerMessage::SyncReady));
+        } else {
+            self.request_more(from);
         }
-        let take = self.pull.unrequested.len().min(SYNC_BATCH);
-        let batch: Vec<(u8, BlockHash)> = self.pull.unrequested.drain(..take).collect();
-        self.pull.outstanding = batch.len();
-        self.emit(Effect::Send(PeerMessage::SyncNeed(batch)));
     }
 
-    fn on_sync_manifest(&mut self, offer: SyncOffer) -> Result<()> {
-        if self.state != (ReplState::Resyncing { source: false }) {
+    fn on_sync_manifest(&mut self, from: NodeId, offer: SyncOffer) -> Result<()> {
+        if self.peers[&from].state != (ReplState::Resyncing { source: false }) {
             return Err(FsError::Corrupt(
                 "offered a sync manifest while not pulling",
             ));
@@ -1002,44 +1297,43 @@ impl<D: Disk> ReplNode<D> {
         // by nothing in this node's own manifest until adoption. The pull
         // arrives top-down, so the pins reach every fetched block through
         // blocks the store holds.
-        self.pool
-            .pin_sync(offer_pins(&offer, self.pool.block_size()));
+        let pins = offer_pins(&offer, self.pool.block_size());
+        self.pool.pin_sync(from, pins);
         let entries = map::entries_per_node(self.pool.block_size());
         let block_size = self.pool.block_size() as u64;
         // A root of a depth-d tree is kind d: its children are kind d-1,
         // and kind 0 is a data block on the vdisk's tier.
+        let session = self.session(from);
         for (_, size_bytes, tier, root) in &offer.vdisks {
             if let Some(root) = root {
                 let depth = map::depth_for(size_bytes.div_ceil(block_size), entries);
-                self.pull.pending.push((*root, depth, *tier));
+                session.pull.pending.push((*root, depth, *tier));
             }
         }
         for (vdisk, _, size_bytes, root) in &offer.snapshots {
             if let Some(root) = root {
                 let depth = map::depth_for(size_bytes.div_ceil(block_size), entries);
-                self.pull
+                session
+                    .pull
                     .pending
                     .push((*root, depth, offer_vdisk_tier(&offer, *vdisk)));
             }
         }
-        self.pull.manifest = Some(offer);
-        self.resolve_pending()?;
-        if self.pull_complete() {
-            self.emit(Effect::Send(PeerMessage::SyncReady));
-        } else {
-            self.request_more();
-        }
+        session.pull.manifest = Some(offer);
+        self.resolve_pending(from)?;
+        self.after_pull_progress(from);
         Ok(())
     }
 
-    fn on_sync_data(&mut self, payloads: Vec<(u8, Vec<u8>)>) -> Result<()> {
-        if self.state != (ReplState::Resyncing { source: false }) {
+    fn on_sync_data(&mut self, from: NodeId, payloads: Vec<(u8, Vec<u8>)>) -> Result<()> {
+        if self.peers[&from].state != (ReplState::Resyncing { source: false }) {
             return Err(FsError::Corrupt("sync data arrived while not pulling"));
         }
         for (store_tier, payload) in payloads {
             let hash = self.pool.put_block(store_tier, &payload)?;
-            self.pull.outstanding = self.pull.outstanding.saturating_sub(1);
-            let continuations = self
+            let session = self.session(from);
+            session.pull.outstanding = session.pull.outstanding.saturating_sub(1);
+            let continuations = session
                 .pull
                 .wanted
                 .remove(&(hash, store_tier))
@@ -1048,16 +1342,12 @@ impl<D: Disk> ReplNode<D> {
                 // The block is here now; walking it from `pending` keeps
                 // one descent path for arrived and already-held blocks
                 // alike.
-                self.pull.seen.remove(&(hash, kind, data_tier));
-                self.pull.pending.push((hash, kind, data_tier));
+                session.pull.seen.remove(&(hash, kind, data_tier));
+                session.pull.pending.push((hash, kind, data_tier));
             }
         }
-        self.resolve_pending()?;
-        if self.pull_complete() {
-            self.emit(Effect::Send(PeerMessage::SyncReady));
-        } else {
-            self.request_more();
-        }
+        self.resolve_pending(from)?;
+        self.after_pull_progress(from);
         Ok(())
     }
 
@@ -1067,45 +1357,66 @@ impl<D: Disk> ReplNode<D> {
     /// the daemon's queue-and-retry window — so that no acknowledged write
     /// can exist that the adopting peer lacks. The fence in the reply is
     /// its position: FIFO delivery puts every streamed op before it.
-    fn on_sync_ready(&mut self) -> Result<()> {
-        if self.state != (ReplState::Resyncing { source: true }) {
+    fn on_sync_ready(&mut self, from: NodeId) -> Result<()> {
+        if self.peers[&from].state != (ReplState::Resyncing { source: true }) {
             return Err(FsError::Corrupt(
                 "a sync-ready arrived at a node that is not sourcing",
             ));
         }
-        self.serving_source = false;
-        self.emit(Effect::Send(PeerMessage::SyncAdopt {
-            final_rseq: self.next_rseq - 1,
-        }));
+        let final_rseq = {
+            let session = self.session(from);
+            session.serving_source = false;
+            session.next_rseq - 1
+        };
+        self.emit(Effect::Send(from, PeerMessage::SyncAdopt { final_rseq }));
         Ok(())
     }
 
-    fn on_sync_adopt(&mut self, final_rseq: u64) -> Result<()> {
-        if self.state != (ReplState::Resyncing { source: false }) || !self.pull_complete() {
+    fn on_sync_adopt(&mut self, from: NodeId, final_rseq: u64) -> Result<()> {
+        let complete = {
+            let session = &self.peers[&from];
+            session.state == (ReplState::Resyncing { source: false })
+                && session.pull.pending.is_empty()
+                && session.pull.wanted.is_empty()
+                && session.pull.unrequested.is_empty()
+        };
+        if !complete {
             return Err(FsError::Corrupt(
                 "told to adopt without a completed pull to adopt",
             ));
         }
-        let offer = self.pull.manifest.take().ok_or(FsError::Corrupt(
-            "finishing a pull that never had a manifest",
-        ))?;
+        let offer = self
+            .session(from)
+            .pull
+            .manifest
+            .take()
+            .ok_or(FsError::Corrupt(
+                "finishing a pull that never had a manifest",
+            ))?;
         let era = offer.era;
-        self.pool
-            .adopt_sync(era, &offer.vdisks, &offer.snapshots, &offer.leases)?;
+        self.pool.adopt_sync(
+            era,
+            &offer.vdisks,
+            &offer.snapshots,
+            &offer.leases,
+            AdoptScope::Whole,
+        )?;
         // The leases came over inside the adoption: the source's view of
         // who may write is part of the state being adopted, not a separate
         // negotiation.
-        self.pull = SyncPull::default();
-        self.pool.unpin_sync();
-        self.state = ReplState::Synced;
+        let session = self.session(from);
+        session.pull = SyncPull::default();
+        session.state = ReplState::Synced;
+        self.pool.unpin_sync(from);
         // The offer was the source at its checkpoint; the backlog is
         // everything its guests did since. Replayed through the ordinary
         // handlers — sequence checks and all — it lands this node on the
         // source's live state, and lockstep continues on that numbering.
-        for message in std::mem::take(&mut self.backlog) {
-            self.handle(message)?;
+        let backlog = std::mem::take(&mut self.session(from).backlog);
+        for message in backlog {
+            self.handle(from, message)?;
         }
-        if self.applied_rseq != final_rseq {
+        if self.peers[&from].applied_rseq != final_rseq {
             return Err(FsError::Corrupt(
                 "the stream this node replayed is not the stream the source sent",
             ));
@@ -1117,22 +1428,32 @@ impl<D: Disk> ReplNode<D> {
         // Anything this node's guests had in flight before it went stale
         // was discarded by the adoption; saying so beats pretending.
         let parked = std::mem::take(&mut self.parked);
-        for (ticket, _) in parked {
-            self.emit(Effect::FlushFailed(ticket));
+        for flush in parked {
+            self.emit(Effect::FlushFailed(flush.ticket));
         }
-        self.emit(Effect::Send(PeerMessage::SyncDone { era }));
+        self.emit(Effect::Send(from, PeerMessage::SyncDone { era }));
         Ok(())
     }
 
-    fn on_apply(&mut self, first_rseq: u64, ops: Vec<ReplOp>) -> Result<()> {
-        if first_rseq != self.applied_rseq + 1 {
+    fn on_apply(&mut self, from: NodeId, first_rseq: u64, ops: Vec<ReplOp>) -> Result<()> {
+        if first_rseq != self.peers[&from].applied_rseq + 1 {
             return Err(FsError::Corrupt("the op stream skipped or repeated"));
         }
         let count = ops.len() as u64;
         for op in ops {
+            let mapped = match &op {
+                ReplOp::Write { vdisk, hash, .. } => Some((*vdisk, *hash)),
+                _ => None,
+            };
             self.apply_op(op)?;
+            // The op landed; the payload it references is reachable from
+            // durable state now and no longer needs its arrival pin.
+            if let Some((vdisk, hash)) = mapped {
+                let tier = self.pool.vdisk_tier(vdisk)?;
+                self.pool.clear_inflight(from, tier, &hash);
+            }
         }
-        self.applied_rseq += count;
+        self.session(from).applied_rseq += count;
         Ok(())
     }
 
@@ -1208,7 +1529,8 @@ mod tests {
             .iter()
             .all(|e| !matches!(e, Effect::FlushDone(_))));
         // The verdict releases it.
-        a.set_peer_fenced().unwrap();
+        let era = a.era_target();
+        a.set_member_fenced(1, era).unwrap();
         assert_eq!(a.state(), ReplState::Degraded);
         assert!(a.take_effects().contains(&Effect::FlushDone(ticket)));
     }
@@ -1217,7 +1539,8 @@ mod tests {
     fn a_degraded_node_acknowledges_alone_and_bumped_its_era() {
         let mut a = node(2, 0);
         assert_eq!(a.pool().era(), 1);
-        a.set_peer_fenced().unwrap();
+        let era = a.era_target();
+        a.set_member_fenced(1, era).unwrap();
         assert_eq!(a.pool().era(), 2);
         a.create_vdisk(1, 100 * 4096, 0).unwrap();
         a.write_block(1, 0, b"alone but honest").unwrap();
@@ -1228,24 +1551,65 @@ mod tests {
     #[test]
     fn a_verdict_for_a_present_peer_is_refused() {
         let mut a = node(3, 0);
-        a.set_peer_fenced().unwrap();
-        // Already degraded: a second verdict makes no sense.
-        assert!(a.set_peer_fenced().is_err());
+        let era = a.era_target();
+        a.set_member_fenced(1, era).unwrap();
+        // Already fenced: a second verdict makes no sense.
+        let era = a.era_target();
+        assert!(a.set_member_fenced(1, era).is_err());
+    }
+
+    #[test]
+    fn a_verdict_below_the_witnessed_floor_is_refused() {
+        let mut a = node(6, 0);
+        // The node's own era is 1, so the target floor is 2; a verdict
+        // naming the era already lived in cannot fence anyone honestly.
+        assert!(a.set_member_fenced(1, 1).is_err());
+        // And the honest number still works.
+        a.set_member_fenced(1, a.era_target()).unwrap();
+        assert_eq!(a.pool().era(), 2);
     }
 
     #[test]
     fn only_the_writer_writes() {
         let mut a = node(4, 0);
-        a.set_peer_fenced().unwrap();
+        let era = a.era_target();
+        a.set_member_fenced(1, era).unwrap();
         a.create_vdisk(1, 100 * 4096, 0).unwrap();
         a.take_effects();
         // Another node's view: same vdisk, no writer role.
         let mut b = node(5, 1);
-        b.set_peer_fenced().unwrap();
+        let era = b.era_target();
+        b.set_member_fenced(0, era).unwrap();
         b.pool_create_for_test(1);
         assert_eq!(
             b.write_block(1, 0, b"not mine").unwrap_err(),
             FsError::NotWriter(1)
+        );
+    }
+
+    #[test]
+    fn an_era_stale_lease_of_a_live_member_is_not_claimable() {
+        let mut a = node(7, 0);
+        a.set_member_fenced(1, a.era_target()).unwrap();
+        a.create_vdisk(1, 100 * 4096, 0).unwrap();
+        // Hand the record to node 2 (live, never fenced), then age it: a
+        // second verdict against a different member bumps the era past
+        // the lease.
+        let lease = Lease {
+            holder: 2,
+            handing_to: None,
+            era: a.pool().era(),
+        };
+        a.pool.set_lease(1, lease).unwrap();
+        a.set_member_fenced(3, a.era_target()).unwrap();
+        // The record is stale but its holder is alive somewhere: claiming
+        // would make a second writer.
+        assert_eq!(
+            a.claim_writer(1).unwrap_err(),
+            FsError::LeaseHeld {
+                vdisk: 1,
+                holder: 2
+            }
         );
     }
 

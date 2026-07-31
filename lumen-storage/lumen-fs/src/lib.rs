@@ -46,7 +46,7 @@ pub use disk::Disk;
 pub use error::{FsError, Result};
 pub use hash::{hash_block, BlockHash};
 pub use pool::bytes::ByteView;
-pub use pool::{Lease, Pool, ScrubReport};
+pub use pool::{AdoptScope, Lease, Pool, ScrubReport};
 pub use repl::slice::{slice_of, Homes, Reassignment, SliceMap, SliceMove, SLICES};
 pub use repl::{Effect, NodeId, PeerMessage, ReplNode, ReplOp, ReplState, SyncOffer};
 pub use store::brick::{BlockRead, BlockWrite, Brick, BrickParams, BrickStats, ByteSpace, GcStats};

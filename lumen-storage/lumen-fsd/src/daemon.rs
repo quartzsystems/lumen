@@ -126,6 +126,13 @@ struct Flushes {
 
 struct Shared {
     node_id: u8,
+    /// The peer this single-link daemon last shook hands with. The engine
+    /// speaks in addressed sessions now; until the mesh lands (phase 5's
+    /// daemon slice) there is exactly one, and this is its name. A fence
+    /// verdict arriving before any handshake falls back to the two-member
+    /// convention: node ids are 0 and 1, so the peer is whichever this
+    /// node is not.
+    peer: Mutex<Option<u8>>,
     engine: Mutex<ReplNode<FileDisk>>,
     /// Notified after every engine call — the wakeable "something changed"
     /// every blocked guest operation waits on. Paired with `engine`.
@@ -154,7 +161,10 @@ impl Shared {
         let mut fl = self.flushes.lock().unwrap();
         for effect in effects {
             match effect {
-                Effect::Send(message) => ob.queue.push_back(message),
+                // One queue because there is one peer: the single-link
+                // daemon's outbound is that peer's session by definition.
+                // The mesh keys queues by the addressee.
+                Effect::Send(_, message) => ob.queue.push_back(message),
                 Effect::FlushDone(ticket) => {
                     fl.outcomes.insert(ticket, true);
                 }
@@ -184,19 +194,29 @@ impl Shared {
     /// A session is up: open a fresh incarnation (dropping anything queued
     /// for a dead one) and say hello. Returns the incarnation this session
     /// owns — its identity for the writer and for teardown.
-    fn session_up(&self) -> u64 {
+    fn session_up(&self, peer: u8) -> u64 {
         let mut engine = self.engine.lock().unwrap();
+        *self.peer.lock().unwrap() = Some(peer);
         let incarnation = {
             let mut ob = self.outbound.lock().unwrap();
             ob.incarnation += 1;
             ob.queue.clear();
             ob.incarnation
         };
-        engine.connect();
+        engine.connect(peer);
         self.drain(&mut engine);
         drop(engine);
         self.notify_all();
         incarnation
+    }
+
+    /// The one peer this daemon speaks to: the last handshake's node id,
+    /// or — before any handshake — the two-member convention's other id.
+    fn peer_id(&self) -> u8 {
+        self.peer
+            .lock()
+            .unwrap()
+            .unwrap_or(if self.node_id == 0 { 1 } else { 0 })
     }
 
     /// A session died. Exactly-once semantics ride the incarnation: if it
@@ -217,7 +237,8 @@ impl Shared {
             }
         };
         if !stale {
-            engine.peer_lost();
+            let peer = self.peer_id();
+            engine.peer_lost(peer);
             self.drain(&mut engine);
         }
         drop(engine);
@@ -225,8 +246,10 @@ impl Shared {
     }
 
     /// The cluster's verdict, applied: force the link down and continue
-    /// alone at the bumped era.
+    /// alone at the agreed era. Fencing a member already fenced is already
+    /// done — the verdict layer may retry, and a retry must not error.
     fn fence_peer(&self) -> Result<(), FsError> {
+        let peer = self.peer_id();
         self.kill_link();
         let mut engine = self.engine.lock().unwrap();
         {
@@ -234,10 +257,17 @@ impl Shared {
             ob.incarnation += 1;
             ob.queue.clear();
         }
-        if engine.state() != ReplState::Suspended {
-            engine.peer_lost();
+        if engine.is_fenced(peer) {
+            drop(engine);
+            self.notify_all();
+            return Ok(());
         }
-        let outcome = engine.set_peer_fenced();
+        engine.peer_lost(peer);
+        // At two members the sole survivor's own floor is the whole
+        // computation; the mesh daemon's verdict verb carries the number
+        // the layer above agreed.
+        let era = engine.era_target();
+        let outcome = engine.set_member_fenced(peer, era);
         self.drain(&mut engine);
         drop(engine);
         self.notify_all();
@@ -566,8 +596,9 @@ fn run_session(shared: &Arc<Shared>, mut stream: TcpStream) {
     // Register the socket so a verdict or a replacement can kill it, then
     // open the session in the engine.
     *shared.live_socket.lock().unwrap() = stream.try_clone().ok();
-    let incarnation = shared.session_up();
-    eprintln!("peer session {incarnation} up (node {})", theirs.node);
+    let peer_node = theirs.node;
+    let incarnation = shared.session_up(peer_node);
+    eprintln!("peer session {incarnation} up (node {peer_node})");
 
     let writer = {
         let shared = Arc::clone(shared);
@@ -586,7 +617,7 @@ fn run_session(shared: &Arc<Shared>, mut stream: TcpStream) {
                 break;
             }
         };
-        let outcome = shared.with_engine(|engine| engine.handle(message));
+        let outcome = shared.with_engine(|engine| engine.handle(peer_node, message));
         if let Err(err) = outcome {
             // A protocol violation or an engine refusal. Dropping the
             // session is always safe: reconnect runs a resync, and the
@@ -676,6 +707,7 @@ impl Daemon {
 
         let shared = Arc::new(Shared {
             node_id: config.node,
+            peer: Mutex::new(None),
             engine: Mutex::new(engine),
             changed: Condvar::new(),
             outbound: Mutex::new(Outbound {

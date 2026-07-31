@@ -300,23 +300,23 @@ fn pump(a: &mut ReplNode<SimDisk>, b: &mut ReplNode<SimDisk>) -> Result<(), FsEr
         let mut moved = false;
         let mut to_b = Vec::new();
         for effect in a.take_effects() {
-            if let Effect::Send(message) = effect {
+            if let Effect::Send(_, message) = effect {
                 to_b.push(message);
             }
         }
         let mut to_a = Vec::new();
         for effect in b.take_effects() {
-            if let Effect::Send(message) = effect {
+            if let Effect::Send(_, message) = effect {
                 to_a.push(message);
             }
         }
         for message in to_b {
             moved = true;
-            b.handle(message)?;
+            b.handle(0, message)?;
         }
         for message in to_a {
             moved = true;
-            a.handle(message)?;
+            a.handle(1, message)?;
         }
         if !moved {
             return Ok(());
@@ -328,8 +328,8 @@ fn pump(a: &mut ReplNode<SimDisk>, b: &mut ReplNode<SimDisk>) -> Result<(), FsEr
 fn a_tier_the_peer_lacks_is_refused_at_create_not_discovered_at_replay() {
     let mut a = two_tier_node(500, 0);
     let mut b = single_tier_node(600, 1);
-    a.connect();
-    b.connect();
+    a.connect(1);
+    b.connect(0);
     pump(&mut a, &mut b).unwrap();
     assert_eq!(a.state(), ReplState::Synced);
 
@@ -352,19 +352,19 @@ fn an_offer_naming_a_tier_the_target_lacks_is_refused_by_name() {
     // block moves, not adopt a vdisk it cannot store.
     let mut a = two_tier_node(700, 0);
     let mut b = single_tier_node(800, 1);
-    a.connect();
-    b.connect();
+    a.connect(1);
+    b.connect(0);
     pump(&mut a, &mut b).unwrap();
 
-    a.peer_lost();
-    b.peer_lost();
-    a.set_peer_fenced().unwrap();
+    a.peer_lost(1);
+    b.peer_lost(0);
+    a.set_member_fenced(1, a.era_target()).unwrap();
     a.create_vdisk(5, 40 * BLOCK as u64, 1).unwrap();
     a.write_block(5, 0, b"tier one only").unwrap();
     a.flush().unwrap();
 
-    a.connect();
-    b.connect();
+    a.connect(1);
+    b.connect(0);
     let outcome = pump(&mut a, &mut b);
     assert_eq!(outcome.unwrap_err(), FsError::NoSuchTier(1));
 }

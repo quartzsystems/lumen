@@ -146,12 +146,41 @@ pub struct Pool<D: Disk> {
     anchor_generation: u64,
     /// The data generation (replication's era) — see format.rs's Anchor.
     era: u64,
-    /// Roots a resync holds live beyond the manifest, as `(hash, depth,
-    /// data_tier)` — depth as map::walk counts it, and the tier the tree's
-    /// *data* blocks live on (its nodes are tier 0 like every map node).
-    /// Volatile on purpose: a crash ends the resync session that needed
-    /// them, and the next session pins its own.
-    sync_pins: Vec<(BlockHash, u32, u8)>,
+    /// What each peer session holds live beyond the manifest. Volatile on
+    /// purpose: a crash ends the sessions that needed them, and the next
+    /// sessions pin their own.
+    session_pins: BTreeMap<NodeId, SessionPins>,
+}
+
+/// One peer session's claims against garbage collection: the roots of a
+/// resync offer in flight on that session, and payloads that arrived
+/// ahead of the ops that will reference them. Both are blocks the manifest
+/// does not reach yet, and both must outlive any collection that runs
+/// while the session does.
+#[derive(Debug, Default)]
+struct SessionPins {
+    /// Offer roots as `(hash, depth, data_tier)` — depth as map::walk
+    /// counts it, and the tier the tree's *data* blocks live on (its
+    /// nodes are tier 0 like every map node).
+    offer: Vec<(BlockHash, u32, u8)>,
+    /// Blocks delivered ahead of their op, as `(store_tier, hash)` —
+    /// pinned exactly until the referencing op lands, because a
+    /// collection in that gap would sweep the block and the op's replay
+    /// would then name a block the store does not hold.
+    inflight: HashSet<(u8, BlockHash)>,
+}
+
+/// How much of an offer an adoption replaces. `Whole` is the two-node
+/// resync: the target becomes the offer, and every vdisk the offer does
+/// not name is discarded with the rest of the divergent history. `Named`
+/// replaces only the vdisks the offer carries and leaves the rest
+/// standing — the shape a three-member rejoin needs, where each vdisk is
+/// adopted from *its lease holder's* offer and no single peer speaks for
+/// all of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdoptScope {
+    Whole,
+    Named,
 }
 
 /// What a WAL entry says. The encoding is fixed little-endian, one byte of
@@ -332,7 +361,7 @@ impl<D: Disk> Pool<D> {
             leases,
             anchor_generation: anchor.generation,
             era: anchor.era,
-            sync_pins: Vec::new(),
+            session_pins: BTreeMap::new(),
         };
 
         // Replay: apply each entry only while everything it references
@@ -1129,48 +1158,94 @@ impl<D: Disk> Pool<D> {
         self.era
     }
 
-    /// This node is continuing without its peer, on a fence verdict the
+    /// This node is continuing without a member, on a fence verdict the
     /// caller holds: the state that follows belongs to a new generation,
     /// and the fact is anchored before any of that state exists.
     ///
-    /// `witnessed` is the highest era the caller has ever heard a peer
-    /// claim, and the new era must clear it as well as our own. Without
-    /// the floor, a node fenced-verdict-surviving at era 1 while mid-way
-    /// through adopting a peer's era-2 history would mint a *second* era
-    /// 2 — two divergent lineages under one name, and the tie-break at
-    /// the next reconnect would treat them as sharing every acknowledged
-    /// write. Eras order lineages only if every bump clears every era the
-    /// node has witnessed.
-    pub fn bump_era(&mut self, witnessed: u64) -> Result<()> {
-        self.era = self.era.max(witnessed) + 1;
+    /// The caller supplies the number rather than this pool computing one,
+    /// because the number must be *agreed*: two survivors each computing
+    /// `max + 1` from their own vantage can mint different eras for the
+    /// same verdict, and the next hello would read the difference as a
+    /// second verdict that never happened. The layer that issues verdicts
+    /// takes every survivor's floor into one target; this pool only
+    /// insists the target actually moves it forward — an era that does
+    /// not rise orders nothing.
+    pub fn bump_era_to(&mut self, target: u64) -> Result<()> {
+        if target <= self.era {
+            return Err(FsError::Corrupt(
+                "an era bump must clear the era it replaces",
+            ));
+        }
+        self.era = target;
         self.checkpoint()
     }
 
-    /// Hold these roots live through collections until [`Pool::unpin_sync`],
-    /// as `(root, depth, data_tier)`. A resync needs this on both ends:
-    /// the source keeps writing past the state it offered, so its next
-    /// checkpoint orphans the offer's trees while the target is still
-    /// fetching them; the target holds a growing top-connected fragment of
-    /// the offer that nothing in its own manifest references yet. Replaces
-    /// any previous pins — one resync session at a time is the protocol's
-    /// shape.
-    pub fn pin_sync(&mut self, pins: Vec<(BlockHash, u32, u8)>) {
-        self.sync_pins = pins;
+    /// Hold these roots live through collections for one peer's session,
+    /// until [`Pool::unpin_sync`] for that peer. A resync needs this on
+    /// both ends: the source keeps writing past the state it offered, so
+    /// its next checkpoint orphans the offer's trees while the target is
+    /// still fetching them; the target holds a growing top-connected
+    /// fragment of the offer that nothing in its own manifest references
+    /// yet. Pins are per session because sessions overlap: a node can
+    /// source one peer's pull while pulling from another, and neither may
+    /// clobber the other's claims.
+    pub fn pin_sync(&mut self, peer: NodeId, pins: Vec<(BlockHash, u32, u8)>) {
+        self.session_pins.entry(peer).or_default().offer = pins;
     }
 
-    /// The resync is over — however it ended, the pins come off. What they
-    /// held either got adopted (reachable again) or is garbage (correctly).
-    pub fn unpin_sync(&mut self) {
-        self.sync_pins.clear();
+    /// This peer's resync is over — however it ended, its offer pins come
+    /// off. What they held either got adopted (reachable again) or is
+    /// garbage (correctly).
+    pub fn unpin_sync(&mut self, peer: NodeId) {
+        if let Some(pins) = self.session_pins.get_mut(&peer) {
+            pins.offer.clear();
+        }
     }
 
-    /// Mark everything reachable from the sync pins *through blocks the
-    /// store holds*. Skipping an absent subtree is correct on both ends: on
-    /// the source everything pinned is present, and on the target the pull
-    /// arrives strictly top-down — a held block's parents are held — so
-    /// every fetched block sits on a present path from a pinned root.
+    /// A payload arrived on this peer's session ahead of the op that will
+    /// reference it. Until that op lands, nothing durable reaches the
+    /// block — a collection in the gap would sweep it, and the op's replay
+    /// would then name a block the store does not hold.
+    pub fn pin_inflight(&mut self, peer: NodeId, tier: u8, hash: BlockHash) {
+        self.session_pins
+            .entry(peer)
+            .or_default()
+            .inflight
+            .insert((tier, hash));
+    }
+
+    /// The op referencing this payload landed; the block is reachable from
+    /// durable state and no longer needs its arrival pin.
+    pub fn clear_inflight(&mut self, peer: NodeId, tier: u8, hash: &BlockHash) {
+        if let Some(pins) = self.session_pins.get_mut(&peer) {
+            pins.inflight.remove(&(tier, *hash));
+        }
+    }
+
+    /// The peer's session died: every claim it held comes off. Payloads
+    /// whose ops will now never arrive become garbage, correctly — the
+    /// next session's offer re-ships anything that still matters.
+    pub fn drop_session_pins(&mut self, peer: NodeId) {
+        self.session_pins.remove(&peer);
+    }
+
+    /// Mark everything reachable from every session's pins *through blocks
+    /// the store holds*. Skipping an absent subtree is correct on both
+    /// ends: on the source everything pinned is present, and on the target
+    /// the pull arrives strictly top-down — a held block's parents are
+    /// held — so every fetched block sits on a present path from a pinned
+    /// root. In-flight payloads are leaves by definition and marked
+    /// directly.
     fn mark_pinned(&self, live: &mut HashSet<(u8, BlockHash)>) -> Result<()> {
-        let mut pending: Vec<(BlockHash, u32, u8)> = self.sync_pins.clone();
+        let mut pending: Vec<(BlockHash, u32, u8)> = Vec::new();
+        for pins in self.session_pins.values() {
+            pending.extend(pins.offer.iter().copied());
+            for (tier, hash) in &pins.inflight {
+                if self.store.contains(*tier, hash) {
+                    live.insert((*tier, *hash));
+                }
+            }
+        }
         let mut seen: HashSet<(BlockHash, u32, u8)> = HashSet::new();
         while let Some((hash, kind, data_tier)) = pending.pop() {
             // A node lives on tier 0; a kind-0 entry is data on its tier.
@@ -1258,19 +1333,28 @@ impl<D: Disk> Pool<D> {
         (self.era, vdisks, snapshots)
     }
 
-    /// Become the offered state: replace every vdisk and snapshot with the
-    /// source's, adopt its era, and anchor it all. The blocks under every
-    /// root must already be in the store — the resync's tree walk is what
-    /// put them there — and whatever this node held before becomes garbage
-    /// for the next collection. This is how a stale node stops being
-    /// stale, and the discard of its divergent unacknowledged history is
-    /// the point, not a side effect.
+    /// Become the offered state: replace what the offer names, adopt its
+    /// era, and anchor it all. The blocks under every root must already be
+    /// in the store — the resync's tree walk is what put them there — and
+    /// whatever the adoption displaces becomes garbage for the next
+    /// collection. This is how a stale node stops being stale, and the
+    /// discard of its divergent unacknowledged history is the point, not a
+    /// side effect.
+    ///
+    /// [`AdoptScope::Whole`] discards every vdisk, snapshot, and lease the
+    /// offer does not name — one source speaks for the whole pool, the
+    /// two-node resync. [`AdoptScope::Named`] replaces only what the offer
+    /// carries and leaves the rest standing, which is the shape a
+    /// three-member rejoin needs: each vdisk adopted from its own lease
+    /// holder's offer, because no single peer can speak for ops another
+    /// writer originated.
     pub fn adopt_sync(
         &mut self,
         era: u64,
         vdisks: &[VdiskOffer],
         snapshots: &[SnapshotOffer],
         leases: &[(u64, Lease)],
+        scope: AdoptScope,
     ) -> Result<()> {
         for (_, _, tier, root) in vdisks {
             // A vdisk on a tier this set lacks has nowhere for its data —
@@ -1292,36 +1376,46 @@ impl<D: Disk> Pool<D> {
                 }
             }
         }
-        self.vdisks = vdisks
-            .iter()
-            .map(|(id, size_bytes, tier, root)| {
-                (
-                    *id,
-                    VdiskState {
-                        size_bytes: *size_bytes,
-                        tier: *tier,
-                        root: *root,
-                        dirty: BTreeMap::new(),
-                    },
-                )
-            })
-            .collect();
-        self.snapshots = snapshots
-            .iter()
-            .map(|(vdisk, snapshot, size_bytes, root)| {
-                (
-                    (*vdisk, *snapshot),
-                    SnapshotState {
-                        size_bytes: *size_bytes,
-                        root: *root,
-                    },
-                )
-            })
-            .collect();
+        if scope == AdoptScope::Whole {
+            self.vdisks.clear();
+            self.snapshots.clear();
+            self.leases.clear();
+        } else {
+            // Named: the offer's vdisks are replaced outright, which
+            // includes every snapshot pinned under them — a snapshot's
+            // truth comes from its vdisk's holder along with the vdisk.
+            for (id, _, _, _) in vdisks {
+                self.vdisks.remove(id);
+                self.snapshots.retain(|(vdisk, _), _| vdisk != id);
+                self.leases.remove(id);
+            }
+        }
+        for (id, size_bytes, tier, root) in vdisks {
+            self.vdisks.insert(
+                *id,
+                VdiskState {
+                    size_bytes: *size_bytes,
+                    tier: *tier,
+                    root: *root,
+                    dirty: BTreeMap::new(),
+                },
+            );
+        }
+        for (vdisk, snapshot, size_bytes, root) in snapshots {
+            self.snapshots.insert(
+                (*vdisk, *snapshot),
+                SnapshotState {
+                    size_bytes: *size_bytes,
+                    root: *root,
+                },
+            );
+        }
         // Who may write is part of the state being adopted, not a separate
         // negotiation: a node that has just taken someone else's history
         // has no standing to keep its own opinion about who holds the pen.
-        self.leases = leases.iter().copied().collect();
+        for (vdisk, lease) in leases {
+            self.leases.insert(*vdisk, *lease);
+        }
         self.era = era;
         self.checkpoint()
     }
@@ -1945,7 +2039,7 @@ mod tests {
         pool.claim_lease(1, 0).unwrap();
         assert!(pool.may_write(1, 0));
 
-        pool.bump_era(0).unwrap();
+        pool.bump_era_to(2).unwrap();
         assert!(!pool.may_write(1, 0), "a stale lease still bound the pool");
         pool.claim_lease(1, 1).unwrap();
         assert!(pool.may_write(1, 1));
@@ -1954,17 +2048,22 @@ mod tests {
     }
 
     #[test]
-    fn an_era_bump_clears_every_era_the_node_has_witnessed() {
-        // A survivor fenced while mid-way through adopting a peer's era
-        // must not mint a second copy of that era: two divergent lineages
-        // under one number would tie at the next reconnect, and the
-        // tie-break assumes tied nodes share every acknowledged write.
+    fn an_era_bump_moves_forward_or_not_at_all() {
+        // The bump's number is agreed above this pool (two survivors
+        // minting independently could disagree), so what the pool itself
+        // enforces is only that eras rise: a target at or below the
+        // current era orders nothing and is refused.
         let mut pool = pool(35);
         assert_eq!(pool.era(), 1);
-        pool.bump_era(0).unwrap();
-        assert_eq!(pool.era(), 2, "a bump with nothing witnessed is just +1");
-        pool.bump_era(7).unwrap();
-        assert_eq!(pool.era(), 8, "the bump did not clear the witnessed era");
+        pool.bump_era_to(2).unwrap();
+        assert_eq!(pool.era(), 2);
+        assert!(pool.bump_era_to(2).is_err(), "a flat bump was accepted");
+        assert!(
+            pool.bump_era_to(1).is_err(),
+            "a backwards bump was accepted"
+        );
+        pool.bump_era_to(8).unwrap();
+        assert_eq!(pool.era(), 8, "the agreed number was not adopted");
         let pool = reopen(pool);
         assert_eq!(pool.era(), 8, "the era bump was not anchored");
     }
@@ -1993,7 +2092,7 @@ mod tests {
             (40 * BLOCK as u64).div_ceil(BLOCK as u64),
             map::entries_per_node(BLOCK as u32),
         );
-        pool.pin_sync(vec![(root, depth, 0)]);
+        pool.pin_sync(1, vec![(root, depth, 0)]);
 
         // The offer becomes history: every index rewritten, checkpointed,
         // collected.
@@ -2014,7 +2113,7 @@ mod tests {
         assert!(pool.has_block(0, &root), "the pinned root itself was swept");
 
         // Unpinned, the offer is garbage like any other history.
-        pool.unpin_sync();
+        pool.unpin_sync(1);
         pool.collect_garbage().unwrap();
         for data in &old_payloads {
             assert!(
@@ -2022,6 +2121,45 @@ mod tests {
                 "an unpinned offer survived collection"
             );
         }
+    }
+
+    #[test]
+    fn an_inflight_payload_survives_a_collection_until_its_op_lands() {
+        // A replicated payload arrives ahead of the op that references
+        // it. In that gap nothing durable reaches the block, so an
+        // unpinned collection would sweep it — and the op's replay would
+        // then name a block the store does not hold. The window was
+        // reachable at two nodes; the simulation had simply never
+        // collected inside it.
+        let mut pool = pool(37);
+        pool.create_vdisk(1, 40 * BLOCK as u64, 0).unwrap();
+        pool.write_block(1, 0, b"traffic to collect around")
+            .unwrap();
+        pool.checkpoint().unwrap();
+        let payload = vec![0x5A; 600];
+        let hash = pool.put_block(0, &payload).unwrap();
+        pool.pin_inflight(9, 0, hash);
+        pool.collect_garbage().unwrap();
+        assert!(
+            pool.has_block(0, &hash),
+            "a collection swept a payload still waiting on its op"
+        );
+        // The op lands; the pin comes off; the block is now reachable
+        // through the map instead.
+        pool.write_block_prehashed(1, 1, hash).unwrap();
+        pool.clear_inflight(9, 0, &hash);
+        pool.checkpoint().unwrap();
+        pool.collect_garbage().unwrap();
+        assert!(pool.has_block(0, &hash), "a mapped block was swept");
+        // And a pin whose op never arrives dies with its session.
+        let orphan = pool.put_block(0, &vec![0x5B; 600]).unwrap();
+        pool.pin_inflight(9, 0, orphan);
+        pool.drop_session_pins(9);
+        pool.collect_garbage().unwrap();
+        assert!(
+            !pool.has_block(0, &orphan),
+            "a dead session's inflight pin outlived it"
+        );
     }
 
     #[test]
