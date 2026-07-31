@@ -1531,6 +1531,14 @@ impl ClusterService {
                 true,
             )
             .await?;
+        // Clustering is what makes live migration possible, so clustering
+        // opens the hypervisor's door for it — with reachability already
+        // confined to the Core interfaces the binding above named. This
+        // was the recorded loose end from the replicated-storage program
+        // ("enabling it silently for every appliance would make the
+        // decision nobody's"); the workflow that needs it enabling it is
+        // whose decision it is.
+        self.backend.set_migration_listener(true).await?;
         self.backend
             .write_cluster_config(&payload.corosync_conf, &payload.authkey)
             .await
@@ -1554,6 +1562,8 @@ impl ClusterService {
             }
         };
         note(self.backend.disable_stack().await);
+        // The migration listener came with clustering and leaves with it.
+        note(self.backend.set_migration_listener(false).await);
         note(self.backend.remove_cluster_config().await);
         if let Some(interface) = &payload.core_interface {
             // The ports close before the address goes: both are things this
@@ -3266,6 +3276,8 @@ mod tests {
             backend.cluster_ports(),
             vec![("nic1".to_string(), Some("nic0".to_string()), true)]
         );
+        // Clustering opens the hypervisor's migration door...
+        assert_eq!(backend.migration_listener(), vec![true]);
         // The configuration still landed — opening the ports is a step
         // before it, not instead of it.
         assert_eq!(backend.written_configs().len(), 1);
@@ -3282,6 +3294,8 @@ mod tests {
             backend.cluster_ports().last().unwrap(),
             &("nic1".to_string(), Some("nic0".to_string()), false)
         );
+        // ...and teardown closes it.
+        assert_eq!(backend.migration_listener(), vec![true, false]);
     }
 
     /// The prepare payload carries the Management interface, so the node

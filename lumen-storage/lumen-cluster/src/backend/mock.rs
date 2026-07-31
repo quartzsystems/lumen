@@ -29,6 +29,8 @@ struct Inner {
     written_configs: Vec<(String, String)>,
     /// Every firewall adjustment, in order: (core, management, open).
     cluster_ports: Vec<(String, Option<String>, bool)>,
+    /// Every migration-listener adjustment, in order: open or close.
+    migration_listener: Vec<bool>,
     stack_enabled: bool,
     config_removed: bool,
     properties: Vec<(String, String)>,
@@ -229,6 +231,11 @@ impl MockBackend {
     /// Every firewall adjustment, in order: (core, management, open).
     pub fn cluster_ports(&self) -> Vec<(String, Option<String>, bool)> {
         self.inner.lock().unwrap().cluster_ports.clone()
+    }
+
+    /// Every migration-listener adjustment, in order: open or close.
+    pub fn migration_listener(&self) -> Vec<bool> {
+        self.inner.lock().unwrap().migration_listener.clone()
     }
 
     pub fn stack_enabled(&self) -> bool {
@@ -466,6 +473,14 @@ impl ClusterBackend for MockBackend {
             management.map(str::to_string),
             open,
         ));
+        Ok(())
+    }
+
+    async fn set_migration_listener(&self, open: bool) -> Result<()> {
+        if let Some(err) = self.take_failure() {
+            return Err(err);
+        }
+        self.inner.lock().unwrap().migration_listener.push(open);
         Ok(())
     }
 

@@ -446,12 +446,16 @@ The replicated-storage program is complete: the HA manager, snapshots and
 the transactional rollback, the guided split-brain recovery, the 2→3
 scale-out with its policy flip, and the packaging (ELRepo kmod-drbd9x,
 kABI-gated exactly like kmod-zfs; the HighAvailability stack; presets that
-keep every cluster daemon off until a cluster exists) have all landed. One
-loose end is deliberate: the migration URI assumes libvirt listening on the
-Core network, and the packaging ships the firewalld service definition for
-it but does **not** enable the listener — virtproxyd's TCP authentication
-is its own security decision, and turning it on silently for every
-appliance would make it nobody's. No external storage export, no thin
+keep every cluster daemon off until a cluster exists) have all landed. The
+migration URI assumes libvirt listening on the Core network; the packaging
+ships the firewalld service definition for it, and cluster prepare is what
+enables the listener (`virtproxyd-tcp.socket`, `auth_tcp = "none"`),
+teardown what disables it — the resolution of a long-deliberate loose end.
+Turning it on silently for every appliance would have made the security
+decision nobody's; the workflow that needs it enabling it makes it the
+cluster's, and the `lumen-replication` firewalld binding — Core interfaces
+alone — is what actually confines who can reach it. A standalone appliance
+never listens. No external storage export, no thin
 provisioning under replication, and no scale past 3 replicas — stated
 non-goals, not omissions.
 

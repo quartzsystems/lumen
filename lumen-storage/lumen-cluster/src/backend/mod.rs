@@ -78,6 +78,21 @@ pub trait ClusterBackend: Send + Sync {
         open: bool,
     ) -> Result<()>;
 
+    /// Open or close the hypervisor's own door for live migration:
+    /// `virtproxyd-tcp.socket` with `auth_tcp = "none"`, the listener the
+    /// migration URI dials on the Core network.
+    ///
+    /// This was a deliberately unshipped decision for a long time —
+    /// "turning it on silently for every appliance would make it
+    /// nobody's" — and the resolution is the same one the firewall
+    /// bindings above reached: the workflow that needs it enables it.
+    /// Clustering is what makes live migration possible, so clustering
+    /// is what opens the door, and `set_cluster_ports` has already
+    /// confined who can knock: the `lumen-replication` service that
+    /// carries 16509 binds to Core interfaces alone. A standalone
+    /// appliance never listens; a torn-down member stops.
+    async fn set_migration_listener(&self, open: bool) -> Result<()>;
+
     /// `systemctl enable --now corosync pacemaker`. Enabled here and only
     /// here: the packages ship presets that keep both off, because a node
     /// that is not in a cluster must not start half of one at boot.

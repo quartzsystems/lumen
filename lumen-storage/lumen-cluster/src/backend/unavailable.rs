@@ -53,6 +53,10 @@ impl ClusterBackend for UnavailableBackend {
         self.error()
     }
 
+    async fn set_migration_listener(&self, _open: bool) -> Result<()> {
+        self.error()
+    }
+
     async fn enable_stack(&self) -> Result<()> {
         self.error()
     }

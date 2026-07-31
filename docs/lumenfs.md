@@ -966,8 +966,11 @@ purge — finally has a reap surface: `DELETE
 /api/storage/pool/disks/{name}`, refused while any defined machine
 still references the device. What remains open is exactly what the
 ledger says: the three-box burn-in, the preview label that only
-scrub-clean time on real hardware can lift, the console's grow dialog,
-and the virtproxyd enablement decision.
+scrub-clean time on real hardware can lift, and the console's grow
+dialog. The virtproxyd enablement decision closed the same day it was
+named: cluster prepare enables the listener and teardown disables it —
+the same resolution the firewall bindings reached, the workflow that
+needs it being the one that turns it on (see `docs/storage.md`).
 
 ## Burning it in
 

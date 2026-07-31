@@ -50,6 +50,10 @@ const PCS: &str = "/usr/sbin/pcs";
 const CIBADMIN: &str = "/usr/sbin/cibadmin";
 
 const FIREWALL_CMD: &str = "/usr/bin/firewall-cmd";
+/// The hypervisor proxy's configuration and its TCP activation unit — the
+/// listener live migration dials on the Core network.
+const VIRTPROXYD_CONF: &str = "/etc/libvirt/virtproxyd.conf";
+const VIRTPROXYD_TCP: &str = "virtproxyd-tcp.socket";
 /// corosync on both rings — bound on Core and Management.
 const CLUSTER_SERVICE: &str = "lumen-cluster";
 /// DRBD, the hypervisor's peer connection, and the migration stream — Core
@@ -309,6 +313,59 @@ impl ClusterBackend for CliBackend {
         self.run_privileged(
             "the host firewall would not reload".into(),
             ExecRequest::new("reload the host firewall", FIREWALL_CMD).args(["--reload"]),
+        )
+        .await
+    }
+
+    async fn set_migration_listener(&self, open: bool) -> Result<()> {
+        if !open {
+            // The conf stays: a `none`-auth line under a listener that no
+            // longer listens authorizes nothing, and leaving it makes the
+            // next prepare a no-op edit instead of a rewrite.
+            return self
+                .run_privileged(
+                    "closing the hypervisor's migration listener failed".into(),
+                    ExecRequest::new("stop the hypervisor's TCP listener", SYSTEMCTL).args([
+                        "disable",
+                        "--now",
+                        VIRTPROXYD_TCP,
+                    ]),
+                )
+                .await;
+        }
+        // The whole file, owned: the distro ships it as commented-out
+        // defaults, and a managed appliance rewrites rather than patches —
+        // the same posture as every other configuration this backend
+        // writes. `none` is not "no lock": the lumen-replication firewalld
+        // service bound above is what decides who can reach 16509 at all,
+        // and it names Core interfaces alone.
+        self.run_privileged(
+            "writing the hypervisor's listener configuration failed".into(),
+            ExecRequest::new("configure the hypervisor's TCP listener", INSTALL)
+                .args(["-m", "0644", "/dev/stdin", VIRTPROXYD_CONF])
+                .stdin(
+                    "# Written by Lumen's cluster prepare. Live migration dials the\n\
+                     # hypervisor on the Core network; the lumen-replication firewalld\n\
+                     # service is what confines who can reach it.\n\
+                     auth_tcp = \"none\"\n",
+                ),
+        )
+        .await?;
+        self.run_privileged(
+            "starting the hypervisor's migration listener failed".into(),
+            ExecRequest::new("enable the hypervisor's TCP listener", SYSTEMCTL).args([
+                "enable",
+                "--now",
+                VIRTPROXYD_TCP,
+            ]),
+        )
+        .await?;
+        // A proxy already running under the old configuration keeps it
+        // until restarted; one not running is left that way.
+        self.run_privileged(
+            "restarting the hypervisor proxy failed".into(),
+            ExecRequest::new("restart the hypervisor proxy if running", SYSTEMCTL)
+                .args(["try-restart", "virtproxyd.service"]),
         )
         .await
     }
@@ -1278,6 +1335,42 @@ Not synchronised\n";
             .filter(|r| r.args.iter().any(|a| a == "--add-service=lumen-cluster"))
             .count();
         assert_eq!(adds, 1);
+    }
+
+    /// The migration listener opens as configuration-then-unit, and the
+    /// close is the unit alone — the conf under a dead listener says
+    /// nothing.
+    #[tokio::test]
+    async fn the_migration_listener_opens_with_its_conf_and_closes_by_unit() {
+        let exec = lumen_sys::exec::MockExec::working();
+        let backend = CliBackend::new(exec.clone());
+        backend.set_migration_listener(true).await.unwrap();
+        let ran = exec.ran().await;
+        assert_eq!(ran[0].program, INSTALL);
+        assert_eq!(
+            ran[0].args,
+            vec!["-m", "0644", "/dev/stdin", VIRTPROXYD_CONF]
+        );
+        let conf = ran[0].stdin.as_deref().unwrap();
+        assert!(conf.contains("auth_tcp = \"none\""), "{conf}");
+        assert!(
+            conf.contains("lumen-replication"),
+            "the conf must say what actually confines reachability: {conf}"
+        );
+        assert_eq!(
+            ran[1].args,
+            vec!["enable", "--now", VIRTPROXYD_TCP],
+            "{:?}",
+            ran[1]
+        );
+        assert_eq!(ran[2].args, vec!["try-restart", "virtproxyd.service"]);
+
+        let exec = lumen_sys::exec::MockExec::working();
+        let backend = CliBackend::new(exec.clone());
+        backend.set_migration_listener(false).await.unwrap();
+        let ran = exec.ran().await;
+        assert_eq!(ran.len(), 1, "a close rewrites nothing");
+        assert_eq!(ran[0].args, vec!["disable", "--now", VIRTPROXYD_TCP]);
     }
 
     /// A teardown removes exactly what the prepare added.
