@@ -104,6 +104,18 @@ pub struct FenceDeviceState {
     /// The last guarded live fence test in this direction, if one was ever
     /// run. `None` pins the persistent untested-fencing warning.
     pub last_test: Option<FenceTest>,
+    /// What the fence agent said when it last failed — Pacemaker's own
+    /// `rc_text` for the failed operation.
+    ///
+    /// The role says "Stopped" whatever went wrong, which is the least
+    /// useful half of the story: a BMC that has stopped answering, a
+    /// credential the firmware no longer accepts, and a device nobody ever
+    /// configured all read identically. The agent's sentence is the one an
+    /// operator acts on, and without it the console sends them to a
+    /// terminal to run `pcs status` — which is exactly the trip this
+    /// appliance exists to save.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     /// The IPMI target the device is aimed at, joined from the cluster
     /// record at assembly — crm_mon reports a device's state but never its
     /// arguments, and "which BMC is this failing against" is the first

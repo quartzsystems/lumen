@@ -34,6 +34,9 @@ pub struct FenceDevice {
     /// BMC address the agent connects to.
     pub bmc_address: String,
     pub bmc_username: String,
+    /// The RMCP+ cipher suite the agent must ask for, when the BMC needs
+    /// telling. See [`crate::model::BmcConfig::cipher`].
+    pub bmc_cipher: Option<u8>,
     /// `pcmk_delay_base`, seconds. A delay on a device is time the *peer*
     /// must wait before killing this device's target — so the preferred node
     /// of a two-node cluster carries the delay on *its* device, and wins the
@@ -126,6 +129,7 @@ impl ClusterTopology {
                 target: node.name.clone(),
                 bmc_address: node.bmc.address.clone(),
                 bmc_username: node.bmc.username.clone(),
+                bmc_cipher: node.bmc.cipher,
                 delay_base_secs: if Some(node.name.as_str()) == preferred {
                     FENCE_RACE_DELAY_SECS
                 } else {
@@ -164,6 +168,7 @@ mod tests {
                 bmc: BmcConfig {
                     address: format!("10.20.0.{i}"),
                     username: "ADMIN".into(),
+                    cipher: None,
                 },
             })
             .collect();
@@ -262,6 +267,7 @@ mod tests {
             bmc: BmcConfig {
                 address: "10.20.0.3".into(),
                 username: "ADMIN".into(),
+                cipher: None,
             },
         });
         grown.preferred_node = None;

@@ -504,6 +504,7 @@ impl ClusterCreate {
                 bmc: BmcConfig {
                     address: member.bmc_address.clone(),
                     username: member.bmc_username.clone(),
+                    cipher: None,
                 },
             });
             core_members.push(AddressedMember {
@@ -571,6 +572,7 @@ mod tests {
             bmc: BmcConfig {
                 address: format!("10.20.0.{last_octet}"),
                 username: "ADMIN".into(),
+                cipher: None,
             },
         }
     }

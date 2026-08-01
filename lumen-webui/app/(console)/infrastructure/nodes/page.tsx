@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { AlertTriangle, Plus, Trash2, Wrench, Zap } from "lucide-react";
+import { AlertTriangle, Plus, Power, RotateCw, Trash2, Wrench, Zap } from "lucide-react";
 import { Page, PageBody, PageHeader } from "@/components/PageHeader";
 import { DataTable, Dash, type Column } from "@/components/console/DataTable";
 import { Button } from "@/components/ui/Button";
@@ -10,6 +10,7 @@ import {
   ConfirmDeadDialog,
   FenceTestDialog,
   MaintenanceDialog,
+  NodePowerDialog,
 } from "@/components/cluster/ClusterDialogs";
 import { ApiError } from "@/lib/authClient";
 import { useConsole } from "@/lib/ConsoleContext";
@@ -19,6 +20,7 @@ import {
   removeNode,
   type ClusterNodeView,
   type EnvironmentResponse,
+  type NodePowerAction,
   type UnassignedNodeView,
 } from "@/lib/clusterClient";
 
@@ -38,6 +40,12 @@ export default function NodesPage() {
   const [maintaining, setMaintaining] = useState<{
     cluster: string;
     node: ClusterNodeView;
+  } | null>(null);
+  /// The hard power path: the node's BMC, through its fence device. Never
+  /// this node — the service refuses it, and the table does not offer it.
+  const [powering, setPowering] = useState<{
+    node: ClusterNodeView;
+    action: NodePowerAction;
   } | null>(null);
 
   const load = useCallback(async () => {
@@ -128,6 +136,7 @@ export default function NodesPage() {
                 onTestFence={(node) => setFencing({ cluster: cluster.name, node })}
                 onConfirmDead={(node) => setConfirming({ cluster: cluster.name, node: node.node })}
                 onMaintenance={(node) => setMaintaining({ cluster: cluster.name, node })}
+                onPower={(node, action) => setPowering({ node, action })}
               />
             </section>
           ))}
@@ -163,6 +172,19 @@ export default function NodesPage() {
             void load();
           }}
           onTested={() => void load()}
+        />
+      )}
+
+      {powering && (
+        <NodePowerDialog
+          node={powering.node}
+          action={powering.action}
+          onClose={() => setPowering(null)}
+          onDone={(message) => {
+            setPowering(null);
+            setToast(message);
+            void load();
+          }}
         />
       )}
 
@@ -351,11 +373,15 @@ const memberColumns = (unreachable: boolean): Column<ClusterNodeView>[] => [
             node.fence.bmc_username ? ` as ${node.fence.bmc_username}` : ""
           }`
         : undefined;
+      // The agent's own words come first when there are any: "invalid role"
+      // names a firmware that stopped accepting the session, which no
+      // amount of "Stopped" ever would.
+      const said = node.fence.reason;
       if (node.fence.failed) {
         return (
           <span
             className="badge badge-crit"
-            title={ipmi ? `${ipmi} — the monitor is failing.` : undefined}
+            title={[said, ipmi && `${ipmi}.`].filter(Boolean).join(" — ") || undefined}
           >
             BMC unreachable
           </span>
@@ -366,10 +392,14 @@ const memberColumns = (unreachable: boolean): Column<ClusterNodeView>[] => [
           <span
             className="badge badge-crit"
             title={
-              ipmi
-                ? `${ipmi} — the device is stopped, so this node cannot be fenced. ` +
-                  `Fix the BMC path, then clean the resource up.`
-                : undefined
+              [
+                said,
+                ipmi &&
+                  `${ipmi} — the device is stopped, so this node cannot be fenced. ` +
+                    `Fix the BMC path, then clean the resource up.`,
+              ]
+                .filter(Boolean)
+                .join(" — ") || undefined
             }
           >
             Stopped
@@ -425,6 +455,7 @@ function MemberTable({
   onTestFence,
   onConfirmDead,
   onMaintenance,
+  onPower,
 }: {
   rows: ClusterNodeView[];
   unreachable: boolean;
@@ -432,6 +463,7 @@ function MemberTable({
   onTestFence: (node: ClusterNodeView) => void;
   onConfirmDead: (node: ClusterNodeView) => void;
   onMaintenance: (node: ClusterNodeView) => void;
+  onPower: (node: ClusterNodeView, action: NodePowerAction) => void;
 }) {
   const columns = useMemo(() => memberColumns(unreachable), [unreachable]);
   return (
@@ -443,7 +475,7 @@ function MemberTable({
       searchPlaceholder="Search nodes…"
       emptyMessage="No members."
       onRefresh={onRefresh}
-      actionsWidth={190}
+      actionsWidth={250}
       actions={(node) => (
         <span className="inline-flex items-center gap-1">
           {/* The break-glass, offered in exactly the one state it exists
@@ -481,6 +513,32 @@ function MemberTable({
             <span title={`Live-test the fencing of ${node.node}`}>
               <Button kind="ghost" size="sm" icon={Zap} onClick={() => onTestFence(node)} />
             </span>
+          )}
+          {/* The hard power path, on every row but this node's: the command
+              goes to that node's BMC through its fence device, so it works
+              when the node's own operating system does not. A node powers
+              *itself* down through Maintenance, where its machines are moved
+              off first — which is why the local row shows the wrench and
+              these two instead. */}
+          {!node.local && node.fence && (
+            <>
+              <span title={`Power-cycle ${node.node} at its BMC`}>
+                <Button
+                  kind="ghost"
+                  size="sm"
+                  icon={RotateCw}
+                  onClick={() => onPower(node, "cycle")}
+                />
+              </span>
+              <span title={`Cut the power to ${node.node} at its BMC`}>
+                <Button
+                  kind="ghost"
+                  size="sm"
+                  icon={Power}
+                  onClick={() => onPower(node, "off")}
+                />
+              </span>
+            </>
           )}
         </span>
       )}

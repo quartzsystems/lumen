@@ -41,6 +41,22 @@ pub struct LocalPreflight {
     pub already_clustered: bool,
 }
 
+/// What a hard power action does to a member, through its fence device.
+///
+/// Deliberately only the two the fence agent gives us with the credentials
+/// already in the CIB. Powering a node *on* is not here: the fence path is
+/// how a cluster removes a node it cannot trust, and the credentials for it
+/// live only where Pacemaker keeps them — an "on" verb would need the BMC
+/// password somewhere this domain can read, which is a separate decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HardPower {
+    /// Cut the power and leave it off.
+    Off,
+    /// Power-cycle it: off, then on again.
+    Cycle,
+}
+
 #[async_trait]
 pub trait ClusterBackend: Send + Sync {
     /// Observed state of one cluster by name. The command-line backend can
@@ -158,6 +174,16 @@ pub trait ClusterBackend: Send + Sync {
     /// power-cycles, and the call answers only when the fence operation has
     /// a result.
     async fn fence_node(&self, target: &str) -> Result<()>;
+
+    /// Take a member's power away through its fence device — the operator's
+    /// version of what fencing does automatically.
+    ///
+    /// This is the path that works when the node's own operating system does
+    /// not: no session, no logind, nothing on the target participating. It is
+    /// the same device, credentials, and routing the cluster already fences
+    /// with, so a node whose fence device is healthy can always be powered
+    /// down from another member's console.
+    async fn power_node(&self, target: &str, action: HardPower) -> Result<()>;
 
     /// `pcs node standby|unstandby` — stop Pacemaker running anything on a
     /// node, and let it run things there again.

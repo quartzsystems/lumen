@@ -102,6 +102,10 @@ impl ClusterBackend for UnavailableBackend {
         self.error()
     }
 
+    async fn power_node(&self, _target: &str, _action: crate::backend::HardPower) -> Result<()> {
+        self.error()
+    }
+
     async fn set_standby(&self, _target: &str, _standby: bool) -> Result<()> {
         self.error()
     }

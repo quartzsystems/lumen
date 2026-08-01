@@ -149,8 +149,26 @@ jobs:
           if [ -z "$tags" ]; then
             echo "No releases yet; publishing an empty repository."
           fi
+          # How many releases actually carry packages — what the gate at the
+          # end judges against, so a release still being built cannot make an
+          # otherwise-correct publish look like a failure.
+          with_assets=0
           for tag in $tags; do
             echo "==> $tag"
+            # A release with no packages *yet* is the ordinary state of a
+            # release being cut: the tag is published the moment it is
+            # created, and release.yml is still compiling the RPMs that will
+            # hang off it. This workflow runs on that publish, so failing
+            # here would mean every release breaks the site for as long as
+            # its build takes — and then fixes itself, which is the worst
+            # kind of alarm. Skipped with a warning instead; release.yml
+            # calls this workflow again once the assets exist.
+            assets="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
+                        --json assets --jq '[.assets[].name | select(endswith(".rpm"))] | length')"
+            if [ "${assets:-0}" -eq 0 ]; then
+              echo "::warning::$tag has no packages yet — skipping it. If its build is still running, this site is republished when it finishes."
+              continue
+            fi
             gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
               --dir "$stable" --pattern '*.rpm' --clobber || {
               echo "::error::could not download packages from $tag"
@@ -167,8 +185,15 @@ jobs:
           # published an empty repository over a working one.
           count="$(find "$stable" -maxdepth 1 -name '*.rpm' | wc -l)"
           echo "==> mirrored $count packages"
-          if [ -n "$tags" ] && [ "$count" -eq 0 ]; then
-            echo "::error::releases exist but no packages were mirrored from them"
+          # The gate this step was missing: every failure above used to end in
+          # a warning, so a run that mirrored nothing at all still went green
+          # and published an empty repository over a working one. It counts
+          # releases that *have* packages, not releases that exist — a brand
+          # new tag whose build is still running is not evidence of anything
+          # being wrong, and treating it as such is what broke v0.4.0's site
+          # publish before its RPMs had been built.
+          if [ "$with_assets" -gt 0 ] && [ "$count" -eq 0 ]; then
+            echo "::error::releases carry packages but none were mirrored from them"
             exit 1
           fi
 

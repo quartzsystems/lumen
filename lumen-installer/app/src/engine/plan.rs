@@ -240,7 +240,7 @@ pub fn build_plan(cfg: &InstallConfig, pins: &BuildPins) -> Vec<Step> {
              NetworkManager chrony firewalld openssh-server \
              policycoreutils selinux-policy-targeted \
              lumen-release lumen-networking lumen-storage lumen-compute \
-             lumen-controlplane"
+             lumen-controlplane lumen-fsd"
             )),
             // The repository configuration, named on its own because nothing
             // requires it: every other lumen package arrives through a

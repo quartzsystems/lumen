@@ -42,6 +42,9 @@ export interface FenceDeviceState {
   /// debugging fencing needs.
   bmc_address?: string;
   bmc_username?: string;
+  /// What the fence agent said when it last failed. The role says "Stopped"
+  /// whatever went wrong; this is the sentence an operator acts on.
+  reason?: string;
 }
 
 /// A node the operator has taken out of service. Read off the replicated
@@ -500,6 +503,20 @@ export const confirmNodeDead = (cluster: string, node: string): Promise<{ confir
     `/environment/clusters/${encodeURIComponent(cluster)}/nodes/${encodeURIComponent(node)}/confirm-dead`,
     { i_have_verified_the_node_is_powered_off: true },
   );
+
+/// A member's power, through its fence device — the path that does not need
+/// the target's operating system to be answering. `off` cuts the power and
+/// leaves it off; `cycle` brings it back.
+export type NodePowerAction = "off" | "cycle";
+
+export const powerNode = (
+  node: string,
+  action: NodePowerAction,
+): Promise<{ node: string; action: NodePowerAction }> =>
+  post(`/environment/nodes/${encodeURIComponent(node)}/power`, {
+    action,
+    i_understand_this_cuts_the_power: true,
+  });
 
 // --- display helpers ---------------------------------------------------------
 

@@ -48,6 +48,23 @@ const IPADDR2_AGENT: &str = "ocf:heartbeat:IPaddr2";
 
 const PCS: &str = "/usr/sbin/pcs";
 const CIBADMIN: &str = "/usr/sbin/cibadmin";
+/// The RMCP+ cipher suite the fence agent is told to use when a node's BMC
+/// does not name one.
+///
+/// Suite 3 (AES-128-CBC, HMAC-SHA1) rather than "whatever the tool picks",
+/// and that is the whole point: `fence_ipmilan` shells out to `ipmitool`,
+/// whose default suite **moved to 17** in recent versions. A BMC that does
+/// not offer 17 — or offers it without privilege, which newer Supermicro
+/// firmware does — then refuses every session with "invalid role", and
+/// fencing is simply gone on a cluster that fenced yesterday. Nothing in
+/// the appliance changed; the tool's default did.
+///
+/// Found the hard way on a pair whose BMC firmware was updated mid-life:
+/// `ipmitool -C 3` answered immediately while the bare command, `-C 17`,
+/// and every privilege level did not. Suite 3 is the one every BMC this
+/// appliance has met supports, so it is what gets asked for unless a node
+/// says otherwise ([`crate::model::BmcConfig::cipher`]).
+const DEFAULT_BMC_CIPHER: u8 = 3;
 
 const FIREWALL_CMD: &str = "/usr/bin/firewall-cmd";
 /// The hypervisor proxy's configuration and its TCP activation unit — the
@@ -501,6 +518,27 @@ impl ClusterBackend for CliBackend {
         .await
     }
 
+    async fn power_node(&self, target: &str, action: crate::backend::HardPower) -> Result<()> {
+        // `pcs stonith fence` runs the node's own fence device from whichever
+        // member can reach its BMC — the credentials stay in the CIB, which
+        // is the whole reason this is not an ipmitool invocation with a
+        // password in its argument vector. Without `--off` the agent's
+        // reboot action runs, which is a power cycle.
+        let mut args = vec!["stonith", "fence", target];
+        if action == crate::backend::HardPower::Off {
+            args.push("--off");
+        }
+        let verb = match action {
+            crate::backend::HardPower::Off => "powering off",
+            crate::backend::HardPower::Cycle => "power-cycling",
+        };
+        self.run_privileged(
+            format!("{verb} {target} through its fence device failed"),
+            ExecRequest::new("power a node through its fence device", PCS).args(args),
+        )
+        .await
+    }
+
     async fn set_standby(&self, target: &str, standby: bool) -> Result<()> {
         let verb = if standby { "standby" } else { "unstandby" };
         self.run_privileged(
@@ -589,6 +627,14 @@ fn fence_primitive_xml(device: &crate::topology::FenceDevice, password: &str) ->
         escape(id.as_str()),
         escape(device.target.as_str()),
     );
+    // Always emitted, never left to the tool's own default — see
+    // DEFAULT_BMC_CIPHER for the failure that rule exists to prevent.
+    let cipher = device.bmc_cipher.unwrap_or(DEFAULT_BMC_CIPHER);
+    xml.push_str(&format!(
+        "    <nvpair id=\"{}-cipher\" name=\"cipher\" value=\"{cipher}\"/>
+",
+        escape(id.as_str())
+    ));
     if device.delay_base_secs > 0 {
         // The fence-race bias: the peer waits this long before killing this
         // device's target. Emitted only when the topology engine set it —
@@ -771,6 +817,7 @@ fn parse_crm_mon(xml: &str) -> Result<(Vec<NodeState>, Vec<FenceDeviceState>, Op
                                 last_test: None,
                                 bmc_address: None,
                                 bmc_username: None,
+                                reason: None,
                             });
                         } else if agent == IPADDR2_AGENT {
                             // The one address resource this appliance creates.
@@ -800,6 +847,20 @@ fn parse_crm_mon(xml: &str) -> Result<(Vec<NodeState>, Vec<FenceDeviceState>, Op
                         if failed_op && mine {
                             if let Some(state) = vip.as_mut() {
                                 state.reason = attr("rc_text");
+                            }
+                        }
+                        // The same reading for a fence device, and it earns
+                        // its keep more: "invalid role" from a BMC whose
+                        // firmware stopped accepting the agent's session is
+                        // a sentence no amount of staring at "Stopped"
+                        // would ever produce.
+                        if failed_op {
+                            if let Some(id) = history_of.as_deref() {
+                                if let Some(device) =
+                                    devices.iter_mut().find(|device| device.device == id)
+                                {
+                                    device.reason = attr("exit-reason").or_else(|| attr("rc_text"));
+                                }
                             }
                         }
                     }
@@ -951,6 +1012,47 @@ Not synchronised\n";
   </node_history>
 </pacemaker-result>
 "#;
+
+    /// A real answer from the night a BMC firmware update stopped accepting
+    /// the fence agent's sessions: both devices stopped, and the only thing
+    /// that says why is the operation's own text.
+    const CRM_MON_FENCE_REFUSED: &str = r#"<pacemaker-result api-version="2.32">
+  <nodes>
+    <node name="lumen1" id="1" online="true" standby="false" unclean="false" type="member"/>
+    <node name="lumen2" id="2" online="true" standby="false" unclean="false" type="member"/>
+  </nodes>
+  <resources>
+    <resource id="fence-lumen1" resource_agent="stonith:fence_ipmilan" role="Stopped" active="false" blocked="false" managed="true" failed="false" nodes_running_on="0"/>
+  </resources>
+  <node_history>
+    <node name="lumen2">
+      <resource_history id="fence-lumen1" orphan="false" migration-threshold="1000000">
+        <operation_history call="9" task="start" rc="1" rc_text="unknown error" exit-reason="Error in open session response message : invalid role" last-rc-change="Sat Aug  1 00:42:07 2026" exec-time="1362ms"/>
+      </resource_history>
+    </node>
+  </node_history>
+</pacemaker-result>
+"#;
+
+    /// A fence device that will not start says "Stopped" and nothing else,
+    /// which is the same word a device nobody configured would use. The
+    /// agent's own sentence is the difference between an operator reading
+    /// the console and an operator reading `pcs status` over SSH — and on
+    /// the night this was written, that sentence was "invalid role", which
+    /// named a firmware problem no amount of staring at "Stopped" would.
+    #[test]
+    fn a_stopped_fence_device_carries_the_agents_reason() {
+        let (_, devices, _) = parse_crm_mon(CRM_MON_FENCE_REFUSED).unwrap();
+        let device = devices
+            .iter()
+            .find(|d| d.device == "fence-lumen1")
+            .expect("the fence device is in the answer");
+        assert!(!device.active);
+        assert_eq!(
+            device.reason.as_deref(),
+            Some("Error in open session response message : invalid role")
+        );
+    }
 
     /// The address resource whose agent will not run. "Stopped" is all the
     /// role says; the actionable half is the operation's own `rc_text`, and
@@ -1140,6 +1242,30 @@ Not synchronised\n";
 
     /// The other place a secret could leak into an argument vector: the BMC
     /// password rides inside CIB XML over the unit's standard input, and the
+    /// A BMC that has been told which cipher suite to demand renders it into
+    /// the primitive. Newer firmware stops offering the agent's default
+    /// suite and refuses the handshake as "invalid role" — fencing simply
+    /// stops, on a pair that was fencing yesterday, with the web interface
+    /// still logging in fine because it never speaks RMCP+. One nvpair is
+    /// the difference between a cluster that can fence and one that cannot.
+    #[tokio::test]
+    async fn a_bmc_cipher_suite_is_rendered_when_one_is_configured() {
+        let exec = lumen_sys::exec::MockExec::working();
+        let backend = CliBackend::new(exec.clone());
+        let device = crate::topology::FenceDevice {
+            id: "fence-alpha-1".into(),
+            target: "alpha-1".into(),
+            bmc_address: "10.20.0.1".into(),
+            bmc_username: "ADMIN".into(),
+            delay_base_secs: 0,
+            bmc_cipher: Some(17),
+        };
+        backend.create_fence_device(&device, "pw").await.unwrap();
+        let ran = exec.ran().await;
+        let xml = ran[0].stdin.as_deref().unwrap();
+        assert!(xml.contains(r#"name="cipher" value="17""#), "{xml}");
+    }
+
     /// argv both cibadmin calls get is fixed text.
     #[tokio::test]
     async fn the_bmc_password_rides_the_cib_xml_over_stdin_never_as_an_argument() {
@@ -1151,6 +1277,7 @@ Not synchronised\n";
             bmc_address: "10.20.0.1".into(),
             bmc_username: "ADMIN".into(),
             delay_base_secs: 10,
+            bmc_cipher: None,
         };
         backend
             .create_fence_device(&device, "s3cret&<pass>")
@@ -1173,6 +1300,10 @@ Not synchronised\n";
         assert!(xml.contains(r#"name="pcmk_delay_base" value="10s""#));
         // The continuous BMC connectivity check.
         assert!(xml.contains(r#"name="monitor" interval="60s""#));
+        // The cipher suite is always named: leaving it to the tool's own
+        // default is what a version bump turned into a cluster that could
+        // not fence.
+        assert!(xml.contains(r#"name="cipher" value="3""#), "{xml}");
 
         // The constraint keeps the device off the node it powers off.
         let constraint = ran[1].stdin.as_deref().unwrap();
@@ -1192,6 +1323,7 @@ Not synchronised\n";
             bmc_address: "10.20.0.2".into(),
             bmc_username: "ADMIN".into(),
             delay_base_secs: 0,
+            bmc_cipher: None,
         };
         assert!(!fence_primitive_xml(&device, "pw").contains("pcmk_delay_base"));
     }

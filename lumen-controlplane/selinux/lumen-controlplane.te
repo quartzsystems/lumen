@@ -71,14 +71,16 @@
 ## socket, and its state directory. That is the right end state and it is a
 ## much larger piece of work than the bug in front of us; see docs/system.md.
 
-module lumen-controlplane 1.1;
+module lumen-controlplane 1.2;
 
 require {
         type system_dbusd_t;
         type init_t;
+        type systemd_logind_t;
         type unconfined_service_t;
         class fifo_file { getattr read write };
         class fd use;
+        class dbus send_msg;
 }
 
 # The broker accepts the descriptors from the daemon.
@@ -88,3 +90,16 @@ allow system_dbusd_t unconfined_service_t:fifo_file { getattr read write };
 # PID 1 accepts them from the broker and attaches them to the transient unit.
 allow init_t unconfined_service_t:fd use;
 allow init_t unconfined_service_t:fifo_file { getattr read write };
+
+# The daemon speaks to logind directly — PowerOff and Reboot on
+# org.freedesktop.login1, through zbus rather than through a spawned command,
+# because "restart this node" should not depend on being able to start a
+# transient unit on a node that is being restarted precisely because it is
+# unwell. The bus check for that message is its own hook (`dbus send_msg`),
+# refused for `unconfined_service_t` under the same dontaudit silence as the
+# descriptor rules above — the console showed only logind's door closing:
+# "org.freedesktop.DBus.Error.AccessDenied: Permission denied", found on the
+# first fresh install to press the button. The reply is a message too, so
+# the grant is stated in both directions.
+allow unconfined_service_t systemd_logind_t:dbus send_msg;
+allow systemd_logind_t unconfined_service_t:dbus send_msg;

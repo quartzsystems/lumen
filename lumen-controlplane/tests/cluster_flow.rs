@@ -429,6 +429,7 @@ fn membership_with_networks() -> EnvironmentMembership {
         bmc: BmcConfig {
             address: format!("10.20.0.{octet}"),
             username: "ADMIN".into(),
+            cipher: None,
         },
     };
     let seat = |name: &str, interface: &str, a: u8, b: u8, c: u8, octet: u8| AddressedMember {

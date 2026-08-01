@@ -37,6 +37,8 @@ struct Inner {
     vips: Vec<(String, String)>,
     fence_devices_created: Vec<(crate::topology::FenceDevice, String)>,
     fenced: Vec<String>,
+    /// Hard power actions asked for, in order: `(node, action)`.
+    powered: Vec<(String, crate::backend::HardPower)>,
     confirmed_dead: Vec<String>,
     standby_calls: Vec<(String, bool)>,
     reloads: usize,
@@ -262,6 +264,12 @@ impl MockBackend {
         self.inner.lock().unwrap().fenced.clone()
     }
 
+    /// Hard power actions asked for, in order — how a test sees that the
+    /// console reached for the fence device rather than the node's own OS.
+    pub fn powered(&self) -> Vec<(String, crate::backend::HardPower)> {
+        self.inner.lock().unwrap().powered.clone()
+    }
+
     pub fn confirmed_dead(&self) -> Vec<String> {
         self.inner.lock().unwrap().confirmed_dead.clone()
     }
@@ -409,6 +417,7 @@ fn healthy_cluster(name: &str, nodes: &[&str], two_node: bool) -> ClusterState {
                 }),
                 bmc_address: None,
                 bmc_username: None,
+                reason: None,
             })
             .collect(),
         // A healthy fixture's address is up on the first member. Tests that
@@ -622,6 +631,7 @@ impl ClusterBackend for MockBackend {
                     last_test: None,
                     bmc_address: None,
                     bmc_username: None,
+                    reason: None,
                 });
             }
         }
@@ -640,6 +650,18 @@ impl ClusterBackend for MockBackend {
             return Err(ClusterError::Backend(anyhow::anyhow!(reason)));
         }
         inner.fenced.push(target.to_string());
+        Ok(())
+    }
+
+    async fn power_node(&self, target: &str, action: crate::backend::HardPower) -> Result<()> {
+        if let Some(err) = self.take_failure() {
+            return Err(err);
+        }
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(reason) = inner.fail_fence.take() {
+            return Err(ClusterError::Backend(anyhow::anyhow!(reason)));
+        }
+        inner.powered.push((target.to_string(), action));
         Ok(())
     }
 
@@ -800,6 +822,7 @@ mod tests {
                     bmc_address: "10.20.0.9".into(),
                     bmc_username: "ADMIN".into(),
                     delay_base_secs: 0,
+                    bmc_cipher: None,
                 },
                 "pw",
             )

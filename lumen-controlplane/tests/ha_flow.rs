@@ -46,6 +46,7 @@ fn alpha_membership() -> EnvironmentMembership {
         bmc: BmcConfig {
             address: format!("10.20.0.{octet}"),
             username: "ADMIN".into(),
+            cipher: None,
         },
     };
     let core = |name: &str, octet: u8| AddressedMember {

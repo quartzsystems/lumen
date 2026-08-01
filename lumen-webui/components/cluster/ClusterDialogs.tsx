@@ -9,13 +9,16 @@ import { ApiError } from "@/lib/authClient";
 import {
   confirmNodeDead,
   destroyCluster,
+  powerNode,
   enterMaintenance,
   exitMaintenance,
   fetchDrain,
   joinEnvironment,
   mintToken,
   testFence,
+  type ClusterNodeView,
   type ClusterView,
+  type NodePowerAction,
   type FenceTestView,
   type MaintenanceProgress,
 } from "@/lib/clusterClient";
@@ -524,6 +527,126 @@ function DrainSteps({ progress }: { progress: MaintenanceProgress }) {
         </li>
       ))}
     </ul>
+  );
+}
+
+/// Cut or cycle a member's power through its fence device.
+///
+/// The console's own power page asks the node's operating system, which is
+/// exactly what cannot be relied on when a node needs this — a wedged
+/// kernel, a refusing logind, a machine that stopped answering. This asks
+/// the BMC instead, through the fence device the cluster already holds
+/// credentials for, so it works when nothing on the target does.
+///
+/// Typed confirmation and a checkbox, the same as the break-glass dialog:
+/// nothing is shut down cleanly here, and a machine still running on the
+/// target stops where it stands.
+export function NodePowerDialog({
+  node,
+  action,
+  onClose,
+  onDone,
+}: {
+  node: ClusterNodeView;
+  action: NodePowerAction;
+  onClose: () => void;
+  onDone: (message: string) => void;
+}) {
+  const [typed, setTyped] = useState("");
+  const [acked, setAcked] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const confirmed = typed.trim() === node.node && acked;
+  const cutting = action === "off";
+
+  const run = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await powerNode(node.node, action);
+      onDone(
+        cutting
+          ? `${node.node} was powered off at its BMC.`
+          : `${node.node} was power-cycled at its BMC — it comes back on its own.`,
+      );
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) return;
+      setError(err instanceof Error ? err.message : "The power command was refused.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <ModalShell onClose={onClose}>
+      <ModalHeader
+        title={cutting ? `Power off ${node.node}?` : `Power-cycle ${node.node}?`}
+        subtitle="Through its fence device, at the BMC — the node itself is not asked."
+        onClose={onClose}
+      />
+      <div className="flex flex-col gap-4">
+        {error && (
+          <div className="callout callout-crit">
+            <AlertTriangle size={17} className="flex-shrink-0 text-[var(--qz-danger)] mt-[1px]" />
+            <div className="text-[13px] text-[var(--qz-fg-2)]">{error}</div>
+          </div>
+        )}
+        <div className="callout callout-crit">
+          <AlertTriangle size={17} className="flex-shrink-0 text-[var(--qz-danger)] mt-[1px]" />
+          <div className="text-[13px] text-[var(--qz-fg-2)]">
+            This takes the power away at the machine. Every virtual machine on {node.node} stops
+            where it is, with no shutdown — the same thing the cluster does to a node it has to
+            fence.{" "}
+            {cutting
+              ? "It stays off until somebody turns it back on at its BMC or in the rack; this console cannot."
+              : "It comes back on by itself and boots normally."}
+          </div>
+        </div>
+        {!node.fence && (
+          <div className="callout callout-warn">
+            <AlertTriangle size={17} className="flex-shrink-0 text-[var(--qz-warn)] mt-[1px]" />
+            <div className="text-[13px] text-[var(--qz-fg-2)]">
+              This node has no fence device, so there is no power path to it. The command will be
+              refused.
+            </div>
+          </div>
+        )}
+        <div className="text-[13px] text-[var(--qz-fg-3)]">
+          To stop a node <em>gracefully</em> — machines moved off first — take it through
+          Maintenance instead. This is the path for a node that is not answering.
+        </div>
+        <label className="qz-check-row">
+          <input
+            type="checkbox"
+            className="qz-check"
+            checked={acked}
+            onChange={() => setAcked(!acked)}
+            style={{ "--qz-check-accent": "var(--qz-danger)" } as CSSProperties}
+          />
+          <span className="text-[13px] text-[var(--qz-fg-2)]">
+            I understand the machines on {node.node} stop without shutting down.
+          </span>
+        </label>
+        <Field label={`Type ${node.node} to confirm`} htmlFor="power-node-name">
+          <TextInput
+            id="power-node-name"
+            value={typed}
+            onChange={setTyped}
+            mono
+            autoFocus
+            placeholder={node.node}
+          />
+        </Field>
+        <ModalFooter
+          onCancel={onClose}
+          saving={busy}
+          disabled={!confirmed}
+          submitLabel={cutting ? "Power off" : "Power-cycle"}
+          savingLabel="Sending…"
+          onSubmit={() => void run()}
+        />
+      </div>
+    </ModalShell>
   );
 }
 

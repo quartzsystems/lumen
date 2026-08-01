@@ -70,6 +70,17 @@ pub struct BmcConfig {
     /// node. A BMC answers when the node cannot, which is the whole point.
     pub address: String,
     pub username: String,
+    /// The RMCP+ cipher suite to demand, when the BMC needs telling.
+    ///
+    /// Absent means suite 3, which the fence device is rendered with
+    /// explicitly rather than left to the tool — `ipmitool`'s own default
+    /// moved to 17, and a BMC that does not privilege 17 refuses every
+    /// session with "invalid role" while its web interface, which never
+    /// speaks RMCP+, logs in perfectly. This field is the override for a
+    /// board that wants something else; the default is what works on every
+    /// BMC this appliance has met.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cipher: Option<u8>,
 }
 
 /// One member of a cluster, as the definition sees it: a name and where its
@@ -160,6 +171,7 @@ mod tests {
             bmc: BmcConfig {
                 address: format!("10.20.0.{last_octet}"),
                 username: "ADMIN".into(),
+                cipher: None,
             },
         }
     }

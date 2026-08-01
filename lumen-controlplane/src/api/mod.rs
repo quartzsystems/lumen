@@ -117,6 +117,13 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/environment/nodes/{node}/disks/{disk}/wipe",
             post(cluster::wipe_node_disk),
         )
+        // A member's power, through its fence device — the path that works
+        // when the node's own operating system does not. Never this node:
+        // see the handler.
+        .route(
+            "/api/environment/nodes/{node}/power",
+            post(cluster::power_node),
+        )
         // Updates across every member: the same four questions the node-local
         // routes answer, asked of the whole environment. Installing walks the
         // members one at a time, this node last; see src/cluster_updates.rs

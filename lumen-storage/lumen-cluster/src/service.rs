@@ -1859,6 +1859,7 @@ impl ClusterService {
             bmc: crate::model::BmcConfig {
                 address: request.bmc_address.clone(),
                 username: request.bmc_username.clone(),
+                cipher: None,
             },
         });
         // A grown cluster is in the quorum regime; a preferred node would be
@@ -2346,6 +2347,84 @@ impl ClusterService {
             at,
             error: result.err().map(|err| err.to_string()),
         })
+    }
+
+    /// Power a member down — or cycle it — through its fence device.
+    ///
+    /// The path that does not need the target's cooperation. A node whose
+    /// operating system is wedged, whose console does not answer, or whose
+    /// logind refuses cannot be restarted by asking it nicely; its BMC can
+    /// still be told, and the cluster already holds those credentials for
+    /// fencing. So this is the same device, the same routing, and the same
+    /// journal-free password handling the fence test uses.
+    ///
+    /// Three guards, and each rules out a different way of being wrong:
+    ///
+    /// - **Never this node.** The command would go down with the answer, and
+    ///   an operator would be left not knowing whether it was sent. A node
+    ///   restarts *itself* through Maintenance, where the drain and the
+    ///   quorum guard live.
+    /// - **It must be a member of a cluster this node is in**, because the
+    ///   fence device is the cluster's.
+    /// - **It must have a fence device at all** — a cluster whose fencing was
+    ///   never built has no power path, and saying so beats a command that
+    ///   fails somewhere in Pacemaker.
+    ///
+    /// Deliberately *not* guarded on quorum or on the target being healthy:
+    /// this is the operation an operator reaches for precisely when a node is
+    /// unwell, and refusing it there would refuse it exactly when it is
+    /// needed. The acknowledgement is what stands in for those guards — the
+    /// caller has been told the machines on it stop.
+    pub async fn power_member(
+        &self,
+        target: &str,
+        action: crate::backend::HardPower,
+        acknowledged: bool,
+    ) -> Result<()> {
+        if !acknowledged {
+            return Err(ClusterError::invalid(ValidationError::new(
+                ValidationCode::UnacknowledgedDestructiveOperation,
+                Some("i_understand_this_cuts_the_power"),
+                "This takes the power away at the machine — every virtual machine on it stops                  where it is, with no shutdown. Acknowledge that first.",
+            )));
+        }
+        if target == self.node {
+            return Err(ClusterError::Conflict(format!(
+                "A node does not cut its own power this way — the answer would go down with                  it. Restart \"{target}\" from its own Maintenance page, where its machines                  are moved off first, or do this from another member."
+            )));
+        }
+        let membership = self.require_membership()?;
+        let Some(cluster) = membership
+            .node(&self.node)
+            .and_then(|node| node.cluster.clone())
+        else {
+            return Err(ClusterError::Conflict(
+                "This node is not in a cluster, and the power path is the cluster's fence                  device."
+                    .to_string(),
+            ));
+        };
+        if membership
+            .node(target)
+            .and_then(|node| node.cluster.as_deref())
+            != Some(cluster.as_str())
+        {
+            return Err(ClusterError::Conflict(format!(
+                "\"{target}\" is not a member of \"{cluster}\", so this cluster has no fence                  device for it."
+            )));
+        }
+        let state = self.backend.cluster_state(&cluster).await?;
+        if state.fence_for(target).is_none() {
+            return Err(ClusterError::Conflict(format!(
+                "\"{target}\" has no fence device, so there is no power path to it. Fencing is                  what gives the cluster one."
+            )));
+        }
+        self.backend.power_node(target, action).await?;
+        tracing::warn!(
+            node = target,
+            ?action,
+            "member powered through its fence device"
+        );
+        Ok(())
     }
 
     /// Break-glass: the operator vouches that an unfenced-unreachable node is
@@ -3620,6 +3699,48 @@ mod tests {
             .with_node("alpha-1")
             .with_environment(&clustered_membership()),
         )
+    }
+
+    /// The power path exists for a node whose own operating system cannot be
+    /// asked, so its guards are about *who* and *whether there is a device* —
+    /// never about the target being healthy, which is the state it is for.
+    #[tokio::test]
+    async fn powering_a_member_needs_the_acknowledgement_and_never_this_node() {
+        let backend = Arc::new(MockBackend::environment());
+        let service = fence_harness(backend.clone());
+
+        // Unacknowledged: refused before anything is asked of the device.
+        let err = service
+            .power_member("alpha-2", crate::backend::HardPower::Off, false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Acknowledge"), "{err}");
+        assert!(backend.powered().is_empty());
+
+        // This node: the answer would go down with the command.
+        let err = service
+            .power_member("alpha-1", crate::backend::HardPower::Cycle, true)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Maintenance"), "{err}");
+        assert!(backend.powered().is_empty());
+
+        // A node outside this cluster has no fence device here.
+        let err = service
+            .power_member("stranger", crate::backend::HardPower::Off, true)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not a member"), "{err}");
+
+        // Acknowledged, another member, a device present: it goes.
+        service
+            .power_member("alpha-2", crate::backend::HardPower::Cycle, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.powered(),
+            vec![("alpha-2".to_string(), crate::backend::HardPower::Cycle)]
+        );
     }
 
     #[tokio::test]

@@ -66,6 +66,11 @@ TARGET_PACKAGES=(
     corosync pacemaker pcs fence-agents-ipmilan
     lumen-release lumen-networking lumen-storage lumen-compute
     lumen-controlplane
+    # The pooled storage daemon. Its own package on purpose (it must never be
+    # restarted by a routine management update — see packages/lumen-fsd.spec),
+    # which means nothing Requires it and it has to be named here or a node
+    # installs cleanly and cannot format a brick.
+    lumen-fsd
 )
 
 UPSTREAM_ISO="${UPSTREAM_ISO:-}"

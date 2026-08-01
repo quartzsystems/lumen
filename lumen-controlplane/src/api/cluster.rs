@@ -96,6 +96,59 @@ pub async fn wipe_node_disk(
     ))
 }
 
+/// POST /api/environment/nodes/{node}/power — cut or cycle a member's power
+/// through its fence device.
+///
+/// The path that does not need the target's cooperation, and the reason it
+/// exists: a node whose operating system is wedged cannot be restarted by
+/// asking it, and every graceful route — this console's own power page, the
+/// peer restart the rolling update uses — asks. Its BMC still answers, and
+/// the cluster already holds those credentials for fencing.
+///
+/// The node rides the path for the same reason the wipe route's does: a
+/// `node` field in a body means "this appliance" everywhere else in this
+/// API, and this route means a member that is deliberately not us. The
+/// guards, the refusal to do this to the node serving the request included,
+/// are the cluster domain's.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodePowerRequest {
+    #[serde(default)]
+    pub action: NodePowerAction,
+    #[serde(default)]
+    pub i_understand_this_cuts_the_power: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodePowerAction {
+    /// Cut the power and leave it off.
+    #[default]
+    Off,
+    /// Power-cycle it: off, then on again.
+    Cycle,
+}
+
+pub async fn power_node(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    Path(node): Path<String>,
+    raw: Body,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let request: NodePowerRequest = body(raw)?;
+    let action = match request.action {
+        NodePowerAction::Off => lumen_cluster::HardPower::Off,
+        NodePowerAction::Cycle => lumen_cluster::HardPower::Cycle,
+    };
+    state
+        .cluster
+        .power_member(&node, action, request.i_understand_this_cuts_the_power)
+        .await?;
+    Ok(Json(
+        serde_json::json!({ "node": node, "action": request.action }),
+    ))
+}
+
 /// GET /api/environment/clusters/{name}/networks — the cluster's typed
 /// networks: Core, Management, and the External list, as the replicated
 /// record carries them. The console's Networks page reads this.

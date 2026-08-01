@@ -47,6 +47,7 @@ pub mod store;
 pub mod topology;
 pub mod validate;
 
+pub use backend::HardPower;
 pub use environment::{
     ClusterRecord, EnvironmentMembership, EnvironmentNode, JoinToken, Maintenance,
 };
