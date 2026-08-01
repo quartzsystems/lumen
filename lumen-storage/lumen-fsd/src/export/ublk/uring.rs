@@ -23,6 +23,7 @@ const SYS_IO_URING_ENTER: libc::c_long = 426;
 const IORING_SETUP_SQE128: u32 = 1 << 10;
 const IORING_ENTER_GETEVENTS: u32 = 1;
 const IORING_OP_URING_CMD: u8 = 46;
+const IORING_OP_READ: u8 = 22;
 
 const IORING_OFF_SQ_RING: i64 = 0;
 const IORING_OFF_CQ_RING: i64 = 0x800_0000;
@@ -209,6 +210,31 @@ impl Uring {
         Ok(uring)
     }
 
+    /// Claim the SQE at the unpublished tail, hand it to `fill` zeroed, and
+    /// publish it. The slot is exclusively ours until the tail store: the
+    /// kernel only reads entries at or before the tail we publish.
+    fn push_sqe(&mut self, fill: impl FnOnce(*mut u8)) -> io::Result<()> {
+        // SAFETY: all ring accesses follow the io_uring contract — see above.
+        unsafe {
+            let head = (*self.sq_head).load(Ordering::Acquire);
+            let tail = (*self.sq_tail).load(Ordering::Relaxed);
+            if tail.wrapping_sub(head) > self.sq_mask {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "submission ring full",
+                ));
+            }
+            let index = tail & self.sq_mask;
+            let sqe = self.sqes.ptr.add(index as usize * self.sqe_len);
+            std::ptr::write_bytes(sqe, 0, self.sqe_len);
+            fill(sqe);
+            *self.sq_array.add(index as usize) = index;
+            (*self.sq_tail).store(tail.wrapping_add(1), Ordering::Release);
+        }
+        self.pending += 1;
+        Ok(())
+    }
+
     /// Queue one `IORING_OP_URING_CMD`. `payload` is the command struct,
     /// copied into the SQE's command area (16 bytes in a plain SQE, 80 in
     /// a 128-byte one).
@@ -223,31 +249,41 @@ impl Uring {
             payload.len() <= self.sqe_len - 48,
             "payload outgrows the SQE"
         );
-        // SAFETY: all ring accesses follow the io_uring contract — the
-        // kernel only reads entries at or before the tail we publish, so
-        // the slot at the unpublished tail is exclusively ours.
-        unsafe {
-            let head = (*self.sq_head).load(Ordering::Acquire);
-            let tail = (*self.sq_tail).load(Ordering::Relaxed);
-            if tail.wrapping_sub(head) > self.sq_mask {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "submission ring full",
-                ));
+        self.push_sqe(|sqe| {
+            // SAFETY: writing fixed offsets inside the zeroed 128-byte SQE
+            // the caller was handed exclusively.
+            unsafe {
+                *sqe = IORING_OP_URING_CMD; // opcode
+                *(sqe.add(4).cast::<i32>()) = fd;
+                *(sqe.add(8).cast::<u32>()) = cmd_op;
+                *(sqe.add(32).cast::<u64>()) = user_data;
+                std::ptr::copy_nonoverlapping(payload.as_ptr(), sqe.add(48), payload.len());
             }
-            let index = tail & self.sq_mask;
-            let sqe = self.sqes.ptr.add(index as usize * self.sqe_len);
-            std::ptr::write_bytes(sqe, 0, self.sqe_len);
-            *sqe = IORING_OP_URING_CMD; // opcode
-            *(sqe.add(4).cast::<i32>()) = fd;
-            *(sqe.add(8).cast::<u32>()) = cmd_op;
-            *(sqe.add(32).cast::<u64>()) = user_data;
-            std::ptr::copy_nonoverlapping(payload.as_ptr(), sqe.add(48), payload.len());
-            *self.sq_array.add(index as usize) = index;
-            (*self.sq_tail).store(tail.wrapping_add(1), Ordering::Release);
-        }
-        self.pending += 1;
-        Ok(())
+        })
+    }
+
+    /// Queue a plain read at offset zero — the worker pool's wake channel:
+    /// an eventfd read that completes when any worker finishes, re-armed
+    /// after every completion. The buffer is named by raw pointer because
+    /// the kernel owns it from this call until the completion; the caller
+    /// keeps it alive and never reads it.
+    pub fn push_wake_read(
+        &mut self,
+        fd: RawFd,
+        user_data: u64,
+        buf: *mut u8,
+        len: u32,
+    ) -> io::Result<()> {
+        self.push_sqe(|sqe| {
+            // SAFETY: as in push_cmd — fixed offsets in an exclusive SQE.
+            unsafe {
+                *sqe = IORING_OP_READ; // opcode
+                *(sqe.add(4).cast::<i32>()) = fd;
+                *(sqe.add(16).cast::<u64>()) = buf as u64;
+                *(sqe.add(24).cast::<u32>()) = len;
+                *(sqe.add(32).cast::<u64>()) = user_data;
+            }
+        })
     }
 
     /// Submit everything queued and wait for at least `wait_for`

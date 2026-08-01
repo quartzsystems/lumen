@@ -656,12 +656,6 @@ fn read_frame(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     Ok(payload)
 }
 
-fn write_frame(stream: &mut TcpStream, payload: &[u8]) -> std::io::Result<()> {
-    stream.write_all(&(payload.len() as u32).to_le_bytes())?;
-    stream.write_all(payload)?;
-    stream.flush()
-}
-
 /// One session, run to its death on the calling thread. The runner thread
 /// runs sessions strictly one after another, which is what makes teardown
 /// and the next session's hello naturally ordered.
@@ -741,23 +735,41 @@ fn run_session(shared: &Arc<Shared>, mut stream: TcpStream) {
     let _ = writer.join();
 }
 
+/// How much of the queue one send gathers, at most. A 1 MiB guest write
+/// queues ~128 messages; sending them one frame per syscall on a NODELAY
+/// socket made every block two packets. Bounded so a deep queue cannot
+/// hold megabytes twice over (queue and send buffer both).
+const SEND_BATCH_BYTES: usize = 4 << 20;
+
 fn writer_loop(shared: &Arc<Shared>, peer: u8, stream: &mut TcpStream, incarnation: u64) {
+    let mut batch: Vec<u8> = Vec::new();
     loop {
-        let message = {
+        batch.clear();
+        {
             let mut links = shared.links.lock().unwrap();
             loop {
                 let link = links.entry(peer).or_default();
                 if shared.shutdown.load(Ordering::SeqCst) || link.incarnation != incarnation {
                     return;
                 }
-                if let Some(message) = link.queue.pop_front() {
-                    break message;
+                // Everything queued goes in one send, frames intact and in
+                // order — the wire format is unchanged, only the syscall
+                // boundaries move.
+                while batch.len() < SEND_BATCH_BYTES {
+                    let Some(message) = link.queue.pop_front() else {
+                        break;
+                    };
+                    let payload = wire::encode(&message);
+                    batch.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                    batch.extend_from_slice(&payload);
+                }
+                if !batch.is_empty() {
+                    break;
                 }
                 links = shared.out_ready.wait_timeout(links, TICK).unwrap().0;
             }
         };
-        let payload = wire::encode(&message);
-        if write_frame(stream, &payload).is_err() {
+        if stream.write_all(&batch).and_then(|_| stream.flush()).is_err() {
             // The reader will hit the same corpse and run the teardown.
             let _ = stream.shutdown(Shutdown::Both);
             return;

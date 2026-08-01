@@ -131,6 +131,11 @@ impl Disk for FileDisk {
     }
 
     fn flush(&mut self) -> Result<()> {
-        self.file.sync_all().map_err(io_failed)
+        // sync_data, not sync_all: the durability promise is about the
+        // bytes, and a brick's length and metadata never change after
+        // format — while sync_all drags the filesystem's metadata journal
+        // into every flush, on the hottest path the engine has. On a raw
+        // block device the two are the same barrier.
+        self.file.sync_data().map_err(io_failed)
     }
 }

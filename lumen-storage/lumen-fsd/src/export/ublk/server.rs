@@ -3,11 +3,18 @@
 //! This is what docs/lumenfs.md chose over vhost-user-blk: in-tree driver
 //! on EL10's 6.12 kernel, a stable identical device path on every member,
 //! and not one line of domain_xml.rs changed. The server side is small on
-//! purpose — single queue, synchronous servicing, kernel-copied buffers —
+//! purpose — single queue, kernel-copied buffers, a bounded worker pool —
 //! because every operation lands on the [`GuestHandle`], where replication,
 //! the flush contract, and suspension already live. A suspended node makes
 //! the *block device* stall, exactly as a DRBD secondary-less primary
 //! would, and a fence verdict releases it.
+//!
+//! Requests are serviced by [`WORKERS`] threads rather than inline on the
+//! queue thread — pool-bench convicted the serial loop: one guest fsync
+//! parked every neighbouring I/O behind it for the whole peer round trip.
+//! The driver requires every io command to come from the queue's own
+//! task, so the ring stays single-threaded and workers announce their
+//! results through an eventfd read armed on the same ring.
 //!
 //! Life cycle: ADD_DEV → SET_PARAMS → the queue thread opens
 //! `/dev/ublkc<id>`, mmaps the descriptor array, and primes one FETCH per
@@ -23,7 +30,7 @@
 
 use std::fs::OpenOptions;
 use std::io;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -363,7 +370,27 @@ fn open_char_dev(dev_id: u32) -> Result<std::fs::File, String> {
     }
 }
 
+/// The service pool behind one export. Sized well below the queue depth:
+/// the engine's one mutex means concurrent requests mostly take turns at
+/// the CPU anyway — what the pool buys is that a request PARKED WITHOUT
+/// the lock (a flush waiting on the peer's durable answer, a read waiting
+/// on a fetched block) no longer stalls every neighbouring I/O behind it,
+/// which is exactly what a guest running fsync-heavy work does to itself
+/// on a serial loop.
+const WORKERS: usize = 8;
+
+/// The wake read's user_data — tags are small, this cannot be one.
+const WAKE: u64 = u64::MAX;
+
+/// What the ring thread hands a worker, and what comes back.
+struct WorkState {
+    jobs: std::collections::VecDeque<(usize, IoDesc)>,
+    shutdown: bool,
+}
+
 fn queue_loop(guest: GuestHandle, vdisk: u64, dev_id: u32) -> Result<(), String> {
+    use std::sync::{Arc, Condvar, Mutex};
+
     let depth = QUEUE_DEPTH as usize;
     let char_dev = open_char_dev(dev_id)?;
 
@@ -372,16 +399,86 @@ fn queue_loop(guest: GuestHandle, vdisk: u64, dev_id: u32) -> Result<(), String>
     let desc_len = depth * std::mem::size_of::<IoDesc>();
     let desc_len = desc_len.div_ceil(4096) * 4096;
     let descs = Descriptors::map(char_dev.as_raw_fd(), desc_len)?;
-    let desc_at = |tag: usize| -> IoDesc { descs.at(tag) };
 
     // One kernel-copy buffer per tag, address registered in every fetch.
-    let mut buffers: Vec<Vec<u8>> = (0..depth)
-        .map(|_| vec![0u8; MAX_IO_BYTES as usize])
+    // Behind a mutex each, because a worker fills it while the ring thread
+    // owns everything else — but never both at once: the driver hands a
+    // tag to exactly one side at a time, from fetch completion to commit.
+    let buffers: Arc<Vec<Mutex<Vec<u8>>>> = Arc::new(
+        (0..depth)
+            .map(|_| Mutex::new(vec![0u8; MAX_IO_BYTES as usize]))
+            .collect(),
+    );
+    // A Vec never moves its heap block, so the addresses registered with
+    // the driver are stable for the export's life.
+    let addrs: Vec<u64> = buffers
+        .iter()
+        .map(|buffer| buffer.lock().unwrap().as_ptr() as u64)
         .collect();
 
-    // SQE128 even though the 16-byte io command would fit a plain SQE:
-    // the driver refuses rings without it.
-    let mut ring = Uring::new(depth as u32, true).map_err(|err| os_err("io_uring_setup", err))?;
+    // Twice the depth: every tag's fetch or commit, plus the wake read,
+    // must fit the submission ring in one burst. SQE128 even though the
+    // 16-byte io command would fit a plain SQE: the driver refuses
+    // data-plane rings without it.
+    let mut ring =
+        Uring::new(depth as u32 * 2, true).map_err(|err| os_err("io_uring_setup", err))?;
+
+    // The wake channel: workers write one count, the ring thread holds a
+    // read armed on its own ring, so "a worker finished" arrives exactly
+    // like "the driver sent a request" and one wait covers both.
+    // SAFETY: plain eventfd syscall; failure checked.
+    let event_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+    if event_fd < 0 {
+        return Err(os_err("eventfd", io::Error::last_os_error()));
+    }
+    // SAFETY: the syscall above returned a fresh fd we now own.
+    let event = unsafe { std::os::fd::OwnedFd::from_raw_fd(event_fd) };
+    let mut wake_buf = [0u8; 8];
+
+    let work = Arc::new((
+        Mutex::new(WorkState {
+            jobs: std::collections::VecDeque::new(),
+            shutdown: false,
+        }),
+        Condvar::new(),
+    ));
+    let done: Arc<Mutex<Vec<(usize, i32)>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let workers: Vec<JoinHandle<()>> = (0..WORKERS)
+        .map(|_| {
+            let guest = guest.clone();
+            let work = Arc::clone(&work);
+            let done = Arc::clone(&done);
+            let buffers = Arc::clone(&buffers);
+            let wake_fd = event.as_raw_fd();
+            std::thread::spawn(move || loop {
+                let (tag, desc) = {
+                    let (state, available) = &*work;
+                    let mut state = state.lock().unwrap();
+                    loop {
+                        if state.shutdown {
+                            return;
+                        }
+                        if let Some(job) = state.jobs.pop_front() {
+                            break job;
+                        }
+                        state = available.wait(state).unwrap();
+                    }
+                };
+                let result = {
+                    let mut buffer = buffers[tag].lock().unwrap();
+                    service(&guest, vdisk, &desc, &mut buffer)
+                };
+                // Result first, wake second — the ring thread drains after
+                // the wake, so everything pushed before it is seen.
+                done.lock().unwrap().push((tag, result));
+                let one = 1u64.to_ne_bytes();
+                // SAFETY: writing 8 bytes to an eventfd we know is open —
+                // workers are joined before the fd is dropped.
+                unsafe { libc::write(wake_fd, one.as_ptr().cast(), 8) };
+            })
+        })
+        .collect();
 
     let io_cmd = |tag: usize, result: i32, addr: u64| -> [u8; 16] {
         let cmd = IoCmd {
@@ -394,38 +491,70 @@ fn queue_loop(guest: GuestHandle, vdisk: u64, dev_id: u32) -> Result<(), String>
         unsafe { std::mem::transmute(cmd) }
     };
 
-    for (tag, buffer) in buffers.iter().enumerate() {
-        ring.push_cmd(
-            char_dev.as_raw_fd(),
-            IO_FETCH_REQ,
-            tag as u64,
-            &io_cmd(tag, -1, buffer.as_ptr() as u64),
-        )
-        .map_err(|err| os_err("prime fetch", err))?;
-    }
-
-    loop {
-        ring.submit_and_wait(1)
-            .map_err(|err| os_err("io_uring_enter", err))?;
-        while let Some(completion) = ring.next_completion() {
-            let tag = completion.user_data as usize;
-            if completion.res != IO_RES_OK {
-                // The device is stopping (or the driver aborted us):
-                // every parked fetch completes with an error and the
-                // export is over.
-                return Ok(());
-            }
-            let desc = desc_at(tag);
-            let result = service(&guest, vdisk, &desc, &mut buffers[tag]);
+    // The loop proper, in a closure so every exit — the driver stopping
+    // the device, or a ring error — releases the workers exactly once.
+    let mut run = || -> Result<(), String> {
+        for (tag, addr) in addrs.iter().enumerate() {
             ring.push_cmd(
                 char_dev.as_raw_fd(),
-                IO_COMMIT_AND_FETCH_REQ,
+                IO_FETCH_REQ,
                 tag as u64,
-                &io_cmd(tag, result, buffers[tag].as_ptr() as u64),
+                &io_cmd(tag, -1, *addr),
             )
-            .map_err(|err| os_err("queue commit", err))?;
+            .map_err(|err| os_err("prime fetch", err))?;
         }
+        ring.push_wake_read(event.as_raw_fd(), WAKE, wake_buf.as_mut_ptr(), 8)
+            .map_err(|err| os_err("arm wake", err))?;
+
+        loop {
+            ring.submit_and_wait(1)
+                .map_err(|err| os_err("io_uring_enter", err))?;
+            while let Some(completion) = ring.next_completion() {
+                if completion.user_data == WAKE {
+                    // Re-arm before draining: a worker finishing between
+                    // the drain and the next wait then lands a fresh wake
+                    // instead of being lost.
+                    ring.push_wake_read(event.as_raw_fd(), WAKE, wake_buf.as_mut_ptr(), 8)
+                        .map_err(|err| os_err("arm wake", err))?;
+                    for (tag, result) in done.lock().unwrap().drain(..) {
+                        ring.push_cmd(
+                            char_dev.as_raw_fd(),
+                            IO_COMMIT_AND_FETCH_REQ,
+                            tag as u64,
+                            &io_cmd(tag, result, addrs[tag]),
+                        )
+                        .map_err(|err| os_err("queue commit", err))?;
+                    }
+                    continue;
+                }
+                let tag = completion.user_data as usize;
+                if completion.res != IO_RES_OK {
+                    // The device is stopping (or the driver aborted us):
+                    // every parked fetch completes with an error and the
+                    // export is over.
+                    return Ok(());
+                }
+                let desc = descs.at(tag);
+                let (state, available) = &*work;
+                state.lock().unwrap().jobs.push_back((tag, desc));
+                available.notify_one();
+            }
+        }
+    };
+    let outcome = run();
+
+    // Release the pool: requests still in a worker's hands finish against
+    // a guest whose cancellation already unblocks them, and their commits
+    // are simply never sent — the driver is tearing the queue down anyway.
+    {
+        let (state, available) = &*work;
+        state.lock().unwrap().shutdown = true;
+        available.notify_all();
     }
+    for worker in workers {
+        let _ = worker.join();
+    }
+    outcome
 }
 
 /// One request against the replicated guest path. Returns the ublk
