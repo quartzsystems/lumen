@@ -289,17 +289,28 @@ pub fn command(daemon: &Daemon, line: &str) -> String {
                     )
                 })
                 .map_err(|err| err.to_string())?,
+            // Starts the pass and answers immediately — the old form held
+            // the engine for the whole walk, which parked every guest
+            // write behind an integrity check nobody was waiting on.
+            // Progress rides `scrub-status` and the status line.
             "scrub" => daemon
-                .scrub()
-                .map(|report| {
-                    format!(
-                        "verified={} corrupt={} missing={}",
-                        report.blocks_verified,
-                        report.corrupt.len(),
-                        report.missing.len()
-                    )
-                })
-                .map_err(|err| err.to_string())?,
+                .start_scrub()
+                .map(|total| format!("started total={total}"))?,
+            "scrub-status" => {
+                let (running, verified, total, last) = daemon.scrub_progress();
+                let mut line = format!("running={running}");
+                if running {
+                    line.push_str(&format!(" verified={verified} total={total}"));
+                }
+                match last {
+                    Some((at, verified, corrupt, missing)) => line.push_str(&format!(
+                        " last={at} last_verified={verified} last_corrupt={corrupt} \
+                         last_missing={missing}"
+                    )),
+                    None => line.push_str(" last=never"),
+                }
+                line
+            }
             "hash" => {
                 let vdisk = number(1)?;
                 vdisk_content_hash(daemon, vdisk)?
@@ -348,7 +359,7 @@ pub fn command(daemon: &Daemon, line: &str) -> String {
             }
             _ => {
                 return Err("unknown command. node: status, capacity, brick-list, \
-                            fence-peer [node era], checkpoint, gc, scrub. \
+                            fence-peer [node era], checkpoint, gc, scrub, scrub-status. \
                             placement: reassign <version> <member>..., \
                             reassign-status, reassign-commit. vdisks: vdisks, \
                             vdisk-create <id> <bytes> [tier], \
@@ -457,6 +468,9 @@ fn status_line(daemon: &Daemon) -> String {
     if let Some(version) = s.reassign_pending {
         line.push_str(&format!(" reassign={version}"));
     }
+    if let Some((verified, total)) = s.scrub {
+        line.push_str(&format!(" scrub={verified}/{total}"));
+    }
     line
 }
 
@@ -542,6 +556,8 @@ pub struct StatusView {
     pub pool_uuid: Option<String>,
     /// The version a reassignment is moving to, while one is open.
     pub reassign_pending: Option<u64>,
+    /// A background scrub in flight: `(records verified, records total)`.
+    pub scrub: Option<(u64, u64)>,
 }
 
 /// One tier's byte figures as a member reports them.
@@ -632,6 +648,7 @@ fn parse_status(reply: &str) -> Option<StatusView> {
     let mut seats = None;
     let mut pool_uuid = None;
     let mut reassign_pending = None;
+    let mut scrub = None;
     for token in reply.split_whitespace() {
         let (key, value) = token.split_once('=')?;
         // Per-peer stream figures ride keys of the form peerN.sent /
@@ -712,6 +729,10 @@ fn parse_status(reply: &str) -> Option<StatusView> {
             "seats" => seats = Some(value.parse().ok()?),
             "pool" => pool_uuid = Some(value.to_string()),
             "reassign" => reassign_pending = Some(value.parse().ok()?),
+            "scrub" => {
+                let (done, of) = value.split_once('/')?;
+                scrub = Some((done.parse().ok()?, of.parse().ok()?));
+            }
             // An unknown key is a newer daemon, not a broken one.
             _ => {}
         }
@@ -747,6 +768,7 @@ fn parse_status(reply: &str) -> Option<StatusView> {
         seats,
         pool_uuid,
         reassign_pending,
+        scrub,
     })
 }
 

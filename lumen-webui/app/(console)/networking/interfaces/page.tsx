@@ -40,6 +40,7 @@ import {
   type InventoryResponse,
   type OwnedLink,
 } from "@/lib/inventoryClient";
+import { OrphanedNics } from "@/components/network/OrphanedNics";
 
 const POLL_MS = 5000;
 
@@ -258,6 +259,11 @@ export default function InterfacesPage() {
               </span>
             </div>
           )}
+
+          {/* A replaced card orphans the name every profile above it was
+              written against — a bond with no ports, a Core network that
+              cannot activate. This is where that is said and repaired. */}
+          <OrphanedNics onAdopted={load} />
 
           {staged.length > 0 && (
             <div className="pending-bar">

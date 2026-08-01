@@ -91,6 +91,17 @@ impl PayloadCache {
     }
 }
 
+/// Where a paused scrub resumes: which brick, and the last address its
+/// slice verified there — `None` when the next slice starts that brick
+/// from its beginning, which is what a slice ending exactly on a brick
+/// boundary must be able to say. Held by whoever drives the pass — the
+/// engine keeps no scrub state of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrubCursor {
+    pub brick: usize,
+    pub after: Option<BlockHash>,
+}
+
 #[derive(Debug)]
 pub struct BrickSet<D: Disk> {
     /// Sorted by `(tier, brick_uuid)` so every walk and every tie-break is
@@ -455,6 +466,55 @@ impl<D: Disk> BrickSet<D> {
         Ok((verified, corrupt))
     }
 
+    /// One bounded slice of the set's scrub, walking the bricks in their
+    /// deterministic order. The cursor names the brick and the address the
+    /// last slice ended at; `None` when the pass is over.
+    pub fn scrub_chunk(
+        &self,
+        cursor: Option<ScrubCursor>,
+        budget: usize,
+    ) -> Result<(u64, Vec<BlockHash>, Option<ScrubCursor>)> {
+        let (mut position, mut after) = match cursor {
+            Some(cursor) => (cursor.brick, cursor.after),
+            None => (0, None),
+        };
+        let mut verified = 0u64;
+        let mut corrupt = Vec::new();
+        let mut remaining = budget.max(1);
+        while position < self.bricks.len() {
+            if remaining == 0 {
+                // Out of budget with bricks still ahead: say exactly where
+                // the next slice picks up, even when that is the top of a
+                // brick this one never touched.
+                return Ok((
+                    verified,
+                    corrupt,
+                    Some(ScrubCursor {
+                        brick: position,
+                        after,
+                    }),
+                ));
+            }
+            let (count, bad, next) = self.bricks[position].scrub_chunk(after, remaining)?;
+            verified += count;
+            corrupt.extend(bad);
+            remaining = remaining.saturating_sub(count as usize);
+            match next {
+                Some(reached) => after = Some(reached),
+                None => {
+                    position += 1;
+                    after = None;
+                }
+            }
+        }
+        Ok((verified, corrupt, None))
+    }
+
+    /// How many records a full scrub of the set covers right now.
+    pub fn scrub_total(&self) -> u64 {
+        self.bricks.iter().map(|brick| brick.scrub_total()).sum()
+    }
+
     // -----------------------------------------------------------------
     // Collection.
 
@@ -618,6 +678,43 @@ mod tests {
             (disk(3), params(3, 1, false)),
         ])
         .unwrap()
+    }
+
+    /// The chunked walk and the one-shot are the same pass: every budget
+    /// covers every record exactly once, whatever slice size drives it.
+    #[test]
+    fn a_chunked_scrub_covers_exactly_what_the_one_shot_does() {
+        let mut set = two_tier_set();
+        for i in 0..12u8 {
+            set.put(i % 2, format!("payload {i}").as_bytes()).unwrap();
+        }
+        set.flush().unwrap();
+
+        let (whole, corrupt) = set.scrub().unwrap();
+        assert_eq!(whole, 12);
+        assert!(corrupt.is_empty());
+        assert_eq!(set.scrub_total(), 12);
+
+        for budget in [1usize, 3, 5, 100] {
+            let mut verified = 0u64;
+            let mut cursor = None;
+            let mut slices = 0;
+            loop {
+                slices += 1;
+                assert!(slices < 100, "budget {budget} never finished");
+                let (count, bad, next) = set.scrub_chunk(cursor, budget).unwrap();
+                verified += count;
+                assert!(bad.is_empty());
+                match next {
+                    Some(next) => cursor = Some(next),
+                    None => break,
+                }
+            }
+            assert_eq!(
+                verified, whole,
+                "budget {budget} missed or repeated records"
+            );
+        }
     }
 
     #[test]

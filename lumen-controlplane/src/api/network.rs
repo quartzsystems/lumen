@@ -1,7 +1,7 @@
-//! Networking endpoints.
+﻿//! Networking endpoints.
 //!
 //! Thin by design: deserialize, call one `lumen_net::NetworkService` method,
-//! serialize. No netlink, no D-Bus, and no validation logic lives here — that
+//! serialize. No netlink, no D-Bus, and no validation logic lives here â€” that
 //! is the whole point of the component split (see docs/networking.md).
 //!
 //! Every route takes the [`Session`] extractor, so an unauthenticated request
@@ -41,7 +41,7 @@ struct ExtendRequest {
     seconds: u32,
 }
 
-/// GET /api/network/interfaces — observed state, grouped by node.
+/// GET /api/network/interfaces â€” observed state, grouped by node.
 pub async fn interfaces(
     _session: Session,
     State(state): State<Arc<AppState>>,
@@ -49,7 +49,7 @@ pub async fn interfaces(
     Ok(Json(state.network.interfaces().await?))
 }
 
-/// GET /api/network/interfaces/:name — one link on the local node.
+/// GET /api/network/interfaces/:name â€” one link on the local node.
 pub async fn interface(
     _session: Session,
     State(state): State<Arc<AppState>>,
@@ -58,7 +58,86 @@ pub async fn interface(
     Ok(Json(state.network.interface(&name).await?))
 }
 
-/// GET /api/network/config — the committed desired state.
+/// GET /api/network/nics/pins â€” the names that have lost their hardware,
+/// and the adapters nothing has claimed.
+///
+/// Its own route rather than a field on the interfaces view, because it
+/// describes what the node's *names* are pinned to rather than what the
+/// links are doing: an orphaned pin has no link to hang off, which is
+/// precisely the problem it reports.
+pub async fn nic_pins(
+    _session: Session,
+    State(_state): State<Arc<AppState>>,
+) -> Result<Json<lumen_net::pins::PinReport>, ApiError> {
+    let roots = lumen_net::pins::PinRoots::default();
+    Ok(Json(
+        tokio::task::spawn_blocking(move || lumen_net::pins::report(&roots))
+            .await
+            .map_err(|err| ApiError::Internal(anyhow::anyhow!("{err}")))?,
+    ))
+}
+
+/// What a card adoption names: the orphaned slot, and the adapter to put
+/// in it.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdoptRequest {
+    slot: u32,
+    mac: String,
+}
+
+/// POST /api/network/nics/adopt â€” give an orphaned name to a new card.
+///
+/// The one repair a replaced adapter needs, and deliberately manual: the
+/// appliance cannot know which port of a new card carries the network the
+/// old one did, and guessing moves storage replication or a cluster ring
+/// onto whatever enumerated first. See `lumen_net::pins`.
+pub async fn adopt_nic(
+    _session: Session,
+    State(_state): State<Arc<AppState>>,
+    raw: Body,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let request: AdoptRequest = required_body(raw)?;
+    let outcome = tokio::task::spawn_blocking(move || {
+        let roots = lumen_net::pins::PinRoots::default();
+        let device = lumen_net::pins::adopt(&roots, request.slot, &request.mac)?;
+        // The pin alone takes effect at the next boot; renaming now is what
+        // makes the profiles above it work today. A rename that fails is
+        // reported, not hidden â€” the pin is written either way, so the next
+        // boot repairs what this could not.
+        let renamed = lumen_net::pins::rename_now(&device, request.slot);
+        Ok::<_, lumen_net::NetError>((device, renamed))
+    })
+    .await
+    .map_err(|err| ApiError::Internal(anyhow::anyhow!("{err}")))??;
+
+    let (device, renamed) = outcome;
+    let slot = request.slot;
+    match renamed {
+        Ok(()) => {
+            tracing::info!(slot, %device, "adapter adopted into an orphaned name");
+            Ok(Json(serde_json::json!({
+                "adopted": format!("nic{slot}"),
+                "device": device,
+                "active": true,
+            })))
+        }
+        Err(err) => {
+            tracing::warn!(slot, %device, %err, "adopted, but the live rename failed");
+            Ok(Json(serde_json::json!({
+                "adopted": format!("nic{slot}"),
+                "device": device,
+                "active": false,
+                "note": format!(
+                    "{device} is pinned as nic{slot} and will carry that name from the next \
+                     restart, but it could not be renamed while running ({err})."
+                ),
+            })))
+        }
+    }
+}
+
+/// GET /api/network/config â€” the committed desired state.
 pub async fn config(
     _session: Session,
     State(state): State<Arc<AppState>>,
@@ -66,7 +145,7 @@ pub async fn config(
     Ok(Json(state.network.config().await?))
 }
 
-/// GET /api/network/pending — staged delta, validation results, checkpoint.
+/// GET /api/network/pending â€” staged delta, validation results, checkpoint.
 pub async fn pending(
     _session: Session,
     State(state): State<Arc<AppState>>,
@@ -74,7 +153,7 @@ pub async fn pending(
     Ok(Json(state.network.pending().await?))
 }
 
-/// DELETE /api/network/pending — discard everything staged.
+/// DELETE /api/network/pending â€” discard everything staged.
 pub async fn discard(
     _session: Session,
     State(state): State<Arc<AppState>>,
@@ -189,7 +268,7 @@ async fn delete_link(
     Ok(Json(state.network.delete_link(&name, kind).await?))
 }
 
-/// POST /api/network/apply — validate, checkpoint, push.
+/// POST /api/network/apply â€” validate, checkpoint, push.
 pub async fn apply(
     _session: Session,
     State(state): State<Arc<AppState>>,
@@ -202,7 +281,7 @@ pub async fn apply(
     Ok(Json(state.network.apply(ack).await?))
 }
 
-/// POST /api/network/confirm — destroy the checkpoint; the change is now
+/// POST /api/network/confirm â€” destroy the checkpoint; the change is now
 /// permanent.
 pub async fn confirm(
     _session: Session,
@@ -213,7 +292,7 @@ pub async fn confirm(
     Ok(Json(state.network.confirm().await?))
 }
 
-/// POST /api/network/rollback — revert now rather than waiting out the window.
+/// POST /api/network/rollback â€” revert now rather than waiting out the window.
 pub async fn rollback(
     _session: Session,
     State(state): State<Arc<AppState>>,
@@ -223,7 +302,7 @@ pub async fn rollback(
     Ok(Json(state.network.rollback().await?))
 }
 
-/// POST /api/network/apply/extend — more time for a slow operator.
+/// POST /api/network/apply/extend â€” more time for a slow operator.
 pub async fn extend(
     _session: Session,
     State(state): State<Arc<AppState>>,
@@ -233,7 +312,7 @@ pub async fn extend(
     Ok(Json(state.network.extend(request.seconds).await?))
 }
 
-/// POST /api/network/management-bridge — convert nicN to brN + port.
+/// POST /api/network/management-bridge â€” convert nicN to brN + port.
 pub async fn management_bridge(
     _session: Session,
     State(state): State<Arc<AppState>>,

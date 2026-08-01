@@ -108,6 +108,10 @@ pub struct Status {
     pub pool_uuid: [u8; 16],
     /// The version a reassignment is moving to, while one is open.
     pub reassign_pending: Option<u64>,
+    /// A background scrub in flight: `(records verified, records total)`.
+    /// Absent when none is running — progress is a fact about a pass, not
+    /// about the node.
+    pub scrub: Option<(u64, u64)>,
 }
 
 /// What an attach got: the pen, or a seat beside it.
@@ -174,7 +178,82 @@ struct Shared {
     flush_ready: Condvar,
     reads: Mutex<Reads>,
     read_ready: Condvar,
+    /// The background scrub, at most one at a time. Its own board rather
+    /// than engine state: pacing and progress are the shell's policy,
+    /// exactly as checkpoint cadence is.
+    scrub: Mutex<ScrubBoard>,
     shutdown: AtomicBool,
+}
+
+/// What the scrub thread reports and the status verbs read.
+#[derive(Default)]
+struct ScrubBoard {
+    running: bool,
+    verified: u64,
+    total: u64,
+    /// The last finished pass: (unix seconds, verified, corrupt, missing).
+    last: Option<(u64, u64, u64, u64)>,
+}
+
+/// How many records one slice of the background scrub verifies before the
+/// engine lock is released. Small enough that guest I/O interleaves — a
+/// slice is a few dozen milliseconds — large enough that the pass is not
+/// all lock churn.
+const SCRUB_CHUNK_BLOCKS: usize = 256;
+/// The breath between slices: the moment a parked guest operation needs
+/// to take the engine first.
+const SCRUB_PAUSE: Duration = Duration::from_millis(2);
+
+/// The pass itself, on its own thread from [`Daemon::start_scrub`] to its
+/// end: verify in slices, keep the board honest, and finish with the
+/// reference walk the one-shot scrub always ran.
+fn scrub_loop(shared: &Arc<Shared>) {
+    let mut cursor = None;
+    let mut verified = 0u64;
+    let mut corrupt: Vec<lumen_fs::BlockHash> = Vec::new();
+    loop {
+        if shared.shutdown.load(Ordering::SeqCst) {
+            shared.scrub.lock().unwrap().running = false;
+            return;
+        }
+        let step =
+            shared.with_engine(|engine| engine.pool().scrub_chunk(cursor, SCRUB_CHUNK_BLOCKS));
+        match step {
+            Ok((count, bad, next)) => {
+                verified += count;
+                corrupt.extend(bad);
+                shared.scrub.lock().unwrap().verified = verified;
+                match next {
+                    Some(reached) => cursor = Some(reached),
+                    None => break,
+                }
+            }
+            Err(err) => {
+                eprintln!("scrub abandoned: {err}");
+                shared.scrub.lock().unwrap().running = false;
+                return;
+            }
+        }
+        std::thread::sleep(SCRUB_PAUSE);
+    }
+    let report = shared.with_engine(|engine| engine.pool().scrub_references(verified, corrupt));
+    let mut board = shared.scrub.lock().unwrap();
+    board.running = false;
+    match report {
+        Ok(report) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            board.last = Some((
+                now,
+                report.blocks_verified,
+                report.corrupt.len() as u64,
+                report.missing.len() as u64,
+            ));
+        }
+        Err(err) => eprintln!("scrub reference walk abandoned: {err}"),
+    }
 }
 
 impl Shared {
@@ -656,11 +735,70 @@ fn read_frame(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     Ok(payload)
 }
 
+/// How long a silent peer link is given before the kernel starts probing
+/// it, how often it probes, and how many unanswered probes kill it — so a
+/// session whose far end vanished dies in about fifteen seconds.
+///
+/// **This is what makes a power cut look different from a quiet pool.** A
+/// peer that loses power sends no FIN: the survivor's socket stays open
+/// forever, the daemon believes the session is live, and it never redials
+/// — so the returning node sits Suspended waiting for a connection nobody
+/// is going to make, while the survivor reports Synced. Observed exactly
+/// that way on real hardware; the cure was restarting the daemon that
+/// still thought it was connected, which is not a thing an appliance
+/// should need an operator for.
+///
+/// Probing does not replace the fence verdict. It ends a dead *socket*
+/// promptly; what that means for the data is still the engine's decision.
+const KEEPALIVE_IDLE_SECS: libc::c_int = 5;
+const KEEPALIVE_INTERVAL_SECS: libc::c_int = 2;
+const KEEPALIVE_PROBES: libc::c_int = 5;
+
+/// Ask the kernel to notice a peer that stopped answering.
+///
+/// Best-effort by design: a kernel that refuses one of these options
+/// leaves the link exactly as it was before, which is the behaviour that
+/// shipped for a year. There is nothing to report and nothing to fail.
+fn keepalive(stream: &TcpStream) {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let set = |level: libc::c_int, name: libc::c_int, value: libc::c_int| {
+        // SAFETY: setsockopt against a socket we own, with a c_int option
+        // value of the length the option expects.
+        unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                name,
+                &value as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    };
+    set(libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1);
+    set(libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, KEEPALIVE_IDLE_SECS);
+    set(
+        libc::IPPROTO_TCP,
+        libc::TCP_KEEPINTVL,
+        KEEPALIVE_INTERVAL_SECS,
+    );
+    set(libc::IPPROTO_TCP, libc::TCP_KEEPCNT, KEEPALIVE_PROBES);
+    // A send that cannot be delivered must not park forever either: with
+    // this the write half gives up on the same order of timescale as the
+    // probes, so a wedged link cannot hold the writer thread indefinitely.
+    set(
+        libc::IPPROTO_TCP,
+        libc::TCP_USER_TIMEOUT,
+        (KEEPALIVE_IDLE_SECS + KEEPALIVE_INTERVAL_SECS * KEEPALIVE_PROBES) * 1000,
+    );
+}
+
 /// One session, run to its death on the calling thread. The runner thread
 /// runs sessions strictly one after another, which is what makes teardown
 /// and the next session's hello naturally ordered.
 fn run_session(shared: &Arc<Shared>, mut stream: TcpStream) {
     stream.set_nodelay(true).ok();
+    keepalive(&stream);
 
     // Handshake first, engine second: a wrong pool or a self-connection
     // must die before the engine hears anything.
@@ -851,6 +989,7 @@ impl Daemon {
             flush_ready: Condvar::new(),
             reads: Mutex::new(Reads::default()),
             read_ready: Condvar::new(),
+            scrub: Mutex::new(ScrubBoard::default()),
             shutdown: AtomicBool::new(false),
         });
 
@@ -1104,7 +1243,15 @@ impl Daemon {
     }
 
     pub fn status(&self) -> Status {
+        // The board first, on its own: the scrub thread takes these locks
+        // in the other order (engine, released, then board), so holding
+        // both here would be asking for the inversion.
+        let scrub = {
+            let board = self.shared.scrub.lock().unwrap();
+            board.running.then_some((board.verified, board.total))
+        };
         self.shared.with_engine(|engine| Status {
+            scrub,
             node: engine.node(),
             state: engine.state(),
             era: engine.pool().era(),
@@ -1140,8 +1287,41 @@ impl Daemon {
         self.shared.with_engine(|engine| engine.collect_garbage())
     }
 
-    pub fn scrub(&self) -> Result<ScrubReport, FsError> {
-        self.shared.with_engine(|engine| engine.pool().scrub())
+    /// Start a background scrub, or say why not. Returns how many records
+    /// the pass will verify — the denominator the progress reads against.
+    ///
+    /// Background rather than inline because a scrub is minutes of reads
+    /// on a real brick, and the old synchronous verb held the engine for
+    /// all of them: every guest write parked behind an integrity check
+    /// nobody was waiting on. The thread takes the engine one slice at a
+    /// time instead ([`SCRUB_CHUNK_BLOCKS`]), so the pass shares the pool
+    /// with the guests it exists to protect.
+    pub fn start_scrub(&self) -> std::result::Result<u64, String> {
+        let total = self
+            .shared
+            .with_engine(|engine| engine.pool().scrub_total());
+        {
+            let mut board = self.shared.scrub.lock().unwrap();
+            if board.running {
+                return Err(format!(
+                    "a scrub is already running ({} of {} records verified)",
+                    board.verified, board.total
+                ));
+            }
+            board.running = true;
+            board.verified = 0;
+            board.total = total;
+        }
+        let shared = Arc::clone(&self.shared);
+        std::thread::spawn(move || scrub_loop(&shared));
+        Ok(total)
+    }
+
+    /// The scrub board, verbatim: running, progress, and the last finished
+    /// pass as `(unix seconds, verified, corrupt, missing)`.
+    pub fn scrub_progress(&self) -> (bool, u64, u64, Option<(u64, u64, u64, u64)>) {
+        let board = self.shared.scrub.lock().unwrap();
+        (board.running, board.verified, board.total, board.last)
     }
 
     /// Stop everything, settle the pool, release the brick. Exports go

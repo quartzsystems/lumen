@@ -42,6 +42,9 @@ export interface PoolMemberStatus {
   seats?: number | null;
   /// The version a rebalance is moving to, while one is running.
   reassign_pending?: number | null;
+  /// A background scrub in flight on this member: `[verified, total]`
+  /// records. Absent when none is running.
+  scrub?: [number, number] | null;
 }
 
 export interface PoolLease {
@@ -114,6 +117,25 @@ export const deletePoolSnapshot = (disk: string, snapshot: number): Promise<void
     `/storage/pool/disks/${encodeURIComponent(disk)}/snapshots/${snapshot}`,
     { method: "DELETE" },
   );
+
+/// Verify every stored block against its address, on every member at
+/// once. Answers with who started; each member's progress rides the pool
+/// view it already reports, as a scrub field on its status.
+export const scrubPool = (): Promise<{ started: string[] }> =>
+  apiFetch<{ started: string[] }>("/storage/pool/scrub", {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+
+/// Reap a pooled volume nothing references — the disk kept when its
+/// machine was deleted without a purge. The backend refuses while any
+/// defined machine still names the device, so this cannot take a disk
+/// out from under one.
+export const deletePoolDisk = (disk: string): Promise<void> =>
+  apiFetch<void>(`/storage/pool/disks/${encodeURIComponent(disk)}`, {
+    method: "DELETE",
+    body: JSON.stringify({ i_understand_this_may_lose_data: true }),
+  });
 
 export const rollbackPoolDisk = (disk: string, snapshot: number): Promise<void> =>
   apiFetch<void>(`/storage/pool/disks/${encodeURIComponent(disk)}/rollback`, {

@@ -845,19 +845,64 @@ impl<D: Disk> Brick<D> {
     /// and a peer's replica; this layer's whole duty is to never let wrong
     /// bytes pass as right ones.
     pub fn scrub(&self) -> Result<(u64, Vec<BlockHash>)> {
-        let mut hashes: Vec<BlockHash> = self.index.keys().copied().collect();
-        hashes.sort_unstable();
         let mut verified = 0u64;
         let mut corrupt = Vec::new();
-        for hash in hashes {
-            let location = self.index[&hash];
-            match self.read_location(&hash, &location) {
+        let mut cursor = None;
+        loop {
+            let (done, bad, next) = self.scrub_chunk(cursor, u64::MAX as usize)?;
+            verified += done;
+            corrupt.extend(bad);
+            match next {
+                Some(after) => cursor = Some(after),
+                None => return Ok((verified, corrupt)),
+            }
+        }
+    }
+
+    /// One bounded slice of the scrub: verify up to `budget` records whose
+    /// address sorts after `after`, in address order. Returns how many
+    /// verified, the addresses that did not, and where the next slice
+    /// starts — `None` when this one reached the end.
+    ///
+    /// The cursor is an address rather than a position so the walk is
+    /// stable under churn: a block written or collected mid-scrub moves no
+    /// other block's place in the order. What that buys is exactness about
+    /// what a pass covers — everything present when its address came up —
+    /// and what it honestly cannot promise: a block created behind the
+    /// cursor is the *next* pass's business.
+    pub fn scrub_chunk(
+        &self,
+        after: Option<BlockHash>,
+        budget: usize,
+    ) -> Result<(u64, Vec<BlockHash>, Option<BlockHash>)> {
+        let mut hashes: Vec<BlockHash> = match after {
+            Some(after) => self.index.keys().copied().filter(|h| *h > after).collect(),
+            None => self.index.keys().copied().collect(),
+        };
+        hashes.sort_unstable();
+        let more = hashes.len() > budget;
+        hashes.truncate(budget.max(1));
+        let mut verified = 0u64;
+        let mut corrupt = Vec::new();
+        for hash in &hashes {
+            let location = self.index[hash];
+            match self.read_location(hash, &location) {
                 Ok(_) => verified += 1,
-                Err(FsError::Corrupt(_)) => corrupt.push(hash),
+                Err(FsError::Corrupt(_)) => corrupt.push(*hash),
                 Err(other) => return Err(other),
             }
         }
-        Ok((verified, corrupt))
+        Ok((
+            verified,
+            corrupt,
+            if more { hashes.last().copied() } else { None },
+        ))
+    }
+
+    /// How many records a full scrub would verify right now — the honest
+    /// denominator under a progress bar.
+    pub fn scrub_total(&self) -> u64 {
+        self.index.len() as u64
     }
 
     pub fn contains(&self, hash: &BlockHash) -> bool {

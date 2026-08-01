@@ -1296,6 +1296,43 @@ impl<D: Disk> Pool<D> {
     /// design working as designed.
     pub fn scrub(&self) -> Result<ScrubReport> {
         let (blocks_verified, corrupt) = self.store.scrub()?;
+        self.scrub_references(blocks_verified, corrupt)
+    }
+
+    /// One bounded slice of the store pass — the expensive half of a
+    /// scrub, every record read back and verified against its address.
+    /// The caller drives the cursor and owns the pacing; taking the pool
+    /// between slices is exactly the point, so a scrub shares the engine
+    /// with the guests instead of standing in front of them.
+    pub fn scrub_chunk(
+        &self,
+        cursor: Option<crate::store::brick_set::ScrubCursor>,
+        budget: usize,
+    ) -> Result<(
+        u64,
+        Vec<BlockHash>,
+        Option<crate::store::brick_set::ScrubCursor>,
+    )> {
+        self.store.scrub_chunk(cursor, budget)
+    }
+
+    /// How many records the store pass covers right now — the denominator
+    /// a progress bar is honest against. Churn moves it; the bar is a
+    /// report, not a promise.
+    pub fn scrub_total(&self) -> u64 {
+        self.store.scrub_total()
+    }
+
+    /// The reference half of a scrub: every dirty entry, tree reference
+    /// and snapshot reference checked against the store — the walk
+    /// [`Pool::scrub`] runs after its store pass, callable on its own so
+    /// a chunked scrub can finish the same way. `verified` and `corrupt`
+    /// are the store pass's tallies, carried into the report unchanged.
+    pub fn scrub_references(
+        &self,
+        blocks_verified: u64,
+        corrupt: Vec<BlockHash>,
+    ) -> Result<ScrubReport> {
         let mut missing = Vec::new();
         let mut ids: Vec<u64> = self.vdisks.keys().copied().collect();
         ids.sort_unstable();
@@ -1321,8 +1358,6 @@ impl<D: Disk> Pool<D> {
                     },
                 )?;
                 for (index, hash) in tree_refs {
-                    // A dirty entry supersedes the tree at this index; only
-                    // the reference a read would actually follow counts.
                     if !state.dirty.contains_key(&index)
                         && self.serves_data(&hash)
                         && !self.store.contains(state.tier, &hash)
@@ -1332,8 +1367,6 @@ impl<D: Disk> Pool<D> {
                 }
             }
         }
-        // Pinned history answers reads too, so it scrubs like the present;
-        // a hole is reported under the vdisk the snapshot belongs to.
         for ((vdisk, _), snap) in &self.snapshots {
             let tier = self.vdisks[vdisk].tier;
             if let Some(root) = &snap.root {

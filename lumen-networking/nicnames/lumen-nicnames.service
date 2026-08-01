@@ -1,0 +1,36 @@
+# Deterministic NIC names on an installed appliance.
+#
+# The installer names the adapters it finds; this is what keeps that true
+# for adapters it never saw. Without it, a card added after installation is
+# never named at all — it keeps whatever the kernel called it, appears in
+# the console under an enp… name nobody chose, and cannot be built on,
+# because every profile Lumen writes addresses a nic<N>.
+#
+# `--apply` renames the running interfaces as well as writing the pins, so
+# a new card is usable on the first boot after it is fitted rather than the
+# second. That is only safe before anything has claimed them, which is what
+# the ordering below is for: after udev has settled, and strictly before
+# NetworkManager reads any profile.
+#
+# Existing MAC pins are preserved, so this never renumbers an adapter the
+# appliance is already configured against. A card that has been REPLACED is
+# deliberately not adopted here — its slot stays orphaned until an operator
+# says which new card belongs in it, because silently moving a name to
+# different hardware moves every network built on it.
+
+[Unit]
+Description=Deterministic NIC names (nic0..nicN)
+Documentation=https://quartz.systems/
+DefaultDependencies=no
+After=systemd-udev-settle.service local-fs.target
+Wants=systemd-udev-settle.service
+Before=network-pre.target NetworkManager.service
+ConditionPathExists=/usr/sbin/lumen-nicnames
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/lumen-nicnames --apply
+
+[Install]
+WantedBy=multi-user.target

@@ -50,5 +50,5 @@ pub use pool::{AdoptScope, Lease, Pool, ScrubReport};
 pub use repl::slice::{slice_of, Homes, Reassignment, SliceMap, SliceMove, SLICES};
 pub use repl::{Effect, NodeId, PeerMessage, ReplNode, ReplOp, ReplState, SyncOffer};
 pub use store::brick::{BlockRead, BlockWrite, Brick, BrickParams, BrickStats, ByteSpace, GcStats};
-pub use store::brick_set::{BrickSet, BrickSpace, SpaceReport, TierSpace};
+pub use store::brick_set::{BrickSet, BrickSpace, ScrubCursor, SpaceReport, TierSpace};
 pub use store::format::{RosterEntry, Superblock, ROSTER_CAP, SECTOR_SIZE, SUPERBLOCK_SLOTS};

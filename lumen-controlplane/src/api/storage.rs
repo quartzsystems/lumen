@@ -302,6 +302,20 @@ pub async fn pooled_storage(
     }))
 }
 
+/// POST /api/storage/pool/scrub — verify every stored block against its
+/// address, on every member at once. Each member runs its own pass in the
+/// background and reports progress through the status the pool view
+/// already reads, so this route answers immediately with who started.
+pub async fn scrub_pool(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    raw: Body,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let _: serde_json::Value = body(raw)?;
+    let started = pool_service(&state)?.start_scrub().await?;
+    Ok(Json(serde_json::json!({ "started": started })))
+}
+
 /// The routes below address a disk by the compute domain's name for it —
 /// `vm-7-disk-3` — because the device path has slashes in it and the name is
 /// the same fact in another form. Anything else is refused by name.

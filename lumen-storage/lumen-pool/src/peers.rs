@@ -133,6 +133,9 @@ pub enum PoolVerb {
     ReassignStatus,
     /// Commit — only after every member reports zero owed.
     CommitReassign,
+    /// Start a background scrub of the member's own bricks. Progress rides
+    /// the status it already reports; a member mid-scrub refuses a second.
+    StartScrub,
 }
 
 /// What a verb answered. One variant per shape rather than a string, so a
@@ -346,6 +349,10 @@ pub fn execute(client: &mut Client, verb: &PoolVerb) -> std::result::Result<Pool
             client.commit_reassign()?;
             PoolAnswer::Done
         }
+        PoolVerb::StartScrub => {
+            client.scrub()?;
+            PoolAnswer::Done
+        }
     })
 }
 
@@ -396,6 +403,7 @@ fn status_of(client: &mut Client) -> std::result::Result<MemberStatus, String> {
         seats: view.seats,
         reassign_pending: view.reassign_pending,
         pool_uuid: view.pool_uuid,
+        scrub: view.scrub,
     })
 }
 
@@ -567,6 +575,10 @@ impl PoolFleet for PeeredFleet {
             .into_done()
     }
 
+    async fn start_scrub(&self, member: &str) -> Result<()> {
+        self.at(member, PoolVerb::StartScrub).await?.into_done()
+    }
+
     async fn lease(&self, member: &str, vdisk: u64) -> Result<Option<(u8, Option<u8>)>> {
         Ok(self
             .at(member, PoolVerb::Lease { vdisk })
@@ -649,6 +661,7 @@ mod tests {
                     seats: None,
                     reassign_pending: None,
                     pool_uuid: None,
+                    scrub: None,
                 }),
                 _ => PoolAnswer::Done,
             })
@@ -796,6 +809,7 @@ mod tests {
             },
             PoolVerb::ReassignStatus,
             PoolVerb::CommitReassign,
+            PoolVerb::StartScrub,
         ] {
             let json = serde_json::to_string(&verb).unwrap();
             assert_eq!(serde_json::from_str::<PoolVerb>(&json).unwrap(), verb);
@@ -841,6 +855,7 @@ mod tests {
                 seats: Some(171),
                 reassign_pending: Some(3),
                 pool_uuid: Some("ab".repeat(16)),
+                scrub: Some((4096, 88_231)),
             }),
             PoolAnswer::Vdisks(vec![(1795, 512 << 20), (2, 8 << 20)]),
             PoolAnswer::Vdisks(Vec::new()),

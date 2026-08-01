@@ -191,6 +191,37 @@ impl PoolService {
             .ok_or_else(|| PoolError::NotFound(format!("{device} is not a disk this pool serves")))
     }
 
+    /// Start a background scrub on every member that can be asked — each
+    /// verifies its own platters, so the pass is per-member by nature.
+    /// Returns who started; a member that could not be asked, or that is
+    /// already mid-pass, is named in the error rather than skipped
+    /// silently.
+    pub async fn start_scrub(&self) -> Result<Vec<String>> {
+        let members = self.members().await?;
+        let mut started = Vec::new();
+        let mut refused = Vec::new();
+        for member in &members {
+            match self.fleet.start_scrub(member).await {
+                Ok(()) => started.push(member.clone()),
+                Err(err) => refused.push(format!("{member}: {err}")),
+            }
+        }
+        if !refused.is_empty() {
+            return Err(PoolError::Conflict(format!(
+                "the scrub started on {} of {} members ({}). Refused: {}",
+                started.len(),
+                members.len(),
+                if started.is_empty() {
+                    "none".to_string()
+                } else {
+                    started.join(", ")
+                },
+                refused.join("; ")
+            )));
+        }
+        Ok(started)
+    }
+
     /// The pool as it is right now — one call, everything a console page
     /// renders. Read live and never stored: a pool's health is a fact about
     /// this instant.

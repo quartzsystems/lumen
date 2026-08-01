@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { AlertTriangle, Camera, Plus, Trash2 } from "lucide-react";
+import { AlertTriangle, Camera, Plus, ShieldCheck, Trash2 } from "lucide-react";
 import { ProgressRow } from "@/components/cluster/CreateClusterDialog";
 import { DataTable, Dash, type Column } from "@/components/console/DataTable";
 import { CreateLumenPoolDialog } from "@/components/storage/CreateLumenPoolDialog";
@@ -12,6 +12,7 @@ import { ApiError } from "@/lib/authClient";
 import { useConsole } from "@/lib/ConsoleContext";
 import { fetchEnvironment } from "@/lib/clusterClient";
 import {
+  deletePoolDisk,
   deletePoolSnapshot,
   destroyLumenPool,
   fetchPooledStorage,
@@ -20,6 +21,7 @@ import {
   POOL_HEALTH_TONE,
   replicationLabel,
   rollbackPoolDisk,
+  scrubPool,
   takePoolSnapshot,
   type PooledStorageView,
   type PoolMember,
@@ -50,6 +52,8 @@ export function PooledStorageSection() {
   const [snapshotting, setSnapshotting] = useState<PoolVdisk | null>(null);
   const [creating, setCreating] = useState(false);
   const [destroying, setDestroying] = useState(false);
+  /// The orphaned disk being reaped, when one is.
+  const [reaping, setReaping] = useState<PoolVdisk | null>(null);
   /// Whether the empty-state create card may render: this node is in a
   /// cluster, because the pool spans one.
   const [eligible, setEligible] = useState(false);
@@ -92,10 +96,10 @@ export function PooledStorageSection() {
   useEffect(() => {
     // Polling pauses while a dialog is open, so a refresh cannot move
     // what the operator is pointing at mid-choice.
-    if (snapshotting || creating || destroying) return;
+    if (snapshotting || creating || destroying || reaping) return;
     const timer = setInterval(() => void load(), POLL_MS);
     return () => clearInterval(timer);
-  }, [load, snapshotting, creating, destroying]);
+  }, [load, snapshotting, creating, destroying, reaping]);
 
   // Keep the dialog's row current across reloads: it shows the snapshot
   // list, which its own actions change.
@@ -171,8 +175,33 @@ export function PooledStorageSection() {
           </span>
         )}
         {pool && (
-          <span className="ml-auto" title="Destroy the pool: every brick wiped">
-            <Button kind="ghost" size="sm" icon={Trash2} onClick={() => setDestroying(true)} />
+          <span className="ml-auto inline-flex items-center gap-1">
+            <span title="Scrub: verify every stored block against its address, on every member. Runs in the background; progress shows on each member's row.">
+              <Button
+                kind="ghost"
+                size="sm"
+                icon={ShieldCheck}
+                disabled={pool.members.some(
+                  (member) => "Answered" in member.view && member.view.Answered.scrub != null,
+                )}
+                onClick={() =>
+                  void (async () => {
+                    try {
+                      const answer = await scrubPool();
+                      setToast(`Scrub started on ${answer.started.join(", ")}.`);
+                      await load();
+                    } catch (err) {
+                      setToast(
+                        err instanceof Error ? err.message : "The scrub could not start.",
+                      );
+                    }
+                  })()
+                }
+              />
+            </span>
+            <span title="Destroy the pool: every brick wiped">
+              <Button kind="ghost" size="sm" icon={Trash2} onClick={() => setDestroying(true)} />
+            </span>
           </span>
         )}
       </div>
@@ -195,6 +224,20 @@ export function PooledStorageSection() {
         </div>
       )}
 
+      {pool && pool.health !== "Healthy" && (
+        <div className="callout callout-warn">
+          <AlertTriangle size={17} className="flex-shrink-0 text-[var(--qz-warn)] mt-[1px]" />
+          <div className="flex flex-col gap-1 text-[13px] text-[var(--qz-fg-2)]">
+            {pool.members
+              .map((member) => diagnosis(member))
+              .filter((sentence): sentence is string => sentence !== null)
+              .map((sentence) => (
+                <div key={sentence}>{sentence}</div>
+              ))}
+          </div>
+        </div>
+      )}
+
       {pool && (
         <>
           <DataTable
@@ -209,14 +252,33 @@ export function PooledStorageSection() {
             rowId={(vdisk) => String(vdisk.vdisk)}
             emptyMessage="The pool holds no disks yet — they are created with a machine."
             actions={(vdisk) => (
-              <span title="Snapshots: instant, crash-consistent, on both members at once">
-                <Button
-                  kind="ghost"
-                  size="sm"
-                  icon={Camera}
-                  onClick={() => setSnapshotting(vdisk)}
-                />
-              </span>
+              <div className="flex items-center gap-1 justify-end">
+                <span title="Snapshots: instant, crash-consistent, on both members at once">
+                  <Button
+                    kind="ghost"
+                    size="sm"
+                    icon={Camera}
+                    onClick={() => setSnapshotting(vdisk)}
+                  />
+                </span>
+                <span
+                  title={
+                    vdisk.exported_on.length > 0
+                      ? "Served right now — stop the machine using it first."
+                      : vdisk.disk === null
+                        ? "Not a machine disk; the pool's own bookkeeping."
+                        : `Delete ${diskLabel(vdisk)} — for a volume its machine left behind.`
+                  }
+                >
+                  <Button
+                    kind="ghost"
+                    size="sm"
+                    icon={Trash2}
+                    disabled={vdisk.exported_on.length > 0 || vdisk.disk === null}
+                    onClick={() => setReaping(vdisk)}
+                  />
+                </span>
+              </div>
             )}
           />
         </>
@@ -235,6 +297,18 @@ export function PooledStorageSection() {
         />
       )}
 
+      {reaping && (
+        <ReapDiskDialog
+          vdisk={reaping}
+          onClose={() => setReaping(null)}
+          onReaped={() => {
+            setToast(`${diskLabel(reaping)} deleted on every member.`);
+            setReaping(null);
+            void load();
+          }}
+        />
+      )}
+
       {destroying && (
         <DestroyLumenPoolDialog
           vdisks={pool?.vdisks.length ?? 0}
@@ -248,6 +322,70 @@ export function PooledStorageSection() {
         />
       )}
     </section>
+  );
+}
+
+/// Reaping one orphaned volume: the disk a deleted machine left behind.
+/// The backend refuses while any defined machine still names the device,
+/// so the acknowledgement here is about the data, not about safety races.
+function ReapDiskDialog({
+  vdisk,
+  onClose,
+  onReaped,
+}: {
+  vdisk: PoolVdisk;
+  onClose: () => void;
+  onReaped: () => void;
+}) {
+  const [acked, setAcked] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [failed, setFailed] = useState<string | null>(null);
+
+  const submit = async () => {
+    setBusy(true);
+    setFailed(null);
+    try {
+      await deletePoolDisk(diskLabel(vdisk));
+      onReaped();
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) return;
+      setFailed(err instanceof Error ? err.message : "The delete was refused.");
+      setBusy(false);
+    }
+  };
+
+  return (
+    <ModalShell onClose={busy ? () => {} : onClose} maxWidth={520}>
+      <ModalHeader
+        title={`Delete ${diskLabel(vdisk)}?`}
+        subtitle="The volume and its snapshots are removed on every member at once."
+        onClose={busy ? () => {} : onClose}
+      />
+      <div className="flex flex-col gap-4">
+        <p className="text-[13px] text-[var(--qz-fg-3)] m-0">
+          This is for a volume its machine left behind — one kept on purpose when the machine
+          was removed. A disk a defined machine still uses is refused here; detach it from the
+          machine instead.
+        </p>
+        {failed && <div className="callout callout-crit">{failed}</div>}
+        <CheckRow checked={acked} onChange={() => setAcked(!acked)}>
+          I understand this may lose data.
+        </CheckRow>
+        <div className="flex justify-end gap-2">
+          <button type="button" className="btn btn-ghost btn-sm" onClick={onClose}>
+            Cancel
+          </button>
+          <button
+            type="button"
+            className="btn btn-danger btn-sm"
+            disabled={!acked || busy}
+            onClick={() => void submit()}
+          >
+            {busy ? "Deleting…" : "Delete the disk"}
+          </button>
+        </div>
+      </div>
+    </ModalShell>
   );
 }
 
@@ -396,6 +534,28 @@ function DestroyLumenPoolDialog({
 const diskLabel = (vdisk: PoolVdisk): string =>
   vdisk.disk ? `vm-${vdisk.disk.vmid}-disk-${vdisk.disk.index}` : `vdisk ${vdisk.vdisk}`;
 
+/// A state badge names a fact; an operator needs the sentence behind it —
+/// what the state means, and what to do about it. `null` for a member
+/// that needs no explaining.
+const diagnosis = (member: PoolMember): string | null => {
+  if ("Silent" in member.view) {
+    return `${member.name} did not answer: ${member.view.Silent}. The view cannot tell whether its data is fine, so the verdict says "cannot tell" rather than guessing.`;
+  }
+  const replication = member.view.Answered.replication;
+  if (replication === "Suspended") {
+    return `${member.name} has no peer link and no fence verdict, so its writes refuse and its flushes park — guests stall rather than diverge. This is almost always the peer session: if the other member rebooted or lost power, the surviving side can sit on a dead connection without noticing and never redial. Restarting lumen-fsd on the member that still shows Synced re-establishes the link, and the pair resyncs on its own.`;
+  }
+  if (replication === "Degraded") {
+    return `${member.name} is serving alone under a fence verdict, at a bumped era. Writes are single-copy until its peer returns and adopts the missed history — that starts by itself when the link comes back.`;
+  }
+  if (typeof replication === "object") {
+    return replication.Resyncing.source
+      ? `${member.name} is the resync source: still serving guests while it streams the peer back up to date.`
+      : `${member.name} is receiving a resync: its state is being replaced, so it refuses writes until the stream lands.`;
+  }
+  return null;
+};
+
 const memberColumns: Column<PoolMember>[] = [
   {
     key: "name",
@@ -429,7 +589,23 @@ const memberColumns: Column<PoolMember>[] = [
         );
       }
       const { label, tone } = replicationLabel(member.view.Answered.replication);
-      return <span className={`badge badge-${tone}`}>{label}</span>;
+      const scrub = member.view.Answered.scrub ?? null;
+      return (
+        <span className="inline-flex items-center gap-2">
+          <span className={`badge badge-${tone}`} title={diagnosis(member) ?? undefined}>
+            {label}
+          </span>
+          {scrub && (
+            <span
+              className="badge badge-info"
+              title={`Verifying every stored block against its address: ${scrub[0].toLocaleString()} of ${scrub[1].toLocaleString()} records. Guest I/O keeps running; the pass takes the engine one slice at a time.`}
+            >
+              Scrubbing{" "}
+              {scrub[1] > 0 ? Math.round((scrub[0] * 100) / scrub[1]) : 0}%
+            </span>
+          )}
+        </span>
+      );
     },
   },
   {

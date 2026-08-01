@@ -1,10 +1,26 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { AlertTriangle, Plus, Power, RotateCw, Trash2, Wrench, Zap } from "lucide-react";
+import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
+import Link from "next/link";
+import { useRouter, useSearchParams } from "next/navigation";
+import {
+  AlertTriangle,
+  ArrowLeft,
+  LayoutDashboard,
+  Plus,
+  Power,
+  RotateCw,
+  Terminal,
+  Trash2,
+  Wrench,
+  Zap,
+} from "lucide-react";
 import { Page, PageBody, PageHeader } from "@/components/PageHeader";
 import { DataTable, Dash, type Column } from "@/components/console/DataTable";
 import { Button } from "@/components/ui/Button";
+import { NodeConsole } from "@/components/cluster/NodeConsole";
+import { NodeOverview } from "@/components/cluster/NodeOverview";
+import { useSecondaryNav } from "@/lib/SecondaryNavContext";
 import {
   AddNodeDialog,
   ConfirmDeadDialog,
@@ -28,6 +44,18 @@ import { ringsByNode } from "@/lib/networkStatus";
 
 const POLL_MS = 5000;
 
+/// A node's own sections. Two, and both earn their place: what the node is,
+/// and a way into it.
+const SECTIONS = [
+  { id: "overview", label: "Overview", icon: LayoutDashboard },
+  { id: "console", label: "Console", icon: Terminal },
+] as const;
+
+type SectionId = (typeof SECTIONS)[number]["id"];
+
+const isSection = (value: string | null): value is SectionId =>
+  SECTIONS.some((section) => section.id === value);
+
 /// One row of the unified table: a cluster's member, or an unassigned node —
 /// which is a valid standalone hypervisor, not a node in a broken state.
 type NodeRow =
@@ -37,8 +65,30 @@ type NodeRow =
 /// Every node in the environment in one table, whatever cluster it belongs
 /// to — the environment is one administrative domain, and this page is its
 /// one roster.
+/// The static export has no dynamic segments, so which node is open and
+/// which section it shows live in the query string — the machines page's
+/// arrangement, for the same reason and with the same Suspense boundary.
 export default function NodesPage() {
+  return (
+    <Suspense
+      fallback={
+        <Page>
+          <PageHeader title="Nodes" />
+          <PageBody>
+            <div className="text-[13px] text-[var(--qz-fg-4)]">Reading the environment…</div>
+          </PageBody>
+        </Page>
+      }
+    >
+      <Nodes />
+    </Suspense>
+  );
+}
+
+function Nodes() {
   const { setToast } = useConsole();
+  const params = useSearchParams();
+  const router = useRouter();
   const [environment, setEnvironment] = useState<EnvironmentResponse | null>(null);
   const [inventory, setInventory] = useState<InventoryResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -100,6 +150,21 @@ export default function NodesPage() {
     }
   };
 
+  // Which node is open, and which of its sections.
+  const requested = params.get("node");
+  const sectionParam = params.get("section");
+  const section: SectionId = isSection(sectionParam) ? sectionParam : "overview";
+  const go = useCallback(
+    (node: string | null, to: SectionId = "overview") => {
+      router.push(
+        node === null
+          ? "/infrastructure/nodes"
+          : `/infrastructure/nodes?node=${encodeURIComponent(node)}&section=${to}`,
+      );
+    },
+    [router],
+  );
+
   const rows = useMemo<NodeRow[]>(() => {
     if (!environment) return [];
     return [
@@ -118,6 +183,96 @@ export default function NodesPage() {
     ];
   }, [environment, inventory]);
 
+  // The node whose page is open, if the query names one this console can
+  // see. A member and a standalone node are both openable — they are both
+  // nodes, and the page says which it is.
+  const opened = useMemo(() => {
+    if (requested === null) return null;
+    return rows.find((row) => row.node.node === requested) ?? null;
+  }, [rows, requested]);
+
+  const openedInventory = useMemo(() => {
+    if (!opened) return null;
+    return (
+      inventory?.members.find((member) => member.node === opened.node.node)?.inventory ?? null
+    );
+  }, [inventory, opened]);
+
+  // The context column, filled only while a node is open — so the roster
+  // keeps the plain two-column shell, exactly as the machines page does.
+  useSecondaryNav(
+    () =>
+      opened ? (
+        <>
+          <button
+            type="button"
+            className="context-nav-item"
+            style={{ background: "none", border: "none", width: "100%" }}
+            onClick={() => go(null)}
+          >
+            <ArrowLeft size={15} />
+            <span>All nodes</span>
+          </button>
+          <div className="context-nav-header">
+            <div className="context-nav-title" title={opened.node.node}>
+              {opened.node.node}
+            </div>
+            <div className="context-nav-sub">
+              {opened.kind === "member" ? (
+                <span className="qz-mono text-[11px] text-[var(--qz-fg-4)]">{opened.cluster}</span>
+              ) : (
+                <span className="qz-mono text-[11px] text-[var(--qz-fg-4)]">standalone</span>
+              )}
+            </div>
+          </div>
+          <nav className="context-nav-items">
+            {SECTIONS.map(({ id, label, icon: Icon }) => (
+              <Link
+                key={id}
+                href={`/infrastructure/nodes?node=${encodeURIComponent(opened.node.node)}&section=${id}`}
+                className={`context-nav-item${id === section ? " context-nav-item-active" : ""}`}
+              >
+                <Icon size={15} />
+                <span>{label}</span>
+              </Link>
+            ))}
+          </nav>
+        </>
+      ) : null,
+    [opened, section, go],
+  );
+
+  // A node that was open and has since left the environment must not leave
+  // the page showing a ghost.
+  const missing = requested !== null && environment !== null && opened === null;
+
+  if (opened) {
+    const isMember = opened.kind === "member";
+    return (
+      <Page>
+        <PageHeader
+          title={opened.node.node}
+          description={
+            isMember
+              ? `A member of ${opened.cluster}.`
+              : "A standalone node, in the environment but in no cluster."
+          }
+        />
+        <PageBody>
+          {section === "overview" ? (
+            <NodeOverview
+              node={opened.node as ClusterNodeView}
+              cluster={isMember ? opened.cluster : null}
+              inventory={openedInventory}
+            />
+          ) : (
+            <NodeConsole node={opened.node.node} local={Boolean(opened.node.local)} />
+          )}
+        </PageBody>
+      </Page>
+    );
+  }
+
   return (
     <Page>
       <PageHeader
@@ -129,6 +284,20 @@ export default function NodesPage() {
           </Button>
         }
       />
+
+      {missing && (
+        <PageBody>
+          <div className="callout callout-warn">
+            <AlertTriangle size={17} className="flex-shrink-0 text-[var(--qz-warn)] mt-[1px]" />
+            <div className="flex-1 text-[13px] text-[var(--qz-fg-2)]">
+              {requested} is not in this environment.
+            </div>
+            <Button kind="secondary" onClick={() => go(null)}>
+              Back to all nodes
+            </Button>
+          </div>
+        </PageBody>
+      )}
 
       <PageBody>
         <div className="flex flex-col gap-4">
@@ -146,6 +315,7 @@ export default function NodesPage() {
           {environment !== null && (
             <NodesTable
               rows={rows}
+              onOpen={(row) => go(row.node.node)}
               onRefresh={load}
               onTestFence={(cluster, node) => setFencing({ cluster, node })}
               onConfirmDead={(cluster, node) => setConfirming({ cluster, node: node.node })}
@@ -414,6 +584,7 @@ const nodeColumns: Column<NodeRow>[] = [
 
 function NodesTable({
   rows,
+  onOpen,
   onRefresh,
   onTestFence,
   onConfirmDead,
@@ -422,6 +593,7 @@ function NodesTable({
   onRemove,
 }: {
   rows: NodeRow[];
+  onOpen: (row: NodeRow) => void;
   onRefresh: () => Promise<void>;
   onTestFence: (cluster: string, node: ClusterNodeView) => void;
   onConfirmDead: (cluster: string, node: ClusterNodeView) => void;
@@ -442,9 +614,21 @@ function NodesTable({
       searchPlaceholder="Search nodes…"
       emptyMessage="No nodes yet."
       onRefresh={onRefresh}
-      actionsWidth={250}
-      actions={(row) =>
-        row.kind === "unassigned" ? (
+      onRowOpen={onOpen}
+      actionsWidth={310}
+      actions={(row) => (
+        <span className="inline-flex items-center gap-1">
+          <Button kind="ghost" size="sm" onClick={() => onOpen(row)}>
+            Open
+          </Button>
+          {rowActions(row)}
+        </span>
+      )}
+    />
+  );
+
+  function rowActions(row: NodeRow) {
+    return row.kind === "unassigned" ? (
           row.node.local ? (
             // A node does not remove itself; the backend refuses, and the
             // control says why before it is tried.
@@ -549,8 +733,6 @@ function NodesTable({
               </>
             )}
           </span>
-        )
-      }
-    />
-  );
+    );
+  }
 }

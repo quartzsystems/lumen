@@ -170,7 +170,7 @@ pub async fn attach(
 /// request no browser sent carries no cookie the sender did not attach on
 /// purpose. Cross-site request forgery needs a victim's browser to be the one
 /// making the request; there is none here to borrow.
-fn same_origin(headers: &HeaderMap, uri: &Uri) -> Result<(), ApiError> {
+pub(crate) fn same_origin(headers: &HeaderMap, uri: &Uri) -> Result<(), ApiError> {
     let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
         return Ok(());
     };

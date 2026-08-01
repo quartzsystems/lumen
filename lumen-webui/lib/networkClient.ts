@@ -4,6 +4,46 @@ import { apiFetch } from "@/lib/authClient";
 // plus thin functions, no logic. Field names mirror lumen-net's serde output
 // exactly, so the wire format is the only contract between the two.
 
+/// One nicN name and the card it is pinned to. A pin whose card is not in
+/// the machine is what a replaced adapter leaves behind: every profile
+/// naming it is bound to nothing until an operator says which new card
+/// takes its place.
+export interface NicPin {
+  slot: number;
+  mac: string;
+  altname: string | null;
+  present: boolean;
+}
+
+/// An adapter the node has that no name claims — a card added or swapped
+/// in since the names were written.
+export interface UnclaimedNic {
+  device: string;
+  mac: string;
+  carrier: boolean;
+  speed_mbps: number | null;
+  driver: string | null;
+}
+
+export interface PinReport {
+  orphaned: NicPin[];
+  unclaimed: UnclaimedNic[];
+}
+
+export const fetchNicPins = (): Promise<PinReport> =>
+  apiFetch<PinReport>("/network/nics/pins");
+
+/// Give an orphaned name to a card that is actually in the machine. The
+/// backend refuses a live slot or an absent adapter.
+export const adoptNic = (
+  slot: number,
+  mac: string,
+): Promise<{ adopted: string; device: string; active: boolean; note?: string }> =>
+  apiFetch("/network/nics/adopt", {
+    method: "POST",
+    body: JSON.stringify({ slot, mac }),
+  });
+
 export type LinkKind = "ethernet" | "bond" | "bridge" | "vlan" | "other";
 export type LinkState = "activated" | "activating" | "disconnected" | "unmanaged" | "unknown";
 export type ChangeState = "unchanged" | "created" | "modified" | "deleted";

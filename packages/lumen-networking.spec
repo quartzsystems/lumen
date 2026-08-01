@@ -14,6 +14,7 @@ BuildArch:      noarch
 
 Source0:        lumen-nicnames
 Source1:        lumen-nm-00-lumen.conf
+Source2:        lumen-nicnames.service
 
 Requires:       bash
 Requires:       iproute
@@ -44,10 +45,28 @@ install -D -p -m 0755 %{SOURCE0} %{buildroot}%{_sbindir}/lumen-nicnames
 # file the operator adds, so this one never becomes a modified config file.
 install -D -p -m 0644 %{SOURCE1} \
     %{buildroot}%{_prefix}/lib/NetworkManager/conf.d/00-lumen.conf
+install -D -p -m 0644 %{SOURCE2} \
+    %{buildroot}%{_unitdir}/lumen-nicnames.service
+
+%post
+%systemd_post lumen-nicnames.service
+# Enable on install as well as on preset: a card fitted to an appliance that
+# has already been installed is exactly the case this unit exists for, and
+# waiting for the next fresh installation would be no use to it.
+if [ $1 -eq 1 ]; then
+    systemctl enable lumen-nicnames.service >/dev/null 2>&1 || :
+fi
+
+%preun
+%systemd_preun lumen-nicnames.service
+
+%postun
+%systemd_postun lumen-nicnames.service
 
 %files
 %{_sbindir}/lumen-nicnames
 %{_prefix}/lib/NetworkManager/conf.d/00-lumen.conf
+%{_unitdir}/lumen-nicnames.service
 
 %changelog
 * Fri Jul 24 2026 Quartz Systems Engineering <engineering@quartz.systems> - 0.3.0-1

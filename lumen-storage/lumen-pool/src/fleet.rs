@@ -80,6 +80,18 @@ pub trait PoolFleet: Send + Sync {
     /// defence the orchestration layer makes first.
     async fn rollback(&self, member: &str, vdisk: u64, snapshot: u64) -> Result<()>;
 
+    /// Start a background scrub of the member's own bricks. Per-member on
+    /// purpose — each verifies its own platters — and refused by a member
+    /// already mid-pass. Progress rides the status it already reports.
+    ///
+    /// Defaulted to a refusal so a fleet that never scrubs (the test
+    /// mocks) says so instead of silently succeeding.
+    async fn start_scrub(&self, member: &str) -> Result<()> {
+        Err(PoolError::Unavailable(format!(
+            "{member} cannot be asked to scrub over this fleet"
+        )))
+    }
+
     /// Who holds a vdisk's pen as this member sees it, and whether a window
     /// is open: `(holder, handing_to)`. `None` means nobody has claimed it.
     /// The open window is the record of its own destination, which is how a
@@ -287,6 +299,7 @@ impl PoolFleet for MockFleet {
             seats: pinned.and_then(|s| s.seats),
             reassign_pending: pinned.and_then(|s| s.reassign_pending),
             pool_uuid: pinned.and_then(|s| s.pool_uuid.clone()),
+            scrub: None,
         })
     }
 

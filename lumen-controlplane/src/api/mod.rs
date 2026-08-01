@@ -6,6 +6,7 @@ pub mod network;
 pub mod nodes;
 pub mod peer;
 pub mod request;
+pub mod shell;
 pub mod storage;
 pub mod system;
 pub mod updates;
@@ -40,6 +41,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/network/bridges/{name}", patch(network::update_bridge))
         .route("/api/network/bonds/{name}", patch(network::update_bond))
         .route("/api/network/vlans/{name}", patch(network::update_vlan))
+        // The name pins: which adapter answers to which nicN, what has lost
+        // its hardware, and the one repair for a replaced card. Before the
+        // {name} route — these are literal segments, not link names.
+        .route("/api/network/nics/pins", get(network::nic_pins))
+        .route("/api/network/nics/adopt", post(network::adopt_nic))
         .route("/api/network/nics/{name}", patch(network::update_nic))
         .route(
             "/api/network/bridges/{name}",
@@ -141,6 +147,9 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/environment/nodes/{node}/power",
             post(cluster::power_node),
         )
+        // A login session on the node itself — administrators only, and
+        // only on the node the request reached. See api/shell.rs.
+        .route("/api/environment/nodes/{node}/shell/ws", get(shell::attach))
         // Updates across every member: the same four questions the node-local
         // routes answer, asked of the whole environment. Installing walks the
         // members one at a time, this node last; see src/cluster_updates.rs
@@ -332,6 +341,9 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/storage/pool/pending",
             get(storage::lumen_pool_pending),
         )
+        // The integrity pass, started on every member; progress rides the
+        // pool view each member already reports.
+        .route("/api/storage/pool/scrub", post(storage::scrub_pool))
         .route(
             "/api/storage/pool/disks/{name}",
             delete(storage::delete_pooled_disk),

@@ -93,6 +93,10 @@ pub struct MemberStatus {
     /// newcomer's bricks with. Absent from a pre-mesh daemon.
     #[serde(default)]
     pub pool_uuid: Option<String>,
+    /// A background scrub in flight on this member: `(records verified,
+    /// records total)`. Absent when none is running.
+    #[serde(default)]
+    pub scrub: Option<(u64, u64)>,
 }
 
 impl MemberStatus {
@@ -458,6 +462,7 @@ mod tests {
             seats: None,
             reassign_pending: None,
             pool_uuid: None,
+            scrub: None,
         }
     }
 

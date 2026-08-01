@@ -23,6 +23,7 @@
 pub mod backend;
 pub mod error;
 pub mod model;
+pub mod pins;
 pub mod plan;
 pub mod service;
 pub mod state;

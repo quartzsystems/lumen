@@ -157,6 +157,7 @@ impl PoolFleet for SocketFleet {
             seats: view.seats,
             reassign_pending: view.reassign_pending,
             pool_uuid: view.pool_uuid,
+            scrub: None,
         })
     }
 

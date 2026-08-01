@@ -521,7 +521,13 @@ fn an_orchestrator_drives_a_whole_migration_over_the_control_protocol() {
     // diagnostic that says whether the two really agree.
     assert!(source("status").contains("state=synced"));
     assert_eq!(source("checkpoint"), "ok");
-    assert!(source("scrub").contains("corrupt=0"));
+    // A scrub starts in the background and reports through its own verb;
+    // the finished pass carries its tallies.
+    assert!(source("scrub").starts_with("ok: started total="));
+    wait_until("the scrub to finish clean", || {
+        let status = source("scrub-status");
+        status.contains("running=false") && status.contains("last_corrupt=0")
+    });
     assert_eq!(
         source(&format!("hash {SECOND}")),
         destination(&format!("hash {SECOND}")),
