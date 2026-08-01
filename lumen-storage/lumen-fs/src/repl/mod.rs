@@ -318,6 +318,103 @@ pub enum PeerMessage {
     SyncDone { era: u64 },
 }
 
+/// Merge what one engine call queued into as few wire messages as the
+/// stream's meaning allows. A large guest write emits `Payloads`, `Apply`,
+/// `Payloads`, `Apply`, … per block — hundreds of messages, each one a
+/// syscall on this side and a lock acquisition on the peer's. Merged, the
+/// same call is one `Payloads` and one `Apply` per peer.
+///
+/// Two rules keep it exactly as meaningful as the original stream:
+///
+/// - **A payload may move earlier; an op may not.** The peer must hold a
+///   block before the op referencing it applies. Folding a payload into
+///   an earlier `Payloads` keeps every payload ahead of its op; folding
+///   an op into an apply that sits BEFORE a payload emitted in between
+///   would put the op ahead of its own block — the three-node sim caught
+///   exactly that — so a freshly opened `Payloads` window closes the
+///   peer's apply window, while merging into an existing earlier one
+///   leaves it open.
+/// - **Applies merge only while dense.** `first_rseq` plus the op count
+///   must meet the next message's `first_rseq` — the stream's numbering
+///   is the replication contract, and a gap means something else
+///   happened in between.
+///
+/// Any other message to the same peer is a barrier: nothing merges across
+/// a `Hello`, a `Flush`, a `Durable` — those carry ordering meaning this
+/// function refuses to reason about. Effects that are not sends pass
+/// through untouched; they answer local waiters, not the wire.
+fn coalesce(effects: Vec<Effect>) -> Vec<Effect> {
+    /// Where a peer's open merge window sits in `out`.
+    #[derive(Default, Clone, Copy)]
+    struct Window {
+        payloads: Option<usize>,
+        apply: Option<(usize, u64)>,
+    }
+
+    let mut out: Vec<Effect> = Vec::with_capacity(effects.len());
+    let mut windows: std::collections::HashMap<NodeId, Window> = std::collections::HashMap::new();
+
+    for effect in effects {
+        match effect {
+            Effect::Send(peer, PeerMessage::Payloads(mut blocks)) => {
+                let window = windows.entry(peer).or_default();
+                match window.payloads {
+                    Some(at) => {
+                        let Effect::Send(_, PeerMessage::Payloads(open)) = &mut out[at] else {
+                            unreachable!("the window indexes what this fn put there");
+                        };
+                        open.append(&mut blocks);
+                    }
+                    None => {
+                        window.payloads = Some(out.len());
+                        // Ops emitted before this point must not merge
+                        // backward past it: an op after this payload may
+                        // reference it.
+                        window.apply = None;
+                        out.push(Effect::Send(peer, PeerMessage::Payloads(blocks)));
+                    }
+                }
+            }
+            Effect::Send(
+                peer,
+                PeerMessage::Apply {
+                    first_rseq,
+                    mut ops,
+                },
+            ) => {
+                let open = windows.entry(peer).or_default().apply;
+                match open {
+                    Some((at, next)) if next == first_rseq => {
+                        let Effect::Send(_, PeerMessage::Apply { ops: window, .. }) = &mut out[at]
+                        else {
+                            unreachable!("the window indexes what this fn put there");
+                        };
+                        let merged = next + ops.len() as u64;
+                        window.append(&mut ops);
+                        windows.entry(peer).or_default().apply = Some((at, merged));
+                    }
+                    _ => {
+                        // A gap (or nothing open): this message starts its
+                        // own window, and the old one is closed by being
+                        // left behind.
+                        let next = first_rseq + ops.len() as u64;
+                        windows.entry(peer).or_default().apply = Some((out.len(), next));
+                        out.push(Effect::Send(peer, PeerMessage::Apply { first_rseq, ops }));
+                    }
+                }
+            }
+            Effect::Send(peer, other) => {
+                // A barrier for this peer: whatever meaning it carries,
+                // nothing merges across it.
+                windows.remove(&peer);
+                out.push(Effect::Send(peer, other));
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// What the node wants the outside world to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
@@ -599,7 +696,7 @@ impl<D: Disk> ReplNode<D> {
     }
 
     pub fn take_effects(&mut self) -> Vec<Effect> {
-        self.effects.drain(..).collect()
+        coalesce(self.effects.drain(..).collect())
     }
 
     fn emit(&mut self, effect: Effect) {
@@ -1152,7 +1249,9 @@ impl<D: Disk> ReplNode<D> {
             return Err(FsError::SliceUnreachable(slice::slice_of(&hash) as u8));
         }
         if local_home {
-            self.pool.put_block(tier, payload)?;
+            // Hashed once, above, to place it — the store takes the
+            // address instead of computing it again over 16 KiB.
+            self.pool.put_block_prehashed(tier, hash, payload)?;
         }
         self.with_wal_room(|pool| pool.write_block_prehashed(vdisk, index, hash))?;
         for peer in &remote_homes {
@@ -2164,5 +2263,151 @@ mod tests {
             // applier would.
             self.pool.create_vdisk(id, 100 * 4096, 0).unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod coalesce_tests {
+    use super::*;
+
+    fn payload(byte: u8) -> (u8, Vec<u8>) {
+        (0, vec![byte; 4])
+    }
+
+    fn op(index: u64) -> ReplOp {
+        ReplOp::Trim { vdisk: 1, index }
+    }
+
+    /// The shape a large guest write actually emits — payload, apply,
+    /// payload, apply — folds to one of each, order preserved: every
+    /// payload still precedes the op that references it.
+    #[test]
+    fn a_writes_worth_of_chatter_becomes_two_messages() {
+        let out = coalesce(vec![
+            Effect::Send(1, PeerMessage::Payloads(vec![payload(1)])),
+            Effect::Send(
+                1,
+                PeerMessage::Apply {
+                    first_rseq: 10,
+                    ops: vec![op(0)],
+                },
+            ),
+            Effect::Send(1, PeerMessage::Payloads(vec![payload(2)])),
+            Effect::Send(
+                1,
+                PeerMessage::Apply {
+                    first_rseq: 11,
+                    ops: vec![op(1)],
+                },
+            ),
+        ]);
+        assert_eq!(
+            out,
+            vec![
+                Effect::Send(1, PeerMessage::Payloads(vec![payload(1), payload(2)])),
+                Effect::Send(
+                    1,
+                    PeerMessage::Apply {
+                        first_rseq: 10,
+                        ops: vec![op(0), op(1)],
+                    },
+                ),
+            ]
+        );
+    }
+
+    /// The stream numbering is the contract: a gap means something
+    /// happened in between, and the messages stay apart.
+    #[test]
+    fn a_sequence_gap_refuses_to_merge() {
+        let effects = vec![
+            Effect::Send(
+                1,
+                PeerMessage::Apply {
+                    first_rseq: 10,
+                    ops: vec![op(0)],
+                },
+            ),
+            Effect::Send(
+                1,
+                PeerMessage::Apply {
+                    first_rseq: 12,
+                    ops: vec![op(1)],
+                },
+            ),
+        ];
+        assert_eq!(coalesce(effects.clone()), effects);
+    }
+
+    /// Any other message is a barrier — a flush's position against the
+    /// payloads around it survives exactly as emitted.
+    #[test]
+    fn a_barrier_stops_the_merge_and_peers_merge_independently() {
+        let out = coalesce(vec![
+            Effect::Send(1, PeerMessage::Payloads(vec![payload(1)])),
+            Effect::Send(2, PeerMessage::Payloads(vec![payload(9)])),
+            Effect::Send(1, PeerMessage::Flush { up_to: 5 }),
+            Effect::Send(1, PeerMessage::Payloads(vec![payload(2)])),
+            Effect::Send(2, PeerMessage::Payloads(vec![payload(8)])),
+        ]);
+        assert_eq!(
+            out,
+            vec![
+                Effect::Send(1, PeerMessage::Payloads(vec![payload(1)])),
+                // Peer 2 merges across peer 1's barrier: barriers are
+                // per-stream facts.
+                Effect::Send(2, PeerMessage::Payloads(vec![payload(9), payload(8)])),
+                Effect::Send(1, PeerMessage::Flush { up_to: 5 }),
+                Effect::Send(1, PeerMessage::Payloads(vec![payload(2)])),
+            ]
+        );
+    }
+
+    /// The pattern a non-home writer sends a home: an op for one block,
+    /// then another block's payload, then its op. The second op must NOT
+    /// merge backward past the payload it references — the three-node
+    /// sim's refusal ("a replicated write names a block the store does
+    /// not hold") is what this pins.
+    #[test]
+    fn an_op_never_merges_backward_past_its_own_payload() {
+        let effects = vec![
+            Effect::Send(
+                1,
+                PeerMessage::Apply {
+                    first_rseq: 10,
+                    ops: vec![op(0)],
+                },
+            ),
+            Effect::Send(1, PeerMessage::Payloads(vec![payload(2)])),
+            Effect::Send(
+                1,
+                PeerMessage::Apply {
+                    first_rseq: 11,
+                    ops: vec![op(1)],
+                },
+            ),
+        ];
+        assert_eq!(coalesce(effects.clone()), effects);
+    }
+
+    /// Non-send effects answer local waiters, not the wire — they pass
+    /// through in place and merge nothing.
+    #[test]
+    fn local_effects_pass_through_untouched() {
+        let effects = vec![
+            Effect::FlushDone(7),
+            Effect::Send(1, PeerMessage::Payloads(vec![payload(1)])),
+            Effect::ReadDone(9),
+            Effect::Send(1, PeerMessage::Payloads(vec![payload(2)])),
+        ];
+        let out = coalesce(effects);
+        assert_eq!(
+            out,
+            vec![
+                Effect::FlushDone(7),
+                Effect::Send(1, PeerMessage::Payloads(vec![payload(1), payload(2)])),
+                Effect::ReadDone(9),
+            ]
+        );
     }
 }

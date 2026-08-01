@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
   AlertTriangle,
+  ArrowLeft,
   Cpu,
   LayoutDashboard,
   ListChecks,
@@ -128,6 +129,18 @@ function VirtualMachines() {
     () =>
       selected ? (
         <>
+          {/* The way out. The sidebar's own entry reads as "you are here"
+              once it is highlighted, so the return path must be spelled out
+              where the operator is actually looking. */}
+          <button
+            type="button"
+            className="context-nav-item"
+            style={{ background: "none", border: "none", width: "100%" }}
+            onClick={() => go(null)}
+          >
+            <ArrowLeft size={15} />
+            <span>All machines</span>
+          </button>
           <div className="context-nav-header">
             <div className="context-nav-title" title={selected.name}>
               {selected.name}
@@ -151,7 +164,7 @@ function VirtualMachines() {
           </nav>
         </>
       ) : null,
-    [selected?.vmid, selected?.name, selected?.state, section],
+    [selected?.vmid, selected?.name, selected?.state, section, go],
   );
 
   const afterAction = useCallback(
@@ -281,6 +294,7 @@ function VirtualMachines() {
                       onRefresh={refresh}
                       onOpen={(vm) => go(vm.vmid)}
                       onAction={afterAction}
+                      onDelete={setDeleting}
                     />
                   </section>
                 ))}
@@ -452,6 +466,7 @@ function VmTable({
   onRefresh,
   onOpen,
   onAction,
+  onDelete,
 }: {
   rows: VmView[];
   busy: boolean;
@@ -459,6 +474,7 @@ function VmTable({
   onRefresh: () => Promise<void>;
   onOpen: (vm: VmView) => void;
   onAction: (message: string) => Promise<void>;
+  onDelete: (vm: VmView) => void;
 }) {
   // The drop-downs offer what is actually on this node, not every value the
   // API can produce — a filter for a state the node does not have is dead
@@ -497,18 +513,26 @@ function VmTable({
       emptyMessage="No machines on this node yet."
       onRefresh={onRefresh}
       onRowOpen={onOpen}
-      // Open and the one obvious lifecycle control. Everything else lives on
-      // the machine's own page — a menu in a table cell earns its keep only
-      // when the row is the only place to act, and it no longer is. The cell
-      // is one flex container so both buttons centre on the same axis instead
-      // of sitting on the text baseline.
-      actionsWidth={110}
+      // Open, the one obvious lifecycle control, and removal — the verbs an
+      // operator reaches for from the list. Everything else lives on the
+      // machine's own page. The cell is one flex container so the buttons
+      // centre on the same axis instead of sitting on the text baseline.
+      actionsWidth={150}
       actions={(vm) => (
         <div className="flex items-center gap-1 justify-end">
           <Button kind="ghost" size="sm" onClick={() => onOpen(vm)}>
             Open
           </Button>
           <LifecycleControls vm={vm} busy={busy} compact menu={false} onDone={onAction} />
+          <span title={vm.actions.delete.reason ?? `Remove ${vm.name}`}>
+            <Button
+              kind="ghost"
+              size="sm"
+              icon={Trash2}
+              disabled={busy || !vm.actions.delete.allowed}
+              onClick={() => onDelete(vm)}
+            />
+          </span>
         </div>
       )}
     />

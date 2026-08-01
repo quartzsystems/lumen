@@ -1516,9 +1516,16 @@ impl<D: Disk> Pool<D> {
 
     /// Store a payload at a tier without mapping it anywhere — a
     /// replicated block arriving ahead of the operation that references
-    /// it, on the tier that operation will reference it at.
+    /// it, on the tier that operation will reference it at. Hashes the
+    /// payload: what arrives off the wire is verified by addressing.
     pub fn put_block(&mut self, tier: u8, payload: &[u8]) -> Result<BlockHash> {
         self.store.put(tier, payload)
+    }
+
+    /// The same store, for a caller that already computed the address —
+    /// the local write path, which hashed the block to place it.
+    pub fn put_block_prehashed(&mut self, tier: u8, hash: BlockHash, payload: &[u8]) -> Result<()> {
+        self.store.put_prehashed(tier, hash, payload)
     }
 
     /// Whether the store holds a block, by tier and address.

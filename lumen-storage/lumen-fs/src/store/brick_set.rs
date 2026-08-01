@@ -34,13 +34,62 @@
 //! the live hashes *routed to it*, so the unrouted copy is swept instead of
 //! leaking forever.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Mutex;
 
 use crate::disk::Disk;
 use crate::error::{FsError, Result};
 use crate::hash::{hash_block, BlockHash};
 use crate::store::brick::{BlockRead, BlockWrite, Brick, BrickStats, ByteSpace, GcStats};
 use crate::store::format::RosterEntry;
+
+/// How much recently-read payload the set keeps in memory. Enough to hold
+/// every hot map node of a busy vdisk with room left for data blocks; a
+/// read served from here skips two device reads and a full BLAKE3
+/// verification — the map walk's entire per-node cost.
+const CACHE_BYTES: usize = 64 << 20;
+
+/// Recently-read payloads by address — correct by construction, with no
+/// invalidation anywhere. The address IS the content, so a cached payload
+/// can never be stale; and existence is never answered from here, only
+/// from the route, so a collected block disappears the moment its route
+/// entry does and a stale cache entry is unreachable memory, not a wrong
+/// answer. Scrub reads the platter through the brick directly and never
+/// passes this way, so rot cannot hide behind it.
+///
+/// FIFO eviction: the reuse this exists for is the same map nodes fetched
+/// again for every block of one large request, which no recency tracking
+/// is needed to catch. Behind a mutex because `get` takes `&self`; the
+/// engine's own lock means it is never contended.
+#[derive(Debug, Default)]
+struct PayloadCache {
+    map: HashMap<(u8, BlockHash), Vec<u8>>,
+    order: VecDeque<(u8, BlockHash)>,
+    bytes: usize,
+}
+
+impl PayloadCache {
+    fn get(&self, key: &(u8, BlockHash)) -> Option<Vec<u8>> {
+        self.map.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: (u8, BlockHash), payload: &[u8]) {
+        if self.map.contains_key(&key) {
+            return;
+        }
+        while self.bytes + payload.len() > CACHE_BYTES {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(evicted) = self.map.remove(&oldest) {
+                self.bytes -= evicted.len();
+            }
+        }
+        self.bytes += payload.len();
+        self.order.push_back(key);
+        self.map.insert(key, payload.to_vec());
+    }
+}
 
 #[derive(Debug)]
 pub struct BrickSet<D: Disk> {
@@ -57,6 +106,7 @@ pub struct BrickSet<D: Disk> {
     /// every mutable borrow — WAL appends and anchors go around the set's
     /// own write path, and a presumed-dirty holder costs one fsync.
     dirty: Vec<bool>,
+    cache: Mutex<PayloadCache>,
 }
 
 impl<D: Disk> BrickSet<D> {
@@ -206,6 +256,7 @@ impl<D: Disk> BrickSet<D> {
             holder,
             route,
             dirty,
+            cache: Mutex::new(PayloadCache::default()),
         })
     }
 
@@ -217,12 +268,22 @@ impl<D: Disk> BrickSet<D> {
     /// and the tier's exhaustion surfaces as [`FsError::Full`] — never a
     /// silent landing on some other tier.
     pub fn put(&mut self, tier: u8, payload: &[u8]) -> Result<BlockHash> {
+        let hash = hash_block(payload);
+        self.put_prehashed(tier, hash, payload)?;
+        Ok(hash)
+    }
+
+    /// Store a payload whose address the caller already computed. The
+    /// write path hashes every block once to place it across the members,
+    /// and hashing 16 KiB a second time here was a measured cost — so the
+    /// hash rides down instead. Trusted exactly as far as its source:
+    /// inside this crate, always from `hash_block` over these same bytes.
+    pub fn put_prehashed(&mut self, tier: u8, hash: BlockHash, payload: &[u8]) -> Result<()> {
         if payload.is_empty() {
             return Err(FsError::EmptyPayload);
         }
-        let hash = hash_block(payload);
         if self.route.contains_key(&(tier, hash)) {
-            return Ok(hash);
+            return Ok(());
         }
         let mut candidates: Vec<usize> = (0..self.bricks.len())
             .filter(|&i| self.bricks[i].tier() == tier)
@@ -238,7 +299,10 @@ impl<D: Disk> BrickSet<D> {
                 Ok(()) => {
                     self.route.insert((tier, hash), position);
                     self.dirty[position] = true;
-                    return Ok(hash);
+                    // Write-through: a fresh block's map node is re-read
+                    // on the very next walk.
+                    self.cache.lock().unwrap().insert((tier, hash), payload);
+                    return Ok(());
                 }
                 Err(FsError::Full) => continue,
                 Err(err) => return Err(err),
@@ -247,10 +311,21 @@ impl<D: Disk> BrickSet<D> {
         Err(FsError::Full)
     }
 
-    /// A stored block's payload, by tier and address.
+    /// A stored block's payload, by tier and address. Existence is the
+    /// route's answer; only content may come from the cache.
     pub fn get(&self, tier: u8, hash: &BlockHash) -> Result<Option<Vec<u8>>> {
         match self.route.get(&(tier, *hash)) {
-            Some(&position) => self.bricks[position].get(hash),
+            Some(&position) => {
+                let key = (tier, *hash);
+                if let Some(hit) = self.cache.lock().unwrap().get(&key) {
+                    return Ok(Some(hit));
+                }
+                let read = self.bricks[position].get(hash)?;
+                if let Some(payload) = &read {
+                    self.cache.lock().unwrap().insert(key, payload);
+                }
+                Ok(read)
+            }
             None => Ok(None),
         }
     }
