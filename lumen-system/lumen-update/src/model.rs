@@ -5,17 +5,17 @@ use serde::{Deserialize, Serialize};
 /// The package-name prefixes that make up the **platform set**: the kernel and
 /// everything pinned against its ABI.
 ///
-/// These are the packages iso/pins.env moves as one — "bump one, re-verify all
-/// three" — and the ones an ordinary update must never touch. The list is
+/// These are the packages iso/pins.env moves as one — bump one, re-verify
+/// the set — and the ones an ordinary update must never touch. The list is
 /// prefixes rather than exact names because the kernel alone arrives as
 /// `kernel`, `kernel-core`, `kernel-modules`, `kernel-modules-core`, and
 /// `kernel-tools`, and the kmod packages carry their series in the name
-/// (`kmod-zfs-2.3`, `kmod-drbd9x`).
+/// (`kmod-zfs-2.3`).
 ///
 /// `zfs` also catches `zfs-dracut`, which is what puts the pool import into
 /// the initramfs — a userland package by packaging but part of the boot path
 /// in practice, so it moves with the module rather than against it.
-pub const PLATFORM_PREFIXES: &[&str] = &["kernel", "kmod-", "zfs", "drbd"];
+pub const PLATFORM_PREFIXES: &[&str] = &["kernel", "kmod-", "zfs"];
 
 /// Whether a package belongs to the platform set.
 ///
@@ -41,7 +41,7 @@ pub fn is_platform(name: &str) -> bool {
 pub enum UpdateKind {
     /// Lumen's own packages — the control plane, the console, the branding.
     Lumen,
-    /// Kernel, kernel modules, ZFS, DRBD. See [`PLATFORM_PREFIXES`].
+    /// Kernel, kernel modules, ZFS. See [`PLATFORM_PREFIXES`].
     Platform,
     /// Everything else the distribution ships.
     Other,
@@ -270,10 +270,8 @@ mod tests {
             "kernel-core",
             "kernel-modules-core",
             "kmod-zfs-2.3",
-            "kmod-drbd9x",
             "zfs",
             "zfs-dracut",
-            "drbd9x-utils",
         ] {
             assert!(is_platform(name), "{name} should be platform");
             assert_eq!(UpdateKind::of(name), UpdateKind::Platform);

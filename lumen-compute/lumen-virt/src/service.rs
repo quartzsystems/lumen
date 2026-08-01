@@ -471,15 +471,12 @@ pub struct DiskCreate {
     /// Volume block size in bytes. `None` leaves the pool default.
     #[serde(default)]
     pub blocksize: Option<u64>,
-    /// Back the disk with a replicated volume instead of a local zvol: the
+    /// Back the disk with a pooled volume instead of a local zvol: the
     /// machine's data lands on every replica before a write is acknowledged,
-    /// and the machine can run on any member holding one.
+    /// and the machine can run on any pool member. Placement is the pool's
+    /// own, so there is nothing else to choose.
     #[serde(default)]
     pub replicated: bool,
-    /// The replica seats for a replicated disk. Empty means "place it for
-    /// me": this node plus the least-utilized other member.
-    #[serde(default)]
-    pub members: Vec<lumen_drbd::VolumeMemberCreate>,
 }
 
 /// An optical drive to define. The image is named by the pool it is in and
@@ -547,11 +544,11 @@ pub struct VirtService {
     backend: Arc<dyn VirtBackend>,
     storage: Arc<StorageService>,
     network: Arc<NetworkService>,
-    /// Replicated disks, through the narrow trait `lumen-drbd` defines for
+    /// Replicated disks, through the narrow trait `lumen-pool` defines for
     /// this one consumer. On a standalone appliance every call refuses with
     /// a sentence, which is exactly the answer a replicated disk deserves
     /// there.
-    volumes: Arc<dyn lumen_drbd::VmVolumes>,
+    volumes: Arc<dyn lumen_pool::VmVolumes>,
     node: String,
     /// Serializes every mutation. Two machines being created at once must not
     /// race for the same identifier.
@@ -583,7 +580,7 @@ impl VirtService {
         backend: Arc<dyn VirtBackend>,
         storage: Arc<StorageService>,
         network: Arc<NetworkService>,
-        volumes: Arc<dyn lumen_drbd::VmVolumes>,
+        volumes: Arc<dyn lumen_pool::VmVolumes>,
     ) -> Self {
         Self {
             backend,
@@ -1054,10 +1051,9 @@ impl VirtService {
             let (source, actual_size, backing) = if disk.replicated {
                 match self
                     .volumes
-                    .create_disk(&lumen_drbd::VmDiskRequest {
+                    .create_disk(&lumen_pool::VmDiskRequest {
                         name: name.clone(),
                         size_bytes: size,
-                        members: disk.members.clone(),
                     })
                     .await
                 {
@@ -1404,13 +1400,11 @@ impl VirtService {
     // --- lifecycle --------------------------------------------------------
 
     async fn start_domain(&self, config: &VmConfig) -> Result<()> {
-        // A replicated device is served, not simply present. DRBD's exists
-        // on every member for as long as the resource does, but a pooled
-        // disk's exists only where its daemon has been asked to serve it —
-        // so every start readies its own devices first. That is what makes
-        // an HA restart work, and a start after the storage daemon
-        // restarted, without either path having to know which engine is
-        // underneath. For DRBD it is a lookup and nothing else.
+        // A replicated device is served, not simply present: a pooled
+        // disk's device exists only where its daemon has been asked to
+        // serve it — so every start readies its own devices first. That is
+        // what makes an HA restart work, and a start after the storage
+        // daemon restarted.
         for disk in &config.disks {
             if self.volumes.disk_of(&disk.source).await?.is_some() {
                 self.volumes.ensure_local_device(&disk.source).await?;
@@ -1512,7 +1506,7 @@ impl VirtService {
     // --- hardware ---------------------------------------------------------
 
     /// Live-migrate a running machine to another member of its disks'
-    /// replica set. The two-primaries window — DRBD's one deliberate
+    /// replica set. The migration window — storage's one deliberate
     /// exception to "one writer" — opens on every replicated disk just
     /// before the migration and closes on **every** path out: the guard is
     /// two loops around one backend call, not a flag something remembers to
@@ -1582,7 +1576,7 @@ impl VirtService {
         let mut opened: Vec<String> = Vec::new();
         let mut failure: Option<VirtError> = None;
         for device in &devices {
-            let opening = lumen_drbd::MigrationWindow::Open {
+            let opening = lumen_pool::MigrationWindow::Open {
                 destination: target.to_string(),
             };
             match self.volumes.migration_window(device, opening).await {
@@ -1604,9 +1598,9 @@ impl VirtService {
         // The ending, named: the machine is either on the destination now
         // or it never left, and the storage layer is told which.
         let ending = if failure.is_none() {
-            lumen_drbd::MigrationWindow::Accepted
+            lumen_pool::MigrationWindow::Accepted
         } else {
-            lumen_drbd::MigrationWindow::Aborted
+            lumen_pool::MigrationWindow::Aborted
         };
         for device in opened.iter().rev() {
             if let Err(err) = self.volumes.migration_window(device, ending.clone()).await {
@@ -1641,9 +1635,10 @@ impl VirtService {
     /// Where a set of replicated devices can run, answered by **this
     /// node's own storage engine** — the seam VirtService was built on.
     /// The HA sweep and the maintenance drain ask through here rather
-    /// than any one engine directly: on a pooled node, asking DRBD about
-    /// a `/dev/ublkb` device is a refusal wearing an answer's clothes,
-    /// and a machine that could restart anywhere would restart nowhere.
+    /// than any engine directly, so neither has to know what serves the
+    /// device — asking the wrong engine is a refusal wearing an answer's
+    /// clothes, and a machine that could restart anywhere would restart
+    /// nowhere.
     pub async fn common_members(&self, devices: &[String]) -> Result<Vec<String>> {
         self.volumes
             .common_members(devices)
@@ -1653,8 +1648,8 @@ impl VirtService {
 
     /// Define-and-start a machine from a replicated definition — the HA
     /// manager's one verb, after the machine's node is confirmed lost. The
-    /// document is defined verbatim: its disks are `/dev/drbd` devices that
-    /// exist here too, which is the whole reason it can move.
+    /// document is defined verbatim: its disks are stable pooled devices
+    /// this node can serve too, which is the whole reason it can move.
     pub async fn adopt(&self, xml: &str) -> Result<VmView> {
         let _guard = self.gate.lock().await;
         let parsed = domain_xml::parse(xml)?;
@@ -1694,10 +1689,9 @@ impl VirtService {
         let (source, actual_size, backing) = if request.replicated {
             let replicated = self
                 .volumes
-                .create_disk(&lumen_drbd::VmDiskRequest {
+                .create_disk(&lumen_pool::VmDiskRequest {
                     name,
                     size_bytes: size,
-                    members: request.members.clone(),
                 })
                 .await?;
             let backing = Backing::Replicated {
@@ -2093,9 +2087,9 @@ impl VirtService {
     }
 
     /// The next free disk index across *both* kinds of backing. A zvol
-    /// carries its index in its device path; a replicated disk's device is
-    /// `/dev/drbd<minor>` and says nothing, so its volume name is looked up
-    /// in the record — which is why this lives here and not on the model.
+    /// carries its index in its device path; a replicated disk's device
+    /// path says nothing about the index, so its volume name is looked up
+    /// through the seam — which is why this lives here and not on the model.
     async fn next_disk_index(&self, config: &VmConfig) -> Result<u32> {
         let mut taken: Vec<u32> = Vec::new();
         for disk in &config.disks {
@@ -2165,7 +2159,7 @@ mod tests {
         service: VirtService,
         virt: Arc<MockBackend>,
         zfs: Arc<MockZfsBackend>,
-        volumes: Arc<lumen_drbd::MockVmVolumes>,
+        volumes: Arc<lumen_pool::MockVmVolumes>,
         state_dir: std::path::PathBuf,
     }
 
@@ -2183,7 +2177,7 @@ mod tests {
     /// knows a machine exists. Replicated storage is the standalone stub —
     /// this node is not in a cluster unless a test says so.
     async fn harness(tag: &str) -> Harness {
-        harness_with(tag, lumen_drbd::MockVmVolumes::standalone()).await
+        harness_with(tag, lumen_pool::MockVmVolumes::standalone()).await
     }
 
     /// The same node inside a two-node cluster, for the replicated-disk and
@@ -2191,12 +2185,12 @@ mod tests {
     async fn clustered_harness(tag: &str) -> Harness {
         harness_with(
             tag,
-            lumen_drbd::MockVmVolumes::clustered("alpha", &["lumen", "lumen02"]),
+            lumen_pool::MockVmVolumes::clustered("alpha", &["lumen", "lumen02"]),
         )
         .await
     }
 
-    async fn harness_with(tag: &str, volumes: lumen_drbd::MockVmVolumes) -> Harness {
+    async fn harness_with(tag: &str, volumes: lumen_pool::MockVmVolumes) -> Harness {
         let state_dir = std::env::temp_dir().join(format!(
             "lumen-virt-service-{tag}-{}-{:?}",
             std::process::id(),
@@ -2270,7 +2264,6 @@ mod tests {
                 discard: true,
                 blocksize: None,
                 replicated: false,
-                members: Vec::new(),
             }],
             nics: vec![NicCreate {
                 bridge: "br0".into(),
@@ -2672,7 +2665,6 @@ mod tests {
                     discard: true,
                     blocksize: None,
                     replicated: false,
-                    members: Vec::new(),
                 },
             )
             .await
@@ -2719,7 +2711,6 @@ mod tests {
                     discard: true,
                     blocksize: None,
                     replicated: false,
-                    members: Vec::new(),
                 },
             )
             .await
@@ -3194,7 +3185,6 @@ mod tests {
             discard: true,
             blocksize: None,
             replicated: true,
-            members: Vec::new(),
         }
     }
 
@@ -3207,7 +3197,7 @@ mod tests {
 
         // The stable device, not a zvol path — the same document is valid on
         // every member.
-        assert_eq!(vm.disks[0].source, "/dev/drbd1");
+        assert_eq!(vm.disks[0].source, "/dev/ublkb1");
         let made = h.volumes.disks();
         assert_eq!(made.len(), 1);
         assert_eq!(made[0].name, format!("vm-{}-disk-0", vm.vmid));
@@ -3225,7 +3215,6 @@ mod tests {
                     discard: true,
                     blocksize: None,
                     replicated: false,
-                    members: Vec::new(),
                 },
             )
             .await
@@ -3295,8 +3284,8 @@ mod tests {
         assert_eq!(
             h.volumes.windows(),
             vec![
-                ("/dev/drbd1".to_string(), true),
-                ("/dev/drbd1".to_string(), false)
+                ("/dev/ublkb1".to_string(), true),
+                ("/dev/ublkb1".to_string(), false)
             ]
         );
         assert!(h.volumes.open_windows().is_empty());
@@ -3307,14 +3296,14 @@ mod tests {
             h.volumes.window_states(),
             vec![
                 (
-                    "/dev/drbd1".to_string(),
-                    lumen_drbd::MigrationWindow::Open {
+                    "/dev/ublkb1".to_string(),
+                    lumen_pool::MigrationWindow::Open {
                         destination: "lumen02".to_string()
                     }
                 ),
                 (
-                    "/dev/drbd1".to_string(),
-                    lumen_drbd::MigrationWindow::Accepted
+                    "/dev/ublkb1".to_string(),
+                    lumen_pool::MigrationWindow::Accepted
                 )
             ]
         );
@@ -3336,7 +3325,7 @@ mod tests {
         let vm = h.service.create(request).await.unwrap();
         assert_eq!(
             h.volumes.ensured(),
-            vec!["/dev/drbd1".to_string()],
+            vec!["/dev/ublkb1".to_string()],
             "creating and starting a machine did not ready its device"
         );
 
@@ -3354,7 +3343,7 @@ mod tests {
         h.service.start(vm.vmid).await.unwrap();
         assert_eq!(
             h.volumes.ensured(),
-            vec!["/dev/drbd1".to_string(), "/dev/drbd1".to_string()],
+            vec!["/dev/ublkb1".to_string(), "/dev/ublkb1".to_string()],
             "a restart did not ready the device again"
         );
     }
@@ -3379,7 +3368,7 @@ mod tests {
         // rather than hand it on.
         assert_eq!(
             h.volumes.window_states().last().map(|(_, w)| w.clone()),
-            Some(lumen_drbd::MigrationWindow::Aborted),
+            Some(lumen_pool::MigrationWindow::Aborted),
             "a failed migration must abort the window, not accept it"
         );
         assert!(

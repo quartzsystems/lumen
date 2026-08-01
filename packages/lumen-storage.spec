@@ -30,16 +30,12 @@ Requires:       systemd
 Requires:       zfs
 # The cluster stack the management daemon drives through its command lines:
 # membership and quorum (corosync), fencing and the CIB (pacemaker, pcs, the
-# one fence agent this appliance uses), and synchronous replication (the
-# DRBD 9 module and its userland, mirrored from ELRepo with a kABI gate in
-# the ISO build). Installed everywhere, running nowhere until a cluster
-# exists — the preset below is what keeps that true.
+# one fence agent this appliance uses). Installed everywhere, running
+# nowhere until a cluster exists — the preset below is what keeps that true.
 Requires:       corosync
 Requires:       pacemaker
 Requires:       pcs
 Requires:       fence-agents-ipmilan
-Requires:       drbd9x-utils
-Requires:       kmod-drbd9x
 # The shell helper every OCF agent sources resolves its own tool paths by
 # shelling out to a command EL10 no longer installs by default, and the
 # package that ships those agents does not ask for it. Without it the lookup
@@ -134,6 +130,9 @@ install -D -p -m 0644 %{SOURCE6} \
 - Load the ublk module at boot: the pool-create preflight asks for
   /dev/ublk-control before any pool exists, so the daemon's own unit
   loading it on start was one workflow too late
+- Retire the DRBD engine: LumenFS pooled storage is the appliance's one
+  replicated engine, so the drbd9x module and userland requirements go,
+  and the replication firewalld service keeps only the migration ports
 * Sun Jul 27 2026 Quartz Systems Engineering <engineering@quartz.systems> - 0.6.0-1
 - Cluster and replication stack: corosync, pacemaker, the one fence agent,
   and the DRBD module and userland, with presets keeping the daemons off

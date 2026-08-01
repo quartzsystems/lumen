@@ -1,10 +1,9 @@
-//! The compute seam over vdisks and leases: `VmVolumes`, implemented a
-//! second time.
+//! The compute seam over vdisks and leases: `VmVolumes`, served.
 //!
 //! Everything here is naming and fan-out. The engine owns the bytes, the
 //! daemon owns the sockets, and this service's whole job is to turn five
 //! verbs the compute domain already speaks into control commands, while
-//! respecting two facts about LumenFS that DRBD did not have:
+//! respecting two facts about LumenFS:
 //!
 //! - **Creating and deleting a vdisk replicates by itself.** One member is
 //!   told; both have it. There is nothing to fan out and nothing to unwind
@@ -21,12 +20,12 @@
 //! exported the device there. See the note on [`PoolService::migration_window`].
 
 use async_trait::async_trait;
-use lumen_drbd::{MigrationWindow, ReplicatedDisk, Result as SeamResult, VmDiskRequest, VmVolumes};
 
-use crate::error::{PoolError, Result};
+use crate::error::{PoolError, Result, Result as SeamResult};
 use crate::fleet::PoolFleet;
 use crate::model::{self, DiskName};
 use crate::state::{self, MemberView, PoolMember, PoolState, SnapshotView};
+use crate::vm::{MigrationWindow, ReplicatedDisk, VmDiskRequest, VmVolumes};
 
 /// How long the source waits for the destination to see the pen arrive.
 /// Generous: it is one op crossing a healthy link, and the alternative to
@@ -320,7 +319,7 @@ impl VmVolumes for PoolService {
                         "the export failed and the vdisk could not be removed either"
                     );
                 }
-                return Err(err.into());
+                return Err(err);
             }
         };
         tracing::info!(%name, vdisk, %device, "pooled disk created");
@@ -341,8 +340,7 @@ impl VmVolumes for PoolService {
         let Some(disk) = self.lookup(device).await? else {
             return Err(PoolError::NotFound(format!(
                 "\"{device}\" is not a pooled disk this node knows."
-            ))
-            .into());
+            )));
         };
         let vdisk = model::vdisk_of_device(device).expect("looked up by this path");
 
@@ -360,8 +358,7 @@ impl VmVolumes for PoolService {
                 Err(err) => {
                     return Err(PoolError::Backend(format!(
                         "cannot tell whether {member} is still serving {device}: {err}"
-                    ))
-                    .into())
+                    )))
                 }
             }
         }
@@ -377,8 +374,7 @@ impl VmVolumes for PoolService {
                 return Err(PoolError::Conflict(format!(
                     "\"{device}\" is not a pooled disk, so the machines using it cannot be \
                      placed by this pool."
-                ))
-                .into());
+                )));
             }
         }
         // Every member of a quorate pool can serve every vdisk: placement
@@ -404,8 +400,7 @@ impl VmVolumes for PoolService {
         let Some(disk) = self.lookup(device).await? else {
             return Err(PoolError::NotFound(format!(
                 "\"{device}\" is not a pooled disk this node knows."
-            ))
-            .into());
+            )));
         };
         let vdisk = model::vdisk_of_device(device).expect("looked up by this path");
         let here = self.here().await?;
@@ -456,8 +451,7 @@ impl VmVolumes for PoolService {
         let Some(disk) = self.lookup(device).await? else {
             return Err(PoolError::NotFound(format!(
                 "\"{device}\" is not a pooled disk this node knows."
-            ))
-            .into());
+            )));
         };
         let vdisk = model::vdisk_of_device(device).expect("looked up by this path");
         let here = self.here().await?;
@@ -474,7 +468,7 @@ impl VmVolumes for PoolService {
                     if let Err(unwind) = self.fleet.abort(&here, vdisk).await {
                         tracing::error!(%device, %unwind, "the window would not close either");
                     }
-                    return Err(err.into());
+                    return Err(err);
                 }
                 Ok(())
             }
@@ -485,8 +479,7 @@ impl VmVolumes for PoolService {
                         return Err(PoolError::Conflict(format!(
                             "\"{device}\" has no migration window open, so there is no one to \
                              hand it to."
-                        ))
-                        .into())
+                        )))
                     }
                 };
                 self.fleet.relinquish(&here, vdisk, to).await?;
@@ -515,8 +508,7 @@ impl VmVolumes for PoolService {
                             return Err(PoolError::Backend(format!(
                                 "the pen for \"{device}\" was handed to {destination} but never \
                                  arrived: {err}"
-                            ))
-                            .into())
+                            )))
                         }
                         Err(_) => tokio::time::sleep(HANDOVER_PAUSE).await,
                     }

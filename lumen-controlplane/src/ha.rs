@@ -14,7 +14,7 @@
 //! Which survivor acts is decided without coordination: the lowest-named
 //! survivor holding a replica of every disk. Every eligible node computes
 //! the same answer from the same gossiped record — and if two ever raced
-//! anyway, DRBD's refusal of a second writer is the backstop.
+//! anyway, the storage engine's refusal of a second writer is the backstop.
 //!
 //! No automatic failback, deliberately: a machine that restarted here stays
 //! here, visible as "away from home", until an operator migrates it back.
@@ -110,9 +110,9 @@ pub async fn sweep(state: &AppState) {
         if devices.is_empty() {
             continue;
         }
-        // Asked through the node's own storage engine, never DRBD by
-        // name: on a pooled node the disks are /dev/ublkb devices, and
-        // asking the wrong engine made every HA machine unrestartable.
+        // Asked through the node's own storage engine, never any engine
+        // by name: asking the wrong one about a device it did not make
+        // once made every HA machine unrestartable.
         let members = match state.virt.common_members(&devices).await {
             Ok(members) => members,
             Err(err) => {

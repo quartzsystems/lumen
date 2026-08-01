@@ -261,7 +261,7 @@ fn futures_lite_block<T>(future: impl std::future::Future<Output = T>) -> T {
 /// belong to the appliance smoke scripts; everything else is here.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_seam_over_real_daemons_answers_for_paths_that_need_no_device() {
-    use lumen_drbd::VmVolumes;
+    use lumen_pool::VmVolumes;
     let (fleet, _a, _b) = real_pool("seam");
     wait_until("both daemons to answer", || {
         futures_lite_block(fleet.node_id("lumen02")).is_ok()
@@ -285,7 +285,11 @@ async fn the_seam_over_real_daemons_answers_for_paths_that_need_no_device() {
     // The bootstrap vdisk is not a machine disk, and a path we never made
     // is not ours — both answered against a live pool.
     assert!(service.disk_of("/dev/ublkb1").await.unwrap().is_none());
-    assert!(service.disk_of("/dev/drbd1").await.unwrap().is_none());
+    assert!(service
+        .disk_of("/dev/zvol/lumen/vm-7-disk-3")
+        .await
+        .unwrap()
+        .is_none());
 
     // Placement is the pool, which is all pooled HA eligibility needs.
     assert_eq!(

@@ -33,9 +33,9 @@ lumen-net = { path = "../../lumen-networking/lumen-net" }
 lumen-zfs = { path = "../../lumen-storage/lumen-zfs" }
 # Replicated disks, through the deliberately narrow `VmVolumes` trait that
 # crate defines for exactly this import: make a disk, recognise one, destroy
-# one, know where the machine can run, hold the two-primaries window. The
-# compute domain never sees records, renderers, or peers.
-lumen-drbd = { path = "../../lumen-storage/lumen-drbd" }
+# one, know where the machine can run, hold the migration window. The
+# compute domain never sees bricks, leases, or peers.
+lumen-pool = { path = "../../lumen-storage/lumen-pool" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # The guest agent takes file contents as base64 inside a JSON message, so a

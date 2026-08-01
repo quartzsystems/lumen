@@ -78,7 +78,7 @@ impl UpdateView {
 /// What the console asked for.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ApplyRequest {
-    /// Install the platform set — kernel, kernel modules, ZFS, DRBD — instead
+    /// Install the platform set — kernel, kernel modules, ZFS — instead
     /// of the ordinary updates. The two are never combined: they are different
     /// decisions with different consequences, and a single button that
     /// sometimes moved the kernel would be the exact failure this domain

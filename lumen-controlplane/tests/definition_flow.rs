@@ -1,7 +1,7 @@
-//! End-to-end tests for replicated volumes: the grouped-by-cluster read, the
-//! create/destroy/resize workflows over the real router, and the peer-ticket
-//! rule on the volume half of the peer surface — every domain on its
-//! in-memory backend, nothing touched on the machine running them.
+//! End-to-end tests for replicated machine definitions: the HA manager's
+//! restart inventory, filled at define time and withdrawn at delete, plus
+//! the peer-ticket rule on its peer routes — every domain on its in-memory
+//! backend, nothing touched on the machine running them.
 
 use std::sync::Arc;
 
@@ -20,8 +20,6 @@ use lumen_controlplane::config::Config;
 use lumen_controlplane::realm::{AuthFailure, Realm, RealmKind, RealmRegistry};
 use lumen_controlplane::security;
 use lumen_controlplane::{app, AppState};
-use lumen_drbd::backend::mock::MockBackend as DrbdMockBackend;
-use lumen_drbd::{DrbdService, MockVolumePeers};
 use lumen_net::NetworkService;
 use lumen_virt::VirtService;
 use lumen_zfs::StorageService;
@@ -55,7 +53,7 @@ struct TempDir(std::path::PathBuf);
 impl TempDir {
     fn new(tag: &str) -> Self {
         let dir = std::env::temp_dir().join(format!(
-            "lumen-volume-flow-{tag}-{}-{:?}",
+            "lumen-definition-flow-{tag}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -107,8 +105,6 @@ fn alpha_membership() -> EnvironmentMembership {
 
 struct Harness {
     router: axum::Router,
-    drbd_backend: Arc<DrbdMockBackend>,
-    peers: Arc<MockVolumePeers>,
     cluster: Arc<ClusterService>,
     cluster_peers: Arc<lumen_cluster::MockPeers>,
     _state_dir: TempDir,
@@ -132,7 +128,7 @@ fn harness(tag: &str, membership: &EnvironmentMembership) -> Harness {
         Arc::new(lumen_virt::backend::mock::MockBackend::appliance()),
         storage.clone(),
         network.clone(),
-        Arc::new(lumen_drbd::MockVmVolumes::standalone()),
+        Arc::new(lumen_pool::MockVmVolumes::standalone()),
     ));
     let sys = Arc::new(lumen_sys::SysService::new(
         Arc::new(lumen_sys::backend::mock::MockPower::appliance()),
@@ -150,14 +146,6 @@ fn harness(tag: &str, membership: &EnvironmentMembership) -> Harness {
         .with_node("alpha-1")
         .with_environment(membership),
     );
-    let drbd_backend = Arc::new(DrbdMockBackend::appliance());
-    let peers = Arc::new(MockVolumePeers::new().with_backend(drbd_backend.clone()));
-    let drbd = Arc::new(DrbdService::new(
-        drbd_backend.clone(),
-        peers.clone(),
-        cluster.clone(),
-        storage.clone(),
-    ));
     let router = app(Arc::new(AppState {
         config,
         jwt_secret: security::session_secret(TICKET_SECRET.to_vec()),
@@ -169,7 +157,6 @@ fn harness(tag: &str, membership: &EnvironmentMembership) -> Harness {
         virt,
         cluster: cluster.clone(),
         peers: Arc::new(lumen_controlplane::inventory::NoPeers),
-        drbd,
         pool: lumen_controlplane::pool::PoolPresence::Absent,
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
         updates: Arc::new(lumen_update::UpdateService::new(
@@ -187,8 +174,6 @@ fn harness(tag: &str, membership: &EnvironmentMembership) -> Harness {
     }));
     Harness {
         router,
-        drbd_backend,
-        peers,
         cluster,
         cluster_peers,
         _state_dir: state_dir,
@@ -253,150 +238,6 @@ async fn request(
         serde_json::from_slice(&bytes).unwrap()
     };
     (status, value)
-}
-
-fn create_body(name: &str, size: u64) -> serde_json::Value {
-    serde_json::json!({
-        "cluster": "alpha",
-        "name": name,
-        "size_bytes": size,
-        "members": [
-            { "node": "alpha-1", "pool": "boot" },
-            { "node": "alpha-2", "pool": "boot" },
-        ],
-    })
-}
-
-#[tokio::test]
-async fn every_volume_route_requires_a_session() {
-    let harness = harness("auth", &alpha_membership());
-    for (method, path) in [
-        (Method::GET, "/api/storage/replicated"),
-        (Method::POST, "/api/storage/replicated"),
-        (Method::DELETE, "/api/storage/replicated/alpha/v0"),
-        (Method::POST, "/api/storage/replicated/alpha/v0/resize"),
-    ] {
-        let (status, _) = request(&harness.router, method.clone(), path, None, None, None).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {path}");
-    }
-}
-
-#[tokio::test]
-async fn a_volume_is_created_listed_grown_and_destroyed_through_the_api() {
-    let harness = harness("lifecycle", &alpha_membership());
-    let cookie = sign_in(&harness.router).await;
-
-    let (status, view) = request(
-        &harness.router,
-        Method::POST,
-        "/api/storage/replicated",
-        Some(&cookie),
-        None,
-        Some(create_body("vm-101-disk-0", 1 << 30)),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{view}");
-    assert_eq!(view["resource"], "alpha-vm-101-disk-0");
-    assert_eq!(view["device"], "/dev/drbd1");
-    assert_eq!(view["health"], "up_to_date");
-    // Both members prepared, initial sync skipped once.
-    assert_eq!(harness.peers.prepared().len(), 2);
-    assert_eq!(harness.peers.primed().len(), 1);
-
-    let (status, listed) = request(
-        &harness.router,
-        Method::GET,
-        "/api/storage/replicated",
-        Some(&cookie),
-        None,
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(listed["clusters"][0]["cluster"], "alpha");
-    let volume = &listed["clusters"][0]["volumes"][0];
-    assert_eq!(volume["name"], "vm-101-disk-0");
-    assert_eq!(volume["replicas"].as_array().unwrap().len(), 2, "{volume}");
-
-    // Grow it; shrinking through the same route is refused.
-    let (status, _) = request(
-        &harness.router,
-        Method::POST,
-        "/api/storage/replicated/alpha/vm-101-disk-0/resize",
-        Some(&cookie),
-        None,
-        Some(serde_json::json!({ "size_bytes": 4u64 << 30 })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(harness.peers.grown().len(), 1);
-    let (status, refused) = request(
-        &harness.router,
-        Method::POST,
-        "/api/storage/replicated/alpha/vm-101-disk-0/resize",
-        Some(&cookie),
-        None,
-        Some(serde_json::json!({ "size_bytes": 1u64 << 30 })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
-
-    // Destroy: refused without the acknowledgement, complete with it.
-    let (status, answer) = request(
-        &harness.router,
-        Method::DELETE,
-        "/api/storage/replicated/alpha/vm-101-disk-0",
-        Some(&cookie),
-        None,
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
-    let (status, _) = request(
-        &harness.router,
-        Method::DELETE,
-        "/api/storage/replicated/alpha/vm-101-disk-0",
-        Some(&cookie),
-        None,
-        Some(serde_json::json!({ "i_understand_this_may_lose_data": true })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(harness.peers.torn_down().len(), 2);
-
-    let (_, listed) = request(
-        &harness.router,
-        Method::GET,
-        "/api/storage/replicated",
-        Some(&cookie),
-        None,
-        None,
-    )
-    .await;
-    assert!(listed["clusters"].as_array().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn a_malformed_create_is_a_validation_answer_with_fields() {
-    let harness = harness("invalid", &alpha_membership());
-    let cookie = sign_in(&harness.router).await;
-    let mut body = create_body("Bad Name", 0);
-    body["members"] = serde_json::json!([{ "node": "alpha-1", "pool": "boot" }]);
-    let (status, answer) = request(
-        &harness.router,
-        Method::POST,
-        "/api/storage/replicated",
-        Some(&cookie),
-        None,
-        Some(body),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
-    let errors = answer["errors"].as_array().unwrap();
-    let codes: Vec<&str> = errors.iter().filter_map(|e| e["code"].as_str()).collect();
-    assert!(codes.contains(&"invalid_volume_name"), "{codes:?}");
-    assert!(codes.contains(&"invalid_volume_size"), "{codes:?}");
-    assert!(harness.peers.prepared().is_empty());
 }
 
 #[tokio::test]
@@ -493,47 +334,4 @@ async fn peer_definition_routes_take_peer_tickets_and_store() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(harness.cluster.stored_definitions().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn peer_volume_routes_take_peer_tickets_and_nothing_else() {
-    let harness = harness("peer-auth", &alpha_membership());
-    let cookie = sign_in(&harness.router).await;
-    let body = serde_json::json!({ "resource": "alpha-v0" });
-
-    let (status, _) = request(
-        &harness.router,
-        Method::POST,
-        "/api/peer/volume/prime",
-        None,
-        None,
-        Some(body.clone()),
-    )
-    .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-
-    // An operator's session is not a peer.
-    let (status, _) = request(
-        &harness.router,
-        Method::POST,
-        "/api/peer/volume/prime",
-        Some(&cookie),
-        None,
-        Some(body.clone()),
-    )
-    .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-
-    let ticket = security::issue_peer_ticket(TICKET_SECRET, "alpha-2").unwrap();
-    let (status, answer) = request(
-        &harness.router,
-        Method::POST,
-        "/api/peer/volume/prime",
-        None,
-        Some(&ticket),
-        Some(body),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{answer}");
-    assert_eq!(harness.drbd_backend.primed(), vec!["alpha-v0"]);
 }

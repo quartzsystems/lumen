@@ -2,41 +2,39 @@
 //!
 //! `lumen-virt` needs five things from replicated storage: make a disk,
 //! recognise one, destroy one, know where a machine using them can run, and
-//! hold the two-primaries window around a live migration. This trait is
-//! those five and nothing else, defined here so the compute domain's
-//! dependency surface stays a single import — it never sees records,
-//! renderers, peers, or ports.
+//! hold the handover window around a live migration. This trait is those
+//! five and nothing else, defined here so the compute domain's dependency
+//! surface stays a single import — it never sees bricks, leases, sockets,
+//! or ports.
 //!
-//! One rule this interface enforces rather than assumes: **the machine's own
-//! node always holds a replica.** `/dev/drbd<minor>` exists only where a
-//! replica does, so a machine whose node is not a member has no device to
-//! open — the request is refused, not accommodated with a diskless client.
+//! It lived in `lumen-drbd` first, as the seam both storage engines
+//! implemented; with that engine retired the pool is the only implementor
+//! left, and the seam lives with it. The trait keeps its engine-neutral
+//! shape on purpose — `VirtService` holds it as `Arc<dyn VmVolumes>` and
+//! has never known which engine answers.
+//!
+//! One rule this interface enforces rather than assumes: **a machine's disks
+//! must be recognisable.** `disk_of` answers `None` for a local zvol and a
+//! record for a pooled device, and that answer is how the compute domain
+//! tells the disks that move with a machine from the ones that pin it.
 //!
 //! Identity is deliberately *not* written into the domain document. The
-//! membership record already carries every volume's identity and placement
-//! (gossiped, durable, and readable when a node is dead — the property HA
-//! needs), and `/dev/drbd<minor>` is stable on every member; a second copy
-//! in `<metadata>` would be a second source of truth to keep honest. The
-//! spec predates the record and is deviated from here, on purpose.
+//! pool derives every vdisk's identity from its machine-disk name, and
+//! `/dev/ublkb<id>` is the same string on every member; a second copy in
+//! `<metadata>` would be a second source of truth to keep honest.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::error::{DrbdError, Result};
-use crate::service::{DrbdService, VolumeCreate, VolumeMemberCreate};
+use crate::error::{PoolError, Result};
 
 /// What a live migration is asking of the storage layer at this instant.
 ///
-/// DRBD's window is symmetric — allow two primaries, or do not — but a
-/// LumenFS lease handover names its destination, and it distinguishes a
-/// migration that completed from one that was abandoned. One shape serves
-/// both engines: the DRBD implementation collapses `Accepted` and
-/// `Aborted` into "close the window", because which one it was does not
-/// change what DRBD must do, while a pooled implementation uses all three.
-///
-/// It also lets the caller say what it already knows. Migration closes the
-/// window on every path out, and has always known whether the move
-/// succeeded; the old boolean discarded that at the door.
+/// A LumenFS lease handover names its destination, and it distinguishes a
+/// migration that completed from one that was abandoned — so the shape
+/// carries all three moments, and lets the caller say what it already
+/// knows. Migration closes the window on every path out, and has always
+/// known whether the move succeeded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MigrationWindow {
     /// Both members may hold the disk open. The machine is still running
@@ -50,9 +48,8 @@ pub enum MigrationWindow {
 }
 
 /// What the compute domain asks for: a disk of `size_bytes`, named by its
-/// machine. `members` empty means "place it for me" — this node plus the
-/// least-utilized other member, each on the pool its existing replicas
-/// already use.
+/// machine. Placement is the engine's own — the pool puts every slice where
+/// its map says, so there is nothing for the caller to choose.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmDiskRequest {
     /// The volume name, `vm-<vmid>-disk-<n>` — the compute domain's naming,
@@ -60,8 +57,6 @@ pub struct VmDiskRequest {
     /// name the same thing.
     pub name: String,
     pub size_bytes: u64,
-    #[serde(default)]
-    pub members: Vec<VolumeMemberCreate>,
 }
 
 /// What it gets back: enough to place the device in a domain document and to
@@ -108,148 +103,76 @@ pub trait VmVolumes: Send + Sync {
     /// Make `device` exist on *this* node, because a machine is about to be
     /// started here.
     ///
-    /// DRBD needs nothing: `/dev/drbd<minor>` exists on every member for as
-    /// long as the resource does. A pooled engine does, because its device
-    /// is served by a daemon and exists only where that daemon has been
-    /// asked to serve it — at create on the node that made it, on the
-    /// destination when a migration window opens, and here whenever a
-    /// machine arrives by any other route. An HA restart is exactly that
-    /// other route, and so is starting a machine after the daemon
-    /// restarted.
+    /// A pooled device is served by a daemon and exists only where that
+    /// daemon has been asked to serve it — at create on the node that made
+    /// it, on the destination when a migration window opens, and here
+    /// whenever a machine arrives by any other route. An HA restart is
+    /// exactly that other route, and so is starting a machine after the
+    /// daemon restarted.
     ///
     /// Idempotent by contract: called before every start, including the
     /// ones where the device is already there.
     async fn ensure_local_device(&self, device: &str) -> Result<()>;
 }
 
+/// The seam where no replicated engine is: the standalone appliance, or a
+/// clustered node whose cluster carries no pool.
+///
+/// `disk_of` answers `None` — a local disk is a local disk here, and the
+/// compute domain's ordinary flows must keep working. Every verb that only
+/// means something on a replicated disk refuses with the sentence an
+/// operator can act on, which is exactly what the retired engine's service
+/// answered from a node outside any cluster.
+pub struct NoReplicatedStorage;
+
 #[async_trait]
-impl VmVolumes for DrbdService {
-    async fn create_disk(&self, request: &VmDiskRequest) -> Result<ReplicatedDisk> {
-        let (cluster, node) = self.home_cluster()?;
-        let members = if request.members.is_empty() {
-            self.place_for_node(&cluster, &node)?
-        } else {
-            if !request.members.iter().any(|m| m.node == node) {
-                return Err(DrbdError::Conflict(format!(
-                    "The machine runs on \"{node}\", so \"{node}\" must hold a replica — the \
-                     disk's device exists only where a replica does."
-                )));
-            }
-            request.members.clone()
-        };
-        let view = self
-            .create_volume(VolumeCreate {
-                cluster: cluster.clone(),
-                name: request.name.clone(),
-                size_bytes: request.size_bytes,
-                members,
-            })
-            .await?;
-        Ok(ReplicatedDisk {
-            cluster,
-            name: view.name,
-            device: view.device,
-            size_bytes: request.size_bytes,
-            members: view.replicas.into_iter().map(|r| r.node).collect(),
-        })
+impl VmVolumes for NoReplicatedStorage {
+    async fn create_disk(&self, _request: &VmDiskRequest) -> Result<ReplicatedDisk> {
+        Err(PoolError::Conflict(
+            "This node has no pooled storage, and replicated disks exist only on one. Create \
+             the pool first, or give the machine a local disk."
+                .to_string(),
+        ))
     }
 
-    async fn disk_of(&self, device: &str) -> Result<Option<ReplicatedDisk>> {
-        let Some(minor) = parse_minor(device) else {
-            return Ok(None);
-        };
-        let Some(membership) = self.membership_or_none()? else {
-            return Ok(None);
-        };
-        for record in &membership.clusters {
-            if let Some(volume) = record.volumes.iter().find(|v| v.minor == minor) {
-                return Ok(Some(ReplicatedDisk {
-                    cluster: record.definition.name.clone(),
-                    name: volume.name.clone(),
-                    device: device.to_string(),
-                    size_bytes: volume.size_bytes,
-                    members: volume.replicas.iter().map(|s| s.node.clone()).collect(),
-                }));
-            }
-        }
+    async fn disk_of(&self, _device: &str) -> Result<Option<ReplicatedDisk>> {
         Ok(None)
     }
 
     async fn destroy_disk(&self, device: &str) -> Result<()> {
-        let Some(disk) = self.disk_of(device).await? else {
-            return Err(DrbdError::NotFound(format!(
-                "\"{device}\" is not a replicated volume this environment knows."
-            )));
-        };
-        // The compute domain's own flow carried the acknowledgement; this
-        // internal call does not ask twice.
-        self.destroy_volume(
-            &disk.cluster,
-            &disk.name,
-            lumen_cluster::Acknowledgements {
-                may_lose_data: true,
-            },
-        )
-        .await
+        Err(PoolError::NotFound(format!(
+            "\"{device}\" is not a replicated volume this node knows."
+        )))
     }
 
     async fn common_members(&self, devices: &[String]) -> Result<Vec<String>> {
-        let mut common: Option<Vec<String>> = None;
-        for device in devices {
-            let Some(disk) = self.disk_of(device).await? else {
-                return Err(DrbdError::Conflict(format!(
-                    "\"{device}\" is not a replicated volume, so the machine cannot leave this \
-                     node."
-                )));
-            };
-            common = Some(match common {
-                None => disk.members,
-                Some(current) => current
-                    .into_iter()
-                    .filter(|node| disk.members.contains(node))
-                    .collect(),
-            });
-        }
-        Ok(common.unwrap_or_default())
-    }
-
-    async fn migration_window(&self, device: &str, window: MigrationWindow) -> Result<()> {
-        let Some(disk) = self.disk_of(device).await? else {
-            return Err(DrbdError::NotFound(format!(
-                "\"{device}\" is not a replicated volume this environment knows."
-            )));
-        };
-        // DRBD has one switch, so both endings collapse to closing it: a
-        // closed window is a machine that cannot have a second writer,
-        // whether the migration landed or not.
-        let allow = matches!(window, MigrationWindow::Open { .. });
-        self.adjust_two_primaries(&disk.cluster, &disk.name, allow)
-            .await
-    }
-
-    async fn ensure_local_device(&self, device: &str) -> Result<()> {
-        // Nothing to do, and the check earns its keep anyway: a device this
-        // environment does not know is a machine about to start on a disk
-        // nobody can account for.
-        match self.disk_of(device).await? {
-            Some(_) => Ok(()),
-            None => Err(DrbdError::NotFound(format!(
-                "\"{device}\" is not a replicated volume this environment knows."
+        match devices.first() {
+            None => Ok(Vec::new()),
+            Some(device) => Err(PoolError::Conflict(format!(
+                "\"{device}\" is not a replicated volume, so the machine cannot leave this \
+                 node."
             ))),
         }
     }
-}
 
-/// The minor out of `/dev/drbd<minor>`, and nothing looser.
-fn parse_minor(device: &str) -> Option<u32> {
-    device.strip_prefix("/dev/drbd")?.parse().ok()
+    async fn migration_window(&self, device: &str, _window: MigrationWindow) -> Result<()> {
+        Err(PoolError::NotFound(format!(
+            "\"{device}\" is not a replicated volume this node knows."
+        )))
+    }
+
+    async fn ensure_local_device(&self, device: &str) -> Result<()> {
+        Err(PoolError::NotFound(format!(
+            "\"{device}\" is not a replicated volume this node knows."
+        )))
+    }
 }
 
 // --- an in-memory implementation for the compute domain's tests --------------
 
 /// The compute domain tests against this, never against a real
-/// [`DrbdService`] — its tests must not need an environment, a membership
-/// record, or a cluster to exist.
+/// [`crate::PoolService`] — its tests must not need a pool, a daemon, or a
+/// cluster to exist.
 #[derive(Default)]
 pub struct MockVmVolumes {
     inner: std::sync::Mutex<MockVmInner>,
@@ -259,7 +182,7 @@ pub struct MockVmVolumes {
 struct MockVmInner {
     /// `None` simulates the standalone appliance: every call refuses.
     cluster: Option<(String, Vec<String>)>,
-    next_minor: u32,
+    next_id: u64,
     disks: Vec<ReplicatedDisk>,
     /// Every window adjustment, in order, as asked for.
     windows: Vec<(String, MigrationWindow)>,
@@ -283,7 +206,7 @@ impl MockVmVolumes {
                     cluster.to_string(),
                     nodes.iter().map(|n| (*n).to_string()).collect(),
                 )),
-                next_minor: 1,
+                next_id: 1,
                 ..MockVmInner::default()
             }),
         }
@@ -332,8 +255,8 @@ impl MockVmVolumes {
         self.inner.lock().unwrap().windows.clone()
     }
 
-    /// Devices whose two-primaries window is open right now — zero after
-    /// any completed migration, success or failure.
+    /// Devices whose handover window is open right now — zero after any
+    /// completed migration, success or failure.
     pub fn open_windows(&self) -> Vec<String> {
         let inner = self.inner.lock().unwrap();
         let mut open: Vec<String> = Vec::new();
@@ -355,25 +278,20 @@ impl VmVolumes for MockVmVolumes {
     async fn create_disk(&self, request: &VmDiskRequest) -> Result<ReplicatedDisk> {
         let mut inner = self.inner.lock().unwrap();
         let Some((cluster, nodes)) = inner.cluster.clone() else {
-            return Err(DrbdError::Conflict(
+            return Err(PoolError::Conflict(
                 "This node has not joined an environment, and replicated volumes exist only \
                  inside one."
                     .to_string(),
             ));
         };
-        let members = if request.members.is_empty() {
-            nodes.iter().take(2).cloned().collect()
-        } else {
-            request.members.iter().map(|m| m.node.clone()).collect()
-        };
-        let minor = inner.next_minor;
-        inner.next_minor += 1;
+        let id = inner.next_id;
+        inner.next_id += 1;
         let disk = ReplicatedDisk {
             cluster,
             name: request.name.clone(),
-            device: crate::model::device_path(minor),
+            device: crate::model::device_path(id),
             size_bytes: request.size_bytes,
-            members,
+            members: nodes,
         };
         inner.disks.push(disk.clone());
         Ok(disk)
@@ -393,7 +311,7 @@ impl VmVolumes for MockVmVolumes {
     async fn destroy_disk(&self, device: &str) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
         let Some(index) = inner.disks.iter().position(|d| d.device == device) else {
-            return Err(DrbdError::NotFound(format!(
+            return Err(PoolError::NotFound(format!(
                 "\"{device}\" is not a replicated volume this environment knows."
             )));
         };
@@ -407,7 +325,7 @@ impl VmVolumes for MockVmVolumes {
         let mut common: Option<Vec<String>> = None;
         for device in devices {
             let Some(disk) = inner.disks.iter().find(|d| &d.device == device) else {
-                return Err(DrbdError::Conflict(format!(
+                return Err(PoolError::Conflict(format!(
                     "\"{device}\" is not a replicated volume, so the machine cannot leave this \
                      node."
                 )));
@@ -426,7 +344,7 @@ impl VmVolumes for MockVmVolumes {
     async fn ensure_local_device(&self, device: &str) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
         if !inner.disks.iter().any(|disk| disk.device == device) {
-            return Err(DrbdError::NotFound(format!(
+            return Err(PoolError::NotFound(format!(
                 "\"{device}\" is not a replicated volume this environment knows."
             )));
         }
@@ -438,7 +356,7 @@ impl VmVolumes for MockVmVolumes {
         let mut inner = self.inner.lock().unwrap();
         if matches!(window, MigrationWindow::Open { .. }) && inner.fail_migration_window {
             inner.fail_migration_window = false;
-            return Err(DrbdError::Conflict(
+            return Err(PoolError::Conflict(
                 "the peer refused to open the window".to_string(),
             ));
         }
@@ -451,15 +369,6 @@ impl VmVolumes for MockVmVolumes {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_device_path_parses_to_its_minor_and_nothing_looser() {
-        assert_eq!(parse_minor("/dev/drbd3"), Some(3));
-        assert_eq!(parse_minor("/dev/drbd12"), Some(12));
-        assert_eq!(parse_minor("/dev/zvol/boot/lumen/vm-1-disk-0"), None);
-        assert_eq!(parse_minor("/dev/drbd"), None);
-        assert_eq!(parse_minor("/dev/drbd3x"), None);
-    }
-
     #[tokio::test]
     async fn the_mock_tracks_windows_the_way_the_guard_needs() {
         let volumes = MockVmVolumes::clustered("alpha", &["alpha-1", "alpha-2"]);
@@ -467,7 +376,6 @@ mod tests {
             .create_disk(&VmDiskRequest {
                 name: "vm-1-disk-0".into(),
                 size_bytes: 1 << 30,
-                members: Vec::new(),
             })
             .await
             .unwrap();
@@ -489,17 +397,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_standalone_mock_refuses_like_the_real_service() {
+    async fn the_standalone_mock_refuses_like_a_node_with_no_pool() {
         let volumes = MockVmVolumes::standalone();
         let err = volumes
             .create_disk(&VmDiskRequest {
                 name: "vm-1-disk-0".into(),
                 size_bytes: 1 << 30,
-                members: Vec::new(),
             })
             .await
             .unwrap_err();
         assert!(err.to_string().contains("environment"), "{err}");
-        assert!(volumes.disk_of("/dev/drbd1").await.unwrap().is_none());
+        assert!(volumes.disk_of("/dev/ublkb1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn no_replicated_storage_recognises_nothing_and_refuses_the_rest() {
+        let seam = NoReplicatedStorage;
+        // A local disk must stay a local disk: `None`, never an error.
+        assert!(seam
+            .disk_of("/dev/zvol/data/vm-1-disk-0")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(seam.common_members(&[]).await.unwrap().is_empty());
+        let err = seam
+            .common_members(&["/dev/ublkb1".to_string()])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot leave"), "{err}");
+        let err = seam
+            .create_disk(&VmDiskRequest {
+                name: "vm-1-disk-0".into(),
+                size_bytes: 1 << 30,
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no pooled storage"), "{err}");
     }
 }

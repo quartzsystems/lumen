@@ -232,18 +232,16 @@ export interface VmDeleteResponse {
 
 export interface DiskCreate {
   /// The pool a local disk's zvol lives in. Unused for a replicated disk,
-  /// whose members each name their own pool.
+  /// which the cluster's pooled storage places by itself.
   pool?: string;
   size_gib: number;
   bus?: DiskBus;
   cache?: CacheMode;
   discard?: boolean;
   blocksize?: number;
-  /// Back the disk with a replicated volume instead of a local zvol.
+  /// Back the disk with the cluster's pooled storage instead of a local
+  /// zvol.
   replicated?: boolean;
-  /// The replica seats for a replicated disk; the machine's own node must
-  /// hold one.
-  members?: { node: string; pool: string }[];
 }
 
 /// POST /api/vms/{vmid}/migrate. No VmView in the answer on purpose: after a

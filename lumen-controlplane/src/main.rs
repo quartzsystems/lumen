@@ -8,8 +8,6 @@ use lumen_controlplane::config::Config;
 use lumen_controlplane::pool::PoolPresence;
 use lumen_controlplane::realm::{lumen::LumenRealm, RealmRegistry};
 use lumen_controlplane::{app, security, tls, AppState};
-use lumen_drbd::backend::cli::CliBackend as DrbdCliBackend;
-use lumen_drbd::DrbdService;
 use lumen_net::backend::nm::NmBackend;
 use lumen_net::backend::unavailable::UnavailableBackend;
 use lumen_net::NetworkService;
@@ -51,7 +49,7 @@ async fn main() -> Result<()> {
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
                 "lumen_controlplane=info,lumen_sys=info,lumen_zfs=info,lumen_virt=info,\
-                 lumen_net=info,lumen_cluster=info,lumen_drbd=info,lumen_update=info,\
+                 lumen_net=info,lumen_cluster=info,lumen_pool=info,lumen_update=info,\
                  tower_http=info"
                     .into()
             }),
@@ -155,12 +153,11 @@ async fn main() -> Result<()> {
     peers.bind(cluster.clone());
 
     // The LumenFS pool, if this node carries one — decided by the daemon's
-    // own drop-in, never a second record. One engine per cluster ever: a
-    // pooled node's machines live on vdisks, so the pool service is also
-    // the `VmVolumes` the compute domain gets below; everywhere else the
-    // DRBD path stays exactly what it was. Assembled before the storage
-    // service because the disk page's wipe guard needs to know which bricks
-    // are the pool's and which are leftovers a reinstall stranded.
+    // own drop-in, never a second record. A pooled node's machines live on
+    // vdisks, so the pool service is also the `VmVolumes` the compute
+    // domain gets below. Assembled before the storage service because the
+    // disk page's wipe guard needs to know which bricks are the pool's and
+    // which are leftovers a reinstall stranded.
     let pool = PoolPresence::assemble(&cluster, peers.clone());
     match &pool {
         PoolPresence::Absent => {}
@@ -171,20 +168,6 @@ async fn main() -> Result<()> {
     }
     let storage =
         Arc::new(StorageService::new(zfs_backend).with_brick_clearance(pool.brick_clearance()));
-
-    // Replicated storage, on top of clustering and local storage: the
-    // record and the replication policy come from the cluster domain, the
-    // backing zvols from the storage domain, and DRBD itself through its
-    // command line — no probe for the same reason clustering has none: a
-    // node without DRBD is the ordinary standalone appliance, and the
-    // volume view carries the reason if it is ever asked anyway.
-    let drbd = Arc::new(DrbdService::new(
-        Arc::new(DrbdCliBackend::new(exec.clone())),
-        peers.clone(),
-        cluster.clone(),
-        storage.clone(),
-    ));
-    peers.bind_volumes(drbd.clone());
 
     // Virtual machines. The hypervisor is a privileged daemon reached over its
     // own socket, exactly as networking reaches NetworkManager over the bus —
@@ -202,10 +185,12 @@ async fn main() -> Result<()> {
         };
     // Constructed last, and given the other three: a machine needs a bridge
     // to attach to and a volume — local or replicated — to boot from, while
-    // none of those domains has any reason to know a machine exists.
-    let vm_volumes: Arc<dyn lumen_drbd::VmVolumes> = match &pool {
+    // none of those domains has any reason to know a machine exists. A node
+    // without a pool gets the seam that recognises nothing and refuses the
+    // rest, which is exactly what a replicated disk deserves there.
+    let vm_volumes: Arc<dyn lumen_pool::VmVolumes> = match &pool {
         PoolPresence::Present { service, .. } => service.clone(),
-        _ => drbd.clone(),
+        _ => Arc::new(lumen_pool::NoReplicatedStorage),
     };
     let virt = Arc::new(VirtService::new(
         virt_backend,
@@ -307,7 +292,6 @@ async fn main() -> Result<()> {
         virt,
         cluster,
         peers: peers.clone(),
-        drbd,
         pool,
         // The pool workflows: their privileged verbs behind the same
         // transient-unit runner as everything else, and their fan-out over

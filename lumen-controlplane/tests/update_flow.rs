@@ -113,7 +113,7 @@ async fn harness(tag: &str, mock: MockUpdates) -> Harness {
         Arc::new(lumen_virt::backend::mock::MockBackend::appliance()),
         storage.clone(),
         network.clone(),
-        Arc::new(lumen_drbd::MockVmVolumes::standalone()),
+        Arc::new(lumen_pool::MockVmVolumes::standalone()),
     ));
     let cluster = Arc::new(lumen_cluster::ClusterService::new(
         Arc::new(lumen_cluster::backend::mock::MockBackend::appliance()),
@@ -121,12 +121,6 @@ async fn harness(tag: &str, mock: MockUpdates) -> Harness {
         network.clone(),
         &dir.0,
         "test",
-    ));
-    let drbd = Arc::new(lumen_drbd::DrbdService::new(
-        Arc::new(lumen_drbd::backend::mock::MockBackend::appliance()),
-        Arc::new(lumen_drbd::MockVolumePeers::new()),
-        cluster.clone(),
-        storage.clone(),
     ));
 
     let updates = Arc::new(mock);
@@ -141,7 +135,6 @@ async fn harness(tag: &str, mock: MockUpdates) -> Harness {
         virt,
         cluster,
         peers: Arc::new(lumen_controlplane::inventory::NoPeers),
-        drbd,
         pool: lumen_controlplane::pool::PoolPresence::Absent,
         updates: Arc::new(UpdateService::new(updates.clone(), "lumen")),
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),

@@ -224,35 +224,6 @@ jobs:
           cargo test --manifest-path lumen-storage/lumen-cluster/Cargo.toml \
             --target-dir build/cargo-target-cluster
 
-  drbd:
-    name: Replicated storage (Rust, AlmaLinux 10)
-    runs-on: ubuntu-latest
-    container: almalinux:10
-    steps:
-      - name: Install Rust toolchain
-        # No system libraries and no DRBD: state is read through drbdsetup's
-        # command line, drbdadm is handed to systemd, and the tests run
-        # against the in-memory backends — CI never replicates a byte.
-        run: dnf -y install rust cargo rustfmt clippy make git-core
-      - uses: actions/checkout@v4
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            build/cargo-target-drbd
-          key: cargo-drbd-${{ hashFiles('lumen-storage/lumen-drbd/Cargo.lock') }}
-      - name: Format
-        run: cargo fmt --manifest-path lumen-storage/lumen-drbd/Cargo.toml --check
-      - name: Clippy
-        run: |
-          cargo clippy --manifest-path lumen-storage/lumen-drbd/Cargo.toml \
-            --all-targets --target-dir build/cargo-target-drbd -- -D warnings
-      - name: Tests
-        run: |
-          cargo test --manifest-path lumen-storage/lumen-drbd/Cargo.toml \
-            --target-dir build/cargo-target-drbd
-
   compute:
     name: Compute (Rust, AlmaLinux 10)
     runs-on: ubuntu-latest

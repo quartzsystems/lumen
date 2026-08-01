@@ -255,41 +255,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/peer/storage/wipe", post(peer::wipe_disk))
         .route("/api/peer/cluster/teardown", post(peer::teardown))
         .route("/api/peer/cluster/reconfigure", post(peer::reconfigure))
-        .route("/api/peer/volume/prepare", post(peer::prepare_volume))
-        .route("/api/peer/volume/prime", post(peer::prime_volume))
-        .route("/api/peer/volume/teardown", post(peer::teardown_volume))
-        .route(
-            "/api/peer/volume/resize-backing",
-            post(peer::resize_volume_backing),
-        )
-        .route("/api/peer/volume/grow", post(peer::grow_volume))
-        .route(
-            "/api/peer/volume/two-primaries",
-            post(peer::volume_two_primaries),
-        )
-        .route(
-            "/api/peer/volume/snapshot",
-            post(peer::snapshot_volume_backing),
-        )
-        .route(
-            "/api/peer/volume/rollback-backing",
-            post(peer::rollback_volume_backing),
-        )
-        .route(
-            "/api/peer/volume/drop-snapshot",
-            post(peer::drop_volume_snapshot),
-        )
-        .route("/api/peer/volume/down", post(peer::down_volume))
-        .route("/api/peer/volume/up", post(peer::up_volume))
-        .route(
-            "/api/peer/volume/invalidate-remote",
-            post(peer::invalidate_remote_volume),
-        )
-        .route("/api/peer/volume/reconnect", post(peer::reconnect_volume))
-        .route(
-            "/api/peer/volume/apply-policy",
-            post(peer::apply_volume_policy),
-        )
         // The pool half of the peer surface: one closed verb enum, run
         // against this node's own daemon over its own loopback — the only
         // way a pool daemon is ever addressed from off-box.
@@ -338,42 +303,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/storage/pools/{pool}", delete(storage::destroy_pool))
         .route("/api/storage/devices", get(storage::devices))
         .route("/api/storage/pools/{pool}/volumes", get(storage::volumes))
-        // Replicated volumes: DRBD resources over each cluster member's
-        // zvols, grouped by cluster; see src/api/storage.rs and
-        // docs/cluster.md.
-        .route("/api/storage/replicated", get(storage::replicated_volumes))
-        .route(
-            "/api/storage/replicated",
-            post(storage::create_replicated_volume),
-        )
-        .route(
-            "/api/storage/replicated/{cluster}/{name}",
-            delete(storage::destroy_replicated_volume),
-        )
-        .route(
-            "/api/storage/replicated/{cluster}/{name}/resize",
-            post(storage::resize_replicated_volume),
-        )
-        .route(
-            "/api/storage/replicated/{cluster}/{name}/snapshots",
-            get(storage::volume_snapshots),
-        )
-        .route(
-            "/api/storage/replicated/{cluster}/{name}/snapshots",
-            post(storage::snapshot_volume),
-        )
-        .route(
-            "/api/storage/replicated/{cluster}/{name}/snapshots/{snapshot}",
-            delete(storage::delete_volume_snapshot),
-        )
-        .route(
-            "/api/storage/replicated/{cluster}/{name}/rollback",
-            post(storage::rollback_volume),
-        )
-        .route(
-            "/api/storage/replicated/{cluster}/{name}/resolve-split-brain",
-            post(storage::resolve_split_brain),
-        )
         // The LumenFS pool: the observed view, and the snapshot verbs. Disks
         // are addressed by the compute domain's name for them — the device
         // path is the same fact with slashes in it.

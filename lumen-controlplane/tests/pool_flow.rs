@@ -17,9 +17,9 @@ use lumen_controlplane::pool::PoolPresence;
 use lumen_controlplane::realm::{AuthFailure, Realm, RealmKind, RealmRegistry};
 use lumen_controlplane::security;
 use lumen_controlplane::{app, AppState};
-use lumen_drbd::{VmDiskRequest, VmVolumes};
 use lumen_net::NetworkService;
 use lumen_pool::{MockFleet, PoolFleet, PoolService};
+use lumen_pool::{VmDiskRequest, VmVolumes};
 use lumen_virt::VirtService;
 use lumen_zfs::StorageService;
 
@@ -105,7 +105,7 @@ fn router_with_deploy(
         Arc::new(lumen_virt::backend::mock::MockBackend::appliance()),
         storage.clone(),
         network.clone(),
-        Arc::new(lumen_drbd::MockVmVolumes::standalone()),
+        Arc::new(lumen_pool::MockVmVolumes::standalone()),
     ));
     let sys = Arc::new(lumen_sys::SysService::new(
         Arc::new(lumen_sys::backend::mock::MockPower::appliance()),
@@ -121,12 +121,6 @@ fn router_with_deploy(
         )
         .with_node(HERE),
     );
-    let drbd = Arc::new(lumen_drbd::DrbdService::new(
-        Arc::new(lumen_drbd::backend::mock::MockBackend::appliance()),
-        Arc::new(lumen_drbd::MockVolumePeers::new()),
-        cluster.clone(),
-        storage.clone(),
-    ));
     let deploy_exec = lumen_sys::exec::MockExec::working();
     let router = app(Arc::new(AppState {
         config,
@@ -139,7 +133,6 @@ fn router_with_deploy(
         virt,
         cluster,
         peers: Arc::new(lumen_controlplane::inventory::NoPeers),
-        drbd,
         pool,
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
         updates: Arc::new(lumen_update::UpdateService::new(
@@ -309,7 +302,6 @@ async fn the_pool_page_is_one_read_and_the_snapshot_verbs_change_what_it_says() 
         .create_disk(&VmDiskRequest {
             name: "vm-7-disk-3".into(),
             size_bytes: 512 << 20,
-            members: Vec::new(),
         })
         .await
         .unwrap();
@@ -398,7 +390,6 @@ async fn a_rollback_needs_the_acknowledgement_and_a_served_disk_still_refuses() 
         .create_disk(&VmDiskRequest {
             name: "vm-7-disk-0".into(),
             size_bytes: 1 << 30,
-            members: Vec::new(),
         })
         .await
         .unwrap();

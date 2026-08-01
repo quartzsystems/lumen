@@ -12,7 +12,7 @@
 //! ```text
 //!   model.rs        what a cluster is: name, members, preferred node, BMCs
 //!   environment.rs  the membership record and its reconciliation rule
-//!   topology.rs     one renderer, two regimes: corosync.conf, fencing, DRBD policy
+//!   topology.rs     one renderer, two regimes: corosync.conf and fencing
 //!   networks.rs     typed cluster networks — Core, Management, External
 //!   state.rs        what corosync and Pacemaker actually report
 //!   validate.rs     pure rules over a definition and the environment
@@ -48,8 +48,7 @@ pub mod topology;
 pub mod validate;
 
 pub use environment::{
-    ClusterRecord, EnvironmentMembership, EnvironmentNode, JoinToken, Maintenance, VolumeRecord,
-    VolumeSeat,
+    ClusterRecord, EnvironmentMembership, EnvironmentNode, JoinToken, Maintenance,
 };
 pub use error::{ClusterError, Result};
 pub use join::{
@@ -73,7 +72,7 @@ pub use state::{
     ClusterState, FenceDeviceState, FenceTest, NodeState, QuorumState, RingLink, VipState,
 };
 pub use store::{EnvironmentStore, Identity, StoredDefinition};
-pub use topology::{ClusterTopology, FenceDevice, ReplicationPolicy};
+pub use topology::{ClusterTopology, FenceDevice};
 pub use validate::{
     Acknowledgements, ClusterCreate, MemberCreate, ValidationCode, ValidationError,
 };

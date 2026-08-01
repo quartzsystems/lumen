@@ -1,5 +1,5 @@
-# lumen-pool — the orchestration domain over LumenFS: the compute seam,
-# implemented a second time.
+# lumen-pool — the orchestration domain over LumenFS, and the home of the
+# compute seam (`VmVolumes`) since the DRBD engine was retired.
 #
 # Deliberately NOT a workspace member, like its siblings — see the note at
 # the top of lumen-cluster/Cargo.toml.
@@ -18,12 +18,6 @@ description = "LumenFS orchestration: the compute seam over vdisks and leases"
 license = "MIT"
 
 [dependencies]
-# The seam itself lives here — trait, ReplicatedDisk, VmDiskRequest,
-# MigrationWindow, and the error type the compute domain already matches
-# on. That it is named for the other engine is a wart this second
-# implementation exposes; moving the seam to neutral ground is a later,
-# larger refactor and is recorded rather than done.
-lumen-drbd = { path = "../lumen-drbd" }
 # The daemon's typed control client is this crate's backend.
 lumen-fsd = { path = "../lumen-fsd" }
 # The engine, for one hash: minting brick/pool identities in the impure

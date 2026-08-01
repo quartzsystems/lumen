@@ -62,7 +62,7 @@ fn test_app() -> axum::Router {
         Arc::new(lumen_virt::backend::mock::MockBackend::appliance()),
         storage.clone(),
         network.clone(),
-        Arc::new(lumen_drbd::MockVmVolumes::standalone()),
+        Arc::new(lumen_pool::MockVmVolumes::standalone()),
     ));
     let sys = Arc::new(lumen_sys::SysService::new(
         Arc::new(lumen_sys::backend::mock::MockPower::appliance()),
@@ -74,12 +74,6 @@ fn test_app() -> axum::Router {
         network.clone(),
         &state_dir,
         "test",
-    ));
-    let drbd = Arc::new(lumen_drbd::DrbdService::new(
-        Arc::new(lumen_drbd::backend::mock::MockBackend::appliance()),
-        Arc::new(lumen_drbd::MockVolumePeers::new()),
-        cluster.clone(),
-        storage.clone(),
     ));
     let state = AppState {
         config,
@@ -94,7 +88,6 @@ fn test_app() -> axum::Router {
         virt,
         cluster,
         peers: Arc::new(lumen_controlplane::inventory::NoPeers),
-        drbd,
         pool: lumen_controlplane::pool::PoolPresence::Absent,
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
         updates: Arc::new(lumen_update::UpdateService::new(

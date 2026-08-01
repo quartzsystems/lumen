@@ -7,7 +7,7 @@ import { apiFetch } from "@/lib/authClient";
 /// Which of three things an update is, from the operator's point of view.
 ///
 /// `platform` is the one that matters: the kernel and the modules built
-/// against its ABI — ZFS and DRBD — which move as one set or not at all. The
+/// against its ABI — ZFS above all — which move as one set or not at all. The
 /// console never offers them on the same button as everything else.
 export type UpdateKind = "lumen" | "platform" | "other";
 

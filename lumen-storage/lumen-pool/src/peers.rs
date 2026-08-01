@@ -26,8 +26,8 @@
 //! ## The shape, which is the one the rest of the appliance already uses
 //!
 //! The control plane already has an authenticated channel to every other
-//! member — the same one that prepares a DRBD volume or hands over a
-//! corosync configuration. So a verb for a remote member travels: this
+//! member — the same one that hands over a corosync configuration. So a
+//! verb for a remote member travels: this
 //! node's control plane → that node's control plane → its own daemon over
 //! *its* loopback. Each daemon is still only ever spoken to by the machine
 //! it runs on.

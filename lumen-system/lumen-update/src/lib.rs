@@ -17,10 +17,10 @@
 //! running `dnf upgrade`.
 //!
 //! Lumen's root file system is ZFS, and ZFS on this appliance is an
-//! out-of-tree kernel module that tracks the kernel ABI. So is DRBD. Both are
-//! pinned against one exact kernel at ISO build time, and both have a real
-//! history of lagging AlmaLinux point-release kernels by days or weeks —
-//! iso/pins.env records that in so many words, and the ISO build gates on it.
+//! out-of-tree kernel module that tracks the kernel ABI. It is pinned
+//! against one exact kernel at ISO build time, and it has a real history of
+//! lagging AlmaLinux point-release kernels by days or weeks — iso/pins.env
+//! records that in so many words, and the ISO build gates on it.
 //!
 //! A node that ran an unguarded `dnf upgrade` would sooner or later install a
 //! kernel with no matching `kmod-zfs`, reboot, and fail to import its root
@@ -32,7 +32,7 @@
 //!   These are what an operator installs on a Tuesday, and applying them can
 //!   never move the kernel, because the transaction excludes the platform set
 //!   by name ([`model::PLATFORM_PREFIXES`]).
-//! - **The platform set** — kernel, `kmod-*`, ZFS, DRBD. These move *together
+//! - **The platform set** — kernel, `kmod-*`, ZFS. These move *together
 //!   or not at all*, and only after the package manager has been asked, in a
 //!   dry run, whether it can resolve them as one transaction. If it cannot,
 //!   the console says so and the button is not offered; there is no way to

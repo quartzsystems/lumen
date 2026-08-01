@@ -1,15 +1,10 @@
 //! What can go wrong reaching a pool, and how it reads to the compute
 //! domain.
 //!
-//! The seam returns `lumen_drbd::Result`, so every failure here has to
-//! arrive as a `DrbdError` the console already knows how to render. That
-//! mapping is the whole of this module, and it is deliberately narrow:
-//! `NotFound` for a thing that is not there, `Conflict` for a state that
-//! refuses, and `Backend` for a daemon that could not be reached or did not
-//! make sense.
-
-use anyhow::anyhow;
-use lumen_drbd::DrbdError;
+//! Deliberately narrow: `NotFound` for a thing that is not there,
+//! `Conflict` for a state that refuses, and `Backend` for a daemon that
+//! could not be reached or did not make sense. The seam in `vm.rs` returns
+//! this type directly — there is no second error for the console to learn.
 
 pub type Result<T> = std::result::Result<T, PoolError>;
 
@@ -39,16 +34,3 @@ impl std::fmt::Display for PoolError {
 }
 
 impl std::error::Error for PoolError {}
-
-impl From<PoolError> for DrbdError {
-    fn from(err: PoolError) -> DrbdError {
-        match err {
-            PoolError::NotFound(what) => DrbdError::NotFound(what),
-            PoolError::Conflict(what) => DrbdError::Conflict(what),
-            // "No pool here" is a state the caller can act on — add one,
-            // or run the machine elsewhere — not a broken backend.
-            PoolError::Unavailable(what) => DrbdError::Conflict(what),
-            PoolError::Backend(what) => DrbdError::Backend(anyhow!(what)),
-        }
-    }
-}

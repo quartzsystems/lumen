@@ -1,15 +1,15 @@
 //! lumen-pool: the orchestration domain over LumenFS.
 //!
-//! docs/lumenfs.md's compute seam, implemented a second time — the same
-//! `VmVolumes` the DRBD path implements, over vdisks and writer leases
-//! instead of resources and roles. `VirtService` holds the seam as
-//! `Arc<dyn VmVolumes>`, so this crate slots in underneath without one
-//! change to the compute domain.
+//! docs/lumenfs.md's compute seam, over vdisks and writer leases.
+//! `VirtService` holds the seam as `Arc<dyn VmVolumes>`, so this crate
+//! slots in underneath without one change to the compute domain.
 //!
 //! ```text
 //!   config.rs   whether this node carries a pool, read from the daemon's
 //!               own drop-in rather than remembered a second time
 //!   model.rs    names, ids, device paths — and why no vdisk record exists
+//!   vm.rs       the compute seam: the `VmVolumes` trait, its shapes, and
+//!               the mock the compute domain tests against
 //!   fleet.rs    the pool's members as something callable, plus a mock
 //!   socket.rs   control connections by address — loopback-reachable only
 //!   peers.rs    the fleet for real: this node's daemon over loopback, and
@@ -40,6 +40,7 @@ pub mod peers;
 pub mod service;
 pub mod socket;
 pub mod state;
+pub mod vm;
 
 pub use config::{PeerRole, PoolConfig, DEFAULT_CONTROL, FSD_CONF};
 pub use deploy::{mint_brick_uuid, mint_pool_uuid, ublk_available, BrickFormat, PoolDeploy};
@@ -55,4 +56,7 @@ pub use socket::SocketFleet;
 pub use state::{
     pool_usable_bytes, BrickSeen, LeaseSeen, MemberStatus, MemberView, PoolHealth, PoolMember,
     PoolState, Replication, SnapshotView, TierCapacitySeen, VdiskView,
+};
+pub use vm::{
+    MigrationWindow, MockVmVolumes, NoReplicatedStorage, ReplicatedDisk, VmDiskRequest, VmVolumes,
 };

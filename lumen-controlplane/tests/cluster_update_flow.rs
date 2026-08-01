@@ -521,7 +521,7 @@ async fn harness(tag: &str, peers: Vec<Arc<FakeMember>>, local: MockUpdates) -> 
         Arc::new(lumen_virt::backend::mock::MockBackend::appliance()),
         storage.clone(),
         network.clone(),
-        Arc::new(lumen_drbd::MockVmVolumes::standalone()),
+        Arc::new(lumen_pool::MockVmVolumes::standalone()),
     ));
     // A formed cluster with every member online, so the rolling update's
     // "has it rejoined?" check has a real answer to read rather than an
@@ -542,12 +542,6 @@ async fn harness(tag: &str, peers: Vec<Arc<FakeMember>>, local: MockUpdates) -> 
         .with_node(LOCAL)
         .with_environment(&membership_of(&names)),
     );
-    let drbd = Arc::new(lumen_drbd::DrbdService::new(
-        Arc::new(lumen_drbd::backend::mock::MockBackend::appliance()),
-        Arc::new(lumen_drbd::MockVolumePeers::new()),
-        cluster.clone(),
-        storage.clone(),
-    ));
 
     let local = Arc::new(local);
     let router = app(Arc::new(AppState {
@@ -561,7 +555,6 @@ async fn harness(tag: &str, peers: Vec<Arc<FakeMember>>, local: MockUpdates) -> 
         virt,
         cluster,
         peers: Arc::new(FakePeers::new(peers.clone())),
-        drbd,
         pool: lumen_controlplane::pool::PoolPresence::Absent,
         updates: Arc::new(UpdateService::new(local.clone(), LOCAL)),
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
@@ -1464,13 +1457,7 @@ async fn a_node_with_no_environment_answers_with_itself() {
         Arc::new(lumen_virt::backend::mock::MockBackend::appliance()),
         storage.clone(),
         network.clone(),
-        Arc::new(lumen_drbd::MockVmVolumes::standalone()),
-    ));
-    let drbd = Arc::new(lumen_drbd::DrbdService::new(
-        Arc::new(lumen_drbd::backend::mock::MockBackend::appliance()),
-        Arc::new(lumen_drbd::MockVolumePeers::new()),
-        cluster.clone(),
-        storage.clone(),
+        Arc::new(lumen_pool::MockVmVolumes::standalone()),
     ));
     let local = Arc::new(MockUpdates::new().with_updates(waiting()));
     let router = app(Arc::new(AppState {
@@ -1487,7 +1474,6 @@ async fn a_node_with_no_environment_answers_with_itself() {
         virt,
         cluster,
         peers: Arc::new(lumen_controlplane::inventory::NoPeers),
-        drbd,
         pool: lumen_controlplane::pool::PoolPresence::Absent,
         updates: Arc::new(UpdateService::new(local.clone(), "lumen")),
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),

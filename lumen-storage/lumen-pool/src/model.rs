@@ -18,10 +18,10 @@
 //! ## Why this is not a record
 //!
 //! docs/lumenfs.md's survey expected a sibling record type on
-//! `ClusterRecord` mapping vdisks to names — the shape `VolumeRecord` has.
-//! DRBD needs that because `/dev/drbd<minor>` says nothing about which
-//! machine owns it: the minor is allocated from a pool, so the association
-//! must be written down. Derivation removes the need, and with it a second
+//! `ClusterRecord` mapping vdisks to names, the shape the retired DRBD
+//! engine kept: its device minors were allocated from a pool and said
+//! nothing about which machine owned them, so the association had to be
+//! written down. Derivation removes the need, and with it a second
 //! source of truth that could disagree with the engine about what exists.
 //! The engine already knows which vdisks it has; asking it and deriving the
 //! name cannot go stale, whereas a record can.
@@ -98,7 +98,7 @@ pub fn device_path(vdisk: u64) -> String {
 }
 
 /// The vdisk behind a device path, or `None` for a path this engine did not
-/// make. A local zvol, a DRBD minor, and a stray string all answer `None`.
+/// make. A local zvol, a foreign device, and a stray string all answer `None`.
 pub fn vdisk_of_device(device: &str) -> Option<u64> {
     device.strip_prefix("/dev/ublkb")?.parse().ok()
 }

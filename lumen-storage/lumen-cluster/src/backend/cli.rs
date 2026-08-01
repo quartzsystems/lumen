@@ -56,8 +56,8 @@ const VIRTPROXYD_CONF: &str = "/etc/libvirt/virtproxyd.conf";
 const VIRTPROXYD_TCP: &str = "virtproxyd-tcp.socket";
 /// corosync on both rings — bound on Core and Management.
 const CLUSTER_SERVICE: &str = "lumen-cluster";
-/// DRBD, the hypervisor's peer connection, and the migration stream — Core
-/// only, because replication never rides anything else.
+/// The hypervisor's peer connection and the migration stream — Core only,
+/// because replication never rides anything else.
 const REPLICATION_SERVICE: &str = "lumen-replication";
 /// The LumenFS peer link, one port per pool — Core only, for the same reason
 /// replication is. Bound whether or not this node has a pool yet: prepare is

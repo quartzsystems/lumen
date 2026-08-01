@@ -11,7 +11,6 @@ import { CheckRow } from "@/components/ui/formkit";
 import { ApiError } from "@/lib/authClient";
 import { useConsole } from "@/lib/ConsoleContext";
 import { fetchEnvironment } from "@/lib/clusterClient";
-import { fetchReplicatedVolumes } from "@/lib/drbdClient";
 import {
   deletePoolSnapshot,
   destroyLumenPool,
@@ -34,12 +33,11 @@ const POLL_MS = 5000;
 /// The LumenFS pool: pooled, deduplicated storage owned by the cluster,
 /// serving each machine disk as the same `/dev/ublkb<id>` on every member.
 ///
-/// The section owns its own data and renders nothing at all on a node with
-/// no pool — absent rather than empty, the same shape the replicated-volume
-/// section takes. The one exception is a pool configuration that exists but
-/// could not be assembled: that is a broken deployment, and it renders as
-/// its own sentence, because "nothing to show" and "your deployment is
-/// broken" must never look alike.
+/// The section owns its own data and renders nothing at all on a
+/// standalone node — absent rather than empty. The one exception is a pool
+/// configuration that exists but could not be assembled: that is a broken
+/// deployment, and it renders as its own sentence, because "nothing to
+/// show" and "your deployment is broken" must never look alike.
 export function PooledStorageSection() {
   const { setToast } = useConsole();
   const [pool, setPool] = useState<PooledStorageView | null>(null);
@@ -49,8 +47,7 @@ export function PooledStorageSection() {
   const [creating, setCreating] = useState(false);
   const [destroying, setDestroying] = useState(false);
   /// Whether the empty-state create card may render: this node is in a
-  /// cluster and the cluster runs no DRBD volumes — the engine
-  /// exclusivity presented, not just enforced server-side.
+  /// cluster, because the pool spans one.
   const [eligible, setEligible] = useState(false);
 
   const load = useCallback(async () => {
@@ -69,22 +66,17 @@ export function PooledStorageSection() {
     void load();
   }, [load]);
 
-  // Read once: whether a create is even offerable here. Both facts change
+  // Read once: whether a create is even offerable here. The fact changes
   // only through workflows that reload this page anyway.
   useEffect(() => {
     void (async () => {
       try {
-        const [environment, replicated] = await Promise.all([
-          fetchEnvironment(),
-          fetchReplicatedVolumes(),
-        ]);
-        const clustered = environment.clusters.some((cluster) =>
-          cluster.nodes.some((node) => node.local),
+        const environment = await fetchEnvironment();
+        setEligible(
+          environment.clusters.some((cluster) =>
+            cluster.nodes.some((node) => node.local),
+          ),
         );
-        const hasVolumes = replicated.clusters.some(
-          (cluster) => cluster.volumes.length > 0,
-        );
-        setEligible(clustered && !hasVolumes);
       } catch {
         // No card, and nothing lost: the pool view above still renders.
       }
@@ -108,10 +100,8 @@ export function PooledStorageSection() {
   }, [pool, snapshotting]);
 
   if (!pool && !broken && !error) {
-    // No pool here. On a clustered node with no replicated volumes that is
-    // an invitation, not an absence — the drive wizard's front door. Where
-    // DRBD volumes exist the card does not render: a cluster runs one
-    // engine, and the exclusivity is presented rather than just enforced.
+    // No pool here. On a clustered node that is an invitation, not an
+    // absence — the drive wizard's front door.
     if (!eligible) return null;
     return (
       <section className="flex flex-col gap-2">

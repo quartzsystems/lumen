@@ -131,6 +131,18 @@ const REJOIN_DEADLINE: Duration = Duration::from_secs(15 * 60);
 const POLL_FIRST: Duration = Duration::from_millis(250);
 const POLL_MAX: Duration = Duration::from_secs(5);
 
+/// How many times the settle question is retried before what is left waiting
+/// on a restarted member is called a failure.
+///
+/// The restart happens *inside* the transaction — it is `lumen-controlplane`'s
+/// own scriptlet — so the package manager is often still finishing when the
+/// daemon comes back. Most of the tolerance for that comes free: the package
+/// manager's lock makes each check wait for the running transaction, so a
+/// single ask usually blocks until there is a real answer. The retries cover
+/// the asks that error out instead of waiting — a check that hit its call
+/// deadline, a daemon still binding its socket.
+const SETTLE_ATTEMPTS: usize = 4;
+
 // --- the environment-wide read ----------------------------------------------
 
 /// One member's update state, from one round trip.
@@ -989,10 +1001,6 @@ async fn await_member(
 ) -> Result<Visit, String> {
     let deadline = tokio::time::Instant::now() + MEMBER_DEADLINE;
     let mut interval = POLL_FIRST;
-    // Whether the member has stopped answering at some point. Only then is an
-    // absent feed evidence of a restart rather than of a member that never
-    // started the transaction at all.
-    let mut went_away = false;
 
     loop {
         if tokio::time::Instant::now() >= deadline {
@@ -1005,14 +1013,10 @@ async fn await_member(
         tokio::time::sleep(interval).await;
         interval = (interval * 2).min(POLL_MAX);
 
-        let asked = match ask(state, node, is_local, false).await {
-            Ok(asked) => asked,
-            Err(_) => {
-                // Expected while it restarts its control plane. The deadline
-                // is what decides a member is genuinely gone.
-                went_away = true;
-                continue;
-            }
+        // Expected to fail while the member restarts its control plane; what
+        // it reports once it answers again is what decides.
+        let Ok(asked) = ask(state, node, is_local, false).await else {
+            continue;
         };
 
         match asked.progress.as_ref() {
@@ -1035,12 +1039,15 @@ async fn await_member(
                         .unwrap_or_else(|| "the package manager gave no reason".to_string()))
                 }
             },
-            // A feed that is absent, or is about some other transaction, on a
-            // member that stopped answering: its control plane restarted. The
-            // package database is asked instead.
-            _ if went_away => return settled(state, node, is_local).await,
-            // It has not published the transaction yet. Keep asking.
-            _ => continue,
+            // Anything else — no transaction, or some other one. The record
+            // was published before `apply` answered and only a control-plane
+            // restart clears it, so an absent or replaced feed IS the
+            // restart; the package database is asked instead. It must not
+            // take a failed poll to prove it: the restart takes a second or
+            // two and the polls settle five apart, so most walks never catch
+            // the member down — waiting for one that did is how a member
+            // that finished in seconds used to be watched for an hour.
+            _ => return settled(state, node, is_local).await,
         }
     }
 }
@@ -1050,41 +1057,59 @@ async fn await_member(
 ///
 /// An empty list is the transaction having done what it was asked. Anything
 /// left is reported as the failure it is — and named, because "these three
-/// packages are still waiting" is what an operator retries against.
+/// packages are still waiting" is what an operator retries against. Retried
+/// a few times before it is called one — see [`SETTLE_ATTEMPTS`] — because
+/// the transaction that restarted the daemon may still be finishing behind
+/// its package manager's lock.
 async fn settled(state: &Arc<AppState>, node: &str, is_local: bool) -> Result<Visit, String> {
-    let after = ask(state, node, is_local, true).await.map_err(|err| {
-        format!(
-            "its control plane restarted during the transaction — which is what installing Lumen \
-             does — and it could not then be asked what it ended up with: {err}"
-        )
-    })?;
+    let mut interval = POLL_FIRST;
+    let mut attempts = SETTLE_ATTEMPTS;
 
-    if after.view.updates.is_empty() {
-        // What changed cannot be recovered: the process that would have
-        // recorded it is the one that restarted. Saying so is better than
-        // reporting an empty list as though nothing moved.
-        return Ok(Visit::Installed {
-            changed: Vec::new(),
-            restart_required: after.view.reboot.required,
-        });
+    loop {
+        match ask(state, node, is_local, true).await {
+            Ok(after) if after.view.updates.is_empty() => {
+                // What changed cannot be recovered: the process that would
+                // have recorded it is the one that restarted. Saying so is
+                // better than reporting an empty list as though nothing moved.
+                return Ok(Visit::Installed {
+                    changed: Vec::new(),
+                    restart_required: after.view.reboot.required,
+                });
+            }
+            Ok(after) if attempts == 0 => {
+                return Err(format!(
+                    "its control plane restarted during the transaction and {} update{} still \
+                     waiting afterwards: {}",
+                    after.view.updates.len(),
+                    if after.view.updates.len() == 1 {
+                        " was"
+                    } else {
+                        "s were"
+                    },
+                    after
+                        .view
+                        .updates
+                        .iter()
+                        .map(|update| update.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            Err(err) if attempts == 0 => {
+                return Err(format!(
+                    "its control plane restarted during the transaction — which is what \
+                     installing Lumen does — and it could not then be asked what it ended up \
+                     with: {err}"
+                ));
+            }
+            // Leftovers, or no answer: possibly a transaction still
+            // finishing. Ask again.
+            Ok(_) | Err(_) => {}
+        }
+        attempts -= 1;
+        tokio::time::sleep(interval).await;
+        interval = (interval * 2).min(POLL_MAX);
     }
-    Err(format!(
-        "its control plane restarted during the transaction and {} update{} still waiting \
-         afterwards: {}",
-        after.view.updates.len(),
-        if after.view.updates.len() == 1 {
-            " was"
-        } else {
-            "s were"
-        },
-        after
-            .view
-            .updates
-            .iter()
-            .map(|update| update.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    ))
 }
 
 /// Take one member out of service and wait for its machines to move.

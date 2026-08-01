@@ -22,7 +22,6 @@ use tower_http::trace::TraceLayer;
 
 use config::Config;
 use lumen_cluster::ClusterService;
-use lumen_drbd::DrbdService;
 use lumen_net::NetworkService;
 use lumen_sys::SysService;
 use lumen_update::UpdateService;
@@ -63,10 +62,6 @@ pub struct AppState {
     /// channel in the daemon, [`inventory::NoPeers`] anywhere there is none;
     /// the workflows reach the full channel through the services that own it.
     pub peers: Arc<dyn inventory::InventoryPeers>,
-    /// Replicated volumes: DRBD resources over each member's zvols. Built on
-    /// the cluster and storage domains, which is why it is constructed after
-    /// both.
-    pub drbd: Arc<DrbdService>,
     /// The LumenFS pool on this node's cluster, if there is one — decided by
     /// the daemon's own drop-in at startup, never by a second record. On a
     /// pooled node this is also the engine `virt` holds as its `VmVolumes`.

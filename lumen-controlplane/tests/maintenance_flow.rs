@@ -16,13 +16,13 @@ use lumen_cluster::backend::mock::{membership_of, MockBackend as ClusterMockBack
 use lumen_cluster::networks::{AddressedMember, ClusterNetworks, CoreNetwork, ManagementNetwork};
 use lumen_cluster::{
     BmcConfig, ClusterDefinition, ClusterRecord, ClusterService, EnvironmentMembership, MemberNode,
-    MockPeers, VolumeRecord, VolumeSeat,
+    MockPeers,
 };
 use lumen_controlplane::config::Config;
 use lumen_controlplane::realm::{AuthFailure, Realm, RealmKind, RealmRegistry};
 use lumen_controlplane::{app, security, AppState};
-use lumen_drbd::{VmDiskRequest, VmVolumes};
 use lumen_net::NetworkService;
+use lumen_pool::{VmDiskRequest, VmVolumes};
 use lumen_virt::model::{VmConfig, VmDisk};
 use lumen_virt::VirtService;
 use lumen_zfs::StorageService;
@@ -65,8 +65,8 @@ impl TempDir {
     }
 }
 
-/// The two-node cluster "alpha", recorded whole: Core seats for the migration
-/// path, and one replicated volume on minor 1.
+/// The two-node cluster "alpha", recorded whole, with Core seats for the
+/// migration path. The machines' pooled disks live in the seam mock.
 fn alpha_membership() -> EnvironmentMembership {
     let mut membership = membership_of(&[("alpha-1", Some("alpha")), ("alpha-2", Some("alpha"))]);
     let member = |name: &str, octet: u8| MemberNode {
@@ -83,7 +83,7 @@ fn alpha_membership() -> EnvironmentMembership {
         interface: "nic1".into(),
         address: std::net::Ipv4Addr::new(10, 10, 0, octet),
     };
-    let mut record = ClusterRecord::new(
+    let record = ClusterRecord::new(
         ClusterDefinition {
             name: "alpha".into(),
             nodes: vec![member("alpha-1", 1), member("alpha-2", 2)],
@@ -103,23 +103,6 @@ fn alpha_membership() -> EnvironmentMembership {
             external: Vec::new(),
         },
     );
-    record.volumes.push(VolumeRecord {
-        name: "vm-101-disk-0".into(),
-        size_bytes: 1 << 30,
-        zvol_bytes: (1 << 30) + (1 << 20),
-        port: 7788,
-        minor: 1,
-        replicas: vec![
-            VolumeSeat {
-                node: "alpha-1".into(),
-                pool: "boot".into(),
-            },
-            VolumeSeat {
-                node: "alpha-2".into(),
-                pool: "boot".into(),
-            },
-        ],
-    });
     membership.clusters.push(record);
     membership
 }
@@ -148,7 +131,7 @@ struct Harness {
     state: Arc<AppState>,
     cluster_backend: Arc<ClusterMockBackend>,
     virt_backend: Arc<lumen_virt::backend::mock::MockBackend>,
-    volumes: Arc<lumen_drbd::MockVmVolumes>,
+    volumes: Arc<lumen_pool::MockVmVolumes>,
     _state_dir: TempDir,
 }
 
@@ -216,21 +199,7 @@ fn build(
         .with_form_poll(Duration::from_millis(5))
         .with_environment(&membership),
     );
-    // Both replicas current: what `choose_target` insists on before it will
-    // move a machine onto a peer.
-    let drbd = Arc::new(lumen_drbd::DrbdService::new(
-        Arc::new(
-            lumen_drbd::backend::mock::MockBackend::appliance().with_healthy(
-                "alpha-vm-101-disk-0",
-                "alpha-2",
-                1,
-            ),
-        ),
-        Arc::new(lumen_drbd::MockVolumePeers::new()),
-        cluster.clone(),
-        storage.clone(),
-    ));
-    let volumes = Arc::new(lumen_drbd::MockVmVolumes::clustered(
+    let volumes = Arc::new(lumen_pool::MockVmVolumes::clustered(
         "alpha",
         &["alpha-1", "alpha-2"],
     ));
@@ -252,7 +221,6 @@ fn build(
         virt,
         cluster,
         peers: Arc::new(lumen_controlplane::inventory::NoPeers),
-        drbd,
         pool: lumen_controlplane::pool::PoolPresence::Absent,
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
         updates: Arc::new(lumen_update::UpdateService::new(
@@ -282,15 +250,15 @@ impl Harness {
     /// A running machine on this node, with a replicated disk the mock
     /// volumes know about.
     async fn running_machine(&self, vmid: u32, name: &str) {
-        self.volumes
+        let disk = self
+            .volumes
             .create_disk(&VmDiskRequest {
                 name: format!("vm-{vmid}-disk-0"),
                 size_bytes: 1 << 30,
-                members: Vec::new(),
             })
             .await
             .unwrap();
-        let xml = lumen_virt::domain_xml::render(&machine(vmid, name, "/dev/drbd1"));
+        let xml = lumen_virt::domain_xml::render(&machine(vmid, name, &disk.device));
         self.state.virt.adopt(&xml).await.unwrap();
     }
 

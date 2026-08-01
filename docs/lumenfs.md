@@ -7,11 +7,13 @@ tiers, and copy-on-write snapshots and clones. The model is VergeOS's
 VergeFS; the implementation is a Rust engine that consumes the cluster
 machinery this appliance already trusts.
 
-This document supersedes the recommendation in docs/storage-scaleout.md —
-that document weighed LINSTOR against Ceph and recommended Ceph for clusters
-of three or more; the decision recorded here is to build the engine instead.
-docs/storage.md (DRBD replicated volumes) remains what exists in production
-and keeps carrying machines until LumenFS has earned them.
+This document superseded the recommendation in docs/storage-scaleout.md
+(since deleted) — that document weighed LINSTOR against Ceph and
+recommended Ceph for clusters of three or more; the decision recorded here
+was to build the engine instead. The DRBD engine this document measures
+itself against has since been removed outright: LumenFS is the appliance's
+one replicated engine, and the DRBD references below are the design's
+recorded context, not a description of anything still in the tree.
 
 **Status: phase 1 has begun.** The `lumen-fs` crate exists with the
 simulation harness and the full single-node data path — the deterministic

@@ -81,44 +81,6 @@ impl EnvironmentNode {
     }
 }
 
-/// One node's seat on a replicated volume: which pool on that node carries
-/// the backing zvol.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VolumeSeat {
-    pub node: String,
-    pub pool: String,
-}
-
-/// One replicated volume as the record remembers it. The model lives here —
-/// below `lumen-drbd` in the dependency order — because volume placement is
-/// membership's business too: a node holding replicas cannot leave its
-/// cluster, and every console must describe every volume whether or not its
-/// cluster answers. Everything operational (rendering, sizing, lifecycle,
-/// observed state) is `lumen-drbd`'s.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VolumeRecord {
-    pub name: String,
-    /// The usable bytes the operator asked for.
-    pub size_bytes: u64,
-    /// The byte-exact backing zvol size — usable bytes plus DRBD's internal
-    /// metadata, rounded to the volblocksize — computed once, before anything
-    /// was created on any node, so every replica is identical by
-    /// construction.
-    pub zvol_bytes: u64,
-    /// The TCP port replication rides on the Core network, allocated from
-    /// the cluster's range.
-    pub port: u16,
-    /// The DRBD device minor: the volume appears as `/dev/drbd<minor>`.
-    pub minor: u32,
-    pub replicas: Vec<VolumeSeat>,
-}
-
-impl VolumeRecord {
-    pub fn seat(&self, node: &str) -> Option<&VolumeSeat> {
-        self.replicas.iter().find(|s| s.node == node)
-    }
-}
-
 /// One cluster's stored shape: the definition the operator built and the
 /// networks it rides. Replicated with the membership record so every node's
 /// console can describe every cluster, reachable or not; the assignment
@@ -134,10 +96,6 @@ pub struct ClusterRecord {
     /// warning on every console.
     #[serde(default)]
     pub fence_tests: std::collections::BTreeMap<String, crate::state::FenceTest>,
-    /// The cluster's replicated volumes. Definitions only — observed
-    /// replication state is read live by `lumen-drbd` and never stored.
-    #[serde(default)]
-    pub volumes: Vec<VolumeRecord>,
 }
 
 impl ClusterRecord {
@@ -146,12 +104,7 @@ impl ClusterRecord {
             definition,
             networks,
             fence_tests: Default::default(),
-            volumes: Vec::new(),
         }
-    }
-
-    pub fn volume(&self, name: &str) -> Option<&VolumeRecord> {
-        self.volumes.iter().find(|v| v.name == name)
     }
 }
 

@@ -7,9 +7,9 @@
 
 use std::sync::Arc;
 
-use lumen_drbd::{MigrationWindow, VmDiskRequest, VmVolumes};
 use lumen_pool::{
-    MemberStatus, MemberView, MockFleet, PoolFleet, PoolHealth, PoolService, Replication,
+    MemberStatus, MemberView, MigrationWindow, MockFleet, PoolFleet, PoolHealth, PoolService,
+    Replication, VmDiskRequest, VmVolumes,
 };
 
 const HERE: &str = "lumen01";
@@ -25,7 +25,6 @@ fn request(name: &str, size_bytes: u64) -> VmDiskRequest {
     VmDiskRequest {
         name: name.to_string(),
         size_bytes,
-        members: Vec::new(),
     }
 }
 
@@ -95,15 +94,9 @@ async fn only_names_the_compute_domain_uses_are_accepted() {
 #[tokio::test]
 async fn disk_of_is_a_predicate_and_says_no_to_everything_else() {
     let (_fleet, service) = pooled();
-    // Another engine's disks, and our own bootstrap vdisk — id 1 decodes to
-    // machine 0, which is no machine, so it is not a pooled machine disk.
-    for foreign in [
-        "/dev/drbd1",
-        "/dev/zvol/lumen/vm-7-disk-0",
-        "/dev/ublkb1",
-        "/dev/sda",
-        "",
-    ] {
+    // Local disks, raw devices, and our own bootstrap vdisk — id 1 decodes
+    // to machine 0, which is no machine, so it is not a pooled machine disk.
+    for foreign in ["/dev/zvol/lumen/vm-7-disk-0", "/dev/ublkb1", "/dev/sda", ""] {
         assert!(
             service.disk_of(foreign).await.unwrap().is_none(),
             "{foreign} was claimed"
@@ -283,10 +276,13 @@ async fn placement_is_every_member_and_a_foreign_disk_is_named() {
     // And a device this pool did not make is refused by name, the way the
     // sweep and the drain both rely on.
     let err = service
-        .common_members(&[disk.device, "/dev/drbd1".to_string()])
+        .common_members(&[disk.device, "/dev/zvol/lumen/vm-4-disk-1".to_string()])
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("/dev/drbd1"), "{err}");
+    assert!(
+        err.to_string().contains("/dev/zvol/lumen/vm-4-disk-1"),
+        "{err}"
+    );
 }
 
 /// The observed view is what a console page renders, so what matters is that
@@ -583,11 +579,5 @@ fn the_service_is_a_drop_in_for_the_seam() {
     // integration is broken however well the logic tests pass.
     let fleet = Arc::new(MockFleet::pooled(&[HERE, THERE]));
     let service: Arc<dyn VmVolumes> = Arc::new(PoolService::new(fleet, "pool0"));
-    // And the DRBD implementation still satisfies the same shape, so both
-    // engines remain interchangeable behind it.
-    let drbd: Arc<dyn VmVolumes> = Arc::new(lumen_drbd::MockVmVolumes::standalone());
-    assert_eq!(
-        [Arc::strong_count(&service), Arc::strong_count(&drbd)],
-        [1, 1]
-    );
+    assert_eq!(Arc::strong_count(&service), 1);
 }

@@ -57,19 +57,9 @@ pub enum ValidationCode {
     InvalidVip,
     InvalidBridgeName,
     InvalidVlan,
-    // Volumes. Produced by `validate_volume_members` here and by
-    // `lumen-drbd`'s own validation — the codes live in one place because
-    // the console matches on them in one place.
-    VolumeMemberOutsideCluster,
-    TooFewVolumeMembers,
-    TooManyVolumeMembers,
-    InvalidVolumeName,
-    DuplicateVolumeName,
-    InvalidVolumeSize,
     // The LumenFS pool workflow (lumen-controlplane's pool_workflow.rs).
-    // Same reasoning as the volume codes above: the console matches on
-    // them in one place, so they live in one place.
-    EngineConflict,
+    // The codes live here because the console matches on them in one
+    // place.
     PoolAlreadyPresent,
     PoolMemberMissing,
     PoolMemberUnreachable,
@@ -116,13 +106,6 @@ impl ValidationCode {
             ValidationCode::InvalidVip => "invalid_vip",
             ValidationCode::InvalidBridgeName => "invalid_bridge_name",
             ValidationCode::InvalidVlan => "invalid_vlan",
-            ValidationCode::VolumeMemberOutsideCluster => "volume_member_outside_cluster",
-            ValidationCode::TooFewVolumeMembers => "too_few_volume_members",
-            ValidationCode::TooManyVolumeMembers => "too_many_volume_members",
-            ValidationCode::InvalidVolumeName => "invalid_volume_name",
-            ValidationCode::DuplicateVolumeName => "duplicate_volume_name",
-            ValidationCode::InvalidVolumeSize => "invalid_volume_size",
-            ValidationCode::EngineConflict => "engine_conflict",
             ValidationCode::PoolAlreadyPresent => "pool_already_present",
             ValidationCode::PoolMemberMissing => "pool_member_missing",
             ValidationCode::PoolMemberUnreachable => "pool_member_unreachable",
@@ -573,36 +556,6 @@ impl ClusterCreate {
     }
 }
 
-/// The placement rule the topology property tests hold for every N: a
-/// replicated volume's members are cluster members, and there are at least
-/// two of them. `lumen-drbd` calls this before anything touches a zvol.
-pub fn validate_volume_members(
-    members: &[String],
-    cluster_nodes: &[String],
-) -> Vec<ValidationError> {
-    let mut errors = Vec::new();
-    if members.len() < 2 {
-        errors.push(ValidationError::new(
-            ValidationCode::TooFewVolumeMembers,
-            Some("members"),
-            "A replicated volume needs at least two members.",
-        ));
-    }
-    for member in members {
-        if !cluster_nodes.contains(member) {
-            errors.push(ValidationError::new(
-                ValidationCode::VolumeMemberOutsideCluster,
-                Some("members"),
-                format!(
-                    "\"{member}\" is not a member of this cluster — replicas live only where \
-                     the cluster's machines can run."
-                ),
-            ));
-        }
-    }
-    errors
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -745,21 +698,5 @@ mod tests {
         assert!(
             codes(&validate_definition(&def, &env)).contains(&ValidationCode::DuplicateRingAddress)
         );
-    }
-
-    #[test]
-    fn volume_members_are_cluster_members_and_at_least_two() {
-        let nodes: Vec<String> = vec!["a-1".into(), "a-2".into(), "a-3".into()];
-        assert_eq!(
-            validate_volume_members(&["a-1".into(), "a-2".into()], &nodes),
-            vec![]
-        );
-        assert!(codes(&validate_volume_members(&["a-1".into()], &nodes))
-            .contains(&ValidationCode::TooFewVolumeMembers));
-        assert!(codes(&validate_volume_members(
-            &["a-1".into(), "b-9".into()],
-            &nodes
-        ))
-        .contains(&ValidationCode::VolumeMemberOutsideCluster));
     }
 }

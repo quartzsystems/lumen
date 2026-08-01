@@ -59,7 +59,7 @@ import {
 ///
 /// **Kernel and storage modules** is the other one. On this appliance the root
 /// file system is ZFS and ZFS is an out-of-tree module tracking the kernel's
-/// ABI; so is DRBD. They have to move together, and the backend refuses to
+/// ABI. They have to move together, and the backend refuses to
 /// install any of them unless the package manager has already confirmed, in a
 /// dry run, that it can move them all. When it cannot, this page says so and
 /// offers nothing — that is the state that would otherwise end with a node

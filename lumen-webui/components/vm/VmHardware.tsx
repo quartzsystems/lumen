@@ -24,12 +24,7 @@ import { Switch } from "@/components/ui/Switch";
 import { DataTable, type Column } from "@/components/console/DataTable";
 import { RowActions } from "@/components/console/RowActions";
 import { fetchEnvironment } from "@/lib/clusterClient";
-import {
-  fetchReplicatedVolumes,
-  VOLUME_HEALTH_LABEL,
-  VOLUME_HEALTH_TONE,
-  type ReplicatedVolumeView,
-} from "@/lib/drbdClient";
+import { fetchPooledStorage, type PooledStorageView } from "@/lib/poolClient";
 import { fetchInterfaces } from "@/lib/networkClient";
 import { fetchPools, type PoolView } from "@/lib/storageClient";
 import {
@@ -56,8 +51,8 @@ import {
   type VmView,
 } from "@/lib/vmClient";
 
-/// The one string that tells a replicated disk from a local one.
-const isReplicatedSource = (source: string) => source.startsWith("/dev/drbd");
+/// The one string that tells a pooled, replicated disk from a local one.
+const isReplicatedSource = (source: string) => source.startsWith("/dev/ublkb");
 
 const numberOf = (text: string): number | undefined => {
   const trimmed = text.trim();
@@ -123,50 +118,48 @@ export function VmHardware({
   const [editing, setEditing] = useState<SizingKey | null>(null);
   const [working, setWorking] = useState(false);
   const [migrating, setMigrating] = useState(false);
-  /// The replicated volumes behind this machine's /dev/drbd disks, by
-  /// device — replica health for the rows, and the target list for a
-  /// migration.
-  const [replicatedViews, setReplicatedViews] = useState<
-    Record<string, ReplicatedVolumeView>
-  >({});
+  /// The pool serving this machine's /dev/ublkb disks — sizes for the
+  /// rows, and the member list a migration chooses from.
+  const [pooled, setPooled] = useState<PooledStorageView | null>(null);
+  const [localNode, setLocalNode] = useState<string | null>(null);
 
   const hasReplicated = vm.disks.some((disk) => isReplicatedSource(disk.source));
   useEffect(() => {
     if (!hasReplicated) {
-      setReplicatedViews({});
+      setPooled(null);
       return;
     }
     void (async () => {
       try {
-        const response = await fetchReplicatedVolumes();
-        const map: Record<string, ReplicatedVolumeView> = {};
-        for (const cluster of response.clusters) {
-          for (const volume of cluster.volumes) {
-            map[volume.device] = volume;
-          }
-        }
-        setReplicatedViews(map);
+        const response = await fetchPooledStorage();
+        setPooled(response.pool);
       } catch {
-        setReplicatedViews({});
+        setPooled(null);
+      }
+      try {
+        const environment = await fetchEnvironment();
+        const home = environment.clusters
+          .flatMap((cluster) => cluster.nodes)
+          .find((node) => node.local);
+        setLocalNode(home?.node ?? null);
+      } catch {
+        setLocalNode(null);
       }
     })();
   }, [hasReplicated, vm.vmid, vm.disks.length]);
 
-  // Where the machine could migrate to: the nodes holding a replica of
-  // every disk, this one excluded. Empty means the button explains itself.
+  const pooledSizeOf = (source: string): number | undefined =>
+    pooled?.vdisks.find((vdisk) => vdisk.device === source)?.size_bytes;
+
+  // Where the machine could migrate to: every pool member except this one —
+  // placement is by content hash, so no member is a better host than
+  // another. Empty means the button explains itself.
   const allReplicated =
     vm.disks.length > 0 && vm.disks.every((disk) => isReplicatedSource(disk.source));
-  const migrateTargets = (() => {
-    if (!allReplicated) return [];
-    let common: string[] | null = null;
-    for (const disk of vm.disks) {
-      const view = replicatedViews[disk.source];
-      if (!view) return [];
-      const nodes = view.replicas.filter((r) => !r.local).map((r) => r.node);
-      common = common === null ? nodes : common.filter((n) => nodes.includes(n));
-    }
-    return common ?? [];
-  })();
+  const migrateTargets =
+    allReplicated && pooled
+      ? pooled.members.map((member) => member.name).filter((name) => name !== localNode)
+      : [];
 
   const report = async (response: VmUpdateResponse, what: string) => {
     const live = response.applied_live.length;
@@ -206,9 +199,9 @@ export function VmHardware({
   } [${cpuModelLabel(vm.cpu_model)}]`;
 
   const diskText = (disk: (typeof vm.disks)[number]) => {
-    // The stored document carries no size for a block-backed disk; a
-    // replicated one's record does, so use it rather than printing 0.
-    const size = replicatedViews[disk.source]?.size_bytes ?? disk.size;
+    // The stored document carries no size for a block-backed disk; the
+    // pool knows its vdisks' sizes, so use that rather than printing 0.
+    const size = pooledSizeOf(disk.source) ?? disk.size;
     return (
       `${disk.source}, ${disk.bus}, ${formatBytes(size)}` +
       `${disk.cache !== "none" ? `, cache=${disk.cache}` : ""}` +
@@ -298,30 +291,26 @@ export function VmHardware({
           <span className="qz-mono truncate" title={diskText(disk)}>
             {diskText(disk)}
           </span>
-          {isReplicatedSource(disk.source) &&
-            (() => {
-              const view = replicatedViews[disk.source];
-              return (
-                <span
-                  className={`badge badge-${view ? VOLUME_HEALTH_TONE[view.health] : "muted"} flex-shrink-0`}
-                  title={
-                    view
-                      ? view.replicas
-                          .map((r) => `${r.node}: ${r.disk_state ?? "state unknown"}`)
-                          .join(", ")
-                      : "Replicated volume"
-                  }
-                >
-                  {view
-                    ? `Replicated · ${VOLUME_HEALTH_LABEL[view.health]}${
-                        view.health === "syncing" && view.sync_percent !== undefined
-                          ? ` ${view.sync_percent.toFixed(1)}%`
-                          : ""
-                      }`
-                    : "Replicated"}
-                </span>
-              );
-            })()}
+          {isReplicatedSource(disk.source) && (
+            <span
+              className={`badge badge-${
+                pooled
+                  ? pooled.health === "Healthy"
+                    ? "ok"
+                    : pooled.health === "Degraded"
+                      ? "warn"
+                      : "muted"
+                  : "muted"
+              } flex-shrink-0`}
+              title={
+                pooled
+                  ? `Served by the ${pooled.name} pool, which is ${pooled.health.toLowerCase()}.`
+                  : "Served by the cluster's pooled storage."
+              }
+            >
+              {pooled ? `Pooled · ${pooled.health.toLowerCase()}` : "Pooled"}
+            </span>
+          )}
         </span>
       ),
       actions: (
@@ -658,7 +647,7 @@ function MigrateDialog({
         <Field
           label="Target"
           htmlFor="migrate-target"
-          hint="A node holding a replica of every disk. DRBD permits two writers only for the moment of the handover, and the window is closed again on every outcome."
+          hint="A pool member. The storage layer permits both sides to hold the disk open only for the moment of the handover, and the window is closed again on every outcome."
         >
           <SelectInput
             id="migrate-target"
@@ -701,9 +690,10 @@ function AddDiskDialog({
   const [bus, setBus] = useState<DiskBus>("virtio-blk");
   const [discard, setDiscard] = useState(true);
   const [replicated, setReplicated] = useState(false);
-  const [seats, setSeats] = useState<
-    { node: string; local: boolean; on: boolean; pool: string }[]
-  >([]);
+  /// Whether this node's cluster serves a pool — what makes the replicated
+  /// switch worth showing at all. The pool places a disk by itself, so the
+  /// switch is the whole of the choice.
+  const [hasPool, setHasPool] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
 
@@ -718,23 +708,8 @@ function AddDiskDialog({
         setPools([]);
       }
       try {
-        // The replica seats, when this node is in a cluster.
-        const environment = await fetchEnvironment();
-        const home = environment.clusters.find((cluster) =>
-          cluster.nodes.some((node) => node.local),
-        );
-        if (home) {
-          setSeats(
-            [...home.nodes]
-              .sort((a, b) => Number(b.local) - Number(a.local))
-              .map((node, index) => ({
-                node: node.node,
-                local: node.local,
-                on: node.local || index === 1,
-                pool: "",
-              })),
-          );
-        }
+        const response = await fetchPooledStorage();
+        setHasPool(response.pool !== null);
       } catch {
         /* a standalone node simply has no replicated choice */
       }
@@ -747,32 +722,14 @@ function AddDiskDialog({
       setErrors({ size_gib: "Use a size of at least 1 GiB." });
       return;
     }
-    if (replicated) {
-      const chosen = seats.filter((seat) => seat.on);
-      if (chosen.length < 2 || chosen.length > 3) {
-        setErrors({ form: "A replicated disk needs 2 or 3 replicas." });
-        return;
-      }
-      if (chosen.some((seat) => seat.pool.trim() === "")) {
-        setErrors({ form: "Name the pool each replica lives in." });
-        return;
-      }
-    } else if (!pool) {
+    if (!replicated && !pool) {
       setErrors({ pool: "Choose a pool." });
       return;
     }
     setSaving(true);
     try {
       const body = replicated
-        ? {
-            size_gib: size,
-            bus,
-            discard,
-            replicated: true,
-            members: seats
-              .filter((seat) => seat.on)
-              .map((seat) => ({ node: seat.node, pool: seat.pool.trim() })),
-          }
+        ? { size_gib: size, bus, discard, replicated: true }
         : { pool, size_gib: size, bus, discard };
       await onAdded(await attachDisk(vm.vmid, body));
     } catch (err) {
@@ -802,54 +759,15 @@ function AddDiskDialog({
           void submit();
         }}
       >
-        {seats.length > 0 && (
+        {hasPool && (
           <label className="flex items-center gap-[10px] cursor-pointer select-none">
             <Switch on={replicated} onChange={setReplicated} />
             <span className="text-[13px] text-[var(--qz-fg-2)]">
-              Replicated across the cluster
+              Replicated across the cluster — served by the pool on every member at once
             </span>
           </label>
         )}
-        {replicated ? (
-          <Field label="Replicas">
-            <div className="flex flex-col gap-2">
-              {seats.map((seat, index) => (
-                <div key={seat.node} className="flex items-center gap-3">
-                  <label className="flex items-center gap-2 w-[180px] cursor-pointer select-none">
-                    <input
-                      type="checkbox"
-                      checked={seat.on}
-                      disabled={seat.local}
-                      onChange={() =>
-                        setSeats((current) =>
-                          current.map((s, i) => (i === index ? { ...s, on: !s.on } : s)),
-                        )
-                      }
-                    />
-                    <span className="qz-mono text-[13px] text-[var(--qz-fg-1)]">
-                      {seat.node}
-                    </span>
-                    {seat.local && <span className="badge badge-muted">this node</span>}
-                  </label>
-                  {seat.on && (
-                    <span className="w-[180px]">
-                      <TextInput
-                        mono
-                        value={seat.pool}
-                        placeholder="pool"
-                        onChange={(v) =>
-                          setSeats((current) =>
-                            current.map((s, i) => (i === index ? { ...s, pool: v } : s)),
-                          )
-                        }
-                      />
-                    </span>
-                  )}
-                </div>
-              ))}
-            </div>
-          </Field>
-        ) : (
+        {!replicated && (
         <Field label="Pool" htmlFor="disk-pool" required error={errors.pool}>
           <SelectInput
             id="disk-pool"

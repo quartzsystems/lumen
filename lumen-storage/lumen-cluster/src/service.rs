@@ -1522,8 +1522,9 @@ impl ClusterService {
         }
         // Before the configuration, because a node whose stack starts into a
         // closed firewall is a cluster that forms on paper and replicates
-        // nowhere: the ports the corosync rings and DRBD need are declared
-        // by the package and bound here, on the interfaces that carry them.
+        // nowhere: the ports the corosync rings and the replication link
+        // need are declared by the package and bound here, on the
+        // interfaces that carry them.
         self.backend
             .set_cluster_ports(
                 &core.interface,
@@ -1939,9 +1940,8 @@ impl ClusterService {
     /// this workflow: the regenerated corosync.conf stops carrying
     /// `two_node`, the fence delays flatten, and `no-quorum-policy=stop`
     /// arrives — all from the same topology engine that decided them at
-    /// two. Volume I/O is never interrupted: corosync reloads, nothing
-    /// restarts, and the volume-policy flip that follows is a live
-    /// `drbdadm adjust`, chained by the control plane.
+    /// two. Volume I/O is never interrupted: corosync reloads and nothing
+    /// restarts.
     pub async fn execute_add_node(self: &Arc<Self>, plan: AddNodePlan) -> Result<()> {
         let result = self.drive_add_node(&plan).await;
         match &result {
@@ -2623,64 +2623,12 @@ impl ClusterService {
 
     // --- the storage domain's door ------------------------------------------
 
-    /// The whole membership record, read-only, for the replicated-storage
-    /// domain built on top of this one: it needs the cluster definitions,
-    /// Core addresses, and volume records to render and validate against,
-    /// and re-deriving them through the view types would mean parsing our
-    /// own presentation.
+    /// The whole membership record, read-only, for the domains built on top
+    /// of this one: they need the cluster definitions and Core addresses to
+    /// render and validate against, and re-deriving them through the view
+    /// types would mean parsing our own presentation.
     pub fn environment_record(&self) -> Result<Option<EnvironmentMembership>> {
         self.membership()
-    }
-
-    /// Record a replicated volume on its cluster — written by `lumen-drbd`
-    /// **after** the volume exists on every member, the same record-last rule
-    /// as a cluster create. Replaces an existing record of the same name,
-    /// which is what a resize is.
-    pub async fn commit_volume(
-        &self,
-        cluster: &str,
-        volume: crate::environment::VolumeRecord,
-    ) -> Result<()> {
-        let _guard = self.gate.lock().await;
-        let mut membership = self.require_membership()?;
-        let Some(record) = membership
-            .clusters
-            .iter_mut()
-            .find(|r| r.definition.name == cluster)
-        else {
-            return Err(ClusterError::NotFound(format!(
-                "There is no cluster called \"{cluster}\" in this environment."
-            )));
-        };
-        record.volumes.retain(|v| v.name != volume.name);
-        record.volumes.push(volume);
-        membership.version += 1;
-        self.store.save_membership(&membership)?;
-        drop(_guard);
-        self.gossip_once().await;
-        Ok(())
-    }
-
-    /// Forget a replicated volume — after every replica is gone, mirroring
-    /// the destroy rule for clusters.
-    pub async fn forget_volume(&self, cluster: &str, name: &str) -> Result<()> {
-        let _guard = self.gate.lock().await;
-        let mut membership = self.require_membership()?;
-        let Some(record) = membership
-            .clusters
-            .iter_mut()
-            .find(|r| r.definition.name == cluster)
-        else {
-            return Err(ClusterError::NotFound(format!(
-                "There is no cluster called \"{cluster}\" in this environment."
-            )));
-        };
-        record.volumes.retain(|v| v.name != name);
-        membership.version += 1;
-        self.store.save_membership(&membership)?;
-        drop(_guard);
-        self.gossip_once().await;
-        Ok(())
     }
 
     // --- assembly ---------------------------------------------------------
@@ -3242,9 +3190,10 @@ mod tests {
     /// interfaces that carry it, and a teardown closes them again.
     ///
     /// This is the step whose absence let a cluster form and replicate
-    /// nowhere: the package ships the two firewalld service definitions, but
-    /// a definition names ports and binds nothing, so DRBD sat in Connecting
-    /// and the first machine to want its disk could not be started.
+    /// nowhere: the package ships the firewalld service definitions, but a
+    /// definition names ports and binds nothing, so replication sat waiting
+    /// to connect and the first machine to want its disk could not be
+    /// started.
     #[tokio::test]
     async fn a_prepare_opens_the_clusters_ports_and_a_teardown_closes_them() {
         let backend = Arc::new(MockBackend::appliance());
@@ -4005,54 +3954,6 @@ mod tests {
             service.create_progress().unwrap().phase,
             WorkflowPhase::Failed
         );
-    }
-
-    #[tokio::test]
-    async fn volume_records_ride_the_cluster_record_and_replace_by_name() {
-        use crate::environment::{VolumeRecord, VolumeSeat};
-        let service = fence_harness(Arc::new(MockBackend::environment()));
-        let volume = VolumeRecord {
-            name: "vm-101-disk-0".into(),
-            size_bytes: 10 << 30,
-            zvol_bytes: (10 << 30) + (4 << 20),
-            port: 7788,
-            minor: 1,
-            replicas: vec![
-                VolumeSeat {
-                    node: "alpha-1".into(),
-                    pool: "tank".into(),
-                },
-                VolumeSeat {
-                    node: "alpha-2".into(),
-                    pool: "tank".into(),
-                },
-            ],
-        };
-        service
-            .commit_volume("alpha", volume.clone())
-            .await
-            .unwrap();
-        let record = service.environment_record().unwrap().unwrap();
-        let alpha = record.cluster_record("alpha").unwrap();
-        assert_eq!(alpha.volume("vm-101-disk-0").unwrap().port, 7788);
-        let version = record.version;
-
-        // Replacing by name is what a resize commit is.
-        let mut grown = volume;
-        grown.size_bytes = 20 << 30;
-        service.commit_volume("alpha", grown).await.unwrap();
-        let record = service.environment_record().unwrap().unwrap();
-        assert!(record.version > version, "every commit bumps the record");
-        assert_eq!(record.cluster_record("alpha").unwrap().volumes.len(), 1);
-
-        service
-            .forget_volume("alpha", "vm-101-disk-0")
-            .await
-            .unwrap();
-        let record = service.environment_record().unwrap().unwrap();
-        assert!(record.cluster_record("alpha").unwrap().volumes.is_empty());
-        // An unknown cluster is a refusal, not a silent no-op.
-        assert!(service.forget_volume("ghost", "x").await.is_err());
     }
 
     #[tokio::test]

@@ -26,10 +26,10 @@ packages/
 **An ordinary update must never move the kernel.**
 
 Lumen boots from ZFS, and ZFS on this appliance is an out-of-tree kernel module
-that tracks the kernel ABI. So is DRBD. `iso/pins.env` already records what
-that means for the ISO build — *"Kernel, kmod-zfs, and kmod-drbd9x move
-together as one pinned set: bump one, re-verify all three"* — and notes that
-the modules have a real history of lagging AlmaLinux point-release kernels.
+that tracks the kernel ABI. `iso/pins.env` already records what that means
+for the ISO build — the kernel and kmod-zfs move together as one pinned
+set — and notes that the module has a real history of lagging AlmaLinux
+point-release kernels.
 
 A node that ran an unguarded `dnf upgrade` would, sooner or later, install a
 kernel with no matching `kmod-zfs`, reboot, and fail to import its root pool.
@@ -42,7 +42,7 @@ So the domain splits every pending update in two:
 | | what it is | how it is installed |
 |---|---|---|
 | **Ordinary** | Lumen's own packages, and userland | one button, no acknowledgement |
-| **Platform** | `kernel*`, `kmod-*`, `zfs*`, `drbd*` | together or not at all, and only when the solver says they resolve |
+| **Platform** | `kernel*`, `kmod-*`, `zfs*` | together or not at all, and only when the solver says they resolve |
 
 The ordinary transaction cannot touch the platform set because it is built with
 `--exclude` for every one of those prefixes. That is asserted at three layers —

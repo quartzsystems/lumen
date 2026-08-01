@@ -89,24 +89,16 @@ impl From<lumen_zfs::ZfsError> for VirtError {
     }
 }
 
-/// The replicated-storage domain, folded in the same way. Its validation
-/// list arrives as a conflict sentence rather than a field-pinned answer:
-/// the codes belong to the storage domain's own create dialog, and by the
-/// time a machine's disk reaches it the compute domain has already shaped
-/// the request — a refusal from below is a state problem here.
-impl From<lumen_drbd::DrbdError> for VirtError {
-    fn from(err: lumen_drbd::DrbdError) -> Self {
+/// The replicated-storage domain, folded in the same way. "No pool here"
+/// arrives as a conflict rather than a broken backend: it is a state the
+/// caller can act on — create the pool, or give the machine a local disk.
+impl From<lumen_pool::PoolError> for VirtError {
+    fn from(err: lumen_pool::PoolError) -> Self {
         match err {
-            lumen_drbd::DrbdError::NotFound(message) => VirtError::NotFound(message),
-            lumen_drbd::DrbdError::Conflict(message) => VirtError::Conflict(message),
-            lumen_drbd::DrbdError::Backend(err) => VirtError::Backend(err),
-            lumen_drbd::DrbdError::Invalid(errors) => VirtError::Conflict(
-                errors
-                    .iter()
-                    .map(|e| e.message.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            ),
+            lumen_pool::PoolError::NotFound(message) => VirtError::NotFound(message),
+            lumen_pool::PoolError::Conflict(message) => VirtError::Conflict(message),
+            lumen_pool::PoolError::Unavailable(message) => VirtError::Conflict(message),
+            lumen_pool::PoolError::Backend(message) => VirtError::Backend(anyhow::anyhow!(message)),
         }
     }
 }

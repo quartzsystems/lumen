@@ -15,7 +15,6 @@ use axum::extract::{Path, State};
 use axum::Json;
 use futures_util::StreamExt;
 
-use lumen_drbd::{ReplicatedVolumesResponse, VolumeCreate, VolumeView};
 use lumen_zfs::service::{DevicesResponse, IsosResponse, PoolView, PoolsResponse, VolumesResponse};
 use lumen_zfs::{Acknowledgements, IsoStoreView, PoolCreate};
 
@@ -188,186 +187,6 @@ pub async fn volumes(
     Ok(Json(state.storage.volumes(&pool).await?))
 }
 
-// --- replicated volumes -----------------------------------------------------
-
-/// GET /api/storage/replicated — every cluster's replicated volumes, grouped
-/// by cluster, definitions joined with whatever this node's DRBD can see.
-pub async fn replicated_volumes(
-    _session: Session,
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<ReplicatedVolumesResponse>, ApiError> {
-    Ok(Json(state.drbd.volumes().await?))
-}
-
-/// POST /api/storage/replicated — create a replicated volume: every member
-/// prepared whole, the initial sync skipped, the record written last. The
-/// answer is the volume as this node then sees it.
-pub async fn create_replicated_volume(
-    _session: Session,
-    State(state): State<Arc<AppState>>,
-    raw: Body,
-) -> Result<Json<VolumeView>, ApiError> {
-    let request: VolumeCreate = required_body(raw)?;
-    Ok(Json(state.drbd.create_volume(request).await?))
-}
-
-/// DELETE /api/storage/replicated/{cluster}/{name} — destroy every replica,
-/// then forget the volume. `i_understand_this_may_lose_data` required.
-pub async fn destroy_replicated_volume(
-    _session: Session,
-    State(state): State<Arc<AppState>>,
-    Path((cluster, name)): Path<(String, String)>,
-    raw: Body,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let request: DestroyPoolRequest = body(raw)?;
-    state
-        .drbd
-        .destroy_volume(
-            &cluster,
-            &name,
-            lumen_cluster::Acknowledgements {
-                may_lose_data: request.i_understand_this_may_lose_data,
-            },
-        )
-        .await?;
-    Ok(Json(serde_json::json!({ "destroyed": true })))
-}
-
-/// POST /api/storage/replicated/{cluster}/{name}/resize — grow the volume:
-/// every backing zvol, then the resource, then the record. Grow only.
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ResizeVolumeRequest {
-    pub size_bytes: u64,
-}
-
-pub async fn resize_replicated_volume(
-    _session: Session,
-    State(state): State<Arc<AppState>>,
-    Path((cluster, name)): Path<(String, String)>,
-    raw: Body,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let request: ResizeVolumeRequest = required_body(raw)?;
-    state
-        .drbd
-        .resize_volume(&cluster, &name, request.size_bytes)
-        .await?;
-    Ok(Json(serde_json::json!({ "resized": true })))
-}
-
-/// GET /api/storage/replicated/{cluster}/{name}/snapshots — this node's own
-/// replica's snapshots.
-pub async fn volume_snapshots(
-    _session: Session,
-    State(state): State<Arc<AppState>>,
-    Path((cluster, name)): Path<(String, String)>,
-) -> Result<Json<Vec<lumen_zfs::SnapshotInfo>>, ApiError> {
-    Ok(Json(state.drbd.volume_snapshots(&cluster, &name).await?))
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SnapshotRequest {
-    pub name: String,
-}
-
-/// POST /api/storage/replicated/{cluster}/{name}/snapshots — snapshot every
-/// replica, or none.
-pub async fn snapshot_volume(
-    _session: Session,
-    State(state): State<Arc<AppState>>,
-    Path((cluster, name)): Path<(String, String)>,
-    raw: Body,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let request: SnapshotRequest = required_body(raw)?;
-    state
-        .drbd
-        .snapshot_volume(&cluster, &name, &request.name)
-        .await?;
-    Ok(Json(serde_json::json!({ "snapshotted": true })))
-}
-
-/// DELETE /api/storage/replicated/{cluster}/{name}/snapshots/{snapshot}.
-pub async fn delete_volume_snapshot(
-    _session: Session,
-    State(state): State<Arc<AppState>>,
-    Path((cluster, name, snapshot)): Path<(String, String, String)>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    state
-        .drbd
-        .delete_snapshot(&cluster, &name, &snapshot)
-        .await?;
-    Ok(Json(serde_json::json!({ "deleted": true })))
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RollbackRequest {
-    pub snapshot: String,
-    /// The member whose snapshot becomes the one truth.
-    pub source: String,
-    #[serde(default)]
-    pub i_understand_this_may_lose_data: bool,
-}
-
-/// POST /api/storage/replicated/{cluster}/{name}/rollback — the
-/// transactional rollback: machine off, resource down everywhere, one
-/// member rolled back, up everywhere, peers resync from the source.
-pub async fn rollback_volume(
-    _session: Session,
-    State(state): State<Arc<AppState>>,
-    Path((cluster, name)): Path<(String, String)>,
-    raw: Body,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let request: RollbackRequest = required_body(raw)?;
-    state
-        .drbd
-        .rollback_volume(
-            &cluster,
-            &name,
-            &request.snapshot,
-            &request.source,
-            lumen_cluster::Acknowledgements {
-                may_lose_data: request.i_understand_this_may_lose_data,
-            },
-        )
-        .await?;
-    Ok(Json(serde_json::json!({ "rolled_back": true })))
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SplitBrainRequest {
-    /// The member whose divergent writes are discarded.
-    pub victim: String,
-    #[serde(default)]
-    pub i_understand_this_may_lose_data: bool,
-}
-
-/// POST /api/storage/replicated/{cluster}/{name}/resolve-split-brain — the
-/// guided recovery: victim named, its writes discarded, every side
-/// reconnected.
-pub async fn resolve_split_brain(
-    _session: Session,
-    State(state): State<Arc<AppState>>,
-    Path((cluster, name)): Path<(String, String)>,
-    raw: Body,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let request: SplitBrainRequest = required_body(raw)?;
-    state
-        .drbd
-        .resolve_split_brain(
-            &cluster,
-            &name,
-            &request.victim,
-            lumen_cluster::Acknowledgements {
-                may_lose_data: request.i_understand_this_may_lose_data,
-            },
-        )
-        .await?;
-    Ok(Json(serde_json::json!({ "resolved": true })))
-}
-
 /// GET /api/storage/iso — the media libraries and everything in them.
 pub async fn isos(
     _session: Session,
@@ -439,9 +258,9 @@ pub async fn delete_iso(
 /// GET /api/storage/pool — the pooled storage on this node's cluster, as it
 /// is right now.
 ///
-/// Three honest shapes in one response. `pool: null, error: null` is the
-/// standalone appliance (or a DRBD cluster): the console renders no section
-/// at all. `pool: null, error: "..."` is a drop-in that exists but could not
+/// Three honest shapes in one response. `pool: null, error: null` is a node
+/// with no pool — the standalone appliance among them: the console renders
+/// no section at all. `pool: null, error: "..."` is a drop-in that exists but could not
 /// be assembled — a broken deployment, shown as its own sentence rather than
 /// hidden behind an empty page. And a present pool is the observed view:
 /// every member's answer or its silence, every vdisk with its snapshots.
@@ -551,11 +370,10 @@ struct PoolDiskDeleteRequest {
 
 /// DELETE /api/storage/pool/disks/{name} — reap an orphaned pooled
 /// volume: one kept when its machine was deleted without a purge, which
-/// until now no operator surface could remove (the replicated-volume
-/// delete route only ever listed DRBD clusters — a recorded gap from the
-/// phase-4 exit test). Refused while any defined machine still
-/// references the device: detaching or deleting the machine is the
-/// honest way to free a disk it still names.
+/// no other operator surface can remove (a recorded gap from the phase-4
+/// exit test). Refused while any defined machine still references the
+/// device: detaching or deleting the machine is the honest way to free a
+/// disk it still names.
 pub async fn delete_pooled_disk(
     _session: Session,
     State(state): State<Arc<AppState>>,
@@ -581,7 +399,7 @@ pub async fn delete_pooled_disk(
             )));
         }
     }
-    use lumen_drbd::VmVolumes;
+    use lumen_pool::VmVolumes;
     pool_service(&state)?.destroy_disk(&device).await?;
     Ok(Json(serde_json::json!({ "deleted": true })))
 }

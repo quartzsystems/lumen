@@ -549,18 +549,6 @@ pub fn validate_create(
         .iter()
         .find(|c| c.definition.name == cluster_name);
 
-    // One replicated-storage engine per cluster, ever.
-    if record.is_some_and(|c| !c.volumes.is_empty()) {
-        errors.push(invalid(
-            ValidationCode::EngineConflict,
-            None,
-            format!(
-                "\"{cluster_name}\" has replicated DRBD volumes. A cluster runs one storage \
-                 engine, and this one is already spoken for."
-            ),
-        ));
-    }
-
     if !quorate {
         errors.push(invalid(
             ValidationCode::NotQuorate,
@@ -1667,7 +1655,7 @@ mod tests {
     /// A two-node environment, deserialized from the same JSON shape the
     /// replicated record actually carries — so the fixture cannot drift
     /// from the record types without failing loudly here.
-    fn membership(volumes: bool, core_members: &[&str]) -> EnvironmentMembership {
+    fn membership(core_members: &[&str]) -> EnvironmentMembership {
         let nodes: Vec<serde_json::Value> = ["lumen01", "lumen02"]
             .iter()
             .map(|name| {
@@ -1702,14 +1690,6 @@ mod tests {
                 })
             })
             .collect();
-        let volume_records: Vec<serde_json::Value> = if volumes {
-            vec![serde_json::json!({
-                "name": "alpha-v0", "size_bytes": 1, "zvol_bytes": 1,
-                "port": 7788, "minor": 1, "replicas": [],
-            })]
-        } else {
-            Vec::new()
-        };
         serde_json::from_value(serde_json::json!({
             "id": "env",
             "version": 1,
@@ -1728,7 +1708,6 @@ mod tests {
                     "management": { "subnet": "10.20.0.0/24", "members": [] },
                     "external": [],
                 },
-                "volumes": volume_records,
             }],
         }))
         .expect("the fixture matches the record's own shape")
@@ -1788,7 +1767,7 @@ mod tests {
 
     #[test]
     fn a_clean_request_validates_clean() {
-        let membership = membership(false, &["lumen01", "lumen02"]);
+        let membership = membership(&["lumen01", "lumen02"]);
         let request = request(
             &[("lumen01", &[("sdb", 0)]), ("lumen02", &[("sdb", 0)])],
             true,
@@ -1801,7 +1780,7 @@ mod tests {
     /// Every refusal, each by its code — the wizard matches on these.
     #[test]
     fn every_problem_is_reported_with_its_code() {
-        let membership = membership(true, &["lumen01"]);
+        let membership = membership(&["lumen01"]);
         let mut busy = free_disk("sdc");
         busy.claimed = true;
         busy.used_by = Some("mounted at /".into());
@@ -1820,7 +1799,6 @@ mod tests {
         let found = codes(&errors);
         for wanted in [
             "unacknowledged_destructive_operation",
-            "engine_conflict",
             "not_quorate",
             "pool_member_missing",     // lumen02 has no seat
             "node_not_in_environment", // lumen09
@@ -1835,7 +1813,7 @@ mod tests {
 
     #[test]
     fn a_seat_off_the_core_network_is_refused_by_name() {
-        let membership = membership(false, &["lumen01"]); // lumen02 has no Core seat
+        let membership = membership(&["lumen01"]); // lumen02 has no Core seat
         let request = request(
             &[("lumen01", &[("sdb", 0)]), ("lumen02", &[("sdb", 0)])],
             true,
@@ -1847,7 +1825,7 @@ mod tests {
 
     #[test]
     fn a_member_already_carrying_a_drop_in_is_refused() {
-        let membership = membership(false, &["lumen01", "lumen02"]);
+        let membership = membership(&["lumen01", "lumen02"]);
         let request = request(
             &[("lumen01", &[("sdb", 0)]), ("lumen02", &[("sdb", 0)])],
             true,
@@ -1868,7 +1846,7 @@ mod tests {
     /// every identity is minted before anything runs.
     #[test]
     fn the_plan_is_computed_whole_before_anything_runs() {
-        let membership = membership(false, &["lumen01", "lumen02"]);
+        let membership = membership(&["lumen01", "lumen02"]);
         let request = request(
             &[
                 ("lumen02", &[("sdc", 1), ("sdb", 0)]),

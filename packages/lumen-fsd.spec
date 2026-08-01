@@ -49,8 +49,7 @@ The data-plane daemon for LumenFS, Lumen's pooled storage: it serves each
 virtual disk as a block device the hypervisor opens, and replicates every
 acknowledged write to the pool's other member before acknowledging it. A
 write is durable when both members hold it, or when the cluster has
-confirmed the other member fenced — the same guarantee the appliance's
-DRBD volumes give, over a pooled store instead of a per-volume mirror.
+confirmed the other member fenced.
 
 Installed on every node that can carry storage and running on none of them
 until a pool is created: the daemon needs a brick to serve and a peer to

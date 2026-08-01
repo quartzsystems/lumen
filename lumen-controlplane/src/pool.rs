@@ -28,8 +28,8 @@ use lumen_pool::{PeeredFleet, PoolConfig, PoolPeers, PoolService};
 /// read once here; reshaping a pool when its cluster grows is phase 5's
 /// slice reassignment, which is where a live re-read belongs.
 pub enum PoolPresence {
-    /// No drop-in: the standalone appliance, or a cluster on the DRBD
-    /// engine. The common case, and not an error anywhere.
+    /// No drop-in: a node with no pool — the standalone appliance among
+    /// them. The common case, and not an error anywhere.
     Absent,
     /// The drop-in exists but no pool can be assembled from it. The console
     /// shows this sentence rather than an empty page, because "nothing to

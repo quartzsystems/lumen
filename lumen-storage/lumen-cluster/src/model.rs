@@ -36,10 +36,10 @@ pub const FENCE_RACE_DELAY_SECS: u32 = 10;
 #[serde(rename_all = "snake_case")]
 pub enum Regime {
     /// Two nodes, witness-less: corosync `two_node` + `wait_for_all`,
-    /// asymmetric fence delays, DRBD `fencing resource-and-stonith`.
+    /// asymmetric fence delays.
     TwoNode,
-    /// Three to five nodes: plain majority quorum, `no-quorum-policy=stop`,
-    /// DRBD quorum for three-replica volumes. None of the two-node mechanisms.
+    /// Three to five nodes: plain majority quorum, `no-quorum-policy=stop`.
+    /// None of the two-node mechanisms.
     Quorum,
 }
 
@@ -118,8 +118,7 @@ impl ClusterDefinition {
 }
 
 /// A usable cluster name: what corosync's `cluster_name` accepts without
-/// quoting games, and what a DRBD resource prefix and a firewall zone can be
-/// built from later. Lowercase letters, digits, and hyphens, starting with a
+/// quoting games, and what a firewall zone can be built from later. Lowercase letters, digits, and hyphens, starting with a
 /// letter — the same shape as a hostname label, because it ends up inside
 /// several files that were designed around one.
 pub fn valid_cluster_name(name: &str) -> bool {

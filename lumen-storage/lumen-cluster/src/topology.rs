@@ -1,9 +1,9 @@
 //! The topology engine: one renderer, two regimes.
 //!
 //! Everything that differs between a two-node cluster and a three-to-five
-//! node cluster is decided here and nowhere else. The rest of the crate — and
-//! `lumen-drbd` after it — asks this module what to write rather than
-//! carrying its own `if n == 2`. That is what makes the 2→3 scale-out a
+//! node cluster is decided here and nowhere else. The rest of the crate
+//! asks this module what to write rather than carrying its own
+//! `if n == 2`. That is what makes the 2→3 scale-out a
 //! regeneration instead of a migration: same engine, one more node, and the
 //! two-node mechanisms fall away because the renderer stops emitting them.
 //!
@@ -14,10 +14,9 @@
 //! | corosync quorum | `two_node: 1`, `wait_for_all: 1` | plain majority |
 //! | fence race | asymmetric `pcmk_delay_base` | none — quorum decides |
 //! | Pacemaker | (defaults) | `no-quorum-policy=stop` |
-//! | DRBD | `fencing resource-and-stonith` + handlers | volume quorum, suspend on loss |
 //!
 //! `tests::the_invariants_hold_for_every_supported_size` walks every N in
-//! 2..=5 and holds all four rows.
+//! 2..=5 and holds all three rows.
 
 use serde::Serialize;
 
@@ -41,22 +40,6 @@ pub struct FenceDevice {
     /// race. Getting this backwards inverts the preference, which is why the
     /// rendering is here, tested, and not assembled at a call site.
     pub delay_base_secs: u32,
-}
-
-/// How DRBD is told to behave for a volume in this cluster — the topology
-/// half of replication policy. `lumen-drbd` renders resource files from this
-/// rather than deciding for itself.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ReplicationPolicy {
-    /// `fencing resource-and-stonith` with the crm-fence-peer handlers: on a
-    /// lost peer, suspend I/O and outdate the peer through Pacemaker before
-    /// resuming. Two-node only — it is what makes auto-promote safe without
-    /// quorum.
-    pub fence_peer_through_pacemaker: bool,
-    /// DRBD's own `quorum majority` + `on-no-quorum suspend-io`. Set for
-    /// three-replica volumes in the quorum regime, where a majority of
-    /// replicas is a meaningful thing to have.
-    pub volume_quorum: bool,
 }
 
 /// The rendered shape of one cluster: everything `pcs cluster setup` and the
@@ -164,24 +147,6 @@ impl ClusterTopology {
         }
         properties
     }
-
-    /// The replication policy for a volume with `replicas` members in this
-    /// cluster. Integrity over availability in both regimes; the mechanism
-    /// differs because what a majority means differs.
-    pub fn replication_policy(&self, replicas: usize) -> ReplicationPolicy {
-        match self.regime() {
-            Regime::TwoNode => ReplicationPolicy {
-                fence_peer_through_pacemaker: true,
-                volume_quorum: false,
-            },
-            Regime::Quorum => ReplicationPolicy {
-                fence_peer_through_pacemaker: false,
-                // With two replicas there is no majority to have; the cluster
-                // quorum and fencing above are what protect those.
-                volume_quorum: replicas >= 3,
-            },
-        }
-    }
 }
 
 #[cfg(test)]
@@ -210,9 +175,9 @@ mod tests {
     }
 
     /// The whole point of this module, held for every supported size at once.
-    /// N=2 must carry all three special mechanisms; N>=3 must carry none of
-    /// them; and the fence-device and volume-membership invariants hold
-    /// everywhere. Exhaustive rather than sampled: the domain is four values.
+    /// N=2 must carry its special mechanisms; N>=3 must carry none of them;
+    /// and the fence-device invariants hold everywhere. Exhaustive rather
+    /// than sampled: the domain is four values.
     #[test]
     fn the_invariants_hold_for_every_supported_size() {
         for n in 2..=5usize {
@@ -248,10 +213,6 @@ mod tests {
                     "N=2 fence delays must be asymmetric, got {delays:?}"
                 );
                 assert!(
-                    topology.replication_policy(2).fence_peer_through_pacemaker,
-                    "N=2 volumes fence their peer through Pacemaker"
-                );
-                assert!(
                     !properties.iter().any(|(k, _)| k == "no-quorum-policy"),
                     "N=2 leaves quorum policy to two_node"
                 );
@@ -268,18 +229,6 @@ mod tests {
                 assert!(
                     properties.contains(&("no-quorum-policy".into(), "stop".into())),
                     "N={n} minority must stop"
-                );
-                assert!(
-                    !topology.replication_policy(2).fence_peer_through_pacemaker,
-                    "N={n} volumes rely on quorum, not peer fencing"
-                );
-                assert!(
-                    topology.replication_policy(3).volume_quorum,
-                    "N={n} three-replica volumes carry their own quorum"
-                );
-                assert!(
-                    !topology.replication_policy(2).volume_quorum,
-                    "N={n} two replicas have no majority to count"
                 );
             }
         }

@@ -8,8 +8,8 @@
 //!
 //! The job is the drain, and it lives here because it is the one part that
 //! spans domains: the machines are `virt`'s, where they may legally run is
-//! `drbd`'s, and who is eligible to receive them is `cluster`'s. Nothing below
-//! the control plane can see all three.
+//! the storage engine's, and who is eligible to receive them is `cluster`'s.
+//! Nothing below the control plane can see all three.
 //!
 //! ## The order, and why
 //!
@@ -342,15 +342,14 @@ async fn drain(state: &Arc<AppState>, machines: Vec<Machine>, by: &str) {
     state.drain.finish(WorkflowPhase::Complete, None, stranded);
 }
 
-/// Where one machine may go: a member that holds a **current** replica of
-/// every disk, is online, and is not itself out of service — carrying the
-/// fewest machines this drain has placed so far.
+/// Where one machine may go: a member that holds a replica of every disk,
+/// is online, and is not itself out of service — carrying the fewest
+/// machines this drain has placed so far.
 ///
-/// `common_members` answers where a machine *may* run, which is a question
-/// about the record. Whether the replica there is current is a question about
-/// DRBD, and migrating onto an `Inconsistent` or `SyncTarget` replica would
-/// leave the machine serving its disks over the network from the node being
-/// rebooted.
+/// `common_members` is the storage engine's own answer, and it carries the
+/// currency question with it: the pool resyncs a stale member itself and
+/// refuses service until it has, so a member it names is one the machine
+/// can genuinely land on.
 async fn choose_target(
     state: &Arc<AppState>,
     node: &str,
@@ -360,8 +359,8 @@ async fn choose_target(
     if machine.devices.is_empty() {
         return Err("This machine has no disks, so nothing names where it could run.".to_string());
     }
-    // The node's own engine answers, whichever one that is — asking DRBD
-    // by name on a pooled node refuses every /dev/ublkb device.
+    // The node's own engine answers — the drain never asks any engine by
+    // name about a device it did not make.
     let members = state
         .virt
         .common_members(&machine.devices)
@@ -369,15 +368,10 @@ async fn choose_target(
         .map_err(|err| format!("Where this machine can run could not be worked out: {err}"))?;
 
     let eligible = eligible_members(state, node).await?;
-    let current = current_replicas(state, &machine.devices).await;
 
     let mut candidates: Vec<&String> = members
         .iter()
-        .filter(|m| {
-            *m != node
-                && eligible.contains(*m)
-                && current.as_ref().is_none_or(|current| current.contains(*m))
-        })
+        .filter(|m| *m != node && eligible.contains(*m))
         .collect();
     if candidates.is_empty() {
         let known = members
@@ -390,7 +384,7 @@ async fn choose_target(
         } else {
             format!(
                 "No member that could take this machine is ready for it — {} hold replicas, but \
-                 none is both in service and fully in sync.",
+                 none is in service.",
                 known.join(", ")
             )
         });
@@ -423,54 +417,6 @@ async fn eligible_members(state: &Arc<AppState>, node: &str) -> Result<Vec<Strin
         .filter(|n| n.online && n.maintenance.is_none())
         .map(|n| n.node)
         .collect())
-}
-
-/// Nodes whose DRBD replica of every DRBD-backed device reads `UpToDate`
-/// — `None` when DRBD has nothing to say about any of them.
-///
-/// This is DRBD's currency question and it constrains only DRBD's own
-/// devices: a `/dev/drbd` volume DRBD cannot account for vetoes every
-/// candidate (conservative — a machine must not land on a replica nobody
-/// can vouch for), while a device belonging to another engine is that
-/// engine's business, already answered by `common_members` — the pool
-/// resyncs a stale member itself and refuses service until it has.
-async fn current_replicas(state: &Arc<AppState>, devices: &[String]) -> Option<Vec<String>> {
-    let drbd_backed: Vec<&String> = devices
-        .iter()
-        .filter(|device| device.starts_with("/dev/drbd"))
-        .collect();
-    if drbd_backed.is_empty() {
-        return None;
-    }
-    let Ok(volumes) = state.drbd.volumes().await else {
-        return Some(Vec::new());
-    };
-    let all: Vec<&lumen_drbd::VolumeView> = volumes
-        .clusters
-        .iter()
-        .flat_map(|cluster| cluster.volumes.iter())
-        .collect();
-
-    let mut current: Option<Vec<String>> = None;
-    for device in drbd_backed {
-        let Some(volume) = all.iter().find(|volume| volume.device == **device) else {
-            return Some(Vec::new());
-        };
-        let up_to_date: Vec<String> = volume
-            .replicas
-            .iter()
-            .filter(|replica| replica.disk_state.as_deref() == Some("UpToDate"))
-            .map(|replica| replica.node.clone())
-            .collect();
-        current = Some(match current {
-            None => up_to_date,
-            Some(previous) => previous
-                .into_iter()
-                .filter(|node| up_to_date.contains(node))
-                .collect(),
-        });
-    }
-    Some(current.unwrap_or_default())
 }
 
 /// The migration destination: the target's seat on its cluster's Core

@@ -147,7 +147,7 @@ async fn harness(tag: &str, signed_in_as: &str) -> Harness {
         Arc::new(lumen_virt::backend::mock::MockBackend::appliance()),
         storage.clone(),
         network.clone(),
-        Arc::new(lumen_drbd::MockVmVolumes::standalone()),
+        Arc::new(lumen_pool::MockVmVolumes::standalone()),
     ));
 
     let cluster = Arc::new(lumen_cluster::ClusterService::new(
@@ -156,12 +156,6 @@ async fn harness(tag: &str, signed_in_as: &str) -> Harness {
         network.clone(),
         &dir.0,
         "test",
-    ));
-    let drbd = Arc::new(lumen_drbd::DrbdService::new(
-        Arc::new(lumen_drbd::backend::mock::MockBackend::appliance()),
-        Arc::new(lumen_drbd::MockVolumePeers::new()),
-        cluster.clone(),
-        storage.clone(),
     ));
     let router = app(Arc::new(AppState {
         config,
@@ -174,7 +168,6 @@ async fn harness(tag: &str, signed_in_as: &str) -> Harness {
         virt,
         cluster,
         peers: Arc::new(lumen_controlplane::inventory::NoPeers),
-        drbd,
         pool: lumen_controlplane::pool::PoolPresence::Absent,
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
         updates: Arc::new(lumen_update::UpdateService::new(

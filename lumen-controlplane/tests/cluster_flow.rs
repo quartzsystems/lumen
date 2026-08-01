@@ -117,7 +117,7 @@ fn harness_with_storage(
         Arc::new(lumen_virt::backend::mock::MockBackend::appliance()),
         storage.clone(),
         network.clone(),
-        Arc::new(lumen_drbd::MockVmVolumes::standalone()),
+        Arc::new(lumen_pool::MockVmVolumes::standalone()),
     ));
     let sys = Arc::new(lumen_sys::SysService::new(
         Arc::new(lumen_sys::backend::mock::MockPower::appliance()),
@@ -137,12 +137,6 @@ fn harness_with_storage(
         cluster = cluster.with_environment(membership);
     }
     let cluster = Arc::new(cluster);
-    let drbd = Arc::new(lumen_drbd::DrbdService::new(
-        Arc::new(lumen_drbd::backend::mock::MockBackend::appliance()),
-        Arc::new(lumen_drbd::MockVolumePeers::new()),
-        cluster.clone(),
-        storage.clone(),
-    ));
     let state = AppState {
         config,
         jwt_secret: security::session_secret(TICKET_SECRET.to_vec()),
@@ -154,7 +148,6 @@ fn harness_with_storage(
         virt,
         cluster,
         peers: Arc::new(lumen_controlplane::inventory::NoPeers),
-        drbd,
         pool: lumen_controlplane::pool::PoolPresence::Absent,
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
         updates: Arc::new(lumen_update::UpdateService::new(
@@ -928,7 +921,7 @@ async fn a_cluster_create_reports_per_node_per_step_progress_and_completes() {
         Arc::new(lumen_virt::backend::mock::MockBackend::appliance()),
         storage.clone(),
         network.clone(),
-        Arc::new(lumen_drbd::MockVmVolumes::standalone()),
+        Arc::new(lumen_pool::MockVmVolumes::standalone()),
     ));
     let sys = Arc::new(lumen_sys::SysService::new(
         Arc::new(lumen_sys::backend::mock::MockPower::appliance()),
@@ -946,12 +939,6 @@ async fn a_cluster_create_reports_per_node_per_step_progress_and_completes() {
         .with_form_poll(Duration::from_millis(5))
         .with_environment(&membership),
     );
-    let drbd = Arc::new(lumen_drbd::DrbdService::new(
-        Arc::new(lumen_drbd::backend::mock::MockBackend::appliance()),
-        Arc::new(lumen_drbd::MockVolumePeers::new()),
-        cluster.clone(),
-        storage.clone(),
-    ));
     let router = app(Arc::new(AppState {
         config,
         jwt_secret: security::session_secret(TICKET_SECRET.to_vec()),
@@ -963,7 +950,6 @@ async fn a_cluster_create_reports_per_node_per_step_progress_and_completes() {
         virt,
         cluster,
         peers: Arc::new(lumen_controlplane::inventory::NoPeers),
-        drbd,
         pool: lumen_controlplane::pool::PoolPresence::Absent,
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
         updates: Arc::new(lumen_update::UpdateService::new(

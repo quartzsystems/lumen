@@ -204,17 +204,6 @@ impl From<lumen_cluster::ClusterError> for ApiError {
     }
 }
 
-impl From<lumen_drbd::DrbdError> for ApiError {
-    fn from(err: lumen_drbd::DrbdError) -> Self {
-        match err {
-            lumen_drbd::DrbdError::Invalid(errors) => ApiError::Validation(errors.into()),
-            lumen_drbd::DrbdError::NotFound(message) => ApiError::NotFound(message),
-            lumen_drbd::DrbdError::Conflict(message) => ApiError::Conflict(message),
-            lumen_drbd::DrbdError::Backend(err) => ApiError::Internal(err),
-        }
-    }
-}
-
 impl From<lumen_pool::PoolError> for ApiError {
     fn from(err: lumen_pool::PoolError) -> Self {
         match err {

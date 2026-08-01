@@ -14,8 +14,7 @@ live. What deliberately remains is listed at the end.
 
 ```
 lumen-storage/
-├── lumen-cluster/     the clustering domain (Rust library crate)
-└── lumen-drbd/        replicated volumes on top of it — see docs/storage.md
+└── lumen-cluster/     the clustering domain (Rust library crate)
 lumen-controlplane/
 ├── src/api/cluster.rs thin HTTP handlers over lumen-cluster
 ├── src/api/peer.rs    one control plane answering another
@@ -32,7 +31,7 @@ A fifth domain, laid out exactly as the other four:
 model.rs        what a cluster is: name, members, preferred node, BMCs
 environment.rs  the membership record, the CA, join tokens
 store.rs        the environment's state on disk: record, identity, tokens
-topology.rs     one renderer, two regimes: corosync.conf, fencing, DRBD policy
+topology.rs     one renderer, two regimes: corosync.conf and fencing
 networks.rs     typed cluster networks — Core, Management, External
 join.rs         the workflows: the peer channel, preflight, create + unwind
 state.rs        what corosync and Pacemaker actually report
@@ -116,16 +115,14 @@ CIB.
 ### One topology engine, two regimes
 
 Everything that differs between a two-node cluster and a three-to-five node
-cluster is decided in `topology.rs` and nowhere else. The rest of the crate —
-and `lumen-drbd` after it — asks the engine what to write rather than
-carrying its own `if n == 2`.
+cluster is decided in `topology.rs` and nowhere else. The rest of the crate
+asks the engine what to write rather than carrying its own `if n == 2`.
 
 | | two nodes | three to five |
 | --- | --- | --- |
 | corosync quorum | `two_node: 1`, `wait_for_all: 1` | plain majority |
 | fence race | asymmetric `pcmk_delay_base` | none — quorum decides |
 | Pacemaker | (defaults) | `no-quorum-policy=stop` |
-| DRBD | `fencing resource-and-stonith` + `stonith_admin-fence-peer.sh` | volume quorum, suspend on loss |
 
 Two nodes are a real regime, not a degenerate three: there is no majority to
 have, so `two_node` keeps the survivor quorate after fencing succeeds,
@@ -164,10 +161,10 @@ the first time it is needed.
 
 **The consequence is accepted, and it is this:** at any N, a partition that
 coincides with the BMC path being unreachable has no automatic resolution.
-Nothing can prove the peer is dead, so nothing pretends to. DRBD's fencing
-policy suspends I/O on the affected volumes — integrity over availability,
-always — until either the BMC path recovers and fencing completes on its own,
-or an operator performs the break-glass **confirm peer is dead** operation:
+Nothing can prove the peer is dead, so nothing pretends to. The pool
+suspends I/O rather than serve from the wrong side of a partition —
+integrity over availability, always — until either the BMC path recovers
+and fencing completes on its own, or an operator performs the break-glass **confirm peer is dead** operation:
 offered only while a peer is unfenced-unreachable, and only after typing the
 peer node's name and acknowledging — in the words of the dialog — that a
 wrongly-confirmed peer means both sides write the same volumes. Underneath
@@ -179,13 +176,13 @@ on the node's own row the moment the node is unfenced-unreachable, and
 nowhere else, because offering it anywhere else would be offering a way to
 corrupt data with one request.
 
-This one path carries more than Pacemaker's own recovery. A two-node
-volume's DRBD `fence-peer` handler is `stonith_admin-fence-peer.sh`, which
-fences the peer node through these same devices before the survivor is
-allowed to promote — so an untested fence device is not only a recovery
-that may not happen, it is a machine that may not start. That is the
-strongest argument for the live fence test being part of the create wizard
-rather than an afterwards.
+This one path carries more than Pacemaker's own recovery. The pool's own
+fence verdicts — the confirmation a survivor needs before it retires a
+dead holder's lease and serves its disks — come through these same
+devices, so an untested fence device is not only a recovery that may not
+happen, it is a machine that may not start. That is the strongest argument
+for the live fence test being part of the create wizard rather than an
+afterwards.
 
 Two things follow from having exactly one fence path. There is **no
 supported configuration with fencing disabled** — no API field, no UI
@@ -380,14 +377,12 @@ CIB like everyone else's; the **live** fence test remains a separate,
 deliberate operator act from the Nodes page — auto-firing a power cycle
 from inside a grow workflow would bypass everything the acknowledgement
 design exists for, a recorded deviation from the spec's "test it during the
-add". After the cluster domain finishes, the control plane chains the
-replicated-volume policy flip (docs/storage.md) — the dependency points
-that way, so the chaining lives above both.
+add".
 
-Existing volumes and machines keep running through all of it: the
-reconfigure is a reload, the delays flatten under a formed cluster, and the
-volume policy applies with `drbdadm adjust`. The newcomer is new capacity —
-no volume moves to it by itself.
+Existing machines keep running through all of it: the reconfigure is a
+reload, and the delays flatten under a formed cluster. The newcomer is new
+capacity — the pool takes it in through its own grow workflow, never as a
+side effect of the cluster's.
 
 ### Joining signs everyone out, and that is the join working
 
@@ -642,8 +637,8 @@ over an address nobody answers on.
 deliberate rather than pending. Their subnets and per-member addresses are
 corosync's ring addressing, written into `corosync.conf` on every member;
 changing one means rewriting that file everywhere, reloading corosync, and
-re-addressing each node's link — with DRBD's peer addresses riding Core and
-the console's own session riding Management. The machinery for the writes
+re-addressing each node's link — with the pool's peer addresses riding Core
+and the console's own session riding Management. The machinery for the writes
 exists (`ReconfigurePayload` does exactly this for the scale-out); what does
 not exist is the part that matters, which is a staged apply with a confirm
 window and an automatic rollback, of the kind the networking domain already

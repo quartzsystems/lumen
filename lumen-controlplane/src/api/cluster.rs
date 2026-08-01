@@ -428,9 +428,7 @@ pub async fn destroy_cluster(
 /// POST /api/environment/clusters/{name}/nodes — the 2→3 scale-out: an
 /// unassigned environment node joins a *running* cluster. Validation
 /// answers now; the workflow runs in the background and the create's
-/// pending feed is its progress too. When the regime flips, the volume
-/// replication policies are refreshed right after — chained here, because
-/// the cluster domain cannot reach the storage domain above it.
+/// pending feed is its progress too.
 pub async fn add_node(
     _session: Session,
     State(state): State<Arc<AppState>>,
@@ -450,18 +448,9 @@ pub async fn add_node(
         .cluster
         .create_progress()
         .expect("prepare_add_node begins the progress");
-    let cluster_name = name.clone();
     let state = state.clone();
     tokio::spawn(async move {
-        if state.cluster.execute_add_node(plan).await.is_ok() {
-            if let Err(err) = state.drbd.refresh_policies(&cluster_name).await {
-                tracing::error!(
-                    cluster = %cluster_name,
-                    "the node joined but the volume policies did not refresh — run the \
-                     scale-out's policy refresh again: {err}"
-                );
-            }
-        }
+        let _ = state.cluster.execute_add_node(plan).await;
     });
     Ok((StatusCode::ACCEPTED, Json(progress)))
 }

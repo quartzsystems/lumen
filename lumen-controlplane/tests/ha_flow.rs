@@ -10,12 +10,13 @@ use lumen_cluster::backend::ClusterBackend;
 use lumen_cluster::networks::{AddressedMember, ClusterNetworks, CoreNetwork, ManagementNetwork};
 use lumen_cluster::{
     BmcConfig, ClusterDefinition, ClusterRecord, ClusterService, EnvironmentMembership, MemberNode,
-    StoredDefinition, VolumeRecord, VolumeSeat,
+    StoredDefinition,
 };
 use lumen_controlplane::config::Config;
 use lumen_controlplane::realm::RealmRegistry;
 use lumen_controlplane::{ha, security, AppState};
 use lumen_net::NetworkService;
+use lumen_pool::{VmDiskRequest, VmVolumes};
 use lumen_virt::model::{VmConfig, VmDisk};
 use lumen_virt::VirtService;
 use lumen_zfs::StorageService;
@@ -34,8 +35,8 @@ impl TempDir {
     }
 }
 
-/// A two-node cluster "alpha" recorded whole, with one replicated volume on
-/// minor 1 — the disk of the machine the tests move around.
+/// A two-node cluster "alpha" recorded whole. The disk of the machine the
+/// tests move around lives in the pooled seam mock, seeded per test.
 fn alpha_membership() -> EnvironmentMembership {
     let mut membership = membership_of(&[("alpha-1", Some("alpha")), ("alpha-2", Some("alpha"))]);
     let member = |name: &str, octet: u8| MemberNode {
@@ -52,7 +53,7 @@ fn alpha_membership() -> EnvironmentMembership {
         interface: "nic1".into(),
         address: std::net::Ipv4Addr::new(10, 10, 0, octet),
     };
-    let mut record = ClusterRecord::new(
+    let record = ClusterRecord::new(
         ClusterDefinition {
             name: "alpha".into(),
             nodes: vec![member("alpha-1", 1), member("alpha-2", 2)],
@@ -72,23 +73,6 @@ fn alpha_membership() -> EnvironmentMembership {
             external: Vec::new(),
         },
     );
-    record.volumes.push(VolumeRecord {
-        name: "vm-101-disk-0".into(),
-        size_bytes: 1 << 30,
-        zvol_bytes: (1 << 30) + (1 << 20),
-        port: 7788,
-        minor: 1,
-        replicas: vec![
-            VolumeSeat {
-                node: "alpha-1".into(),
-                pool: "boot".into(),
-            },
-            VolumeSeat {
-                node: "alpha-2".into(),
-                pool: "boot".into(),
-            },
-        ],
-    });
     membership.clusters.push(record);
     membership
 }
@@ -123,7 +107,7 @@ fn ha_definition() -> StoredDefinition {
     StoredDefinition {
         vmid: 101,
         node: "alpha-2".into(),
-        xml: lumen_virt::domain_xml::render(&machine(101, "web01", true, "/dev/drbd1")),
+        xml: lumen_virt::domain_xml::render(&machine(101, "web01", true, "/dev/ublkb1")),
     }
 }
 
@@ -131,7 +115,24 @@ struct Harness {
     state: Arc<AppState>,
     cluster_backend: Arc<ClusterMockBackend>,
     virt_backend: Arc<lumen_virt::backend::mock::MockBackend>,
+    volumes: Arc<lumen_pool::MockVmVolumes>,
     _state_dir: TempDir,
+}
+
+impl Harness {
+    /// Seed the machine's pooled disk into the seam, so eligibility and the
+    /// adoption's own device checks answer the way a pooled cluster would.
+    /// The first seeded disk is `/dev/ublkb1`, which is what the stored
+    /// definitions name.
+    async fn seed_disk(&self) {
+        self.volumes
+            .create_disk(&VmDiskRequest {
+                name: "vm-101-disk-0".into(),
+                size_bytes: 1 << 30,
+            })
+            .await
+            .unwrap();
+    }
 }
 
 fn harness(tag: &str, cluster_backend: ClusterMockBackend) -> Harness {
@@ -163,22 +164,20 @@ fn harness(tag: &str, cluster_backend: ClusterMockBackend) -> Harness {
         .with_node("alpha-1")
         .with_environment(&alpha_membership()),
     );
-    let drbd = Arc::new(lumen_drbd::DrbdService::new(
-        Arc::new(lumen_drbd::backend::mock::MockBackend::appliance()),
-        Arc::new(lumen_drbd::MockVolumePeers::new()),
-        cluster.clone(),
-        storage.clone(),
+    let volumes = Arc::new(lumen_pool::MockVmVolumes::clustered(
+        "alpha",
+        &["alpha-1", "alpha-2"],
     ));
     let virt_backend = Arc::new(lumen_virt::backend::mock::MockBackend::appliance());
-    // The DRBD service IS the seam, exactly as main.rs wires an unpooled
-    // node — the HA sweep asks eligibility through VirtService now, and a
+    // The pooled seam mock IS the seam, exactly as main.rs wires a pooled
+    // node — the HA sweep asks eligibility through VirtService, and a
     // fixture that handed it a standalone mock would test a machine no
     // deployment runs.
     let virt = Arc::new(VirtService::new(
         virt_backend.clone(),
         storage.clone(),
         network.clone(),
-        drbd.clone(),
+        volumes.clone(),
     ));
     let state = Arc::new(AppState {
         config,
@@ -191,7 +190,6 @@ fn harness(tag: &str, cluster_backend: ClusterMockBackend) -> Harness {
         virt,
         cluster,
         peers: Arc::new(lumen_controlplane::inventory::NoPeers),
-        drbd,
         pool: lumen_controlplane::pool::PoolPresence::Absent,
         tasks: lumen_controlplane::tasks::TaskLog::ephemeral(),
         updates: Arc::new(lumen_update::UpdateService::new(
@@ -211,6 +209,7 @@ fn harness(tag: &str, cluster_backend: ClusterMockBackend) -> Harness {
         state,
         cluster_backend,
         virt_backend,
+        volumes,
         _state_dir: state_dir,
     }
 }
@@ -222,6 +221,7 @@ async fn an_unclean_member_is_waited_on_and_a_clean_loss_restarts_here() {
         "restart",
         ClusterMockBackend::environment().with_partition("alpha", "alpha-2"),
     );
+    harness.seed_disk().await;
     harness
         .state
         .cluster
@@ -285,7 +285,7 @@ async fn a_machine_without_the_flag_or_without_replicas_stays_down() {
         .peer_store_definition(&StoredDefinition {
             vmid: 102,
             node: "alpha-2".into(),
-            xml: lumen_virt::domain_xml::render(&machine(102, "db01", false, "/dev/drbd1")),
+            xml: lumen_virt::domain_xml::render(&machine(102, "db01", false, "/dev/ublkb1")),
         })
         .unwrap();
 
@@ -323,6 +323,7 @@ async fn a_node_in_maintenance_is_not_a_lost_node() {
         "maintenance",
         ClusterMockBackend::environment().with_partition("alpha", "alpha-2"),
     );
+    harness.seed_disk().await;
     harness
         .cluster_backend
         .confirm_node_dead("alpha-2")

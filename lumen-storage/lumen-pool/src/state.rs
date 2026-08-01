@@ -4,10 +4,9 @@
 //! of per-member answers into one verdict. Deliberately **not** stored:
 //! there is no pool record to consult here and nothing cached, because a
 //! pool's health is a fact about this instant and a remembered one is a
-//! stale one. The same rule `lumen-drbd`'s state module follows.
+//! stale one.
 //!
-//! Two honesty rules carried over from the DRBD side, both of which shaped
-//! these types more than anything else:
+//! Two honesty rules shaped these types more than anything else:
 //!
 //! **A member that does not answer is presented, not dropped.** A pool of
 //! two whose second member is unreachable is not a pool of one — it is a
