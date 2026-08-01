@@ -283,7 +283,10 @@ pub async fn power(
         crate::api::cluster::NodePowerAction::Off => lumen_cluster::HardPower::Off,
         crate::api::cluster::NodePowerAction::Cycle => lumen_cluster::HardPower::Cycle,
     };
-    state.cluster.power_member(&request.node, action, true).await?;
+    state
+        .cluster
+        .power_member(&request.node, action, true)
+        .await?;
     Ok(Json(
         serde_json::json!({ "node": request.node, "action": request.action }),
     ))

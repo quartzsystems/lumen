@@ -621,7 +621,11 @@ pub fn generate_mac(vmid: u32, index: u32) -> String {
 pub fn normalize_mac(mac: &str) -> Option<String> {
     let octets: Vec<u8> = mac
         .split(':')
-        .map(|part| u8::from_str_radix(part, 16).ok().filter(|_| part.len() == 2))
+        .map(|part| {
+            u8::from_str_radix(part, 16)
+                .ok()
+                .filter(|_| part.len() == 2)
+        })
         .collect::<Option<Vec<u8>>>()?;
     if octets.len() != 6 || octets[0] & 0x01 != 0 {
         return None;

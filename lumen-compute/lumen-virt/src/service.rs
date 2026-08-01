@@ -1977,7 +1977,12 @@ impl VirtService {
         let machine = self.machine(vmid).await?;
         let mut config = machine.config.clone();
 
-        let id = match request.mac.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+        let id = match request
+            .mac
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+        {
             Some(mac) => normalize_mac(mac).ok_or_else(|| {
                 VirtError::invalid(
                     ValidationError::new(
@@ -2092,7 +2097,12 @@ impl VirtService {
             ))
             .await?;
         let (applied_live, pending_reboot) = self
-            .live_device(&machine, true, &domain_xml::cdrom_fragment(&cdrom), &cdrom.id)
+            .live_device(
+                &machine,
+                true,
+                &domain_xml::cdrom_fragment(&cdrom),
+                &cdrom.id,
+            )
             .await;
 
         tracing::info!(vmid, cdrom = %cdrom.id, "optical drive attached");
@@ -2151,9 +2161,7 @@ impl VirtService {
                 Ok(()) => (vec![format!("\"{id}\" {what}")], Vec::new()),
                 Err(err) => (
                     Vec::new(),
-                    vec![format!(
-                        "\"{id}\" {what} when the machine restarts ({err})"
-                    )],
+                    vec![format!("\"{id}\" {what} when the machine restarts ({err})")],
                 ),
             }
         } else {
@@ -3427,7 +3435,11 @@ mod tests {
             image: None,
             source: None,
         };
-        let response = h.service.attach_cdrom(vm.vmid, empty.clone()).await.unwrap();
+        let response = h
+            .service
+            .attach_cdrom(vm.vmid, empty.clone())
+            .await
+            .unwrap();
         assert_eq!(response.vm.cdroms.len(), 1);
         assert_eq!(response.vm.cdroms[0].source, None);
         let id = response.vm.cdroms[0].id.clone();

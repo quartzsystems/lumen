@@ -364,7 +364,10 @@ async fn an_ova_becomes_a_machine_with_its_disks_filled() {
     assert_eq!(appliance["firmware"], "uefi");
     assert_eq!(appliance["scsi_controller"], "pvscsi");
     assert_eq!(appliance["disks"][0]["file"], "web-disk1.vmdk");
-    assert_eq!(appliance["disks"][0]["capacity"], 40u64 * 1024 * 1024 * 1024);
+    assert_eq!(
+        appliance["disks"][0]["capacity"],
+        40u64 * 1024 * 1024 * 1024
+    );
     assert_eq!(appliance["disks"][0]["bus"], "virtio-scsi");
     assert_eq!(appliance["nics"][0]["network"], "VM Network");
     assert_eq!(appliance["nics"][0]["model"], "vmxnet3");
@@ -475,7 +478,10 @@ async fn a_failed_fill_removes_the_half_imported_machine() {
     let done = h.settled().await;
     assert_eq!(done["phase"], "failed", "{done}");
     assert!(
-        done["error"].as_str().unwrap().contains("pretend converter"),
+        done["error"]
+            .as_str()
+            .unwrap()
+            .contains("pretend converter"),
         "{done}"
     );
 

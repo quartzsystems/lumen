@@ -655,7 +655,10 @@ pub async fn enter_maintenance(
                  of \"{node}\"."
             )));
         }
-        let progress = state.peers.enter_maintenance(&member, &principal(&session)).await?;
+        let progress = state
+            .peers
+            .enter_maintenance(&member, &principal(&session))
+            .await?;
         return Ok((StatusCode::ACCEPTED, Json(progress)));
     }
     let progress =
@@ -678,13 +681,16 @@ pub async fn exit_maintenance(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let member = member_of(&state, &name, &node)?;
     if node != state.cluster.node() {
-        state.peers.exit_maintenance(&member, &principal(&session)).await?;
+        state
+            .peers
+            .exit_maintenance(&member, &principal(&session))
+            .await?;
         return Ok(Json(serde_json::json!({ "in_service": true })));
     }
     let view = crate::maintenance::end(&state, &principal(&session)).await?;
-    Ok(Json(
-        serde_json::to_value(view).unwrap_or_else(|_| serde_json::json!({ "in_service": true })),
-    ))
+    Ok(Json(serde_json::to_value(view).unwrap_or_else(
+        |_| serde_json::json!({ "in_service": true }),
+    )))
 }
 
 /// The drain query: which node's drain, when not this one's.

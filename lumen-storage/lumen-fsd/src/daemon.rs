@@ -769,7 +769,11 @@ fn writer_loop(shared: &Arc<Shared>, peer: u8, stream: &mut TcpStream, incarnati
                 links = shared.out_ready.wait_timeout(links, TICK).unwrap().0;
             }
         };
-        if stream.write_all(&batch).and_then(|_| stream.flush()).is_err() {
+        if stream
+            .write_all(&batch)
+            .and_then(|_| stream.flush())
+            .is_err()
+        {
             // The reader will hit the same corpse and run the teardown.
             let _ = stream.shutdown(Shutdown::Both);
             return;

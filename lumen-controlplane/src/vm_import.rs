@@ -201,13 +201,15 @@ impl ImportState {
         expected: Option<u64>,
     ) -> Result<OvaUpload, ApiError> {
         let final_path = self.path(name)?;
-        tokio::fs::create_dir_all(&self.spool).await.map_err(|err| {
-            ApiError::Conflict(format!(
-                "The import spool at {} cannot be written ({err}). Update the appliance \
+        tokio::fs::create_dir_all(&self.spool)
+            .await
+            .map_err(|err| {
+                ApiError::Conflict(format!(
+                    "The import spool at {} cannot be written ({err}). Update the appliance \
                  packages and restart the control plane so its unit allows the spool.",
-                self.spool.display()
-            ))
-        })?;
+                    self.spool.display()
+                ))
+            })?;
         if tokio::fs::metadata(&final_path).await.is_ok() {
             return Err(ApiError::Conflict(format!(
                 "\"{name}\" is already in the import spool. Remove it first, or import it."
@@ -803,9 +805,13 @@ async fn run_import(
         Err(err) => {
             let reason = err.to_string();
             if let Some(vmid) = requested {
-                state
-                    .tasks
-                    .record(vmid, "import", format!("Import {source}"), by, Some(reason.clone()));
+                state.tasks.record(
+                    vmid,
+                    "import",
+                    format!("Import {source}"),
+                    by,
+                    Some(reason.clone()),
+                );
             }
             import.set_step("define", StepState::Failed, Some(reason.clone()));
             import.finish(WorkflowPhase::Failed, Some(reason));
@@ -837,7 +843,14 @@ async fn run_import(
             // Cannot happen — the create request had one disk per archive
             // disk — but if it ever does, refusing beats filling the wrong
             // volume.
-            unwind(state, vmid, &step, "The defined machine is missing a disk.", &by).await;
+            unwind(
+                state,
+                vmid,
+                &step,
+                "The defined machine is missing a disk.",
+                &by,
+            )
+            .await;
             return;
         };
         import.set_step(&step, StepState::Running, Some("0%".into()));

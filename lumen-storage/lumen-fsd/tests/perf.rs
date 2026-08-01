@@ -39,7 +39,10 @@ struct Scratch(std::path::PathBuf);
 impl Scratch {
     fn new(name: &str) -> Scratch {
         let mut path = std::env::temp_dir();
-        path.push(format!("lumen-fsd-perf-{}-{name}.brick", std::process::id()));
+        path.push(format!(
+            "lumen-fsd-perf-{}-{name}.brick",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&path);
         Scratch(path)
     }
@@ -97,7 +100,9 @@ fn synced_pair() -> (Daemon, Daemon, Scratch, Scratch) {
 /// flatter, without a rand dependency: an LCG stirred into every word.
 fn fill_random(buffer: &mut [u8], seed: &mut u64) {
     for chunk in buffer.chunks_mut(8) {
-        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let bytes = seed.to_le_bytes();
         chunk.copy_from_slice(&bytes[..chunk.len()]);
     }
@@ -105,7 +110,9 @@ fn fill_random(buffer: &mut [u8], seed: &mut u64) {
 
 /// A pseudo-random aligned offset inside the vdisk for `len`-byte ops.
 fn random_offset(len: u64, seed: &mut u64) -> u64 {
-    *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    *seed = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     let slots = VDISK_BYTES / len;
     (*seed >> 16) % slots * len
 }

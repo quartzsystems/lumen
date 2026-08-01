@@ -75,11 +75,13 @@ impl DeviceRoots {
 
 /// Kernel names that are never a disk somebody builds a pool on.
 ///
-/// `zd*` is the important one: those are ZFS's own volumes, and offering a
-/// guest's disk as a candidate for a new pool would be a spectacular way to
-/// lose a virtual machine.
+/// `zd*` and `ublk*` are the important ones: ZFS's own volumes and the
+/// LumenFS pool's own exports — each one a guest's disk wearing a block
+/// device's clothes, and offering it as a candidate for a new pool (or,
+/// worse, as reclaimable) would be a spectacular way to lose a virtual
+/// machine.
 fn is_a_real_disk(name: &str) -> bool {
-    const NEVER: [&str; 7] = ["loop", "ram", "zram", "dm-", "md", "sr", "zd"];
+    const NEVER: [&str; 8] = ["loop", "ram", "zram", "dm-", "md", "sr", "zd", "ublk"];
     !NEVER.iter().any(|prefix| name.starts_with(prefix))
 }
 
@@ -420,10 +422,18 @@ mod tests {
         disk("sda", 2_147_483_648, "1", &["sda1", "sda2", "sda3"]);
         disk("sdb", 2_147_483_648, "0", &["sdb1"]);
         disk("nvme0n1", 2_147_483_648, "0", &[]);
-        // Not disks: a loopback, a CD, and a ZFS volume belonging to a guest.
+        // Not disks: a loopback, a CD, a ZFS volume belonging to a guest,
+        // and the LumenFS pool's own export — a guest's disk too, wearing
+        // the partitions its OS installer wrote.
         disk("loop0", 1024, "0", &[]);
         disk("sr0", 1024, "1", &[]);
         disk("zd0", 2_147_483_648, "0", &[]);
+        disk(
+            "ublkb25600",
+            268_435_456,
+            "0",
+            &["ublkb25600p1", "ublkb25600p2"],
+        );
         // A card reader with nothing in it.
         disk("sdz", 0, "1", &[]);
 
@@ -471,8 +481,10 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// `zd*` is a guest's own disk. Offering one as a candidate for a new pool
-    /// would destroy a virtual machine.
+    /// `zd*` and `ublk*` are a guest's own disk. Offering one as a candidate
+    /// for a new pool — or as reclaimable, which is how a pooled machine
+    /// disk actually appeared on the console — would destroy a virtual
+    /// machine.
     #[test]
     fn things_that_are_not_disks_are_not_offered_at_all() {
         let (roots, root) = node("not-disks");
@@ -481,7 +493,7 @@ mod tests {
 
         assert!(names.contains(&"sda"));
         assert!(names.contains(&"nvme0n1"));
-        for never in ["loop0", "sr0", "zd0", "sdz"] {
+        for never in ["loop0", "sr0", "zd0", "sdz", "ublkb25600"] {
             assert!(!names.contains(&never), "{never} must not be offered");
         }
         let _ = fs::remove_dir_all(root);

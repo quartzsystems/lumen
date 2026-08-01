@@ -159,12 +159,14 @@ pub fn read_appliance(path: &Path) -> Result<OvaAppliance> {
         .collect();
     let mut disks = Vec::new();
     for disk in parsed.disks {
-        let member = by_name.get(disk.file.trim_start_matches("./")).ok_or_else(|| {
-            VirtError::Conflict(format!(
-                "The descriptor names \"{}\" as a disk, but the archive does not contain it.",
-                disk.file
-            ))
-        })?;
+        let member = by_name
+            .get(disk.file.trim_start_matches("./"))
+            .ok_or_else(|| {
+                VirtError::Conflict(format!(
+                    "The descriptor names \"{}\" as a disk, but the archive does not contain it.",
+                    disk.file
+                ))
+            })?;
         disks.push(OvaDisk {
             file: disk.file,
             capacity: disk.capacity,
@@ -209,7 +211,8 @@ fn tar_members(file: &mut File) -> Result<Vec<TarMember>> {
     let mut header = [0u8; 512];
 
     while offset + 512 <= total {
-        file.seek(SeekFrom::Start(offset)).map_err(VirtError::from)?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(VirtError::from)?;
         file.read_exact(&mut header).map_err(VirtError::from)?;
         if header.iter().all(|byte| *byte == 0) {
             break; // The end-of-archive marker.
@@ -272,7 +275,10 @@ fn tar_members(file: &mut File) -> Result<Vec<TarMember>> {
 
 /// A NUL-terminated text field.
 fn text_field(field: &[u8]) -> String {
-    let end = field.iter().position(|byte| *byte == 0).unwrap_or(field.len());
+    let end = field
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(field.len());
     String::from_utf8_lossy(&field[..end]).trim().to_string()
 }
 
@@ -376,7 +382,9 @@ fn parse_descriptor(xml: &str) -> Result<ParsedDescriptor> {
 
     loop {
         let event = reader.read_event().map_err(|err| {
-            VirtError::Conflict(format!("The appliance descriptor is not readable XML: {err}"))
+            VirtError::Conflict(format!(
+                "The appliance descriptor is not readable XML: {err}"
+            ))
         })?;
         let empty = matches!(event, Event::Empty(_));
 
@@ -429,8 +437,17 @@ fn parse_descriptor(xml: &str) -> Result<ParsedDescriptor> {
                     _ => {}
                 }
                 if empty {
-                    close_element(&mut path, &mut item, &mut warnings, &mut vcpus, &mut memory_mib,
-                        &mut controllers, &mut scsi_sub_type, &mut disk_items, &mut nics);
+                    close_element(
+                        &mut path,
+                        &mut item,
+                        &mut warnings,
+                        &mut vcpus,
+                        &mut memory_mib,
+                        &mut controllers,
+                        &mut scsi_sub_type,
+                        &mut disk_items,
+                        &mut nics,
+                    );
                 }
             }
             Event::Text(ref text) => {
@@ -452,8 +469,17 @@ fn parse_descriptor(xml: &str) -> Result<ParsedDescriptor> {
                 }
             }
             Event::End(_) => {
-                close_element(&mut path, &mut item, &mut warnings, &mut vcpus, &mut memory_mib,
-                    &mut controllers, &mut scsi_sub_type, &mut disk_items, &mut nics);
+                close_element(
+                    &mut path,
+                    &mut item,
+                    &mut warnings,
+                    &mut vcpus,
+                    &mut memory_mib,
+                    &mut controllers,
+                    &mut scsi_sub_type,
+                    &mut disk_items,
+                    &mut nics,
+                );
             }
             _ => {}
         }
@@ -515,7 +541,9 @@ fn parse_descriptor(xml: &str) -> Result<ParsedDescriptor> {
         let Some(claimed) = disk_items.iter().find(|item| &item.disk_id == id) else {
             // A disk in the section no hardware item claims is not attached
             // to the machine.
-            warnings.push(format!("Disk \"{id}\" is in the archive but attached to nothing."));
+            warnings.push(format!(
+                "Disk \"{id}\" is in the archive but attached to nothing."
+            ));
             continue;
         };
         let Some(href) = files.get(file_ref) else {
@@ -548,7 +576,11 @@ fn parse_descriptor(xml: &str) -> Result<ParsedDescriptor> {
         });
     }
 
-    let name = if system_name.is_empty() { system_id } else { system_name };
+    let name = if system_name.is_empty() {
+        system_id
+    } else {
+        system_name
+    };
     Ok(ParsedDescriptor {
         name,
         vcpus: vcpus.unwrap_or(1),
@@ -828,7 +860,10 @@ mod tests {
         assert_eq!(parsed.memory_mib, 4096);
         assert_eq!(parsed.firmware, Firmware::Uefi);
         assert_eq!(parsed.scsi_controller, Some(ScsiController::Pvscsi));
-        assert_eq!(parsed.os.as_deref(), Some("Red Hat Enterprise Linux 9 (64-bit)"));
+        assert_eq!(
+            parsed.os.as_deref(),
+            Some("Red Hat Enterprise Linux 9 (64-bit)")
+        );
 
         assert_eq!(parsed.disks.len(), 2);
         assert_eq!(parsed.disks[0].file, "web-disk1.vmdk");
@@ -951,10 +986,12 @@ mod tests {
         // disks' own bytes, which is what the converter will do.
         let mut file = File::open(&path).unwrap();
         let mut byte = [0u8; 1];
-        file.seek(SeekFrom::Start(appliance.disks[0].offset)).unwrap();
+        file.seek(SeekFrom::Start(appliance.disks[0].offset))
+            .unwrap();
         file.read_exact(&mut byte).unwrap();
         assert_eq!(byte[0], 0xAA);
-        file.seek(SeekFrom::Start(appliance.disks[1].offset)).unwrap();
+        file.seek(SeekFrom::Start(appliance.disks[1].offset))
+            .unwrap();
         file.read_exact(&mut byte).unwrap();
         assert_eq!(byte[0], 0xBB);
 
@@ -963,10 +1000,7 @@ mod tests {
 
     #[test]
     fn a_disk_the_archive_does_not_contain_is_refused_by_name() {
-        let bytes = tar(&[
-            ("web.ovf", DESCRIPTOR.as_bytes()),
-            ("web-disk1.vmdk", b"x"),
-        ]);
+        let bytes = tar(&[("web.ovf", DESCRIPTOR.as_bytes()), ("web-disk1.vmdk", b"x")]);
         let path = write_archive("missing", &bytes);
         let err = read_appliance(&path).unwrap_err();
         assert!(err.to_string().contains("web-disk2.vmdk"), "{err}");
