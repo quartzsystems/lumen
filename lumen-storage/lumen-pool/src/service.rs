@@ -212,54 +212,61 @@ impl PoolService {
             _ => return PoolState::none(),
         };
 
-        let mut members = Vec::with_capacity(names.len());
-        for name in &names {
-            let view = match self.fleet.status(name).await {
+        // Every member is asked at once. Each remote call opens its own
+        // connection, so asking in sequence would bill the page the sum of
+        // the round trips — concurrently, it waits for the slowest one.
+        let views = futures_util::future::join_all(names.iter().map(|name| async move {
+            match self.fleet.status(name).await {
                 Ok(status) => MemberView::Answered(status),
                 Err(why) => MemberView::Silent(why.to_string()),
-            };
-            members.push(PoolMember {
+            }
+        }))
+        .await;
+        let members: Vec<PoolMember> = names
+            .iter()
+            .zip(views)
+            .map(|(name, view)| PoolMember {
                 name: name.clone(),
                 view,
-            });
-        }
+            })
+            .collect();
 
         // Exports are per-member, so every member is asked; a silent one
         // contributes nothing rather than an empty list that would read as
         // "serving nothing".
+        //
+        // The vdisk listing and the leases are replicated, and they arrived
+        // with the status — so one answering member speaks for the pool and
+        // nothing is asked twice. Snapshots are replicated too, but they are
+        // not in the status line, so the same speaker is asked once for the
+        // whole pool's rather than once per disk — in the same wave as the
+        // exports, because neither waits on the other.
         let answering: Vec<String> = members
             .iter()
             .filter(|m| m.view.status().is_some())
             .map(|m| m.name.clone())
             .collect();
-        let mut exports: Vec<(String, Vec<u64>)> = Vec::new();
-        for name in &answering {
-            if let Ok(serving) = self.fleet.exports(name).await {
-                exports.push((
+        let speaker = answering.first().cloned();
+        let (exports, snapshots) = tokio::join!(
+            futures_util::future::join_all(answering.iter().map(|name| async move {
+                let serving = self.fleet.exports(name).await.ok()?;
+                Some((
                     name.clone(),
-                    serving.into_iter().map(|(id, _)| id).collect(),
-                ));
+                    serving.into_iter().map(|(id, _)| id).collect::<Vec<u64>>(),
+                ))
+            })),
+            async {
+                match &speaker {
+                    Some(speaker) => self
+                        .fleet
+                        .snapshots(speaker, None)
+                        .await
+                        .unwrap_or_default(),
+                    None => Vec::new(),
+                }
             }
-        }
-
-        // The vdisk listing and the leases are replicated, and they arrived
-        // with the status — so one answering member speaks for the pool and
-        // nothing is asked twice. Snapshots are replicated too, but they are
-        // not in the status line, so the same speaker is asked once for the
-        // whole pool's rather than once per disk.
-        let speaker = members
-            .iter()
-            .filter(|m| m.view.status().is_some())
-            .map(|m| m.name.clone())
-            .next();
-        let snapshots = match &speaker {
-            Some(speaker) => self
-                .fleet
-                .snapshots(speaker, None)
-                .await
-                .unwrap_or_default(),
-            None => Vec::new(),
-        };
+        );
+        let exports: Vec<(String, Vec<u64>)> = exports.into_iter().flatten().collect();
         let vdisks = members
             .iter()
             .filter_map(|m| m.view.status())

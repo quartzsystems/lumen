@@ -43,6 +43,10 @@ export function PooledStorageSection() {
   const [pool, setPool] = useState<PooledStorageView | null>(null);
   const [broken, setBroken] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /// Whether the first answer has arrived. Until it has, the section
+  /// renders nothing — "still loading" must never look like "no pool",
+  /// or every page open starts with an invitation to create one.
+  const [loaded, setLoaded] = useState(false);
   const [snapshotting, setSnapshotting] = useState<PoolVdisk | null>(null);
   const [creating, setCreating] = useState(false);
   const [destroying, setDestroying] = useState(false);
@@ -59,6 +63,8 @@ export function PooledStorageSection() {
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) return;
       setError(err instanceof Error ? err.message : "Could not read the pool.");
+    } finally {
+      setLoaded(true);
     }
   }, []);
 
@@ -101,8 +107,10 @@ export function PooledStorageSection() {
 
   if (!pool && !broken && !error) {
     // No pool here. On a clustered node that is an invitation, not an
-    // absence — the drive wizard's front door.
-    if (!eligible) return null;
+    // absence — the drive wizard's front door. But only once the server
+    // has actually said so: before the first answer this knows nothing,
+    // and an invitation would read as the pool having vanished.
+    if (!eligible || !loaded) return null;
     return (
       <section className="flex flex-col gap-2">
         <div className="callout">

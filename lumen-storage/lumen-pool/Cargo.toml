@@ -28,6 +28,9 @@ lumen-fs = { path = "../lumen-fs" }
 lumen-sys = { path = "../../lumen-system/lumen-sys" }
 anyhow = "1"
 async-trait = "0.1"
+# `join_all`: the observed view asks every member at once, so the console
+# page waits for the slowest answer instead of the sum of them.
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 # The peer channel carries typed verbs between control planes, and the
 # observed view is served as JSON to the console.
 serde = { version = "1", features = ["derive"] }
