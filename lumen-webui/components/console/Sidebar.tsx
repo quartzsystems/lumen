@@ -5,10 +5,8 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { NAV, type NavItem } from "@/lib/nav";
-import { SidebarVms } from "@/components/console/SidebarVms";
 import { getCurrentUser, logout as apiLogout } from "@/lib/authClient";
 import type { AuthUserInfo } from "@/lib/authClient";
-import { useVmsOptional } from "@/lib/VmContext";
 
 /// Avatar initials — the first two letters of the username. The built-in realm
 /// authenticates OS accounts, which carry no display name.
@@ -21,9 +19,6 @@ export function Sidebar({ onOpenPalette }: { onOpenPalette: () => void }) {
   const pathname = (usePathname() ?? "/").replace(/\/+$/, "") || "/";
   const router = useRouter();
   const [user, setUser] = useState<AuthUserInfo | null>(null);
-  // Which machine is open, if any. Only used to decide whether the Virtual
-  // Machines item is itself the destination — see below.
-  const openVm = useVmsOptional()?.selected ?? null;
 
   // localStorage is unavailable during prerender — read it after mount.
   useEffect(() => {
@@ -134,31 +129,13 @@ export function Sidebar({ onOpenPalette }: { onOpenPalette: () => void }) {
             );
           }
 
-          // A machine that is open is the destination, and its own row below
-          // says so. Lighting the parent as well would claim two places at
-          // once — the same reason a section with children never lights up.
-          const active =
-            pathname.startsWith(item.href) && !(item.id === "virtual-machines" && openVm !== null);
-          const link = (
+          const active = pathname.startsWith(item.href);
+          return (
             <Link key={item.id} href={item.href} className={itemClass(active)}>
               <Icon size={16} />
               <span>{item.label}</span>
             </Link>
           );
-
-          // Machines hang off their nav item as live data rather than as nav
-          // entries: lib/nav.ts is static and they are not. See SidebarVms.
-          if (item.id === "virtual-machines") {
-            return (
-              <div key={item.id}>
-                {link}
-                <div className="ml-[26px] mt-[2px]">
-                  <SidebarVms />
-                </div>
-              </div>
-            );
-          }
-          return link;
         })}
       </div>
 

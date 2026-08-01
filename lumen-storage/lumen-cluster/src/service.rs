@@ -1190,10 +1190,45 @@ impl ClusterService {
         Ok(merged)
     }
 
+    /// Bring the record's row for this node up to the control plane actually
+    /// running. The row is written at join and then trusted, so a package
+    /// update plus restart left every console showing the version this node
+    /// joined with, forever. Stamped before each gossip send rather than once
+    /// at startup: last-writer-wins can drop a bump that tied with a
+    /// concurrent write, and a stamp that repeats until the record agrees
+    /// heals that on the next pass.
+    async fn note_own_version(&self) {
+        let _guard = self.gate.lock().await;
+        let Ok(Some(mut membership)) = self.membership() else {
+            return;
+        };
+        let Some(node) = membership.nodes.iter_mut().find(|n| n.name == self.node) else {
+            return;
+        };
+        if node.controlplane_version == self.controlplane_version {
+            // Already true. The counter is what makes every peer re-read the
+            // record; spending it on nothing would be noise (see
+            // set_maintenance's no-op).
+            return;
+        }
+        node.controlplane_version = self.controlplane_version.clone();
+        membership.version += 1;
+        match self.store.save_membership(&membership) {
+            Ok(()) => tracing::info!(
+                version = %self.controlplane_version,
+                "the membership record caught up with the running control plane"
+            ),
+            Err(err) => {
+                tracing::warn!("the record did not take this node's version: {err}")
+            }
+        }
+    }
+
     /// Gossip send: push our record to every peer, adopt anything newer that
     /// comes back. Best-effort by design — an unreachable peer is reported
     /// by the environment view, not by gossip failing loudly every minute.
     pub async fn gossip_once(&self) {
+        self.note_own_version().await;
         let Ok(Some(mut membership)) = self.membership() else {
             return;
         };
@@ -4110,6 +4145,51 @@ mod tests {
         stranger.version = 99;
         let kept = service.receive_membership(stranger).await.unwrap();
         assert_eq!(kept.version, 9, "a stranger's record is never adopted");
+    }
+
+    /// The record's row for a node is written at join and never touched
+    /// again, so a package update plus restart left every console showing
+    /// the version the node joined with. Gossip now stamps the running
+    /// version first — and only when it differs, because the counter makes
+    /// every peer re-read the record.
+    #[tokio::test]
+    async fn gossip_stamps_the_running_version_into_the_record() {
+        // Joined as 0.3.0 (what membership_of writes); running 0.4.0 — the
+        // shape a dnf update plus restart leaves behind.
+        let membership = membership_of(&[("alpha-1", None), ("alpha-2", None)]);
+        let service = Arc::new(
+            ClusterService::new(
+                Arc::new(MockBackend::appliance()),
+                Arc::new(MockPeers::new()),
+                network(),
+                &test_dir("version-stamp"),
+                "0.4.0",
+            )
+            .with_node("alpha-1")
+            .with_environment(&membership),
+        );
+        let before = service.environment_record().unwrap().unwrap().version;
+
+        service.gossip_once().await;
+
+        let record = service.environment_record().unwrap().unwrap();
+        assert_eq!(
+            record.node("alpha-1").unwrap().controlplane_version,
+            "0.4.0"
+        );
+        assert_eq!(
+            record.node("alpha-2").unwrap().controlplane_version,
+            "0.3.0",
+            "a peer's row is its own to stamp"
+        );
+        assert_eq!(record.version, before + 1);
+
+        // Already true: the next pass must not spend the counter on nothing.
+        service.gossip_once().await;
+        assert_eq!(
+            service.environment_record().unwrap().unwrap().version,
+            before + 1
+        );
     }
 
     // --- maintenance --------------------------------------------------------

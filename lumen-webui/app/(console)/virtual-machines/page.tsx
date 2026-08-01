@@ -472,6 +472,7 @@ function VmTable({
       searchPlaceholder="Search machines…"
       emptyMessage="No machines on this node yet."
       onRefresh={onRefresh}
+      onRowOpen={onOpen}
       // Open and the one obvious lifecycle control. Everything else lives on
       // the machine's own page — a menu in a table cell earns its keep only
       // when the row is the only place to act, and it no longer is. The cell

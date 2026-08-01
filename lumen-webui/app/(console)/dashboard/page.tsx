@@ -43,6 +43,7 @@ import {
   type InventoryResponse,
   type PooledCapacity,
 } from "@/lib/inventoryClient";
+import { fetchPooledStorage, type PooledStorageView } from "@/lib/poolClient";
 import { ringsByNode, ringState, vipState } from "@/lib/networkStatus";
 
 /// Matches lib/VmContext.tsx: often enough that the page feels live, slow
@@ -108,11 +109,15 @@ export default function DashboardPage() {
   /// What every member has, which is the only way a cluster row can add up
   /// its members' processors, memory, and disks.
   const [inventory, setInventory] = useState<InventoryResponse | null>(null);
+  /// The LumenFS pool this node serves, if any. Its bricks are not zpools, so
+  /// the inventory's sums know nothing about it — the cluster row asks here
+  /// for the replicated capacity.
+  const [lumenPool, setLumenPool] = useState<PooledStorageView | null>(null);
 
   // Settled rather than all: a dashboard is six independent readings, and one
   // subsystem being down must not blank the five that are up.
   const load = useCallback(async () => {
-    const [nodes, interfaces, staged, storage, log, environment, everyone] =
+    const [nodes, interfaces, staged, storage, log, environment, everyone, pool] =
       await Promise.allSettled([
         fetchNodes(),
         fetchInterfaces(),
@@ -121,6 +126,7 @@ export default function DashboardPage() {
         fetchRecentTasks(LOG_ROWS),
         fetchEnvironment(),
         fetchInventory(),
+        fetchPooledStorage(),
       ]);
 
     const failed: string[] = [];
@@ -148,6 +154,9 @@ export default function DashboardPage() {
     take(log, "the log", (value) => setTasks(value.tasks));
     take(environment, "the environment", (value) => setClusters(value.clusters));
     take(everyone, "the other members", setInventory);
+    // `pool: null` is the ordinary unpooled node, not a failure — only a
+    // request that errored joins the unread list.
+    take(pool, "pooled storage", (value) => setLumenPool(value.pool));
     setUnread(failed);
 
     // The shared network definitions live one request per cluster behind the
@@ -432,11 +441,12 @@ export default function DashboardPage() {
                         <th style={{ width: 130 }}>Quorum</th>
                         <th style={{ width: 100 }}>Cores</th>
                         <th style={{ width: 130 }}>RAM</th>
-                        {/* Raw, and labelled raw. A replicated volume costs its
-                            full size on every member holding a replica, so the
-                            sum of the pools is what the hardware is — not what
-                            a machine may be given. */}
-                        <th style={{ width: 130 }}>Storage (raw)</th>
+                        {/* What machines may be given, not what the hardware
+                            is: each member's zpools count once (nothing local
+                            is replicated), and the LumenFS pool contributes
+                            its usable figure — already the minimum over the
+                            members, so replication is charged exactly once. */}
+                        <th style={{ width: 130 }}>Storage</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -448,6 +458,13 @@ export default function DashboardPage() {
                             inventory,
                             cluster.nodes.map((node) => node.node),
                           )}
+                          // The pool is named for its cluster, and a node only
+                          // serves its own cluster's pool.
+                          poolUsable={
+                            lumenPool && lumenPool.name === cluster.name
+                              ? (lumenPool.usable_bytes ?? null)
+                              : undefined
+                          }
                         />
                       ))}
                     </tbody>
@@ -677,7 +694,18 @@ function NodeRow({
   );
 }
 
-function ClusterRow({ cluster, pooled }: { cluster: ClusterView; pooled: PooledCapacity }) {
+function ClusterRow({
+  cluster,
+  pooled,
+  poolUsable,
+}: {
+  cluster: ClusterView;
+  pooled: PooledCapacity;
+  /// The cluster's LumenFS capacity: `undefined` where it serves no pool,
+  /// `null` where the pool exists but withheld its figure because a member
+  /// was silent — half a pool would be a guess.
+  poolUsable?: number | null;
+}) {
   const online = cluster.nodes.filter((node) => node.online).length;
   // A total is only a total if every member was counted. When one could not
   // be asked, the figure is marked partial rather than quietly reported as
@@ -713,8 +741,18 @@ function ClusterRow({ cluster, pooled }: { cluster: ClusterView; pooled: PooledC
       <Pooled partial={partial} none={none} of={pooled.of} counted={pooled.counted}>
         {formatMib(pooled.memoryMib)}
       </Pooled>
-      <Pooled partial={partial} none={none} of={pooled.of} counted={pooled.counted}>
-        {formatBytes(pooled.rawStorage)}
+      <Pooled
+        partial={partial || poolUsable === null}
+        none={none}
+        of={pooled.of}
+        counted={pooled.counted}
+        caveat={
+          poolUsable === null
+            ? "The pooled storage withheld its capacity — a member is silent, so only the local pools are counted"
+            : undefined
+        }
+      >
+        {formatBytes(pooled.rawStorage + (poolUsable ?? 0))}
       </Pooled>
     </tr>
   );
@@ -732,12 +770,16 @@ function Pooled({
   none,
   counted,
   of,
+  caveat,
 }: {
   children: React.ReactNode;
   partial: boolean;
   none: boolean;
   counted: number;
   of: number;
+  /// Replaces the members-answered sentence when the figure is partial for a
+  /// different reason than an unreachable member.
+  caveat?: string;
 }) {
   if (none) {
     return (
@@ -754,7 +796,7 @@ function Pooled({
       {partial && (
         <span
           className="qz-dim ml-1"
-          title={`${counted} of ${of} members answered; the rest are not counted`}
+          title={caveat ?? `${counted} of ${of} members answered; the rest are not counted`}
         >
           *
         </span>

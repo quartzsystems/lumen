@@ -56,6 +56,7 @@ export function DataTable<T>({
   bulkActions,
   actionsWidth = 90,
   onRefresh,
+  onRowOpen,
   storageKey,
 }: {
   rows: T[];
@@ -87,6 +88,8 @@ export function DataTable<T>({
   actionsWidth?: number;
   /** When provided, renders a Refresh button that re-runs this in place (spinner managed here). */
   onRefresh?: () => void | Promise<void>;
+  /** Double-clicking a row opens it. The checkbox and actions cells are exempt. */
+  onRowOpen?: (row: T) => void;
   /** Namespace for persisting column layout (order/width/visibility). Falls back to the column set. */
   storageKey?: string;
 }) {
@@ -669,8 +672,13 @@ export function DataTable<T>({
                     className={isSel ? "selected" : ""}
                     onMouseDown={(e) => onRowMouseDown(e, index)}
                     onMouseEnter={() => onRowMouseEnter(index)}
+                    onDoubleClick={onRowOpen ? () => onRowOpen(row) : undefined}
                   >
-                    <td onMouseDown={(e) => e.stopPropagation()} style={{ cursor: "default" }}>
+                    <td
+                      onMouseDown={(e) => e.stopPropagation()}
+                      onDoubleClick={(e) => e.stopPropagation()}
+                      style={{ cursor: "default" }}
+                    >
                       <input
                         type="checkbox"
                         checked={isSel}
@@ -691,6 +699,7 @@ export function DataTable<T>({
                     {actions && (
                       <td
                         onMouseDown={(e) => e.stopPropagation()}
+                        onDoubleClick={(e) => e.stopPropagation()}
                         style={{ cursor: "default", whiteSpace: "nowrap" }}
                         className="text-right"
                       >

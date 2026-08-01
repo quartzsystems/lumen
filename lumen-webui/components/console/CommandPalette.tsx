@@ -2,8 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowRight, Search } from "lucide-react";
-import { NAV, firstChildHref } from "@/lib/nav";
-import { vmHref } from "@/components/console/SidebarVms";
+import { NAV, firstChildHref, vmHref } from "@/lib/nav";
 import { useVmsOptional } from "@/lib/VmContext";
 
 interface PaletteAction {

@@ -648,7 +648,6 @@ function MembersTable({
       render: (row) => (
         <span className="inline-flex items-center gap-2 min-w-0">
           <span className="qz-mono truncate">{row.node}</span>
-          {row.local && <span className="badge badge-muted">this node</span>}
         </span>
       ),
     },

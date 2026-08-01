@@ -26,9 +26,15 @@ import {
 
 const POLL_MS = 5000;
 
-/// Every node in the environment: the current node first, then each cluster's
-/// members, then the unassigned nodes — which are valid standalone
-/// hypervisors, not nodes in a broken state.
+/// One row of the unified table: a cluster's member, or an unassigned node —
+/// which is a valid standalone hypervisor, not a node in a broken state.
+type NodeRow =
+  | { kind: "member"; cluster: string; unreachable: boolean; node: ClusterNodeView }
+  | { kind: "unassigned"; node: UnassignedNodeView };
+
+/// Every node in the environment in one table, whatever cluster it belongs
+/// to — the environment is one administrative domain, and this page is its
+/// one roster.
 export default function NodesPage() {
   const { setToast } = useConsole();
   const [environment, setEnvironment] = useState<EnvironmentResponse | null>(null);
@@ -83,22 +89,26 @@ export default function NodesPage() {
     }
   };
 
-  // The current node's own card, wherever it lives.
-  const self = useMemo(() => {
-    if (!environment) return null;
-    for (const cluster of environment.clusters) {
-      const member = cluster.nodes.find((node) => node.local);
-      if (member) return { member, cluster: cluster.name };
-    }
-    const unassigned = environment.unassigned.find((node) => node.local);
-    return unassigned ? { member: unassigned, cluster: null } : null;
+  const rows = useMemo<NodeRow[]>(() => {
+    if (!environment) return [];
+    return [
+      ...environment.clusters.flatMap((cluster) =>
+        cluster.nodes.map<NodeRow>((node) => ({
+          kind: "member",
+          cluster: cluster.name,
+          unreachable: Boolean(cluster.error),
+          node,
+        })),
+      ),
+      ...environment.unassigned.map<NodeRow>((node) => ({ kind: "unassigned", node })),
+    ];
   }, [environment]);
 
   return (
     <Page>
       <PageHeader
         title="Nodes"
-        description="Every node this console can see, grouped by the cluster it belongs to."
+        description="Every node this console can see, and the cluster each one belongs to."
         actions={
           <Button kind="primary" size="sm" icon={Plus} onClick={() => setAdding(true)}>
             Add Node
@@ -119,35 +129,16 @@ export default function NodesPage() {
             <div className="text-[13px] text-[var(--qz-fg-4)]">Reading the environment…</div>
           )}
 
-          {self && <SelfCard self={self.member} cluster={self.cluster} />}
-
-          {environment?.clusters.map((cluster) => (
-            <section key={cluster.name} className="flex flex-col gap-2">
-              <h2
-                className="text-[13px] font-semibold text-[var(--qz-fg-2)] m-0"
-                style={{ fontFamily: "var(--qz-font-mono)" }}
-              >
-                {cluster.name}
-              </h2>
-              <MemberTable
-                rows={cluster.nodes}
-                unreachable={Boolean(cluster.error)}
-                onRefresh={load}
-                onTestFence={(node) => setFencing({ cluster: cluster.name, node })}
-                onConfirmDead={(node) => setConfirming({ cluster: cluster.name, node: node.node })}
-                onMaintenance={(node) => setMaintaining({ cluster: cluster.name, node })}
-                onPower={(node, action) => setPowering({ node, action })}
-              />
-            </section>
-          ))}
-
-          {environment !== null && environment.unassigned.length > 0 && (
-            <section className="flex flex-col gap-2">
-              <h2 className="text-[13px] font-semibold text-[var(--qz-fg-2)] m-0">
-                {environment.environment ? "Unassigned" : "This node"}
-              </h2>
-              <UnassignedTable rows={environment.unassigned} onRefresh={load} onRemove={remove} />
-            </section>
+          {environment !== null && (
+            <NodesTable
+              rows={rows}
+              onRefresh={load}
+              onTestFence={(cluster, node) => setFencing({ cluster, node })}
+              onConfirmDead={(cluster, node) => setConfirming({ cluster, node: node.node })}
+              onMaintenance={(cluster, node) => setMaintaining({ cluster, node })}
+              onPower={(node, action) => setPowering({ node, action })}
+              onRemove={remove}
+            />
           )}
         </div>
       </PageBody>
@@ -219,84 +210,30 @@ export default function NodesPage() {
   );
 }
 
-function SelfCard({
-  self,
-  cluster,
-}: {
-  self: ClusterNodeView | UnassignedNodeView;
-  cluster: string | null;
-}) {
-  const rings = "rings" in self ? self.rings : [];
-  const maintenance = "maintenance" in self ? self.maintenance : undefined;
-  return (
-    <section className="surface p-5">
-      <header className="flex items-center gap-3 mb-4">
-        <h2
-          className="text-[15px] font-semibold text-[var(--qz-fg-1)] m-0"
-          style={{ fontFamily: "var(--qz-font-mono)" }}
-        >
-          {self.node}
-        </h2>
-        <span className="badge badge-muted">this node</span>
-        {maintenance && <span className="badge badge-warn">Out of service</span>}
-      </header>
-      <dl className="qz-facts m-0">
-        <dt>Cluster</dt>
-        <dd>{cluster ?? "Unassigned — standalone hypervisor"}</dd>
-        {maintenance && (
-          <>
-            <dt>Maintenance</dt>
-            <dd>
-              Since {new Date(maintenance.since * 1000).toLocaleString()}, by{" "}
-              <span className="qz-mono">{maintenance.by}</span>
-            </dd>
-          </>
-        )}
-        <dt>Version</dt>
-        <dd className="qz-mono">{self.controlplane_version ?? "—"}</dd>
-        {rings.length > 0 && (
-          <>
-            <dt>Rings</dt>
-            <dd>
-              <span className="inline-flex items-center gap-3">
-                {rings.map((ring) => (
-                  <span key={ring.link} className="inline-flex items-center gap-[6px]">
-                    <span className={`state-dot-${ring.connected ? "ok" : "crit"}`} />
-                    <span className="qz-mono text-[12px]">
-                      ring{ring.link} {ring.address}
-                    </span>
-                  </span>
-                ))}
-              </span>
-            </dd>
-          </>
-        )}
-      </dl>
-    </section>
-  );
-}
-
-const memberColumns = (unreachable: boolean): Column<ClusterNodeView>[] => [
+const nodeColumns: Column<NodeRow>[] = [
   {
     key: "state",
     header: "State",
-    value: (node) => nodeTone(node).label,
+    value: (row) => (row.kind === "member" ? nodeTone(row.node).label : "Standalone"),
     sortable: true,
     width: 110,
-    render: (node) => {
+    render: (row) => {
+      if (row.kind === "unassigned") {
+        return <span className="badge badge-muted">Standalone</span>;
+      }
       // Maintenance survives an unreachable cluster: it is Lumen's own record,
       // not something corosync was asked, and a node being worked on is a
       // common reason for the cluster to be unaskable in the first place.
-      if (unreachable && !node.maintenance) {
+      if (row.unreachable && !row.node.maintenance) {
         return <span className="badge badge-muted">Unknown</span>;
       }
-      const { tone, label } = nodeTone(node);
+      const { tone, label } = nodeTone(row.node);
       return (
         <span
           className={`badge badge-${tone}`}
           title={
-            node.maintenance
-              ? `Out of service since ${new Date(node.maintenance.since * 1000).toLocaleString()}, by ${node.maintenance.by}`
+            row.node.maintenance
+              ? `Out of service since ${new Date(row.node.maintenance.since * 1000).toLocaleString()}, by ${row.node.maintenance.by}`
               : undefined
           }
         >
@@ -308,32 +245,43 @@ const memberColumns = (unreachable: boolean): Column<ClusterNodeView>[] => [
   {
     key: "name",
     header: "Name",
-    value: (node) => node.node,
+    value: (row) => row.node.node,
     sortable: true,
     width: 180,
-    render: (node) => (
-      <span className="inline-flex items-center gap-2 min-w-0">
-        <span
-          className="text-[var(--qz-fg-1)] font-semibold truncate"
-          style={{ fontFamily: "var(--qz-font-mono)" }}
-        >
-          {node.node}
-        </span>
-        {node.local && <span className="badge badge-muted">this node</span>}
+    render: (row) => (
+      <span
+        className="text-[var(--qz-fg-1)] font-semibold truncate"
+        style={{ fontFamily: "var(--qz-font-mono)" }}
+      >
+        {row.node.node}
       </span>
     ),
   },
   {
+    key: "cluster",
+    header: "Cluster",
+    value: (row) => (row.kind === "member" ? row.cluster : ""),
+    sortable: true,
+    width: 140,
+    render: (row) =>
+      row.kind === "member" ? (
+        <span className="qz-mono">{row.cluster}</span>
+      ) : (
+        <span className="qz-dim">Unassigned</span>
+      ),
+  },
+  {
     key: "rings",
     header: "Rings",
-    value: (node) => node.rings.filter((ring) => ring.connected).length,
+    value: (row) =>
+      row.kind === "member" ? row.node.rings.filter((ring) => ring.connected).length : null,
     width: 140,
-    render: (node) =>
-      node.rings.length === 0 ? (
+    render: (row) =>
+      row.kind === "unassigned" || row.node.rings.length === 0 ? (
         <Dash />
       ) : (
         <span className="inline-flex items-center gap-3">
-          {node.rings.map((ring) => (
+          {row.node.rings.map((ring) => (
             <span
               key={ring.link}
               className="inline-flex items-center gap-[5px]"
@@ -349,13 +297,13 @@ const memberColumns = (unreachable: boolean): Column<ClusterNodeView>[] => [
   {
     key: "fence",
     header: "Fencing",
-    value: (node) =>
-      node.fence
-        ? node.fence.failed
+    value: (row) =>
+      row.kind === "member" && row.node.fence
+        ? row.node.fence.failed
           ? "failing"
-          : !node.fence.active
+          : !row.node.fence.active
             ? "stopped"
-            : node.fence.last_test
+            : row.node.fence.last_test
               ? "tested"
               : "untested"
         : "",
@@ -366,18 +314,19 @@ const memberColumns = (unreachable: boolean): Column<ClusterNodeView>[] => [
     // the fact an operator acts on now, and "Tested" over a stopped device
     // was how a broken fence path read as fine. The tooltip names the IPMI
     // target, because "against which BMC" is the first debugging question.
-    render: (node) => {
-      if (!node.fence) return <Dash />;
-      const ipmi = node.fence.bmc_address
-        ? `fence_ipmilan against ${node.fence.bmc_address}${
-            node.fence.bmc_username ? ` as ${node.fence.bmc_username}` : ""
+    render: (row) => {
+      if (row.kind === "unassigned" || !row.node.fence) return <Dash />;
+      const fence = row.node.fence;
+      const ipmi = fence.bmc_address
+        ? `fence_ipmilan against ${fence.bmc_address}${
+            fence.bmc_username ? ` as ${fence.bmc_username}` : ""
           }`
         : undefined;
       // The agent's own words come first when there are any: "invalid role"
       // names a firmware that stopped accepting the session, which no
       // amount of "Stopped" ever would.
-      const said = node.fence.reason;
-      if (node.fence.failed) {
+      const said = fence.reason;
+      if (fence.failed) {
         return (
           <span
             className="badge badge-crit"
@@ -387,7 +336,7 @@ const memberColumns = (unreachable: boolean): Column<ClusterNodeView>[] => [
           </span>
         );
       }
-      if (!node.fence.active) {
+      if (!fence.active) {
         return (
           <span
             className="badge badge-crit"
@@ -406,21 +355,21 @@ const memberColumns = (unreachable: boolean): Column<ClusterNodeView>[] => [
           </span>
         );
       }
-      if (!node.fence.last_test) {
+      if (!fence.last_test) {
         return (
           <span className="badge badge-warn" title={ipmi}>
-            Healthy · untested
+            Healthy - Untested
           </span>
         );
       }
       return (
         <span
-          className={node.fence.last_test.passed ? "qz-dim" : "badge badge-warn"}
+          className={fence.last_test.passed ? "qz-dim" : "badge badge-warn"}
           title={`${ipmi ? `${ipmi} — ` : ""}last test ${new Date(
-            node.fence.last_test.at * 1000,
+            fence.last_test.at * 1000,
           ).toLocaleString()}`}
         >
-          {node.fence.last_test.passed ? "Healthy · tested" : "Healthy · test failed"}
+          {fence.last_test.passed ? "Healthy - Tested" : "Healthy - Test failed"}
         </span>
       );
     },
@@ -428,228 +377,165 @@ const memberColumns = (unreachable: boolean): Column<ClusterNodeView>[] => [
   {
     key: "address",
     header: "Address",
-    value: (node) => node.address ?? "",
+    value: (row) => row.node.address ?? "",
     sortable: true,
     width: 140,
-    render: (node) => (node.address ? <span className="qz-mono">{node.address}</span> : <Dash />),
+    render: (row) =>
+      row.node.address ? <span className="qz-mono">{row.node.address}</span> : <Dash />,
   },
   {
     key: "version",
     header: "Version",
-    value: (node) => node.controlplane_version ?? "",
+    value: (row) => row.node.controlplane_version ?? "",
     sortable: true,
     width: 100,
-    render: (node) =>
-      node.controlplane_version ? (
-        <span className="qz-mono">{node.controlplane_version}</span>
+    render: (row) =>
+      row.node.controlplane_version ? (
+        <span className="qz-mono">{row.node.controlplane_version}</span>
       ) : (
         <Dash />
       ),
   },
 ];
 
-function MemberTable({
+function NodesTable({
   rows,
-  unreachable,
   onRefresh,
   onTestFence,
   onConfirmDead,
   onMaintenance,
   onPower,
-}: {
-  rows: ClusterNodeView[];
-  unreachable: boolean;
-  onRefresh: () => Promise<void>;
-  onTestFence: (node: ClusterNodeView) => void;
-  onConfirmDead: (node: ClusterNodeView) => void;
-  onMaintenance: (node: ClusterNodeView) => void;
-  onPower: (node: ClusterNodeView, action: NodePowerAction) => void;
-}) {
-  const columns = useMemo(() => memberColumns(unreachable), [unreachable]);
-  return (
-    <DataTable
-      rows={rows}
-      columns={columns}
-      rowId={(node) => node.node}
-      storageKey="infrastructure-nodes"
-      searchPlaceholder="Search nodes…"
-      emptyMessage="No members."
-      onRefresh={onRefresh}
-      actionsWidth={250}
-      actions={(node) => (
-        <span className="inline-flex items-center gap-1">
-          {/* The break-glass, offered in exactly the one state it exists
-              for: lost and not successfully fenced. */}
-          {!unreachable && node.unclean && (
-            <button
-              type="button"
-              className="btn btn-danger btn-sm"
-              onClick={() => onConfirmDead(node)}
-            >
-              Confirm dead
-            </button>
-          )}
-          {/* Only on this node's own row: a drain moves machines, and only
-              the node running them can move them. Offered even when the
-              cluster is unreachable if the node is already out of service,
-              because getting *back* is the one thing an operator must never
-              be locked out of. */}
-          {node.local && !node.unclean && (!unreachable || node.maintenance) && (
-            <button
-              type="button"
-              className="btn btn-sm"
-              title={
-                node.maintenance
-                  ? `Let Pacemaker run things on ${node.node} again`
-                  : `Move the machines off ${node.node} and hold it out of service`
-              }
-              onClick={() => onMaintenance(node)}
-            >
-              <Wrench size={13} className="mr-[6px]" />
-              {node.maintenance ? "Return to service" : "Maintenance"}
-            </button>
-          )}
-          {!unreachable && !node.unclean && node.fence && (
-            <span title={`Live-test the fencing of ${node.node}`}>
-              <Button kind="ghost" size="sm" icon={Zap} onClick={() => onTestFence(node)} />
-            </span>
-          )}
-          {/* The hard power path, on every row but this node's: the command
-              goes to that node's BMC through its fence device, so it works
-              when the node's own operating system does not. A node powers
-              *itself* down through Maintenance, where its machines are moved
-              off first — which is why the local row shows the wrench and
-              these two instead. */}
-          {!node.local && node.fence && (
-            <>
-              <span title={`Power-cycle ${node.node} at its BMC`}>
-                <Button
-                  kind="ghost"
-                  size="sm"
-                  icon={RotateCw}
-                  onClick={() => onPower(node, "cycle")}
-                />
-              </span>
-              <span title={`Cut the power to ${node.node} at its BMC`}>
-                <Button
-                  kind="ghost"
-                  size="sm"
-                  icon={Power}
-                  onClick={() => onPower(node, "off")}
-                />
-              </span>
-            </>
-          )}
-        </span>
-      )}
-    />
-  );
-}
-
-const unassignedColumns: Column<UnassignedNodeView>[] = [
-  {
-    key: "name",
-    header: "Name",
-    value: (node) => node.node,
-    sortable: true,
-    width: 200,
-    render: (node) => (
-      <span className="inline-flex items-center gap-2 min-w-0">
-        <span
-          className="text-[var(--qz-fg-1)] font-semibold truncate"
-          style={{ fontFamily: "var(--qz-font-mono)" }}
-        >
-          {node.node}
-        </span>
-        {node.local && <span className="badge badge-muted">this node</span>}
-      </span>
-    ),
-  },
-  {
-    key: "address",
-    header: "Address",
-    value: (node) => node.address ?? "",
-    sortable: true,
-    width: 160,
-    render: (node) => (node.address ? <span className="qz-mono">{node.address}</span> : <Dash />),
-  },
-  {
-    key: "version",
-    header: "Version",
-    value: (node) => node.controlplane_version ?? "",
-    sortable: true,
-    width: 110,
-    render: (node) =>
-      node.controlplane_version ? (
-        <span className="qz-mono">{node.controlplane_version}</span>
-      ) : (
-        <Dash />
-      ),
-  },
-  {
-    key: "role",
-    header: "Role",
-    value: () => "standalone",
-    render: () => <span className="qz-dim">Standalone hypervisor</span>,
-  },
-];
-
-function UnassignedTable({
-  rows,
-  onRefresh,
   onRemove,
 }: {
-  rows: UnassignedNodeView[];
+  rows: NodeRow[];
   onRefresh: () => Promise<void>;
+  onTestFence: (cluster: string, node: ClusterNodeView) => void;
+  onConfirmDead: (cluster: string, node: ClusterNodeView) => void;
+  onMaintenance: (cluster: string, node: ClusterNodeView) => void;
+  onPower: (node: ClusterNodeView, action: NodePowerAction) => void;
   onRemove: (node: UnassignedNodeView) => Promise<void>;
 }) {
-  // Inline confirm, like staging a link deletion: the trash flips into a
-  // ✓/✕ pair rather than opening a modal for a reversible act — the node
-  // can simply join again.
-  const [confirming, setConfirming] = useState<string | null>(null);
+  // Inline confirm for removing an unassigned node, like staging a link
+  // deletion: the trash flips into a Remove/Keep pair rather than opening a
+  // modal for a reversible act — the node can simply join again.
+  const [removing, setRemoving] = useState<string | null>(null);
   return (
     <DataTable
       rows={rows}
-      columns={unassignedColumns}
-      rowId={(node) => node.node}
-      storageKey="infrastructure-nodes-unassigned"
+      columns={nodeColumns}
+      rowId={(row) => row.node.node}
+      storageKey="infrastructure-nodes-all"
       searchPlaceholder="Search nodes…"
-      emptyMessage="Every node is in a cluster."
+      emptyMessage="No nodes yet."
       onRefresh={onRefresh}
-      actionsWidth={96}
-      actions={(node) =>
-        node.local ? (
-          // A node does not remove itself; the backend refuses, and the
-          // control says why before it is tried.
-          <span title="A node does not remove itself — do this from another environment node." />
-        ) : confirming === node.node ? (
-          <span className="inline-flex items-center gap-1">
-            <button
-              type="button"
-              className="btn btn-danger btn-sm"
-              onClick={() => {
-                setConfirming(null);
-                void onRemove(node);
-              }}
-            >
-              Remove
-            </button>
-            <button
-              type="button"
-              className="btn btn-ghost btn-sm"
-              onClick={() => setConfirming(null)}
-            >
-              Keep
-            </button>
-          </span>
+      actionsWidth={250}
+      actions={(row) =>
+        row.kind === "unassigned" ? (
+          row.node.local ? (
+            // A node does not remove itself; the backend refuses, and the
+            // control says why before it is tried.
+            <span title="A node does not remove itself — do this from another environment node." />
+          ) : removing === row.node.node ? (
+            <span className="inline-flex items-center gap-1">
+              <button
+                type="button"
+                className="btn btn-danger btn-sm"
+                onClick={() => {
+                  setRemoving(null);
+                  void onRemove(row.node);
+                }}
+              >
+                Remove
+              </button>
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm"
+                onClick={() => setRemoving(null)}
+              >
+                Keep
+              </button>
+            </span>
+          ) : (
+            <span title="Remove from the environment">
+              <Button
+                kind="ghost"
+                size="sm"
+                icon={Trash2}
+                onClick={() => setRemoving(row.node.node)}
+              />
+            </span>
+          )
         ) : (
-          <span title="Remove from the environment">
-            <Button
-              kind="ghost"
-              size="sm"
-              icon={Trash2}
-              onClick={() => setConfirming(node.node)}
-            />
+          <span className="inline-flex items-center gap-1">
+            {/* The break-glass, offered in exactly the one state it exists
+                for: lost and not successfully fenced. */}
+            {!row.unreachable && row.node.unclean && (
+              <button
+                type="button"
+                className="btn btn-danger btn-sm"
+                onClick={() => onConfirmDead(row.cluster, row.node)}
+              >
+                Confirm dead
+              </button>
+            )}
+            {/* Only on this node's own row: a drain moves machines, and only
+                the node running them can move them. Offered even when the
+                cluster is unreachable if the node is already out of service,
+                because getting *back* is the one thing an operator must never
+                be locked out of. */}
+            {row.node.local &&
+              !row.node.unclean &&
+              (!row.unreachable || row.node.maintenance) && (
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  title={
+                    row.node.maintenance
+                      ? `Let Pacemaker run things on ${row.node.node} again`
+                      : `Move the machines off ${row.node.node} and hold it out of service`
+                  }
+                  onClick={() => onMaintenance(row.cluster, row.node)}
+                >
+                  <Wrench size={13} className="mr-[6px]" />
+                  {row.node.maintenance ? "Return to service" : "Maintenance"}
+                </button>
+              )}
+            {!row.unreachable && !row.node.unclean && row.node.fence && (
+              <span title={`Live-test the fencing of ${row.node.node}`}>
+                <Button
+                  kind="ghost"
+                  size="sm"
+                  icon={Zap}
+                  onClick={() => onTestFence(row.cluster, row.node)}
+                />
+              </span>
+            )}
+            {/* The hard power path, on every row but this node's: the command
+                goes to that node's BMC through its fence device, so it works
+                when the node's own operating system does not. A node powers
+                *itself* down through Maintenance, where its machines are moved
+                off first — which is why the local row shows the wrench and
+                these two instead. */}
+            {!row.node.local && row.node.fence && (
+              <>
+                <span title={`Power-cycle ${row.node.node} at its BMC`}>
+                  <Button
+                    kind="ghost"
+                    size="sm"
+                    icon={RotateCw}
+                    onClick={() => onPower(row.node, "cycle")}
+                  />
+                </span>
+                <span title={`Cut the power to ${row.node.node} at its BMC`}>
+                  <Button
+                    kind="ghost"
+                    size="sm"
+                    icon={Power}
+                    onClick={() => onPower(row.node, "off")}
+                  />
+                </span>
+              </>
+            )}
           </span>
         )
       }

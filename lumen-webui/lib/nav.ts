@@ -24,6 +24,11 @@ import {
   type LucideIcon,
 } from "lucide-react";
 
+/// Where a machine's own page lives. Machines are runtime data rather than
+/// nav entries, but the way to address one is still navigation's to define.
+export const vmHref = (vmid: number, section = "overview"): string =>
+  `/virtual-machines?vm=${vmid}&section=${section}`;
+
 /// A leaf destination inside an expandable section.
 export interface NavChild {
   id: string;

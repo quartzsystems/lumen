@@ -1,8 +1,9 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { AlertTriangle, Plus, ShieldAlert, Trash2, UserPlus } from "lucide-react";
+import { AlertTriangle, Plus, Trash2, UserPlus } from "lucide-react";
 import { Page, PageBody, PageHeader } from "@/components/PageHeader";
+import { DataTable, Dash, type Column } from "@/components/console/DataTable";
 import { Button } from "@/components/ui/Button";
 import { AddNodeDialog } from "@/components/cluster/AddNodeDialog";
 import { CreateClusterDialog } from "@/components/cluster/CreateClusterDialog";
@@ -129,20 +130,13 @@ export default function ClustersPage() {
             )}
 
           {environment !== null && environment.clusters.length > 0 && (
-            <div
-              className="grid gap-4"
-              style={{ gridTemplateColumns: "repeat(auto-fill, minmax(340px, 1fr))" }}
-            >
-              {environment.clusters.map((cluster) => (
-                <ClusterCard
-                  key={cluster.name}
-                  cluster={cluster}
-                  canGrow={cluster.nodes.length < 5 && spareNodes > 0}
-                  onAddNode={() => setAddingTo(cluster)}
-                  onDestroy={() => setDestroying(cluster)}
-                />
-              ))}
-            </div>
+            <ClusterTable
+              rows={environment.clusters}
+              spareNodes={spareNodes}
+              onRefresh={load}
+              onAddNode={setAddingTo}
+              onDestroy={setDestroying}
+            />
           )}
         </div>
       </PageBody>
@@ -185,115 +179,190 @@ export default function ClustersPage() {
   );
 }
 
-function ClusterCard({
-  cluster,
-  canGrow,
+const clusterColumns: Column<ClusterView>[] = [
+  {
+    key: "health",
+    header: "Health",
+    value: (cluster) => HEALTH_LABEL[cluster.health],
+    sortable: true,
+    width: 110,
+    // An unreachable cluster's badge carries the why: its row shows dashes
+    // for everything corosync would have answered, and this is the one place
+    // left to say what stopped it answering.
+    render: (cluster) => (
+      <span className={`badge badge-${HEALTH_TONE[cluster.health]}`} title={cluster.error}>
+        {HEALTH_LABEL[cluster.health]}
+      </span>
+    ),
+  },
+  {
+    key: "name",
+    header: "Name",
+    value: (cluster) => cluster.name,
+    sortable: true,
+    width: 170,
+    render: (cluster) => (
+      <span
+        className="text-[var(--qz-fg-1)] font-semibold truncate"
+        style={{ fontFamily: "var(--qz-font-mono)" }}
+      >
+        {cluster.name}
+      </span>
+    ),
+  },
+  {
+    key: "regime",
+    header: "Regime",
+    value: (cluster) => REGIME_LABEL[cluster.regime],
+    sortable: true,
+    width: 210,
+    render: (cluster) => (
+      <span className="truncate">
+        {REGIME_LABEL[cluster.regime]}
+        {cluster.preferred_node && (
+          <span className="qz-mono text-[12px] text-[var(--qz-fg-4)]">
+            {" "}
+            · prefers {cluster.preferred_node}
+          </span>
+        )}
+      </span>
+    ),
+  },
+  {
+    key: "nodes",
+    header: "Nodes",
+    value: (cluster) => cluster.nodes.filter((node) => node.online).length,
+    sortable: true,
+    width: 180,
+    // Membership stays at a glance: one dot per member, named in its
+    // tooltip. The per-node detail lives on Infrastructure → Nodes.
+    render: (cluster) => {
+      const online = cluster.nodes.filter((node) => node.online).length;
+      return (
+        <span className="inline-flex items-center gap-2">
+          <span className="inline-flex items-center gap-[5px]">
+            {cluster.nodes.map((node) => {
+              const { tone, label } = nodeTone(node);
+              return (
+                <span
+                  key={node.node}
+                  className={`state-dot-${cluster.error ? "muted" : tone}`}
+                  title={`${node.node} — ${cluster.error ? "unknown" : label}`}
+                />
+              );
+            })}
+          </span>
+          <span className="qz-dim">
+            {online} of {cluster.nodes.length} online
+          </span>
+        </span>
+      );
+    },
+  },
+  {
+    key: "quorum",
+    header: "Quorum",
+    value: (cluster) =>
+      cluster.error ? "" : cluster.quorum.quorate ? "Quorate" : "Not quorate",
+    sortable: true,
+    width: 170,
+    render: (cluster) =>
+      cluster.error ? (
+        <Dash />
+      ) : (
+        <span>
+          {cluster.quorum.quorate ? "Quorate" : "Not quorate"}
+          <span className="qz-mono text-[12px] text-[var(--qz-fg-4)]">
+            {" "}
+            ({cluster.quorum.votes}/{cluster.quorum.expected_votes} votes)
+          </span>
+        </span>
+      ),
+  },
+  {
+    key: "fence",
+    header: "Fencing",
+    value: (cluster) =>
+      cluster.error
+        ? ""
+        : cluster.fence.devices === 0
+          ? "not configured"
+          : cluster.fence.failed > 0
+            ? "failing"
+            : cluster.fence.untested > 0
+              ? "untested"
+              : "healthy",
+    sortable: true,
+    width: 170,
+    // IPMI is the only fence path this appliance has, so an untested
+    // direction stays a pinned warning until the test is run — the card's
+    // callout, folded into the badge and its tooltip.
+    render: (cluster) => {
+      if (cluster.error) return <Dash />;
+      if (cluster.fence.devices === 0) {
+        return <span className="badge badge-warn">Not configured yet</span>;
+      }
+      if (cluster.fence.failed > 0) {
+        return (
+          <span className="badge badge-crit">
+            {cluster.fence.failed} device{cluster.fence.failed === 1 ? "" : "s"} failing
+          </span>
+        );
+      }
+      if (cluster.fence.untested > 0) {
+        return (
+          <span
+            className="badge badge-warn"
+            title={`Fencing has not been live-tested for ${cluster.fence.untested} node${
+              cluster.fence.untested === 1 ? "" : "s"
+            }. An untested fence path is one that fails during the outage that needed it — test each direction from Infrastructure → Nodes.`}
+          >
+            {cluster.fence.untested} untested
+          </span>
+        );
+      }
+      return (
+        <span>
+          {cluster.fence.healthy} of {cluster.fence.devices} healthy
+        </span>
+      );
+    },
+  },
+];
+
+function ClusterTable({
+  rows,
+  spareNodes,
+  onRefresh,
   onAddNode,
   onDestroy,
 }: {
-  cluster: ClusterView;
-  canGrow: boolean;
-  onAddNode: () => void;
-  onDestroy: () => void;
+  rows: ClusterView[];
+  spareNodes: number;
+  onRefresh: () => Promise<void>;
+  onAddNode: (cluster: ClusterView) => void;
+  onDestroy: (cluster: ClusterView) => void;
 }) {
-  const online = cluster.nodes.filter((node) => node.online).length;
   return (
-    <section className="surface p-5 flex flex-col gap-4">
-      <header className="flex items-center gap-3">
-        <h2
-          className="text-[15px] font-semibold text-[var(--qz-fg-1)] m-0 flex-1 truncate"
-          style={{ fontFamily: "var(--qz-font-mono)" }}
-        >
-          {cluster.name}
-        </h2>
-        <span className={`badge badge-${HEALTH_TONE[cluster.health]}`}>
-          {HEALTH_LABEL[cluster.health]}
+    <DataTable
+      rows={rows}
+      columns={clusterColumns}
+      rowId={(cluster) => cluster.name}
+      storageKey="infrastructure-clusters"
+      searchPlaceholder="Search clusters…"
+      emptyMessage="No clusters."
+      onRefresh={onRefresh}
+      actionsWidth={96}
+      actions={(cluster) => (
+        <span className="inline-flex items-center gap-1">
+          {cluster.nodes.length < 5 && spareNodes > 0 && (
+            <span title="Add a node to this cluster">
+              <Button kind="ghost" size="sm" icon={UserPlus} onClick={() => onAddNode(cluster)} />
+            </span>
+          )}
+          <Button kind="ghost" size="sm" icon={Trash2} onClick={() => onDestroy(cluster)} />
         </span>
-        {canGrow && (
-          <span title="Add a node to this cluster">
-            <Button kind="ghost" size="sm" icon={UserPlus} onClick={onAddNode} />
-          </span>
-        )}
-        <Button kind="ghost" size="sm" icon={Trash2} onClick={onDestroy} />
-      </header>
-
-      {cluster.error && <div className="text-[12px] text-[var(--qz-fg-4)]">{cluster.error}</div>}
-
-      <dl className="qz-facts m-0">
-        <dt>Regime</dt>
-        <dd>
-          {REGIME_LABEL[cluster.regime]}
-          {cluster.preferred_node && (
-            <span className="qz-mono text-[12px] text-[var(--qz-fg-4)]">
-              {" "}
-              · prefers {cluster.preferred_node}
-            </span>
-          )}
-        </dd>
-        <dt>Nodes</dt>
-        <dd>
-          {online} of {cluster.nodes.length} online
-        </dd>
-        <dt>Quorum</dt>
-        <dd>
-          {cluster.error ? (
-            "—"
-          ) : (
-            <>
-              {cluster.quorum.quorate ? "Quorate" : "Not quorate"}
-              <span className="qz-mono text-[12px] text-[var(--qz-fg-4)]">
-                {" "}
-                ({cluster.quorum.votes}/{cluster.quorum.expected_votes} votes)
-              </span>
-            </>
-          )}
-        </dd>
-        <dt>Fencing</dt>
-        <dd>
-          {cluster.error ? (
-            "—"
-          ) : cluster.fence.devices === 0 ? (
-            <span className="badge badge-warn">Not configured yet</span>
-          ) : cluster.fence.failed > 0 ? (
-            <span className="badge badge-crit">
-              {cluster.fence.failed} device{cluster.fence.failed === 1 ? "" : "s"} failing
-            </span>
-          ) : (
-            <span>
-              {cluster.fence.healthy} of {cluster.fence.devices} healthy
-            </span>
-          )}
-        </dd>
-      </dl>
-
-      {/* IPMI is the only fence path this appliance has, so an untested
-          direction is a warning that stays pinned until the test is run. */}
-      {!cluster.error && cluster.fence.untested > 0 && (
-        <div className="callout callout-warn">
-          <ShieldAlert size={17} className="flex-shrink-0 text-[var(--qz-warn)] mt-[1px]" />
-          <div className="text-[13px] text-[var(--qz-fg-2)]">
-            Fencing has not been live-tested for {cluster.fence.untested} node
-            {cluster.fence.untested === 1 ? "" : "s"}. An untested fence path is one that fails
-            during the outage that needed it — test each direction from Infrastructure → Nodes.
-          </div>
-        </div>
       )}
-
-      <ul className="m-0 p-0 flex flex-col gap-[6px]" style={{ listStyle: "none" }}>
-        {cluster.nodes.map((node) => {
-          const { tone, label } = nodeTone(node);
-          return (
-            <li key={node.node} className="flex items-center gap-2 text-[13px]">
-              <span className={`state-dot-${cluster.error ? "muted" : tone}`} />
-              <span className="qz-mono text-[var(--qz-fg-2)]">{node.node}</span>
-              {node.local && <span className="badge badge-muted">this node</span>}
-              <span className="text-[12px] text-[var(--qz-fg-4)] ml-auto">
-                {cluster.error ? "unknown" : label}
-              </span>
-            </li>
-          );
-        })}
-      </ul>
-    </section>
+    />
   );
 }
