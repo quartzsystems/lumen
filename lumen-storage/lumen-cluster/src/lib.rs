@@ -53,16 +53,16 @@ pub use environment::{
 };
 pub use error::{ClusterError, Result};
 pub use join::{
-    CreateProgress, JoinGrant, JoinRequest, MockPeers, PeerChannel, PreflightReport, PreflightView,
-    PreparePayload, ProgressHandle, TeardownPayload,
+    CoreSeatUpdate, CreateProgress, JoinGrant, JoinRequest, MockPeers, PeerChannel,
+    PreflightReport, PreflightView, PreparePayload, ProgressHandle, TeardownPayload,
 };
 pub use model::{
     valid_cluster_name, valid_node_name, BmcConfig, ClusterDefinition, MemberNode, Regime,
     COROSYNC_PORT, FENCE_RACE_DELAY_SECS, MAX_CLUSTER_NODES, MIN_CLUSTER_NODES,
 };
 pub use networks::{
-    valid_bridge_name, AddressedMember, ClusterNetworks, CoreNetwork, ExternalNetwork,
-    ManagementNetwork, Subnet, Uplink, VlanMode,
+    valid_bridge_name, AddressedMember, ClusterNetworks, CoreNetwork, CoreNetworkUpdate,
+    ExternalNetwork, ManagementNetwork, Subnet, Uplink, VlanMode,
 };
 pub use service::{
     quorum_survives_loss, AddNodePlan, ClusterHealth, ClusterNodeView, ClusterService, ClusterView,

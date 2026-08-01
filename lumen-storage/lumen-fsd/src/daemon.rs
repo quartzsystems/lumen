@@ -44,7 +44,7 @@ use std::time::Duration;
 use lumen_fs::disk::file::{is_block_device, FileDisk};
 use lumen_fs::{
     Brick, BrickParams, BrickSet, BrickStats, ByteView, Disk, Effect, FsError, GcStats, Lease,
-    PeerMessage, Pool, ReplNode, ReplState, ScrubReport, SpaceReport,
+    PeerMessage, Pool, ReplNode, ReplState, SpaceReport,
 };
 
 use crate::wire::{self, Handshake, HANDSHAKE_LEN, MAX_FRAME};
@@ -922,6 +922,10 @@ fn writer_loop(shared: &Arc<Shared>, peer: u8, stream: &mut TcpStream, incarnati
 // ---------------------------------------------------------------------------
 // The daemon.
 
+/// A finished scrub pass: unix seconds it ended, records verified, found
+/// corrupt, and found missing.
+pub type ScrubOutcome = (u64, u64, u64, u64);
+
 pub struct Daemon {
     shared: Arc<Shared>,
     threads: Vec<JoinHandle<()>>,
@@ -1318,8 +1322,8 @@ impl Daemon {
     }
 
     /// The scrub board, verbatim: running, progress, and the last finished
-    /// pass as `(unix seconds, verified, corrupt, missing)`.
-    pub fn scrub_progress(&self) -> (bool, u64, u64, Option<(u64, u64, u64, u64)>) {
+    /// pass.
+    pub fn scrub_progress(&self) -> (bool, u64, u64, Option<ScrubOutcome>) {
         let board = self.shared.scrub.lock().unwrap();
         (board.running, board.verified, board.total, board.last)
     }

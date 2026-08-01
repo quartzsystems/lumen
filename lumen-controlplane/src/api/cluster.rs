@@ -232,6 +232,25 @@ pub async fn create_external_network(
     Ok((StatusCode::CREATED, Json(created)))
 }
 
+/// PUT /api/environment/clusters/{name}/networks/core — change the Core
+/// network without destroying the cluster: the MTU, and which link carries
+/// each member's seat.
+///
+/// The subnet and the per-member addresses are deliberately not changeable
+/// here — they are corosync's ring 0 addressing, and the request shape
+/// cannot carry a new subnet at all. Members change one at a time through
+/// their own networking domains, record last; see
+/// `ClusterService::update_core_network`.
+pub async fn update_core_network(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    raw: Body,
+) -> Result<Json<lumen_cluster::CoreNetwork>, ApiError> {
+    let update: lumen_cluster::CoreNetworkUpdate = required_body(raw)?;
+    Ok(Json(state.cluster.update_core_network(&name, update).await?))
+}
+
 /// PUT /api/environment/clusters/{name}/networks/external/{network} — change
 /// an External network and rebuild it on every member.
 ///

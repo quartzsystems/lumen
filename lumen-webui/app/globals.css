@@ -235,6 +235,25 @@ body {
 .qz-table tr { cursor: pointer; }
 .qz-table tbody tr:hover td { background: color-mix(in oklab, white 4%, var(--qz-surface)); }
 .qz-table tbody tr.selected td { background: var(--qz-accent-soft); }
+
+/* The actions cell rides the right edge of the viewport instead of
+   scrolling away with the columns. A ten-column table (Interfaces) pushed
+   Edit and Delete out of sight, so acting on a row began with a sideways
+   scroll every time. The header cell is already sticky to the top; this
+   adds the horizontal half, and a background so scrolled cells pass
+   underneath rather than through. Hover and selection are restated
+   because a sticky cell needs its own opaque fill to sit on. */
+.qz-table th.qz-sticky-actions,
+.qz-table td.qz-sticky-actions { position: sticky; right: 0; }
+.qz-table th.qz-sticky-actions { z-index: 2; }
+.qz-table td.qz-sticky-actions {
+  background: var(--qz-surface);
+  border-left: 1px solid var(--qz-divider);
+}
+.qz-table tbody tr:hover td.qz-sticky-actions {
+  background: color-mix(in oklab, white 4%, var(--qz-surface));
+}
+.qz-table tbody tr.selected td.qz-sticky-actions { background: var(--qz-accent-soft); }
 .qz-table td.mono { font-family: var(--qz-font-mono); color: var(--qz-fg-1); }
 .qz-mono { font-family: var(--qz-font-mono); }
 .qz-dim { color: var(--qz-fg-4); }

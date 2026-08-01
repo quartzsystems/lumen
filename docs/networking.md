@@ -521,7 +521,7 @@ each entry carrying `code`, `link`, `field`, and `message`.
 | POST | `/api/network/apply/extend` | Extend the confirm window |
 | POST | `/api/network/management-bridge` | Convert `nicN` → `br0` |
 
-### Node grouping
+### Node grouping and cross-node writes
 
 `GET /api/network/interfaces` answers
 
@@ -529,11 +529,24 @@ each entry carrying `code`, `link`, `field`, and `message`.
 { "nodes": [ { "node": "lumen", "interfaces": [ … ] } ] }
 ```
 
-— a one-element list today. Mutating endpoints accept an optional `node`
-field which defaults to the local node and currently rejects anything else
-with a clear "not in a cluster" error. The response shape and the request
-field are in place from day one so neither changes when clustering lands, and
-so the console can render its per-node layout now.
+— a one-element list: each control plane observes only itself, and the
+environment-wide table is assembled from `/api/environment/inventory`.
+
+Mutating endpoints accept an optional `node` field, in place since day one
+so the request shape would not change when clustering landed — and now it
+has. A `node` naming another environment member forwards the request to that
+member over the peer channel (`POST /api/peer/network/verb`, a closed verb
+enum with the same shape discipline as the pool's): the change is staged
+*there*, validated there, applied inside that member's own checkpoint, and
+auto-reverted by that member if no confirm arrives — including because the
+change severed the path the confirm would have travelled, which is exactly
+the failure the checkpoint design already absorbs. The two reads a remote
+edit leans on — `GET /api/network/pending` and `GET /api/network/nics/pins`
+— take the same target as `?node=`. A name the environment record does not
+carry is refused with a clear error; on a standalone appliance that is every
+name but its own. Writes in the other domains (machines, storage pools)
+still refuse a foreign `node` outright — a machine can only be moved by the
+node running it.
 
 Each interface object carries everything a table row needs without a second
 round trip: `name`, `altname`, `kind`, `admin_up`, `oper_state`, `carrier`,

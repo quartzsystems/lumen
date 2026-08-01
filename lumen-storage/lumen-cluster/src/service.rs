@@ -28,7 +28,10 @@ use crate::join::{
     TeardownPayload,
 };
 use crate::model::Regime;
-use crate::networks::{valid_bridge_name, ClusterNetworks, ExternalNetwork, VlanMode};
+use crate::networks::{
+    valid_bridge_name, validate_networks, ClusterNetworks, CoreNetwork, CoreNetworkUpdate,
+    ExternalNetwork, VlanMode,
+};
 use crate::state::{
     hostname, ClusterState, FenceDeviceState, FenceTest, QuorumState, RingLink, VipState,
 };
@@ -930,6 +933,194 @@ impl ClusterService {
         }))
     }
 
+    /// Change the Core network without destroying the cluster: the MTU, and
+    /// which link carries each member's seat.
+    ///
+    /// What it will not change is the ring's identity. The subnet and every
+    /// member's address are corosync's ring 0 addressing — written into
+    /// `corosync.conf` on every member, ridden by the pool's peer links —
+    /// and changing them stays a destroy-and-recreate; the request shape
+    /// itself cannot carry a new subnet, and a `members` list that moves an
+    /// address or the set of seats is refused here. The MTU and the seat
+    /// interfaces appear in no ring configuration at all, which is what
+    /// makes this edit possible: each member re-realizes the same seat
+    /// through its own networking domain, inside its own checkpoint.
+    ///
+    /// Members change one at a time. During a seat move the member's ring 0
+    /// drops until the new link carries the address; ring 1 on Management is
+    /// what keeps the cluster quorate through the blip, and a member whose
+    /// change goes wrong is restored by its own checkpoint. A member that
+    /// fails stops the walk: the members already changed are on the new
+    /// definition, the record stays on the old one, and the error names the
+    /// member — the same non-atomicity the External edit accepts, with the
+    /// same repair, because a member already changed stages nothing on the
+    /// retry and succeeds.
+    pub async fn update_core_network(
+        &self,
+        cluster: &str,
+        update: CoreNetworkUpdate,
+    ) -> Result<CoreNetwork> {
+        let _guard = self.gate.lock().await;
+        if self.progress.busy() {
+            return Err(ClusterError::Conflict(
+                "A cluster workflow is running. Let it finish before changing the networks."
+                    .to_string(),
+            ));
+        }
+        let mut membership = self.require_membership()?;
+        let Some(record) = membership.cluster_record(cluster).cloned() else {
+            return Err(ClusterError::NotFound(format!(
+                "There is no cluster called \"{cluster}\" in this environment."
+            )));
+        };
+        if membership
+            .node(&self.node)
+            .and_then(|n| n.cluster.as_deref())
+            != Some(cluster)
+        {
+            return Err(ClusterError::Conflict(format!(
+                "The Core network is changed from inside the cluster. Open the console of a \
+                 member of \"{cluster}\"."
+            )));
+        }
+
+        let old = record.networks.core.clone();
+        let mut wanted = old.clone();
+        if let Some(mtu) = update.mtu {
+            wanted.mtu = mtu;
+        }
+        if let Some(members) = update.members {
+            wanted.members = members;
+        }
+
+        // The seats stay the same seats: same members, same addresses. An
+        // address is corosync's name for the member and the pool's peer
+        // address, on every member at once — not a per-node act this walk
+        // could perform safely.
+        for member in &old.members {
+            let Some(next) = wanted.members.iter().find(|m| m.node == member.node) else {
+                return Err(ClusterError::Conflict(format!(
+                    "\"{}\" has a Core seat and this edit drops it. Seats are added by growing \
+                     the cluster and leave with the member — not here.",
+                    member.node
+                )));
+            };
+            if next.address != member.address {
+                return Err(ClusterError::Conflict(format!(
+                    "\"{}\"'s Core address cannot change here: {} is corosync's ring 0 name for \
+                     it and the pool's peer address, written on every member. Re-addressing \
+                     Core is a destroy and re-create.",
+                    member.node, member.address
+                )));
+            }
+        }
+        for member in &wanted.members {
+            if !old.members.iter().any(|m| m.node == member.node) {
+                return Err(ClusterError::Conflict(format!(
+                    "\"{}\" has no Core seat to change.",
+                    member.node
+                )));
+            }
+        }
+        if wanted == old {
+            return Err(ClusterError::Conflict(
+                "Nothing in that request differs from what the cluster already has.".to_string(),
+            ));
+        }
+
+        // Validate the whole document against what every member actually
+        // has, read fresh — a seat must move onto a link that exists and
+        // carries link, per the owner's own report. A member that cannot be
+        // asked blocks the edit: the walk below has to reach every member
+        // whose seat changes, and starting one it cannot finish is how the
+        // record and the members drift apart.
+        let members: Vec<EnvironmentNode> = membership
+            .members_of(cluster)
+            .into_iter()
+            .cloned()
+            .collect();
+        let mut observed = Vec::new();
+        for member in &members {
+            match self.peers.preflight(member).await {
+                Ok(report) => observed.push(lumen_net::ObservedState {
+                    node: member.name.clone(),
+                    links: report.links,
+                }),
+                Err(err) => {
+                    return Err(ClusterError::Conflict(format!(
+                        "\"{}\" could not be asked about its links, and a Core edit does not \
+                         start on a cluster it cannot finish walking: {err}",
+                        member.name
+                    )))
+                }
+            }
+        }
+        let mut candidate = record.networks.clone();
+        candidate.core = wanted.clone();
+        let node_names: Vec<String> = members.iter().map(|m| m.name.clone()).collect();
+        let errors = validate_networks(&candidate, &node_names, &observed);
+        if !errors.is_empty() {
+            return Err(ClusterError::Invalid(errors));
+        }
+
+        // One member at a time, unchanged members skipped. Sequential on
+        // purpose: a seat move blips that member's ring 0, and two members
+        // blipping at once on a two-node cluster is both rings' worth of
+        // trouble instead of one member's.
+        for member in &members {
+            let Some(seat) = wanted.members.iter().find(|m| m.node == member.name) else {
+                continue;
+            };
+            let Some(was) = old.members.iter().find(|m| m.node == member.name) else {
+                continue;
+            };
+            let moved = seat.interface != was.interface;
+            if !moved && wanted.mtu == old.mtu {
+                continue;
+            }
+            let payload = crate::join::CoreSeatUpdate {
+                cluster: cluster.to_string(),
+                old_interface: moved.then(|| was.interface.clone()),
+                core: crate::join::CoreAssignment {
+                    interface: seat.interface.clone(),
+                    address: seat.address,
+                    prefix: wanted.subnet.prefix,
+                    mtu: wanted.mtu,
+                },
+            };
+            if let Err(err) = self.peers.update_core_seat(member, &payload).await {
+                return Err(ClusterError::Conflict(format!(
+                    "\"{}\" could not take the new Core definition, so the change was not \
+                     recorded: {err}. The members already changed are on the new definition and \
+                     the record is still on the old one — fix that member and ask again; a \
+                     member already changed will not object the second time.",
+                    member.name
+                )));
+            }
+        }
+
+        // Recorded only now that every member is on it — the External
+        // edit's order, for the External edit's reason.
+        let Some(stored) = membership
+            .clusters
+            .iter_mut()
+            .find(|candidate| candidate.definition.name == cluster)
+        else {
+            return Err(ClusterError::NotFound(format!(
+                "There is no cluster called \"{cluster}\" in this environment."
+            )));
+        };
+        stored.networks.core = wanted.clone();
+        membership.version += 1;
+        self.store.save_membership(&membership)?;
+        tracing::info!(
+            cluster = cluster,
+            mtu = wanted.mtu,
+            "core network changed on every member"
+        );
+        Ok(wanted)
+    }
+
     /// Every member has an uplink and every uplink names a member — the
     /// every-member-or-none rule, checked before anything is built rather
     /// than discovered halfway through.
@@ -1436,16 +1627,31 @@ impl ClusterService {
 
     /// Put addressing on this node's Core seat, whatever kind of link it is.
     ///
-    /// A Core seat is a NIC most of the time and a bond when the operator
-    /// wants the ring to survive a cable — and `lumen-net` patches each kind
-    /// through its own call, so the kind has to be looked up rather than
-    /// assumed. Applied and confirmed in one motion: a Core address on a link
-    /// that is not the console cannot sever the operator, which is what the
-    /// confirm window exists to protect against.
+    /// Applied and confirmed in one motion: a Core address on a link that is
+    /// not the console cannot sever the operator, which is what the confirm
+    /// window exists to protect against.
     async fn address_core_seat(
         &self,
         interface: &str,
         ip: lumen_net::IpConfig,
+        mtu: Option<u32>,
+    ) -> Result<()> {
+        self.stage_seat_patch(interface, Some(ip), mtu).await?;
+        self.apply_and_confirm().await
+    }
+
+    /// Stage one seat patch without applying it — the Core edit stages the
+    /// old link's release and the new link's addressing as *one* pending set,
+    /// so the checkpoint restores both or neither.
+    ///
+    /// A Core seat is a NIC most of the time and a bond when the operator
+    /// wants the ring to survive a cable — and `lumen-net` patches each kind
+    /// through its own call, so the kind has to be looked up rather than
+    /// assumed.
+    async fn stage_seat_patch(
+        &self,
+        interface: &str,
+        ip: Option<lumen_net::IpConfig>,
         mtu: Option<u32>,
     ) -> Result<()> {
         use lumen_net::service::{BondPatch, BridgePatch, NicPatch, VlanPatch};
@@ -1458,7 +1664,6 @@ impl ClusterService {
             .ok_or_else(|| {
                 ClusterError::Conflict(format!("This node has no link called \"{interface}\"."))
             })?;
-        let ip = Some(ip);
         match kind {
             LinkKind::Ethernet => {
                 self.network
@@ -1518,11 +1723,93 @@ impl ClusterService {
             }
         }
         .map_err(ClusterError::from)?;
+        Ok(())
+    }
+
+    /// Apply and confirm whatever seat patches are staged, in one motion —
+    /// see [`Self::address_core_seat`] for why no confirm window is kept.
+    async fn apply_and_confirm(&self) -> Result<()> {
         self.network
             .apply(lumen_net::Acknowledgements::default())
             .await
             .map_err(ClusterError::from)?;
         self.network.confirm().await.map_err(ClusterError::from)?;
+        Ok(())
+    }
+
+    /// Re-realize this node's Core seat: the same address on a different
+    /// link, a different MTU, or both — the Core edit's per-member half.
+    ///
+    /// The release of the old link and the addressing of the new one are one
+    /// staged apply inside one checkpoint, so a failure restores both. Each
+    /// half is staged only where the box disagrees with it, which is what
+    /// makes a retry after a half-finished change stage nothing and succeed
+    /// rather than refuse — the coordinator's "ask again" depends on it.
+    pub async fn peer_update_core_seat(&self, update: &crate::join::CoreSeatUpdate) -> Result<()> {
+        let core = &update.core;
+        let observed = self.network.observe().await.map_err(ClusterError::from)?;
+        let cidr = format!("{}/{}", core.address, core.prefix);
+        let Some(link) = observed.link(&core.interface) else {
+            return Err(ClusterError::Conflict(format!(
+                "This node has no link called \"{}\".",
+                core.interface
+            )));
+        };
+        let old = update
+            .old_interface
+            .as_deref()
+            .filter(|old| *old != core.interface);
+
+        let mut staged = false;
+        if let Some(old) = old {
+            let holds = observed
+                .link(old)
+                .is_some_and(|link| link.addresses.contains(&cidr));
+            if holds {
+                // Released, never deleted: a bond the operator built before
+                // the cluster outlives the seat that is leaving it.
+                self.stage_seat_patch(old, Some(lumen_net::IpConfig::Disabled), None)
+                    .await?;
+                staged = true;
+            }
+        }
+        let needs_address = !link.addresses.contains(&cidr);
+        let needs_mtu = link.mtu != Some(core.mtu);
+        if needs_address || needs_mtu {
+            self.stage_seat_patch(
+                &core.interface,
+                needs_address.then(|| lumen_net::IpConfig::Static {
+                    cidr: cidr.clone(),
+                    // A Core network routes nowhere, exactly as at prepare.
+                    gateway: String::new(),
+                    dns: Vec::new(),
+                }),
+                Some(core.mtu),
+            )
+            .await?;
+            staged = true;
+        }
+        if staged {
+            self.apply_and_confirm().await?;
+        }
+
+        // The firewall bindings follow the seat. Old closed before new
+        // opened so that two links sharing a zone end with the services
+        // bound; management's own binding is not this edit's to touch,
+        // which is what the `None` says.
+        if let Some(old) = old {
+            self.backend.set_cluster_ports(old, None, false).await?;
+            self.backend
+                .set_cluster_ports(&core.interface, None, true)
+                .await?;
+        }
+        tracing::info!(
+            cluster = %update.cluster,
+            interface = %core.interface,
+            mtu = core.mtu,
+            moved_from = ?old,
+            "core seat re-realized"
+        );
         Ok(())
     }
 
@@ -3706,6 +3993,335 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["alpha-1"]
         );
+    }
+
+    // --- core network edit --------------------------------------------------
+
+    /// A service standing on a formed two-node cluster, every member with a
+    /// spare `nic2`, and the mock peers kept out so a test can read what
+    /// crossed the channel.
+    fn core_edit_harness(
+        tag: &str,
+        prime: impl FnOnce(MockPeers) -> MockPeers,
+    ) -> (Arc<ClusterService>, Arc<MockPeers>) {
+        let peers = Arc::new(prime(
+            MockPeers::new()
+                .with_healthy_node("alpha-1", "0.3.0", &["nic0", "nic1", "nic2"])
+                .with_healthy_node("alpha-2", "0.3.0", &["nic0", "nic1", "nic2"]),
+        ));
+        let service = Arc::new(
+            ClusterService::new(
+                Arc::new(MockBackend::appliance()) as Arc<dyn ClusterBackend>,
+                peers.clone(),
+                network(),
+                &test_dir(tag),
+                "0.3.0",
+            )
+            .with_node("alpha-1")
+            .with_environment(&clustered_membership()),
+        );
+        (service, peers)
+    }
+
+    #[tokio::test]
+    async fn the_core_mtu_changes_on_every_member_and_the_record_last() {
+        let (service, peers) = core_edit_harness("core-mtu", |p| p);
+        let core = service
+            .update_core_network(
+                "alpha",
+                CoreNetworkUpdate {
+                    mtu: Some(1500),
+                    members: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(core.mtu, 1500);
+
+        let seats = peers.core_seats();
+        assert_eq!(
+            seats.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            vec!["alpha-1", "alpha-2"]
+        );
+        // An MTU change moves no seat: no old interface, same links.
+        assert!(seats
+            .iter()
+            .all(|(_, u)| u.old_interface.is_none() && u.core.mtu == 1500));
+        assert_eq!(service.cluster_networks("alpha").unwrap().core.mtu, 1500);
+    }
+
+    #[tokio::test]
+    async fn a_core_seat_moves_to_another_link_and_only_that_member_is_touched() {
+        let (service, peers) = core_edit_harness("core-move", |p| p);
+        let mut members = service.cluster_networks("alpha").unwrap().core.members;
+        members
+            .iter_mut()
+            .find(|m| m.node == "alpha-2")
+            .unwrap()
+            .interface = "nic2".into();
+
+        let core = service
+            .update_core_network(
+                "alpha",
+                CoreNetworkUpdate {
+                    mtu: None,
+                    members: Some(members),
+                },
+            )
+            .await
+            .unwrap();
+
+        let seat = |node: &str| {
+            core.members
+                .iter()
+                .find(|m| m.node == node)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(seat("alpha-2").interface, "nic2");
+        // The address went nowhere — the ring's name for the member is the
+        // one thing a seat move must not touch.
+        assert_eq!(seat("alpha-2").address.to_string(), "10.10.0.2");
+
+        let seats = peers.core_seats();
+        assert_eq!(seats.len(), 1, "{seats:?}");
+        let (node, update) = &seats[0];
+        assert_eq!(node, "alpha-2");
+        assert_eq!(update.old_interface.as_deref(), Some("nic1"));
+        assert_eq!(update.core.interface, "nic2");
+        assert_eq!(update.core.mtu, 9000);
+
+        let recorded = service.cluster_networks("alpha").unwrap().core;
+        assert_eq!(
+            recorded
+                .members
+                .iter()
+                .find(|m| m.node == "alpha-2")
+                .unwrap()
+                .interface,
+            "nic2"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_rings_identity_cannot_change_through_the_edit() {
+        let (service, peers) = core_edit_harness("core-identity", |p| p);
+
+        // A different address is refused before any member is asked.
+        let mut members = service.cluster_networks("alpha").unwrap().core.members;
+        members
+            .iter_mut()
+            .find(|m| m.node == "alpha-2")
+            .unwrap()
+            .address = "10.10.0.9".parse().unwrap();
+        let error = service
+            .update_core_network(
+                "alpha",
+                CoreNetworkUpdate {
+                    mtu: None,
+                    members: Some(members),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("destroy"), "{error}");
+
+        // So is dropping a seat.
+        let members: Vec<_> = service
+            .cluster_networks("alpha")
+            .unwrap()
+            .core
+            .members
+            .into_iter()
+            .filter(|m| m.node != "alpha-2")
+            .collect();
+        let error = service
+            .update_core_network(
+                "alpha",
+                CoreNetworkUpdate {
+                    mtu: None,
+                    members: Some(members),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("alpha-2"), "{error}");
+
+        // And an edit that changes nothing says so.
+        let error = service
+            .update_core_network(
+                "alpha",
+                CoreNetworkUpdate {
+                    mtu: Some(9000),
+                    members: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("differs"), "{error}");
+
+        assert!(peers.core_seats().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_seat_cannot_move_onto_a_link_the_member_does_not_have() {
+        let (service, peers) = core_edit_harness("core-missing-link", |p| p);
+        let mut members = service.cluster_networks("alpha").unwrap().core.members;
+        members
+            .iter_mut()
+            .find(|m| m.node == "alpha-2")
+            .unwrap()
+            .interface = "nic9".into();
+        let error = service
+            .update_core_network(
+                "alpha",
+                CoreNetworkUpdate {
+                    mtu: None,
+                    members: Some(members),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("nic9"), "{error}");
+        assert!(peers.core_seats().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_member_that_fails_leaves_the_record_on_the_old_definition() {
+        let (service, peers) =
+            core_edit_harness("core-fail", |p| p.fail_core_seat_on("alpha-2"));
+        let error = service
+            .update_core_network(
+                "alpha",
+                CoreNetworkUpdate {
+                    mtu: Some(1500),
+                    members: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("alpha-2"), "{error}");
+
+        // The member before it changed; the record did not — the error told
+        // the operator to fix the member and ask again.
+        assert_eq!(
+            peers
+                .core_seats()
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha-1"]
+        );
+        assert_eq!(service.cluster_networks("alpha").unwrap().core.mtu, 9000);
+    }
+
+    /// The member's own half, against the real (mock-backed) networking
+    /// domain: the release of the old link and the addressing of the new one
+    /// are one staged apply, the firewall bindings follow the seat, and a
+    /// retry stages nothing.
+    #[tokio::test]
+    async fn a_seat_move_releases_the_old_link_and_rebinds_the_ports() {
+        use lumen_net::{IpConfig, LinkKind, LinkState, ObservedLink, ObservedState};
+        let observed = ObservedState {
+            node: "alpha-1".into(),
+            links: vec![
+                ObservedLink {
+                    name: "nic0".into(),
+                    kind: LinkKind::Ethernet,
+                    state: LinkState::Activated,
+                    managed: true,
+                    carrier: true,
+                    mtu: Some(1500),
+                    addresses: vec!["192.168.10.1/24".into()],
+                    gateway: Some("192.168.10.254".into()),
+                    ip: IpConfig::Static {
+                        cidr: "192.168.10.1/24".into(),
+                        gateway: "192.168.10.254".into(),
+                        dns: Vec::new(),
+                    },
+                    connection_uuid: Some("uuid-nic0".into()),
+                    ..ObservedLink::default()
+                },
+                ObservedLink {
+                    name: "nic1".into(),
+                    kind: LinkKind::Ethernet,
+                    state: LinkState::Activated,
+                    managed: true,
+                    carrier: true,
+                    mtu: Some(9000),
+                    addresses: vec!["10.10.0.1/24".into()],
+                    ip: IpConfig::Static {
+                        cidr: "10.10.0.1/24".into(),
+                        gateway: String::new(),
+                        dns: Vec::new(),
+                    },
+                    connection_uuid: Some("uuid-nic1".into()),
+                    ..ObservedLink::default()
+                },
+                ObservedLink {
+                    name: "nic2".into(),
+                    kind: LinkKind::Ethernet,
+                    state: LinkState::Disconnected,
+                    managed: true,
+                    carrier: true,
+                    mtu: Some(1500),
+                    ..ObservedLink::default()
+                },
+            ],
+        };
+        let net_backend = Arc::new(lumen_net::backend::mock::MockBackend::new(observed));
+        let network = Arc::new(lumen_net::NetworkService::new(
+            net_backend.clone(),
+            &test_dir("seat-move-net"),
+            60,
+        ));
+        let backend = Arc::new(MockBackend::appliance());
+        let service = ClusterService::new(
+            backend.clone() as Arc<dyn ClusterBackend>,
+            Arc::new(MockPeers::new()),
+            network,
+            &test_dir("seat-move"),
+            "0.3.0",
+        )
+        .with_node("alpha-1");
+
+        let update = crate::join::CoreSeatUpdate {
+            cluster: "alpha".into(),
+            old_interface: Some("nic1".into()),
+            core: crate::join::CoreAssignment {
+                interface: "nic2".into(),
+                address: "10.10.0.1".parse().unwrap(),
+                prefix: 24,
+                mtu: 9000,
+            },
+        };
+        service.peer_update_core_seat(&update).await.unwrap();
+
+        let state = net_backend.state();
+        let nic1 = state.link("nic1").unwrap();
+        let nic2 = state.link("nic2").unwrap();
+        assert!(
+            !nic1.addresses.iter().any(|a| a == "10.10.0.1/24"),
+            "{nic1:?}"
+        );
+        assert!(
+            nic2.addresses.iter().any(|a| a == "10.10.0.1/24"),
+            "{nic2:?}"
+        );
+        assert_eq!(nic2.mtu, Some(9000));
+        assert_eq!(
+            backend.cluster_ports(),
+            vec![
+                ("nic1".into(), None, false),
+                ("nic2".into(), None, true)
+            ]
+        );
+
+        // A retry — the coordinator's "ask again" after a failure elsewhere
+        // in the walk — finds the box already right and stages nothing.
+        let before = net_backend.applied().len();
+        service.peer_update_core_seat(&update).await.unwrap();
+        assert_eq!(net_backend.applied().len(), before);
     }
 
     // --- fencing ------------------------------------------------------------

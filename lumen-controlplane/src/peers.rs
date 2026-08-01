@@ -586,6 +586,29 @@ impl crate::inventory::InventoryPeers for HttpPeerChannel {
             .await?;
         Ok(())
     }
+
+    async fn network(
+        &self,
+        node: &EnvironmentNode,
+        verb: &crate::inventory::NetworkVerb,
+    ) -> Result<serde_json::Value, ClusterError> {
+        // An apply waits on NetworkManager's checkpoint and activations; an
+        // edit to a staged document does not. The deadline follows the verb.
+        let deadline = if verb.is_slow() {
+            SLOW_CALL_DEADLINE
+        } else {
+            CALL_DEADLINE
+        };
+        self.call(
+            &node.address,
+            "/api/peer/network/verb",
+            verb,
+            self.ca_client_config()?,
+            Some(self.peer_ticket()?),
+            deadline,
+        )
+        .await
+    }
 }
 
 #[async_trait]
@@ -681,6 +704,28 @@ impl PeerChannel for HttpPeerChannel {
                 Some(self.peer_ticket()?),
                 // Building it applies a network change and waits for its
                 // confirm, the same as the bond.
+                SLOW_CALL_DEADLINE,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn update_core_seat(
+        &self,
+        node: &EnvironmentNode,
+        update: &lumen_cluster::CoreSeatUpdate,
+    ) -> Result<(), ClusterError> {
+        if self.is_local(node) {
+            return self.service()?.peer_update_core_seat(update).await;
+        }
+        let _: serde_json::Value = self
+            .call(
+                &node.address,
+                "/api/peer/cluster/core-seat",
+                update,
+                self.ca_client_config()?,
+                Some(self.peer_ticket()?),
+                // A staged apply and its confirm, the same wait as prepare.
                 SLOW_CALL_DEADLINE,
             )
             .await?;

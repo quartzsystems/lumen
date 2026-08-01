@@ -734,10 +734,13 @@ async fn a_volume_is_only_ever_reached_through_the_machine_it_belongs_to() {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
 }
 
-// --- clustering placeholders -------------------------------------------------
+// --- cross-node guard ----------------------------------------------------------
 
 #[tokio::test]
 async fn a_request_for_another_node_is_refused_clearly() {
+    // The networking routes forward a named node's request to that member;
+    // a machine write never does — its machines can only be moved by the
+    // node running them — so the guard here refuses rather than routes.
     let h = harness("other-node").await;
     let (status, body) = h
         .post(
@@ -747,7 +750,7 @@ async fn a_request_for_another_node_is_refused_clearly() {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(
-        body["error"].as_str().unwrap().contains("not in a cluster"),
+        body["error"].as_str().unwrap().contains("cannot be sent"),
         "{body}"
     );
 

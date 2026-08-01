@@ -595,8 +595,10 @@ the other, and `openssl s_client` against both afterwards shows the same CA.
 
 ## Editing the networks
 
-A cluster's typed networks are defined when it is created, and two of the
-three can be changed afterwards.
+A cluster's typed networks are defined when it is created. Afterwards,
+External networks and the cluster VIP change freely, Core changes in the
+ways that do not touch the ring's addressing, and Management does not
+change at all.
 
 **External networks** change the way they are defined: `PUT
 /api/environment/clusters/{name}/networks/external/{network}` rebuilds the
@@ -633,19 +635,36 @@ than with a success flag: a recovery run before the cause is fixed re-probes,
 fails the same way, and the console reports that instead of a green toast
 over an address nobody answers on.
 
-**Core and Management cannot be changed here**, and the omission is
-deliberate rather than pending. Their subnets and per-member addresses are
-corosync's ring addressing, written into `corosync.conf` on every member;
-changing one means rewriting that file everywhere, reloading corosync, and
-re-addressing each node's link — with the pool's peer addresses riding Core
-and the console's own session riding Management. The machinery for the writes
-exists (`ReconfigurePayload` does exactly this for the scale-out); what does
-not exist is the part that matters, which is a staged apply with a confirm
-window and an automatic rollback, of the kind the networking domain already
-keeps for an ordinary link change. Without it a member that drops out
-mid-change leaves a cluster whose members disagree about their own ring, and
-that is a split, not a failed edit. It belongs behind that machinery, not in
-front of it.
+**Core can be changed — in the two ways that do not touch the ring's
+identity.** `PUT /api/environment/clusters/{name}/networks/core` takes the
+MTU and the per-member seats, and the console's Networks page opens it from
+the Core row's pencil. What makes these two edits safe is a fact about
+`corosync.conf`: it names each member by `ring0_addr` — an address — and
+never mentions the interface carrying it or its frame size. So a seat can
+move to a different link (the bond built after the cluster was, the adopted
+replacement card's port) and the MTU can change, with the ring configuration
+untouched on every member. Each member re-realizes its seat through its own
+networking domain — the old link's release and the new link's addressing
+staged as one set, applied inside one NetworkManager checkpoint, so a
+failure restores both or neither — then swaps its firewall bindings onto the
+new interface. Members change one at a time; a moved seat drops that
+member's ring 0 for the moment the address crosses, and ring 1 on Management
+is what keeps the cluster quorate through the blip. A member that fails
+stops the walk with its name in the error and the record on the old
+definition, the External edit's non-atomicity with the External edit's
+repair: a member already changed stages nothing on the retry and succeeds.
+
+**What the edit refuses is the addressing.** The subnet and the per-member
+addresses are corosync's ring addressing, written into `corosync.conf` on
+every member and ridden by the pool's peer links; the request shape cannot
+carry a new subnet at all, and a `members` list that changes an address or
+the set of seats is refused before any member is asked. Changing them means
+rewriting the ring file everywhere in lockstep, and a member that drops out
+mid-change leaves a cluster whose members disagree about their own ring —
+a split, not a failed edit. That stays behind destroy-and-recreate.
+**Management cannot be changed here** for the same reason plus one more: its
+addressing is also the console's own session and every member's peer
+address, so there is no seat of it an edit could safely stand on.
 
 ## Out of scope
 
@@ -660,15 +679,17 @@ realization (bridges on every member, which is also what would give the
 page's External list something to say); **removing** a member from a live cluster (a node
 holding volume replicas cannot leave — the record knows enough to refuse,
 and the workflow is the scale-out run backwards plus that refusal); the
-environment-wide console federation — aggregated reads with per-node
-freshness, proxied writes — for which the peer channel built here is the
-transport; and gossip beyond the once-a-minute record exchange. A removed
+rest of the environment-wide console federation — the networking domain's
+half has landed (aggregated reads through the inventory, writes forwarded
+to the owning member as `POST /api/peer/network/verb`, see
+docs/networking.md), and what remains is the same treatment for the other
+domains plus gossip beyond the once-a-minute record exchange. A removed
 node keeps its stale environment state until it re-joins somewhere; a
 "leave and reset" for the node itself rides the federation stage. One
-fencing consequence of the missing federation is worth naming: a fence
-test runs from a member of the cluster it tests, so testing every
-direction of a cluster means signing into each node once — the
-proxied-writes stage dissolves that. And one packaging loose end is
+fencing consequence of the federation being partial is worth naming: a
+fence test runs from a member of the cluster it tests, so testing every
+direction of a cluster means signing into each node once — extending the
+proxied writes to fencing dissolves that. And one packaging loose end is
 recorded in docs/storage.md: the libvirt Core-network listener that live
 migration assumes ships as a firewalld service definition only, its
 enablement being a security decision this program declined to make

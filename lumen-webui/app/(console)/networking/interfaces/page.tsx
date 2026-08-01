@@ -16,7 +16,12 @@ import { RowActions } from "@/components/console/RowActions";
 import { Button } from "@/components/ui/Button";
 import { ModalShell, ModalHeader } from "@/components/ui/Modal";
 import { ModalFooter } from "@/components/ui/formkit";
-import { LinkDialog, dialogKindFor, type DialogKind } from "@/components/network/LinkDialog";
+import {
+  LinkDialog,
+  dialogKindFor,
+  type DialogKind,
+  type DialogMember,
+} from "@/components/network/LinkDialog";
 import { ApiError } from "@/lib/authClient";
 import { titleCase, titleCaseOptions } from "@/lib/labels";
 import { shortNodeName } from "@/lib/nodeNames";
@@ -24,11 +29,13 @@ import { useConsole } from "@/lib/ConsoleContext";
 import { useNetworkCheckpoint } from "@/lib/NetworkCheckpointContext";
 import {
   applyPending,
+  confirmApply,
   convertManagementBridge,
   deleteLink,
   discardPending,
   fetchInterfaces,
   fetchPending,
+  rollbackApply,
   type InterfacesResponse,
   type LinkView,
   type PendingResponse,
@@ -44,43 +51,86 @@ import { OrphanedNics } from "@/components/network/OrphanedNics";
 
 const POLL_MS = 5000;
 
+/// One member's staged state, as this page tracks it: whose it is, and
+/// whether the write that changes it needs the `node` field.
+interface MemberPending {
+  node: string;
+  local: boolean;
+  pending: PendingResponse;
+}
+
+/// The node argument a client call wants: nothing for the node serving the
+/// console, the member's name for everyone else.
+const nodeArg = (member: { node: string; local: boolean }): string | undefined =>
+  member.local ? undefined : member.node;
+
 /// The node's network configuration, in the shape Proxmox's node network page
 /// established: one table per node covering every link, with edits staged and
-/// applied as a set rather than one at a time.
+/// applied as a set rather than one at a time — and since the console
+/// federation landed, the table's pencil works on every member's rows, with
+/// the staged set, the apply, and the confirm window all living on the member
+/// that owns the link.
 export default function InterfacesPage() {
   const { setToast } = useConsole();
   const { checkpoint, begin, refresh: refreshCheckpoint } = useNetworkCheckpoint();
 
   const [interfaces, setInterfaces] = useState<InterfacesResponse | null>(null);
-  /// Every member's links. The node-local read above is still what the edit
-  /// dialogs work against; this is what the table renders.
+  /// Every member's links. The node-local read above is still what the
+  /// management banner works against; this is what the table renders.
   const [inventory, setInventory] = useState<InventoryResponse | null>(null);
-  const [pending, setPending] = useState<PendingResponse | null>(null);
+  /// Every member's staged set, this node's first. A change staged on a
+  /// member lives on that member, so watching it means asking that member —
+  /// through the same forwarded read the edit used.
+  const [pendings, setPendings] = useState<MemberPending[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [dialog, setDialog] = useState<{ kind: DialogKind; editing: LinkView | null } | null>(null);
-  const [confirming, setConfirming] = useState(false);
+  const [dialog, setDialog] = useState<{
+    kind: DialogKind;
+    editing: LinkView | null;
+    node: string | null;
+  } | null>(null);
+  /// The member an ApplyDialog is open for, if any.
+  const [confirming, setConfirming] = useState<MemberPending | null>(null);
   const [busy, setBusy] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
 
   // Polling pauses while a dialog or the apply confirmation is open, so a
   // refresh cannot yank the form out from under the operator mid-edit.
-  const paused = dialog !== null || confirming;
+  const paused = dialog !== null || confirming !== null;
   const pausedRef = useRef(paused);
   pausedRef.current = paused;
 
   const load = useCallback(async () => {
     try {
-      const [links, staged, everyone] = await Promise.all([
+      const [links, everyone] = await Promise.all([
         fetchInterfaces(),
-        fetchPending(),
         // Settled rather than awaited with the rest: the environment read
         // reaches other nodes, and one member being away must not cost this
-        // page the two reads that answered locally.
+        // page the read that answered locally.
         fetchInventory().catch(() => null),
       ]);
       setInterfaces(links);
-      setPending(staged);
       setInventory(everyone);
+
+      // One staged set per member that can be asked. A member whose pending
+      // cannot be read simply has no bar — its rows still render from the
+      // inventory, and the next poll asks again.
+      const members: { node: string; local: boolean }[] =
+        everyone !== null
+          ? everyone.members
+              .filter((member) => member.reachable)
+              .map((member) => ({ node: member.node, local: member.local }))
+          : [{ node: links.nodes[0]?.node ?? "", local: true }];
+      const settled = await Promise.allSettled(
+        members.map((member) => fetchPending(nodeArg(member))),
+      );
+      setPendings(
+        members.flatMap((member, index) => {
+          const answer = settled[index];
+          return answer.status === "fulfilled"
+            ? [{ ...member, pending: answer.value }]
+            : [];
+        }),
+      );
       setError(null);
     } catch (err) {
       // A 401 has already redirected to /login. A status 0 during a confirm
@@ -108,22 +158,61 @@ export default function InterfacesPage() {
     if (!checkpoint) void load();
   }, [checkpoint, load]);
 
-  // This node's own links: what the dialogs validate against (a bond may not
-  // swallow a name that is taken *here*) and what the management banner reads.
+  // This node's own links: what the management banner reads.
   const allLinks = interfaces?.nodes.flatMap((node) => node.interfaces) ?? [];
+  const localNode = interfaces?.nodes[0]?.node ?? "";
   // Every member's, for the table. Falls back to this node alone when the
   // environment read failed, so the page still works standalone.
   const rows: OwnedLink[] =
     inventory !== null
       ? linksByMember(inventory)
-      : allLinks.map((link) => ({ node: interfaces?.nodes[0]?.node ?? "", local: true, link }));
+      : allLinks.map((link) => ({ node: localNode, local: true, link }));
   const missing = unreachable(inventory);
-  const staged = pending?.changes ?? [];
+  const localPending = pendings.find((entry) => entry.local)?.pending ?? null;
+  const staged = localPending?.changes ?? [];
   const management = allLinks.find((link) => link.management) ?? null;
   // Assume bridged until proven otherwise, so the banner never flashes up
   // during the first load.
   const managementIsBridged = management === null || management.kind === "bridge";
   const outstanding = checkpoint !== null;
+  // Members with an applied-but-unconfirmed change. Acting on such a member
+  // while its checkpoint counts down would race the revert.
+  const blocked = useMemo(
+    () =>
+      new Set(
+        pendings
+          .filter((entry) => entry.pending.checkpoint !== null || (entry.local && outstanding))
+          .map((entry) => entry.node),
+      ),
+    [pendings, outstanding],
+  );
+
+  /// What the link dialogs work against, per member: that member's own
+  /// links, and which of them carries its management address.
+  const dialogMembers: DialogMember[] = useMemo(() => {
+    if (inventory === null) {
+      return [
+        {
+          node: localNode,
+          local: true,
+          links: allLinks,
+          managementLink: management?.name ?? null,
+        },
+      ];
+    }
+    return inventory.members
+      .filter((member) => member.reachable && member.inventory)
+      .map((member) => {
+        const links = member.inventory?.interfaces ?? [];
+        return {
+          node: member.node,
+          local: member.local,
+          links,
+          managementLink: links.find((link) => link.management)?.name ?? null,
+        };
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [inventory, interfaces]);
 
   const run = async (action: () => Promise<unknown>, success: string) => {
     setBusy(true);
@@ -138,13 +227,24 @@ export default function InterfacesPage() {
     }
   };
 
-  const apply = async () => {
+  const apply = async (member: MemberPending) => {
     setBusy(true);
     try {
-      const response = await applyPending(pending?.requires_disconnect_ack ?? false);
-      begin(response.checkpoint);
-      setConfirming(false);
-      setToast("Applied. Confirm before the window runs out.");
+      const response = await applyPending(
+        member.pending.requires_disconnect_ack,
+        nodeArg(member),
+      );
+      if (member.local) {
+        // The local checkpoint lives above the pages, because its revert can
+        // sever this very session.
+        begin(response.checkpoint);
+      }
+      setConfirming(null);
+      setToast(
+        member.local
+          ? "Applied. Confirm before the window runs out."
+          : `Applied on ${shortNodeName(member.node)}. Confirm before the window runs out.`,
+      );
       await load();
     } catch (err) {
       setToast(err instanceof Error ? err.message : "Could not apply the changes.");
@@ -197,7 +297,7 @@ export default function InterfacesPage() {
                 className="menu-item"
                 onClick={() => {
                   setMenuOpen(false);
-                  setDialog({ kind, editing: null });
+                  setDialog({ kind, editing: null, node: null });
                 }}
               >
                 <Icon size={15} /> {label}
@@ -262,49 +362,74 @@ export default function InterfacesPage() {
 
           {/* A replaced card orphans the name every profile above it was
               written against — a bond with no ports, a Core network that
-              cannot activate. This is where that is said and repaired. */}
-          <OrphanedNics onAdopted={load} />
+              cannot activate. This is where that is said and repaired, for
+              every member the environment can reach. */}
+          <OrphanedNics
+            members={
+              inventory !== null
+                ? inventory.members
+                    .filter((member) => member.reachable)
+                    .map((member) => ({ node: member.node, local: member.local }))
+                : [{ node: localNode, local: true }]
+            }
+            onAdopted={load}
+          />
 
-          {staged.length > 0 && (
-            <div className="pending-bar">
-              <span className="text-[13px] font-semibold text-[var(--qz-fg-1)] flex-1">
-                {staged.length} staged {staged.length === 1 ? "change" : "changes"}, not yet applied
-              </span>
-              <Button
-                kind="ghost"
-                disabled={busy || outstanding}
-                onClick={() => run(discardPending, "Staged changes discarded.")}
-              >
-                Discard all
-              </Button>
-              <span
-                title={
-                  (pending?.errors.length ?? 0) > 0
-                    ? "Fix the problems listed below first"
-                    : undefined
+          {pendings
+            .filter(
+              (entry) =>
+                entry.pending.changes.length > 0 ||
+                (!entry.local && entry.pending.checkpoint !== null),
+            )
+            .map((entry) => (
+              <PendingBar
+                key={entry.node}
+                entry={entry}
+                several={pendings.length > 1}
+                busy={busy}
+                localOutstanding={outstanding}
+                onDiscard={() =>
+                  run(
+                    () => discardPending(nodeArg(entry)),
+                    entry.local
+                      ? "Staged changes discarded."
+                      : `Staged changes on ${shortNodeName(entry.node)} discarded.`,
+                  )
                 }
-              >
-                <Button
-                  kind="primary"
-                  disabled={busy || outstanding || (pending?.errors.length ?? 0) > 0}
-                  onClick={() => setConfirming(true)}
-                >
-                  Apply configuration
-                </Button>
-              </span>
-            </div>
-          )}
+                onApply={() => setConfirming(entry)}
+                onConfirm={() =>
+                  run(
+                    () => confirmApply(nodeArg(entry)),
+                    `Confirmed on ${shortNodeName(entry.node)}.`,
+                  )
+                }
+                onRollback={() =>
+                  run(
+                    () => rollbackApply(nodeArg(entry)),
+                    `Rolled back on ${shortNodeName(entry.node)}.`,
+                  )
+                }
+              />
+            ))}
 
-          {(pending?.errors.length ?? 0) > 0 && (
-            <div className="callout callout-crit">
-              <AlertTriangle size={17} className="flex-shrink-0 text-[var(--qz-danger)] mt-[1px]" />
-              <ul className="m-0 pl-4 text-[13px] text-[var(--qz-fg-2)]">
-                {pending?.errors.map((item) => (
-                  <li key={`${item.code}-${item.link ?? ""}`}>{item.message}</li>
-                ))}
-              </ul>
-            </div>
-          )}
+          {pendings
+            .filter((entry) => entry.pending.errors.length > 0)
+            .map((entry) => (
+              <div key={`${entry.node}-errors`} className="callout callout-crit">
+                <AlertTriangle
+                  size={17}
+                  className="flex-shrink-0 text-[var(--qz-danger)] mt-[1px]"
+                />
+                <ul className="m-0 pl-4 text-[13px] text-[var(--qz-fg-2)]">
+                  {entry.pending.errors.map((item) => (
+                    <li key={`${item.code}-${item.link ?? ""}`}>
+                      {pendings.length > 1 ? `${shortNodeName(entry.node)}: ` : ""}
+                      {item.message}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ))}
 
           {interfaces === null && !error && (
             <div className="text-[13px] text-[var(--qz-fg-4)]">
@@ -332,12 +457,24 @@ export default function InterfacesPage() {
           {interfaces !== null && (
             <InterfaceTable
               rows={rows}
-              busy={busy || outstanding}
+              busy={busy}
+              blocked={blocked}
               toolbar={createControl}
               onRefresh={load}
-              onEdit={(link) => setDialog({ kind: dialogKindFor(link.kind), editing: link })}
-              onDelete={(link) =>
-                run(() => deleteLink(link.kind, link.name), `${link.name} staged for removal.`)
+              onEdit={(row) =>
+                setDialog({
+                  kind: dialogKindFor(row.link.kind),
+                  editing: row.link,
+                  node: row.node,
+                })
+              }
+              onDelete={(row) =>
+                run(
+                  () => deleteLink(row.link.kind, row.link.name, row.local ? undefined : row.node),
+                  row.local
+                    ? `${row.link.name} staged for removal.`
+                    : `${row.link.name} staged for removal on ${shortNodeName(row.node)}.`,
+                )
               }
             />
           )}
@@ -348,13 +485,19 @@ export default function InterfacesPage() {
         <LinkDialog
           kind={dialog.kind}
           editing={dialog.editing}
-          links={allLinks}
-          managementLink={management?.name ?? null}
+          members={
+            // An edit belongs to its owner; a create may choose its node.
+            dialog.editing
+              ? dialogMembers.filter((member) => member.node === dialog.node)
+              : dialogMembers
+          }
+          initialNode={dialog.node ?? dialogMembers.find((m) => m.local)?.node ?? localNode}
           onClose={() => setDialog(null)}
-          onSaved={(next) => {
-            setPending(next);
+          onSaved={(node) => {
             setDialog(null);
-            setToast("Change staged.");
+            setToast(
+              node === null ? "Change staged." : `Change staged on ${shortNodeName(node)}.`,
+            );
             void load();
           }}
         />
@@ -362,15 +505,97 @@ export default function InterfacesPage() {
 
       {confirming && (
         <ApplyDialog
-          count={staged.length}
-          seconds={pending?.checkpoint?.rollback_secs ?? null}
-          requiresAck={pending?.requires_disconnect_ack ?? false}
+          node={confirming.local ? null : confirming.node}
+          count={confirming.pending.changes.length}
+          seconds={confirming.pending.checkpoint?.rollback_secs ?? null}
+          requiresAck={confirming.pending.requires_disconnect_ack}
           busy={busy}
-          onCancel={() => setConfirming(false)}
-          onApply={apply}
+          onCancel={() => setConfirming(null)}
+          onApply={() => apply(confirming)}
         />
       )}
     </Page>
+  );
+}
+
+/// One member's staged set, and — for a remote member — its confirm window.
+///
+/// The local node's window is deliberately absent here: it lives in the
+/// shell's own countdown, above the pages, because its revert can sever the
+/// very session watching it. A remote member's revert cannot, so its window
+/// is shown where its changes are.
+function PendingBar({
+  entry,
+  several,
+  busy,
+  localOutstanding,
+  onDiscard,
+  onApply,
+  onConfirm,
+  onRollback,
+}: {
+  entry: MemberPending;
+  several: boolean;
+  busy: boolean;
+  localOutstanding: boolean;
+  onDiscard: () => void;
+  onApply: () => void;
+  onConfirm: () => void;
+  onRollback: () => void;
+}) {
+  const checkpoint = entry.local ? null : entry.pending.checkpoint;
+  const [secondsLeft, setSecondsLeft] = useState(0);
+  useEffect(() => {
+    if (!checkpoint) return;
+    const deadline = checkpoint.confirm_deadline;
+    const tick = () => setSecondsLeft(Math.max(0, Math.round(deadline - Date.now() / 1000)));
+    tick();
+    const timer = setInterval(tick, 1000);
+    return () => clearInterval(timer);
+  }, [checkpoint]);
+
+  if (checkpoint) {
+    return (
+      <div className="pending-bar">
+        <span className="text-[13px] font-semibold text-[var(--qz-fg-1)] flex-1">
+          Applied on {shortNodeName(entry.node)} — confirm within {secondsLeft}s or it reverts
+          itself.
+        </span>
+        <Button kind="ghost" disabled={busy} onClick={onRollback}>
+          Roll back
+        </Button>
+        <Button kind="primary" disabled={busy} onClick={onConfirm}>
+          Confirm
+        </Button>
+      </div>
+    );
+  }
+
+  const count = entry.pending.changes.length;
+  const blockedByLocal = entry.local && localOutstanding;
+  return (
+    <div className="pending-bar">
+      <span className="text-[13px] font-semibold text-[var(--qz-fg-1)] flex-1">
+        {count} staged {count === 1 ? "change" : "changes"}
+        {several ? ` on ${shortNodeName(entry.node)}` : ""}, not yet applied
+      </span>
+      <Button kind="ghost" disabled={busy || blockedByLocal} onClick={onDiscard}>
+        Discard all
+      </Button>
+      <span
+        title={
+          entry.pending.errors.length > 0 ? "Fix the problems listed below first" : undefined
+        }
+      >
+        <Button
+          kind="primary"
+          disabled={busy || blockedByLocal || entry.pending.errors.length > 0}
+          onClick={onApply}
+        >
+          Apply configuration
+        </Button>
+      </span>
+    </div>
   );
 }
 
@@ -538,13 +763,14 @@ const columns: Column<OwnedLink>[] = [
 /// port?" — is asked across the environment, and answering it by scrolling
 /// between tables is the console making them do the join by hand.
 ///
-/// Editing stays node-local. The links of another member are shown and not
-/// touched: the writes behind that pencil land on whichever node serves the
-/// request, so offering them on a remote row would quietly change the wrong
-/// box.
+/// The pencil works on every member's rows. The write behind it names the
+/// owning node and is forwarded there, landing in that node's own staged
+/// set behind that node's own validation and confirm window — so editing a
+/// remote row is exactly editing it on the owner's console, minus the trip.
 function InterfaceTable({
   rows,
   busy,
+  blocked,
   toolbar,
   onRefresh,
   onEdit,
@@ -552,10 +778,13 @@ function InterfaceTable({
 }: {
   rows: OwnedLink[];
   busy: boolean;
+  /// Nodes with an applied-but-unconfirmed change: acting on them now would
+  /// race the revert, so their rows wait for the window to resolve.
+  blocked: Set<string>;
   toolbar?: React.ReactNode;
   onRefresh: () => Promise<void>;
-  onEdit: (link: LinkView) => void;
-  onDelete: (link: LinkView) => Promise<void>;
+  onEdit: (row: OwnedLink) => void;
+  onDelete: (row: OwnedLink) => Promise<void>;
 }) {
   // The drop-downs offer what is actually out there, not every value the API
   // can produce — a filter for a type nothing has is dead space. The option
@@ -607,26 +836,22 @@ function InterfaceTable({
       actions={(row) => (
         <RowActions
           label={row.link.name}
-          onEdit={() => onEdit(row.link)}
-          onDelete={() => onDelete(row.link)}
-          editDisabled={busy || !row.local || row.link.kind === "other"}
-          // Named by its owner rather than contrasted with wherever this
-          // console happens to be pointed: which node is serving the page is
-          // not something an operator should have to keep track of, and
-          // "that node's console" only means anything if they do.
+          onEdit={() => onEdit(row)}
+          onDelete={() => onDelete(row)}
+          editDisabled={busy || blocked.has(row.node) || row.link.kind === "other"}
           editTitle={
-            !row.local
-              ? `Owned by ${shortNodeName(row.node)} — edit it on ${shortNodeName(row.node)}`
+            blocked.has(row.node)
+              ? `${shortNodeName(row.node)} has an applied change waiting to be confirmed`
               : row.link.kind === "other"
                 ? "Not managed by Lumen"
                 : undefined
           }
-          deleteDisabled={busy || !row.local || !row.link.deletable}
+          deleteDisabled={busy || blocked.has(row.node) || !row.link.deletable}
           // The control explains itself instead of being silently greyed out:
-          // the backend supplies the reason for a local row.
+          // the owning node supplies the reason.
           deleteTitle={
-            !row.local
-              ? `Owned by ${shortNodeName(row.node)} — delete it on ${shortNodeName(row.node)}`
+            blocked.has(row.node)
+              ? `${shortNodeName(row.node)} has an applied change waiting to be confirmed`
               : (row.link.delete_blocked_reason ?? undefined)
           }
         />
@@ -655,8 +880,9 @@ function ActiveCell({ link }: { link: LinkView }) {
 }
 
 /// Says plainly what applying does — including that nobody confirming means it
-/// all comes back.
+/// all comes back, and on which node all of that happens.
 function ApplyDialog({
+  node,
   count,
   seconds,
   requiresAck,
@@ -664,6 +890,8 @@ function ApplyDialog({
   onCancel,
   onApply,
 }: {
+  /// The member being applied to, or null for the node serving the console.
+  node: string | null;
   count: number;
   /// The window length as the API reports it — never a number hardcoded here.
   seconds: number | null;
@@ -674,12 +902,13 @@ function ApplyDialog({
 }) {
   const [acked, setAcked] = useState(false);
   const windowText = seconds !== null ? `${seconds} seconds` : "the confirm window";
+  const where = node === null ? "this node" : shortNodeName(node);
 
   return (
     <ModalShell onClose={onCancel}>
       <ModalHeader
         title="Apply network configuration"
-        subtitle={`${count} ${count === 1 ? "change" : "changes"} will be applied to this node.`}
+        subtitle={`${count} ${count === 1 ? "change" : "changes"} will be applied to ${where}.`}
         onClose={onCancel}
       />
 
@@ -687,9 +916,19 @@ function ApplyDialog({
         <div className="callout callout-warn">
           <AlertTriangle size={17} className="flex-shrink-0 text-[var(--qz-warn)] mt-[1px]" />
           <div className="text-[13px] text-[var(--qz-fg-2)]">
-            The node applies the changes and then waits for you to confirm them. If nobody confirms
-            within {windowText}, it restores the previous configuration by itself — so if a change
-            cuts your connection, doing nothing brings the node back.
+            {node === null ? (
+              <>
+                The node applies the changes and then waits for you to confirm them. If nobody
+                confirms within {windowText}, it restores the previous configuration by itself —
+                so if a change cuts your connection, doing nothing brings the node back.
+              </>
+            ) : (
+              <>
+                {where} applies the changes and then waits for you to confirm them. If nobody
+                confirms within {windowText} — including because the change cut the path this
+                console reaches it over — it restores the previous configuration by itself.
+              </>
+            )}
           </div>
         </div>
 

@@ -96,6 +96,7 @@ export function DataTable<T>({
   const [query, setQuery] = useState("");
   const [refreshing, setRefreshing] = useState(false);
 
+
   const handleRefresh = async () => {
     if (!onRefresh || refreshing) return;
     setRefreshing(true);
@@ -649,7 +650,7 @@ export function DataTable<T>({
                 </th>
               ))}
               {actions && (
-                <th style={{ width: actionsWidth }} className="text-right">
+                <th style={{ width: actionsWidth }} className="text-right qz-sticky-actions">
                   Actions
                 </th>
               )}
@@ -701,7 +702,7 @@ export function DataTable<T>({
                         onMouseDown={(e) => e.stopPropagation()}
                         onDoubleClick={(e) => e.stopPropagation()}
                         style={{ cursor: "default", whiteSpace: "nowrap" }}
-                        className="text-right"
+                        className="text-right qz-sticky-actions"
                       >
                         {actions(row)}
                       </td>

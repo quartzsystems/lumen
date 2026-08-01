@@ -7,12 +7,13 @@
 //! member the same three questions and returns the answers side by side.
 //!
 //! It is deliberately a *separate* endpoint rather than a widening of those
-//! three. Those routes mean "this appliance" — the same rule `check_node`
-//! states for request bodies — and the console's edit and delete actions on a
-//! link or a pool are written against that meaning. Widening them would make
-//! every existing write ambiguous about which node it lands on. Reading is the
-//! part that wants the whole environment; writing still belongs to the node
-//! that owns the thing.
+//! three. Those routes mean "this appliance" unless a request *names* another
+//! node — never by default — and the console's edit and delete actions on a
+//! pool are written against that meaning. Reading is the part that wants the
+//! whole environment; writing still belongs to the node that owns the thing,
+//! and where a write may now be asked for from another member's console
+//! ([`NetworkVerb`], `wipe_disk`), it still runs on the owner, behind the
+//! owner's own guards.
 //!
 //! One unreachable member degrades one row. The console renders six
 //! independent readings and must not blank five of them because a sixth node
@@ -25,12 +26,72 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use lumen_cluster::{ClusterError, EnvironmentNode};
-use lumen_net::service::LinkView;
+use lumen_net::service::{BondPatch, BridgePatch, LinkView, NicPatch, VlanPatch};
 use lumen_virt::service::NodeView;
 use lumen_zfs::service::PoolView;
 use lumen_zfs::BlockDevice;
 
 use crate::AppState;
+
+/// One networking act, named — the closed set a console's network write can
+/// ask another member to perform, the same shape as `lumen_pool::PoolVerb`
+/// and for the same reason: a peer can request one of these and nothing
+/// else, and every variant is deserialized whole before anything runs.
+///
+/// The verbs mirror the operator-facing `/api/network` routes one for one,
+/// staged lifecycle included: a change staged on a member stays staged
+/// *there*, its apply opens a checkpoint *there*, and a confirm that never
+/// arrives — including because the change severed the path it travelled —
+/// is rolled back by that member on its own. That auto-revert is what makes
+/// forwarding a write no more dangerous than typing it on the member's own
+/// console.
+///
+/// `Apply` carries the disconnect acknowledgement, unlike `wipe_disk`,
+/// which deliberately hardcodes its consent. The difference: the wipe route
+/// exists only for already-acknowledged requests, while `may_disconnect`
+/// is a validator input that is legitimately false — carrying it is what
+/// keeps the target's validator able to refuse a management-address move
+/// nobody acknowledged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "verb", content = "with", rename_all = "snake_case")]
+pub enum NetworkVerb {
+    /// The staged delta, validation results, and any open checkpoint.
+    Pending,
+    Discard,
+    CreateBridge(lumen_net::Bridge),
+    CreateBond(lumen_net::Bond),
+    CreateVlan(lumen_net::Vlan),
+    UpdateBridge { name: String, patch: BridgePatch },
+    UpdateBond { name: String, patch: BondPatch },
+    UpdateVlan { name: String, patch: VlanPatch },
+    UpdateNic { name: String, patch: NicPatch },
+    DeleteLink { name: String, kind: lumen_net::LinkKind },
+    Apply { may_disconnect: bool },
+    Confirm,
+    Rollback,
+    Extend { seconds: u32 },
+    ManagementBridge,
+    /// The nicN pins: names that have lost their hardware, and adapters
+    /// nothing has claimed.
+    Pins,
+    /// Give an orphaned nicN to the adapter that replaced its card.
+    Adopt { slot: u32, mac: String },
+}
+
+impl NetworkVerb {
+    /// Whether the verb applies a change and waits on NetworkManager —
+    /// checkpoints, activations, a live rename — rather than editing a
+    /// staged document. The channel gives these the generous deadline.
+    pub fn is_slow(&self) -> bool {
+        matches!(
+            self,
+            NetworkVerb::Apply { .. }
+                | NetworkVerb::Rollback
+                | NetworkVerb::ManagementBridge
+                | NetworkVerb::Adopt { .. }
+        )
+    }
+}
 
 /// The one thing this module needs from the peer channel.
 ///
@@ -118,6 +179,20 @@ pub trait InventoryPeers: Send + Sync {
     /// that succeeds is one the member agreed was safe — the coordinator's
     /// belief about the cluster carries no weight over the member's own.
     async fn restart(&self, node: &EnvironmentNode) -> Result<(), ClusterError>;
+
+    /// Run one networking verb on one member — the federation's proxied
+    /// write, and the answer is exactly the JSON that member's own console
+    /// route would have returned, relayed untouched.
+    ///
+    /// The write still belongs to the node that owns the link: it lands in
+    /// that member's own networking domain, behind that member's own
+    /// validation, checkpoint, and confirm window. What this changes is only
+    /// where the operator may be sitting when they ask.
+    async fn network(
+        &self,
+        node: &EnvironmentNode,
+        verb: &NetworkVerb,
+    ) -> Result<serde_json::Value, ClusterError>;
 
     /// Cut or cycle `target`'s power through `via`'s fence device.
     ///
@@ -222,6 +297,14 @@ impl InventoryPeers for NoPeers {
 
     async fn restart(&self, node: &EnvironmentNode) -> Result<(), ClusterError> {
         Err(no_channel(node, "restarted"))
+    }
+
+    async fn network(
+        &self,
+        node: &EnvironmentNode,
+        _verb: &NetworkVerb,
+    ) -> Result<serde_json::Value, ClusterError> {
+        Err(no_channel(node, "asked to change its network"))
     }
 }
 

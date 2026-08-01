@@ -426,6 +426,14 @@ impl InventoryPeers for FakePeers {
         member.down_for.store(2, Ordering::SeqCst);
         Ok(())
     }
+
+    async fn network(
+        &self,
+        _node: &EnvironmentNode,
+        _verb: &lumen_controlplane::inventory::NetworkVerb,
+    ) -> Result<serde_json::Value, ClusterError> {
+        unreachable!("the update tests never touch a member's network")
+    }
 }
 
 // --- the harness -------------------------------------------------------------

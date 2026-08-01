@@ -603,10 +603,13 @@ async fn one_interface_can_be_fetched_on_its_own() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
-// --- clustering placeholders ------------------------------------------------
+// --- cross-node routing -------------------------------------------------------
 
 #[tokio::test]
-async fn a_request_for_another_node_is_refused_clearly() {
+async fn a_request_for_a_stranger_is_refused_clearly() {
+    // The `node` field routes a write to the member that owns the link —
+    // but only to a member. A name the environment record does not carry is
+    // refused, and on a standalone appliance that is every name but its own.
     let h = harness("other-node").await;
     let (status, body) = h
         .post(
@@ -616,15 +619,22 @@ async fn a_request_for_another_node_is_refused_clearly() {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(
-        body["error"].as_str().unwrap().contains("not in a cluster"),
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("not a member of this environment"),
         "{body}"
     );
+
+    // The reads a remote edit leans on refuse a stranger the same way.
+    let (status, body) = h.call("GET", "/api/network/pending?node=lumen02", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
 
 #[tokio::test]
 async fn the_node_check_also_covers_routes_with_no_other_payload() {
     // Quietly applying a request meant for another node to this one is the
-    // wrong failure, so the check has to hold even where `node` is the only
+    // wrong failure, so the routing has to hold even where `node` is the only
     // field the body can carry.
     let h = harness("other-node-bodyless").await;
     h.post("/api/network/bridges", r#"{"name":"br1","ports":["nic1"]}"#)
@@ -647,6 +657,37 @@ async fn the_node_check_also_covers_routes_with_no_other_payload() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     // …and the staged set is untouched by any of it.
     assert!(!h.get("/api/network/pending").await["target"].is_null());
+}
+
+#[tokio::test]
+async fn the_peer_verb_route_runs_here_with_a_ticket_and_never_with_a_cookie() {
+    // The forwarded write's landing pad: a ticketed peer stages through the
+    // same dispatcher the local routes use, so what it staged shows up in
+    // this node's own pending set.
+    let h = harness("peer-verb").await;
+    let ticket =
+        lumen_controlplane::security::issue_peer_ticket(TICKET_SECRET, "lumen02").unwrap();
+    let request = Request::post("/api/peer/network/verb")
+        .header(header::AUTHORIZATION, format!("Bearer {ticket}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"verb":"update_nic","with":{"name":"nic1","patch":{"comment":"peer wrote this"}}}"#,
+        ))
+        .unwrap();
+    let response = h.router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let pending = h.get("/api/network/pending").await;
+    assert_eq!(pending["changes"].as_array().unwrap().len(), 1, "{pending}");
+
+    // A browser session is not a peer: the route takes the bearer ticket
+    // and nothing else, exactly as every other peer route does.
+    let request = Request::post("/api/peer/network/verb")
+        .header(header::COOKIE, &h.cookie)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"verb":"pending"}"#))
+        .unwrap();
+    let response = h.router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 // --- authentication ---------------------------------------------------------

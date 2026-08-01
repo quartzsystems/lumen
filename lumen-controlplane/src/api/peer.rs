@@ -346,6 +346,30 @@ pub async fn create_bond(
     Ok(Json(serde_json::json!({ "bonded": true })))
 }
 
+/// POST /api/peer/network/verb — run one networking verb against this
+/// node's own networking domain, on behalf of an operator working from
+/// another member's console. The console federation's proxied write.
+///
+/// The verb is a closed enum, deserialized whole before anything runs — a
+/// peer can ask for one of the named acts and nothing else — and it lands
+/// in the same `run_verb` the operator-facing routes use, so a forwarded
+/// change is staged, validated, checkpointed, and auto-reverted exactly as
+/// one typed on this node's own console would be. That checkpoint is the
+/// safety story: a change that severs this node from the asking one takes
+/// the confirm path down with it, and this node rolls itself back.
+///
+/// `Apply`'s disconnect acknowledgement *is* taken from the wire, unlike
+/// the wipe route's consent — it is a validator input that is legitimately
+/// false, and carrying it keeps this node's validator able to refuse a
+/// management-address move nobody acknowledged. See `NetworkVerb`.
+pub async fn network_verb(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+    Json(verb): Json<crate::inventory::NetworkVerb>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(crate::api::network::run_verb(&state, verb).await?))
+}
+
 /// POST /api/peer/network/bridge — build an External network's bridge here,
 /// through this node's own networking domain. Like the bond above, what comes
 /// out is an ordinary link that outlives the cluster.
@@ -356,6 +380,19 @@ pub async fn create_bridge(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     state.cluster.peer_create_bridge(&seat).await?;
     Ok(Json(serde_json::json!({ "built": true })))
+}
+
+/// POST /api/peer/cluster/core-seat — re-realize this node's Core seat:
+/// the same address on a different link, a different MTU, or both. The
+/// Core edit's per-member write; the payload cannot carry a different
+/// address, and the staged apply runs inside this node's own checkpoint.
+pub async fn update_core_seat(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+    Json(update): Json<lumen_cluster::CoreSeatUpdate>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state.cluster.peer_update_core_seat(&update).await?;
+    Ok(Json(serde_json::json!({ "seated": true })))
 }
 
 /// POST /api/peer/cluster/start — enable and start the cluster stack.

@@ -197,6 +197,33 @@ export interface ClusterNetworks {
 export const fetchClusterNetworks = (name: string): Promise<ClusterNetworks> =>
   apiFetch<ClusterNetworks>(`/environment/clusters/${encodeURIComponent(name)}/networks`);
 
+/// What a Core-network edit may change: the frame size, and which link
+/// carries each member's seat. Deliberately not a `CoreNetwork`: the subnet
+/// and the per-member addresses are corosync's ring addressing — the ring's
+/// identity — and a request shape that cannot carry them is one that cannot
+/// quietly ask for a renumbering. A `members` list must keep every seat's
+/// node and address exactly as recorded; only the interfaces move.
+export interface CoreNetworkUpdate {
+  mtu?: number;
+  members?: AddressedMember[];
+}
+
+/// Change the Core network without destroying the cluster.
+///
+/// Members change one at a time, each re-realizing its seat through its own
+/// networking domain inside its own checkpoint; the record changes last. A
+/// member that fails names itself in the error, the record stays on the old
+/// definition, and asking again finishes the job — a member already changed
+/// stages nothing and succeeds.
+export const updateCoreNetwork = (
+  cluster: string,
+  update: CoreNetworkUpdate,
+): Promise<CoreNetwork> =>
+  apiFetch<CoreNetwork>(
+    `/environment/clusters/${encodeURIComponent(cluster)}/networks/core`,
+    { method: "PUT", body: JSON.stringify(update) },
+  );
+
 /// An External network to define, with one uplink per member.
 ///
 /// Every member or none: an External network that exists on some members is

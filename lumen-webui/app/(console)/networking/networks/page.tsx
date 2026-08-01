@@ -33,6 +33,7 @@ import { shortNodeName, shortNodeNames } from "@/lib/nodeNames";
 import { useConsole } from "@/lib/ConsoleContext";
 import { CreateExternalNetworkDialog } from "@/components/network/CreateExternalNetworkDialog";
 import { EditClusterVipDialog } from "@/components/network/EditClusterVipDialog";
+import { EditCoreNetworkDialog } from "@/components/network/EditCoreNetworkDialog";
 
 const POLL_MS = 5000;
 
@@ -71,11 +72,11 @@ interface NetworkRow {
   /// Which members carry it, for the column that answers "is this everywhere?"
   members: string[];
   of: number;
-  /// What this row can be acted on as. Core and Management carry no actions
-  /// yet; the cluster VIP and the External networks do, and they are
-  /// different actions — so the row says which it is rather than the actions
-  /// column guessing from the name.
-  acts: "vip" | "external" | null;
+  /// What this row can be acted on as. The cluster VIP, the External
+  /// networks, and Core each have their own edit; Management carries no
+  /// actions — so the row says which it is rather than the actions column
+  /// guessing from the name.
+  acts: "core" | "vip" | "external" | null;
   /// The External network behind the row, for the edit dialog.
   external?: ExternalNetwork;
   /// The cluster VIP's state, for the recovery.
@@ -111,7 +112,7 @@ function networkRows(
       status: core.status,
       members: networks.core.members.map((member) => member.node),
       of: cluster.nodes.length,
-      acts: null,
+      acts: "core",
     },
     {
       key: `${cluster.name}/management`,
@@ -362,7 +363,7 @@ function NetworksTable({
             editDisabled={busy || row.acts === null}
             editTitle={
               row.acts === null
-                ? "Core and Management are defined when the cluster is created"
+                ? "Management adopts the addressing the nodes already have — it is defined when the cluster is created"
                 : undefined
             }
             // The cluster VIP is removed by editing it — clearing the
@@ -372,7 +373,7 @@ function NetworksTable({
             deleteTitle={
               row.acts === "vip"
                 ? "Clear the address in the edit dialog to remove it"
-                : row.acts === null
+                : row.acts === "core" || row.acts === null
                   ? "Core and Management go when the cluster does"
                   : undefined
             }
@@ -399,6 +400,8 @@ export default function NetworksPage() {
   );
   /// The cluster whose address is being changed.
   const [editingVip, setEditingVip] = useState<string | null>(null);
+  /// The cluster whose Core network is being changed.
+  const [editingCore, setEditingCore] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [inventory, setInventory] = useState<InventoryResponse | null>(null);
   const { setToast } = useConsole();
@@ -486,6 +489,7 @@ export default function NetworksPage() {
 
   const edit = (row: NetworkRow) => {
     if (row.acts === "vip") setEditingVip(row.cluster);
+    else if (row.acts === "core") setEditingCore(row.cluster);
     else if (row.external) setEditing({ cluster: row.cluster, network: row.external });
   };
 
@@ -613,6 +617,25 @@ export default function NetworksPage() {
           }}
         />
       )}
+
+      {editingCore &&
+        (() => {
+          const answer = answers[editingCore];
+          const networks = answer && !("error" in answer) ? answer.networks : null;
+          return networks ? (
+            <EditCoreNetworkDialog
+              cluster={editingCore}
+              networks={networks}
+              inventory={inventory}
+              onClose={() => setEditingCore(null)}
+              onSaved={(message) => {
+                setEditingCore(null);
+                setToast(message);
+                void load();
+              }}
+            />
+          ) : null;
+        })()}
 
       {editingVip && (
         <EditClusterVipDialog

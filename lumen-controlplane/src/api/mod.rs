@@ -197,6 +197,13 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/environment/clusters/{name}/networks/external",
             post(cluster::create_external_network),
         )
+        // Changing the Core network — its MTU, and which link carries each
+        // member's seat. Never its addressing: that is the ring's identity,
+        // and it stays behind destroy-and-recreate. See the handler.
+        .route(
+            "/api/environment/clusters/{name}/networks/core",
+            put(cluster::update_core_network),
+        )
         // Changing an External network rebuilds it everywhere before the
         // record admits the change, exactly as defining one does. Removing
         // it forgets the definition and leaves the bridges — see the handler.
@@ -255,9 +262,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/peer/membership", post(peer::membership))
         .route("/api/peer/preflight", post(peer::preflight))
         .route("/api/peer/cluster/prepare", post(peer::prepare))
+        .route("/api/peer/cluster/core-seat", post(peer::update_core_seat))
         .route("/api/peer/cluster/start", post(peer::start))
         .route("/api/peer/network/bond", post(peer::create_bond))
         .route("/api/peer/network/bridge", post(peer::create_bridge))
+        // The networking half of the console federation: one closed verb
+        // enum, run against this node's own networking domain — staged,
+        // checkpointed, and auto-reverted here exactly as a local edit is.
+        .route("/api/peer/network/verb", post(peer::network_verb))
         .route("/api/peer/node/inventory", post(peer::inventory))
         .route("/api/peer/system/updates", post(peer::updates))
         .route("/api/peer/system/updates/check", post(peer::check_updates))

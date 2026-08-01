@@ -167,7 +167,7 @@ pub struct ManagementBridgeResponse {
 /// `ip` and `comment` are common to all four: the console's dialogs are the
 /// same form with different middles, and an address is now a property of the
 /// link rather than of the appliance.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NicPatch {
     pub ip: Option<IpConfig>,
@@ -178,7 +178,7 @@ pub struct NicPatch {
     pub duplex: Option<Duplex>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BridgePatch {
     pub ip: Option<IpConfig>,
@@ -191,7 +191,7 @@ pub struct BridgePatch {
     pub mtu: Option<u32>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BondPatch {
     pub ip: Option<IpConfig>,
@@ -205,7 +205,7 @@ pub struct BondPatch {
     pub mtu: Option<u32>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VlanPatch {
     pub ip: Option<IpConfig>,

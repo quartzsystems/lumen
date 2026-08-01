@@ -174,6 +174,29 @@ pub struct PreparePayload {
     pub management_interface: Option<String>,
 }
 
+/// One member's half of a Core-network edit: the seat as it should now be,
+/// and — when the seat is moving — the interface it is leaving.
+///
+/// Deliberately *not* a corosync change. A seat's address is the ring's
+/// identity, written into every member's `corosync.conf`, and this payload
+/// cannot carry a different one: the edit workflow refuses address changes
+/// before anything is built. What a member is asked to do here is re-realize
+/// the same seat — same address — on a different link, or at a different
+/// MTU, neither of which appears in the ring configuration at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoreSeatUpdate {
+    pub cluster: String,
+    /// The interface the seat is leaving, when it moves. `None` for an
+    /// MTU-only change. The old link is released (its Core address goes,
+    /// the link stays) in the same staged apply that addresses the new one,
+    /// so a checkpoint rollback restores both or neither.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_interface: Option<String>,
+    /// The seat as it should now be. The address matches what the record
+    /// already says for this member — see above.
+    pub core: CoreAssignment,
+}
+
 /// What teardown needs to know to put a node back exactly as it was.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TeardownPayload {
@@ -272,6 +295,16 @@ pub trait PeerChannel: Send + Sync {
     /// reason: what it builds outlives the cluster, because the machines
     /// attached to it do.
     async fn create_bridge(&self, node: &EnvironmentNode, seat: &ExternalSeat) -> Result<()>;
+
+    /// Re-realize a member's Core seat — a different link or a different
+    /// MTU, never a different address. The Core edit's per-member write,
+    /// landing in that node's own networking domain the way `create_bond`
+    /// does, staged and applied inside that node's own checkpoint.
+    async fn update_core_seat(
+        &self,
+        node: &EnvironmentNode,
+        update: &CoreSeatUpdate,
+    ) -> Result<()>;
 
     async fn start(&self, node: &EnvironmentNode) -> Result<()>;
     async fn teardown(&self, node: &EnvironmentNode, payload: &TeardownPayload) -> Result<()>;
@@ -838,9 +871,11 @@ struct MockPeersInner {
     fail_teardown: Option<String>,
     fail_bond: Option<String>,
     fail_bridge: Option<String>,
+    fail_core_seat: Option<String>,
     prepared: Vec<(String, PreparePayload)>,
     bonds: Vec<(String, lumen_net::Bond)>,
     bridges: Vec<(String, ExternalSeat)>,
+    core_seats: Vec<(String, CoreSeatUpdate)>,
     started: Vec<String>,
     torn_down: Vec<(String, TeardownPayload)>,
     reconfigured: Vec<(String, ReconfigurePayload)>,
@@ -911,6 +946,16 @@ impl MockPeers {
 
     pub fn bridges(&self) -> Vec<(String, ExternalSeat)> {
         self.inner.lock().unwrap().bridges.clone()
+    }
+
+    pub fn fail_core_seat_on(self, node: &str) -> Self {
+        self.inner.lock().unwrap().fail_core_seat = Some(node.to_string());
+        self
+    }
+
+    /// Every Core-seat change pushed to a member: (member, update).
+    pub fn core_seats(&self) -> Vec<(String, CoreSeatUpdate)> {
+        self.inner.lock().unwrap().core_seats.clone()
     }
 
     pub fn with_grant(self, grant: JoinGrant) -> Self {
@@ -1078,6 +1123,38 @@ impl PeerChannel for MockPeers {
             });
         }
         inner.bridges.push((node.name.clone(), seat.clone()));
+        Ok(())
+    }
+
+    async fn update_core_seat(
+        &self,
+        node: &EnvironmentNode,
+        update: &CoreSeatUpdate,
+    ) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.fail_core_seat.as_deref() == Some(node.name.as_str()) {
+            return Err(ClusterError::Conflict(format!(
+                "the seat could not be re-realized on \"{}\"",
+                node.name
+            )));
+        }
+        // A moved seat shows on the next preflight the way a grown bond
+        // does: the address leaves the old link and lands on the new one.
+        if let Some(report) = inner.reports.get_mut(&node.name) {
+            let cidr = format!("{}/{}", update.core.address, update.core.prefix);
+            for link in report.links.iter_mut() {
+                if Some(link.name.as_str()) == update.old_interface.as_deref() {
+                    link.addresses.retain(|a| a != &cidr);
+                }
+                if link.name == update.core.interface {
+                    if !link.addresses.contains(&cidr) {
+                        link.addresses.push(cidr.clone());
+                    }
+                    link.mtu = Some(update.core.mtu);
+                }
+            }
+        }
+        inner.core_seats.push((node.name.clone(), update.clone()));
         Ok(())
     }
 

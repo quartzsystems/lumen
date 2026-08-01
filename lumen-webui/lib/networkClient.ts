@@ -30,18 +30,32 @@ export interface PinReport {
   unclaimed: UnclaimedNic[];
 }
 
-export const fetchNicPins = (): Promise<PinReport> =>
-  apiFetch<PinReport>("/network/nics/pins");
+/// Every function below takes an optional target `node`. Absent, the request
+/// acts on the node serving the console; named, the control plane forwards it
+/// to that member over the peer channel and relays the member's own answer —
+/// staged there, validated there, applied inside that member's own confirm
+/// window. Mutations carry it in the body (the `node` field every mutating
+/// route has accepted since day one); the two reads a remote edit leans on
+/// take it as `?node=`.
+const nodeQuery = (node?: string): string =>
+  node ? `?node=${encodeURIComponent(node)}` : "";
+
+const withNode = <T extends object>(body: T, node?: string): T | (T & { node: string }) =>
+  node ? { ...body, node } : body;
+
+export const fetchNicPins = (node?: string): Promise<PinReport> =>
+  apiFetch<PinReport>(`/network/nics/pins${nodeQuery(node)}`);
 
 /// Give an orphaned name to a card that is actually in the machine. The
 /// backend refuses a live slot or an absent adapter.
 export const adoptNic = (
   slot: number,
   mac: string,
+  node?: string,
 ): Promise<{ adopted: string; device: string; active: boolean; note?: string }> =>
   apiFetch("/network/nics/adopt", {
     method: "POST",
-    body: JSON.stringify({ slot, mac }),
+    body: JSON.stringify(withNode({ slot, mac }, node)),
   });
 
 export type LinkKind = "ethernet" | "bond" | "bridge" | "vlan" | "other";
@@ -210,57 +224,80 @@ const post = <T>(path: string, body?: unknown): Promise<T> =>
 const patch = <T>(path: string, body: unknown): Promise<T> =>
   apiFetch<T>(path, { method: "PATCH", body: JSON.stringify(body) });
 
-const del = <T>(path: string): Promise<T> => apiFetch<T>(path, { method: "DELETE" });
+const del = <T>(path: string, body?: unknown): Promise<T> =>
+  apiFetch<T>(path, {
+    method: "DELETE",
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
 
 export const fetchInterfaces = (): Promise<InterfacesResponse> =>
   apiFetch<InterfacesResponse>("/network/interfaces");
 
-export const fetchPending = (): Promise<PendingResponse> =>
-  apiFetch<PendingResponse>("/network/pending");
+export const fetchPending = (node?: string): Promise<PendingResponse> =>
+  apiFetch<PendingResponse>(`/network/pending${nodeQuery(node)}`);
 
 export const fetchConfig = (): Promise<DesiredState> => apiFetch<DesiredState>("/network/config");
 
-export const createBridge = (bridge: BridgeInput): Promise<PendingResponse> =>
-  post<PendingResponse>("/network/bridges", bridge);
+export const createBridge = (bridge: BridgeInput, node?: string): Promise<PendingResponse> =>
+  post<PendingResponse>("/network/bridges", withNode(bridge, node));
 
-export const createBond = (bond: BondInput): Promise<PendingResponse> =>
-  post<PendingResponse>("/network/bonds", bond);
+export const createBond = (bond: BondInput, node?: string): Promise<PendingResponse> =>
+  post<PendingResponse>("/network/bonds", withNode(bond, node));
 
-export const createVlan = (vlan: VlanInput): Promise<PendingResponse> =>
-  post<PendingResponse>("/network/vlans", vlan);
+export const createVlan = (vlan: VlanInput, node?: string): Promise<PendingResponse> =>
+  post<PendingResponse>("/network/vlans", withNode(vlan, node));
 
 export const updateBridge = (
   name: string,
   body: Partial<BridgeInput>,
-): Promise<PendingResponse> => patch<PendingResponse>(`/network/bridges/${name}`, body);
+  node?: string,
+): Promise<PendingResponse> => patch<PendingResponse>(`/network/bridges/${name}`, withNode(body, node));
 
-export const updateBond = (name: string, body: Partial<BondInput>): Promise<PendingResponse> =>
-  patch<PendingResponse>(`/network/bonds/${name}`, body);
+export const updateBond = (
+  name: string,
+  body: Partial<BondInput>,
+  node?: string,
+): Promise<PendingResponse> => patch<PendingResponse>(`/network/bonds/${name}`, withNode(body, node));
 
-export const updateVlan = (name: string, body: Partial<VlanInput>): Promise<PendingResponse> =>
-  patch<PendingResponse>(`/network/vlans/${name}`, body);
+export const updateVlan = (
+  name: string,
+  body: Partial<VlanInput>,
+  node?: string,
+): Promise<PendingResponse> => patch<PendingResponse>(`/network/vlans/${name}`, withNode(body, node));
 
-export const updateNic = (name: string, body: NicPatch): Promise<PendingResponse> =>
-  patch<PendingResponse>(`/network/nics/${name}`, body);
+export const updateNic = (
+  name: string,
+  body: NicPatch,
+  node?: string,
+): Promise<PendingResponse> => patch<PendingResponse>(`/network/nics/${name}`, withNode(body, node));
 
-export const deleteLink = (kind: LinkKind, name: string): Promise<PendingResponse> =>
-  del<PendingResponse>(`/network/${kind}s/${name}`);
+export const deleteLink = (
+  kind: LinkKind,
+  name: string,
+  node?: string,
+): Promise<PendingResponse> =>
+  del<PendingResponse>(`/network/${kind}s/${name}`, node ? { node } : undefined);
 
-export const discardPending = (): Promise<PendingResponse> =>
-  del<PendingResponse>("/network/pending");
+export const discardPending = (node?: string): Promise<PendingResponse> =>
+  del<PendingResponse>("/network/pending", node ? { node } : undefined);
 
-export const applyPending = (acknowledgeDisconnect: boolean): Promise<ApplyResponse> =>
-  post<ApplyResponse>("/network/apply", {
-    i_understand_this_may_disconnect_me: acknowledgeDisconnect,
-  });
+export const applyPending = (
+  acknowledgeDisconnect: boolean,
+  node?: string,
+): Promise<ApplyResponse> =>
+  post<ApplyResponse>(
+    "/network/apply",
+    withNode({ i_understand_this_may_disconnect_me: acknowledgeDisconnect }, node),
+  );
 
-export const confirmApply = (): Promise<PendingResponse> => post<PendingResponse>("/network/confirm");
+export const confirmApply = (node?: string): Promise<PendingResponse> =>
+  post<PendingResponse>("/network/confirm", node ? { node } : {});
 
-export const rollbackApply = (): Promise<PendingResponse> =>
-  post<PendingResponse>("/network/rollback");
+export const rollbackApply = (node?: string): Promise<PendingResponse> =>
+  post<PendingResponse>("/network/rollback", node ? { node } : {});
 
-export const extendApply = (seconds: number): Promise<CheckpointView> =>
-  post<CheckpointView>("/network/apply/extend", { seconds });
+export const extendApply = (seconds: number, node?: string): Promise<CheckpointView> =>
+  post<CheckpointView>("/network/apply/extend", withNode({ seconds }, node));
 
 export const convertManagementBridge = (): Promise<ManagementBridgeResponse> =>
   post<ManagementBridgeResponse>("/network/management-bridge");

@@ -161,15 +161,38 @@ fn present_macs(roots: &PinRoots) -> HashMap<String, String> {
         if read_trimmed(&dir.join("type")).as_deref() != Some("1") {
             continue;
         }
-        let Some(mac) = read_trimmed(&dir.join("address")).map(|m| lower(&m)) else {
+        // And the namer's driver exclusions, for the same reason: a BMC's
+        // USB gadget looks like an ethernet NIC and leads to the service
+        // processor. Offering it as a replacement for a real adapter would
+        // pin a cluster network to a dead end.
+        if let Ok(driver) = std::fs::read_link(dir.join("device/driver")) {
+            if let Some(name) = driver.file_name().and_then(|n| n.to_str()) {
+                if matches!(name, "rndis_host" | "cdc_ether" | "cdc_ncm" | "cdc_eem") {
+                    continue;
+                }
+            }
+        }
+        let Some(mac) = permanent_mac(&dir) else {
             continue;
         };
-        if mac.is_empty() || mac == "00:00:00:00:00:00" {
-            continue;
-        }
         found.insert(mac, entry.file_name().to_string_lossy().into_owned());
     }
     found
+}
+
+/// The address a pin is written against: the card's **permanent** one.
+///
+/// `address` is the address the link is *using*, and an enslaved bond port
+/// borrows its bond's — so comparing a pin against it reports every
+/// bonded adapter as missing hardware. That is not hypothetical: it fired
+/// on a live node, declaring the second port of a healthy Core bond an
+/// orphan and offering to replace a card that was sitting right there.
+/// The kernel keeps the real one for exactly this case.
+fn permanent_mac(dir: &Path) -> Option<String> {
+    read_trimmed(&dir.join("bonding_slave/perm_hwaddr"))
+        .or_else(|| read_trimmed(&dir.join("address")))
+        .map(|mac| lower(&mac))
+        .filter(|mac| !mac.is_empty() && mac != "00:00:00:00:00:00")
 }
 
 fn read_trimmed(path: &Path) -> Option<String> {
@@ -336,6 +359,14 @@ mod tests {
         // The replacement, still under its kernel name.
         adapter("enp1s0f0", "aa:bb:cc:00:00:aa", "1", "10000");
         adapter("enp1s0f1", "aa:bb:cc:00:00:ab", "0", "-1");
+        // The BMC's USB gadget: passes the ethernet test, leads to the
+        // service processor. Must never be offered.
+        adapter("enp5s0f3u2u1c2", "be:3a:f2:00:00:99", "1", "-1");
+        let gadget = roots.sys_class_net.join("enp5s0f3u2u1c2/device");
+        let driver_dir = roots.sys_class_net.join("drivers/rndis_host");
+        fs::create_dir_all(&driver_dir).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&driver_dir, gadget.join("driver")).unwrap();
         // A virtual link: no device directory, so not an adapter.
         let bond = roots.sys_class_net.join("bond0");
         fs::create_dir_all(&bond).unwrap();
@@ -343,6 +374,34 @@ mod tests {
         fs::write(bond.join("type"), "1\n").unwrap();
 
         roots
+    }
+
+    /// A bonded port answers to its bond's address while enslaved. Its pin
+    /// is written against its own, so the pin must be read against the
+    /// permanent address the kernel keeps — the live failure this guards:
+    /// a healthy Core bond's second port reported as a missing card.
+    #[test]
+    fn an_enslaved_port_is_not_a_missing_card() {
+        let roots = node("enslaved");
+        // nic0 joins a bond and takes the bond's address, as the kernel
+        // does; its permanent one stays where the pin can find it.
+        let dir = roots.sys_class_net.join("nic0");
+        fs::write(dir.join("address"), "aa:bb:cc:00:00:f0\n").unwrap();
+        fs::create_dir_all(dir.join("bonding_slave")).unwrap();
+        fs::write(dir.join("bonding_slave/perm_hwaddr"), "aa:bb:cc:00:00:01\n").unwrap();
+
+        let report = report(&roots);
+        assert!(
+            report.orphaned.iter().all(|pin| pin.slot != 0),
+            "an enslaved port was called a missing card: {report:?}"
+        );
+        assert!(
+            !report
+                .unclaimed
+                .iter()
+                .any(|adapter| adapter.device == "nic0"),
+            "and it must not be offered as an unclaimed adapter either"
+        );
     }
 
     #[test]

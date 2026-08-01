@@ -12,6 +12,7 @@ import {
   SelectInput,
   TextInput,
 } from "@/components/ui/formkit";
+import { shortNodeName } from "@/lib/nodeNames";
 import {
   createBond,
   createBridge,
@@ -25,10 +26,19 @@ import {
   type IpConfig,
   type LinkKind,
   type LinkView,
-  type PendingResponse,
 } from "@/lib/networkClient";
 
 export type DialogKind = "bridge" | "bond" | "vlan" | "ethernet";
+
+/// One member the dialog may act on: its own links (the port and parent
+/// pickers must offer what *that* node has, not what this one does), and
+/// which of them carries its management address.
+export interface DialogMember {
+  node: string;
+  local: boolean;
+  links: LinkView[];
+  managementLink: string | null;
+}
 
 /// How a link is addressed. The three arms of the backend's `IpConfig`, in the
 /// words the form uses.
@@ -131,35 +141,52 @@ const ipConfigOf = (draft: Draft): IpConfig => {
   return { mode: "disabled" };
 };
 
-/// Create or edit one link.
+/// Create or edit one link, on whichever member owns it.
 ///
 /// All four kinds share one form: name, addressing, MTU, and a description are
 /// in the same place every time, with only the middle — ports, VLAN id, bond
 /// options — changing. Server-side validation errors come back with the field
 /// they belong to, so they land under the input that caused them instead of in
 /// a banner at the top.
+///
+/// An edit is pinned to the member that owns the link; a create with more
+/// than one member to choose from asks which node first, because everything
+/// below that answer — the free ports, the VLAN parents, the management
+/// exclusion — is that node's.
 export function LinkDialog({
   kind,
   editing,
-  links,
-  managementLink,
+  members,
+  initialNode,
   onClose,
   onSaved,
 }: {
   kind: DialogKind;
   /// The row being edited, or null when creating.
   editing: LinkView | null;
-  /// Every link on the node, for the port and parent pickers.
-  links: LinkView[];
-  managementLink: string | null;
+  /// The members the link may live on: exactly the owner for an edit, every
+  /// reachable member for a create.
+  members: DialogMember[];
+  initialNode: string;
   onClose: () => void;
-  onSaved: (pending: PendingResponse) => void;
+  /// Called with the node the change was staged on — null for the node
+  /// serving the console.
+  onSaved: (node: string | null) => void;
 }) {
   const [draft, setDraft] = useState<Draft>(() => (editing ? draftFrom(editing) : emptyDraft()));
+  const [targetNode, setTargetNode] = useState(initialNode);
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
   const set = <K extends keyof Draft>(key: K, value: Draft[K]) =>
     setDraft((d) => ({ ...d, [key]: value }));
+
+  const member =
+    members.find((candidate) => candidate.node === targetNode) ?? members[0] ?? null;
+  const links = member?.links ?? [];
+  const managementLink = member?.managementLink ?? null;
+  /// What the client calls want: nothing for the serving node, the name for
+  /// a member the request must be forwarded to.
+  const node = member === null || member.local ? undefined : member.node;
 
   // A candidate port is any link that is free, or already ours. The
   // management link is deliberately absent: enslaving it without moving the
@@ -220,7 +247,6 @@ export function LinkDialog({
     try {
       const mtu = numberOrUndefined(draft.mtu);
       const common = { ip: ipConfigOf(draft), comment: draft.comment.trim(), mtu };
-      let pending: PendingResponse;
       if (kind === "bridge") {
         // Spanning tree and its forward delay are not offered: a hypervisor
         // bridge carries guest ports, and a listening period before traffic
@@ -233,9 +259,9 @@ export function LinkDialog({
           stp: false,
           vlan_filtering: draft.vlanAware,
         };
-        pending = editing
-          ? await updateBridge(editing.name, body)
-          : await createBridge({ name: draft.name, ...body });
+        await (editing
+          ? updateBridge(editing.name, body, node)
+          : createBridge({ name: draft.name, ...body }, node));
       } else if (kind === "bond") {
         const body = {
           ...common,
@@ -246,25 +272,25 @@ export function LinkDialog({
           xmit_hash_policy: draft.hashPolicy || undefined,
           primary: draft.primary || undefined,
         };
-        pending = editing
-          ? await updateBond(editing.name, body)
-          : await createBond({ name: draft.name, ...body });
+        await (editing
+          ? updateBond(editing.name, body, node)
+          : createBond({ name: draft.name, ...body }, node));
       } else if (kind === "vlan") {
         const body = {
           ...common,
           parent: draft.parent,
           vlan_id: numberOrUndefined(draft.vlanId) ?? 0,
         };
-        pending = editing
-          ? await updateVlan(editing.name, body)
-          : await createVlan({ name: draft.name, ...body });
+        await (editing
+          ? updateVlan(editing.name, body, node)
+          : createVlan({ name: draft.name, ...body }, node));
       } else {
         // A physical NIC is configured, never created. Speed and duplex are
         // left to auto-negotiation — the fields are omitted rather than sent
         // empty, so whatever the link already agreed on stays agreed on.
-        pending = await updateNic(editing!.name, common);
+        await updateNic(editing!.name, common, node);
       }
-      onSaved(pending);
+      onSaved(node ?? null);
     } catch (err) {
       const detail = validationErrorsOf(err);
       if (detail.length > 0) {
@@ -314,6 +340,32 @@ export function LinkDialog({
           void submit();
         }}
       >
+        {editing === null && members.length > 1 && (
+          <Field
+            label="Node"
+            htmlFor="link-node"
+            hint="The member this interface is created on. Ports and parents below are that node's."
+          >
+            <SelectInput
+              id="link-node"
+              value={targetNode}
+              mono
+              onChange={(v) => {
+                setTargetNode(v);
+                // Ports and parents belong to the node that was chosen when
+                // they were picked; a new node starts them over.
+                setDraft((d) => ({ ...d, ports: [], parent: "", primary: "" }));
+              }}
+            >
+              {members.map((candidate) => (
+                <option key={candidate.node} value={candidate.node}>
+                  {shortNodeName(candidate.node)}
+                </option>
+              ))}
+            </SelectInput>
+          </Field>
+        )}
+
         <Field label="Name" htmlFor="link-name" required={editing === null} error={errors.name}>
           <TextInput
             id="link-name"

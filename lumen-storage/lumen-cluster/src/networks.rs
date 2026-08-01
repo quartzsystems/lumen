@@ -124,6 +124,25 @@ pub struct CoreNetwork {
     pub members: Vec<AddressedMember>,
 }
 
+/// What a Core-network edit may change: the frame size, and which link
+/// carries each member's seat.
+///
+/// Deliberately not a [`CoreNetwork`]: the subnet and the per-member
+/// addresses are corosync's ring 0 addressing — the ring's identity — and a
+/// request shape that cannot carry them is a request that cannot quietly ask
+/// for a renumbering. The edit workflow additionally refuses a `members`
+/// list that changes an address or the set of seats.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoreNetworkUpdate {
+    #[serde(default)]
+    pub mtu: Option<u32>,
+    /// The seats as they should now be: every member, same addresses, only
+    /// the interfaces free to differ from the record.
+    #[serde(default)]
+    pub members: Option<Vec<AddressedMember>>,
+}
+
 /// The Management network: the console, corosync ring 1, and the optional
 /// cluster VIP.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -7,19 +7,29 @@
 //! the hypervisor already opened; a node's is a **pseudoterminal this
 //! process creates**, with a login session on the other side of it.
 //!
-//! ## Why `login`, and not a shell this process starts
+//! ## Why the shell directly, and not `login`
 //!
-//! The child could drop privileges and exec a shell directly. It would
-//! also then have no PAM session, no utmp entry, no audit record, and no
-//! `loginctl` session — a shell that exists outside every accounting
-//! mechanism the operating system has for shells. `login -f` does all of
-//! that properly and is the same program the physical console runs, so a
-//! browser session and a keyboard-and-monitor session are the same kind
-//! of thing to everything that looks at them afterwards.
+//! `login -f` would be the tidier answer: PAM session, utmp entry, the
+//! same program the physical console runs. It cannot be used here. From
+//! this daemon's SELinux domain (`unconfined_service_t`) executing
+//! `/usr/bin/login` fails with EACCES — and so does `su` — while
+//! `/bin/bash` execs fine; both are setuid programs the policy does not
+//! let a service domain start. Measured on the appliance, not assumed:
+//! the console reported "no shell: Permission denied" and the same exec
+//! reproduced by hand under the daemon's own context.
 //!
-//! `-f` skips the password because the operator already proved who they
-//! are — that is what the session cookie on the upgrade IS, checked by
-//! PAM against this same node moments earlier.
+//! So the child drops privileges itself and execs the operator's login
+//! shell. What that costs is worth stating plainly: **no utmp entry and
+//! no PAM session**, so this shell does not appear in `who`, and
+//! `loginctl` does not know about it. What it keeps is everything that
+//! matters for the shell being *this operator's*: their uid, their
+//! groups (so `sudo` and group-gated files behave), their home, and their
+//! shell. The audit trail lives where the rest of the appliance's does —
+//! the journal records who opened and closed a node shell.
+//!
+//! No password is asked because the operator already proved who they are:
+//! the session cookie on the upgrade is that proof, checked by PAM
+//! against this same node moments earlier.
 //!
 //! ## Who gets one
 //!
@@ -54,9 +64,8 @@ use crate::error::ApiError;
 use crate::security::Session;
 use crate::AppState;
 
-/// Where `login` lives. Probed in order: util-linux installs the first,
-/// and the second is where it has historically been.
-const LOGIN_PATHS: [&str; 2] = ["/usr/bin/login", "/bin/login"];
+/// The shell an account gets when its passwd entry names none.
+const FALLBACK_SHELL: &str = "/bin/bash";
 
 /// How much of the shell's output becomes one WebSocket frame.
 const CHUNK: usize = 16 * 1024;
@@ -98,15 +107,7 @@ pub async fn attach(
         )));
     }
 
-    let user = shell_user(&session).await?;
-    let login = LOGIN_PATHS
-        .iter()
-        .find(|path| std::path::Path::new(path).exists())
-        .ok_or_else(|| {
-            ApiError::Conflict(
-                "This node has no login program, so it cannot open a shell session.".into(),
-            )
-        })?;
+    let who = shell_user(&session).await?;
 
     let upgrade = upgrade.map_err(|rejection| {
         ApiError::BadRequest(format!(
@@ -114,15 +115,16 @@ pub async fn attach(
         ))
     })?;
 
-    let pty = Pty::open(login, &user).map_err(|err| {
-        tracing::warn!(%user, %err, "could not open a node shell");
+    let name = who.name.clone();
+    let pty = Pty::open(&who).map_err(|err| {
+        tracing::warn!(user = %name, %err, "could not open a node shell");
         ApiError::Conflict(format!("Could not start a shell session: {err}"))
     })?;
 
-    tracing::info!(%user, node = %here, "node shell opened");
+    tracing::info!(user = %name, node = %here, "node shell opened");
     Ok(upgrade.on_upgrade(move |socket| async move {
         pump(socket, pty).await;
-        tracing::info!(%user, "node shell closed");
+        tracing::info!(user = %name, "node shell closed");
     }))
 }
 
@@ -132,7 +134,7 @@ pub async fn attach(
 /// The account has to be local because `login` is: a realm this appliance
 /// authenticates against elsewhere is not a user the node can start a
 /// session for, and saying so is better than a shell that dies at exec.
-async fn shell_user(session: &Session) -> Result<String, ApiError> {
+async fn shell_user(session: &Session) -> Result<ShellUser, ApiError> {
     let name = session.0.sub.clone();
     let accounts = lumen_sys::state::read(&lumen_sys::AccountFiles::default()).await;
     let account = accounts
@@ -152,7 +154,27 @@ async fn shell_user(session: &Session) -> Result<String, ApiError> {
             lumen_sys::ADMIN_GROUP
         )));
     }
-    Ok(name)
+    Ok(ShellUser {
+        name,
+        uid: account.uid,
+        gid: account.gid,
+        home: account.home.clone(),
+        shell: if account.shell.is_empty() {
+            FALLBACK_SHELL.to_string()
+        } else {
+            account.shell.clone()
+        },
+    })
+}
+
+/// Everything the child needs to become the operator.
+#[derive(Debug, Clone)]
+struct ShellUser {
+    name: String,
+    uid: u32,
+    gid: u32,
+    home: String,
+    shell: String,
 }
 
 /// The pseudoterminal and the session on the other side of it.
@@ -168,17 +190,49 @@ impl Pty {
     /// only async-signal-safe calls are legal, and this process has other
     /// threads whose locks the child does not hold. So: allocate the
     /// argument vector here, and let the child do nothing but exec it.
-    fn open(login: &str, user: &str) -> Result<Pty, std::io::Error> {
-        let program = std::ffi::CString::new(login)?;
-        let dash_f = std::ffi::CString::new("-f")?;
-        let who = std::ffi::CString::new(user)?;
-        // argv[0] is the program's own name, by convention.
-        let argv: [*const libc::c_char; 4] = [
-            program.as_ptr(),
-            dash_f.as_ptr(),
-            who.as_ptr(),
-            std::ptr::null(),
+    fn open(who: &ShellUser) -> Result<Pty, std::io::Error> {
+        let program = std::ffi::CString::new(who.shell.as_str())?;
+        // argv[0] with a leading dash is how every shell has been told it
+        // is a login shell: it reads the profile files, which is the
+        // difference between a usable session and a bare prompt with no
+        // PATH worth having.
+        let leaf = who.shell.rsplit('/').next().unwrap_or("sh");
+        let argv0 = std::ffi::CString::new(format!("-{leaf}"))?;
+        let argv: [*const libc::c_char; 2] = [argv0.as_ptr(), std::ptr::null()];
+
+        let home = std::ffi::CString::new(who.home.as_str())?;
+        // The environment, built here because the child may not allocate.
+        // TERM matters: the browser's terminal is xterm-compatible, and a
+        // shell told nothing draws a prompt for a teletype.
+        let env: Vec<std::ffi::CString> = vec![
+            std::ffi::CString::new("TERM=xterm-256color")?,
+            std::ffi::CString::new(format!("HOME={}", who.home))?,
+            std::ffi::CString::new(format!("USER={}", who.name))?,
+            std::ffi::CString::new(format!("LOGNAME={}", who.name))?,
+            std::ffi::CString::new(format!("SHELL={}", who.shell))?,
+            std::ffi::CString::new("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin")?,
         ];
+        let mut envp: Vec<*const libc::c_char> = env.iter().map(|v| v.as_ptr()).collect();
+        envp.push(std::ptr::null());
+
+        // The operator's supplementary groups, resolved before the fork —
+        // `getgrouplist` reads /etc/group and allocates, neither of which
+        // is safe on the other side of it. Without them a shell loses the
+        // group memberships `sudo` and group-gated files are decided by.
+        let name = std::ffi::CString::new(who.name.as_str())?;
+        let mut groups: Vec<libc::gid_t> = vec![0; 64];
+        let mut count = groups.len() as libc::c_int;
+        // SAFETY: getgrouplist fills up to `count` entries and rewrites it
+        // with the number needed; a too-small buffer returns -1, and the
+        // count it leaves is the size to retry with.
+        let found =
+            unsafe { libc::getgrouplist(name.as_ptr(), who.gid, groups.as_mut_ptr(), &mut count) };
+        if found < 0 {
+            groups.resize(count.max(1) as usize, 0);
+            // SAFETY: as above, now with the buffer it asked for.
+            unsafe { libc::getgrouplist(name.as_ptr(), who.gid, groups.as_mut_ptr(), &mut count) };
+        }
+        groups.truncate(count.max(0) as usize);
         // A terminal the browser has not measured yet — the viewer's first
         // message replaces it.
         let size = libc::winsize {
@@ -188,6 +242,8 @@ impl Pty {
             ws_ypixel: 0,
         };
 
+        // Copied out before the fork: the child may not touch `who`.
+        let (who_uid, who_gid) = (who.uid, who.gid);
         let mut master: RawFd = -1;
         // SAFETY: forkpty writes the master fd through the pointer and
         // returns a pid; both outcomes are checked below.
@@ -205,11 +261,26 @@ impl Pty {
         if pid == 0 {
             // The child. forkpty has already made this a session leader
             // with the slave as its controlling terminal and as all three
-            // standard descriptors, so there is exactly one thing left.
-            // SAFETY: execv replaces this image; on failure the child must
-            // not return into a runtime it no longer shares.
+            // standard descriptors, so what is left is becoming the
+            // operator and starting their shell — syscalls only, in the
+            // one order that cannot go wrong: groups and gid before uid,
+            // because dropping uid first would forfeit the privilege the
+            // other two need.
+            //
+            // SAFETY: every call below is a syscall on values built before
+            // the fork; execve replaces the image, and a failure exits
+            // rather than returning into a runtime this process no longer
+            // shares with anyone.
             unsafe {
-                libc::execv(program.as_ptr(), argv.as_ptr());
+                libc::setgroups(groups.len(), groups.as_ptr());
+                libc::setgid(who_gid);
+                libc::setuid(who_uid);
+                // A shell that starts somewhere the operator cannot read
+                // is a confusing shell; / is the honest fallback.
+                if libc::chdir(home.as_ptr()) != 0 {
+                    libc::chdir(c"/".as_ptr());
+                }
+                libc::execve(program.as_ptr(), argv.as_ptr(), envp.as_ptr());
                 libc::_exit(127);
             }
         }
