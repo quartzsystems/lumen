@@ -135,8 +135,6 @@ async fn main() -> Result<()> {
                 ))
             }
         };
-    let storage = Arc::new(StorageService::new(zfs_backend));
-
     // Clustering. No probe and no unavailable fallback: a node without a
     // cluster stack is the ordinary standalone appliance, and the backend
     // answers "no environment" for it rather than being broken. Reads are
@@ -156,6 +154,24 @@ async fn main() -> Result<()> {
     ));
     peers.bind(cluster.clone());
 
+    // The LumenFS pool, if this node carries one — decided by the daemon's
+    // own drop-in, never a second record. One engine per cluster ever: a
+    // pooled node's machines live on vdisks, so the pool service is also
+    // the `VmVolumes` the compute domain gets below; everywhere else the
+    // DRBD path stays exactly what it was. Assembled before the storage
+    // service because the disk page's wipe guard needs to know which bricks
+    // are the pool's and which are leftovers a reinstall stranded.
+    let pool = PoolPresence::assemble(&cluster, peers.clone());
+    match &pool {
+        PoolPresence::Absent => {}
+        PoolPresence::Broken(why) => {
+            tracing::error!("the pool configuration is unusable: {why}")
+        }
+        PoolPresence::Present { .. } => tracing::info!("this node serves a LumenFS pool"),
+    }
+    let storage =
+        Arc::new(StorageService::new(zfs_backend).with_brick_clearance(pool.brick_clearance()));
+
     // Replicated storage, on top of clustering and local storage: the
     // record and the replication policy come from the cluster domain, the
     // backing zvols from the storage domain, and DRBD itself through its
@@ -169,20 +185,6 @@ async fn main() -> Result<()> {
         storage.clone(),
     ));
     peers.bind_volumes(drbd.clone());
-
-    // The LumenFS pool, if this node carries one — decided by the daemon's
-    // own drop-in, never a second record. One engine per cluster ever: a
-    // pooled node's machines live on vdisks, so the pool service is also
-    // the `VmVolumes` the compute domain gets below; everywhere else the
-    // DRBD path stays exactly what it was.
-    let pool = PoolPresence::assemble(&cluster, peers.clone());
-    match &pool {
-        PoolPresence::Absent => {}
-        PoolPresence::Broken(why) => {
-            tracing::error!("the pool configuration is unusable: {why}")
-        }
-        PoolPresence::Present { .. } => tracing::info!("this node serves a LumenFS pool"),
-    }
 
     // Virtual machines. The hypervisor is a privileged daemon reached over its
     // own socket, exactly as networking reaches NetworkManager over the bus —

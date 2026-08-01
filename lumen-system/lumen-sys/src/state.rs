@@ -18,7 +18,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::model::{LocalUser, LoginState, ADMIN_GROUP, FIRST_HUMAN_UID, NOLOGIN_SHELLS};
+use crate::model::{
+    LocalUser, LoginState, ADMIN_GROUP, FIRST_HUMAN_UID, LAST_HUMAN_UID, NOLOGIN_SHELLS,
+};
 
 /// Where the account database lives. Overridable so tests read a directory of
 /// their own rather than the machine running them.
@@ -136,7 +138,7 @@ pub fn parse(passwd: &str, group: &str, shadow: Option<&str>) -> Vec<LocalUser> 
                     .as_ref()
                     .and_then(|h| h.get(&name))
                     .and_then(|entry| entry.changed_days),
-                system: uid < FIRST_HUMAN_UID,
+                system: !(FIRST_HUMAN_UID..=LAST_HUMAN_UID).contains(&uid),
                 name,
                 uid,
                 gid,
@@ -283,6 +285,7 @@ qemu:x:107:107:qemu user:/:/sbin/nologin
 alice:x:1000:1000:Alice Kowalski,Rack 4,,:/home/alice:/bin/bash
 bob:x:1001:1001::/home/bob:/bin/bash
 carol:x:1002:1002:Carol:/home/carol:/bin/bash
+nobody:x:65534:65534:Kernel Overflow User:/:/usr/sbin/nologin
 ";
 
     const GROUP: &str = "\
@@ -293,6 +296,7 @@ qemu:x:107:
 alice:x:1000:
 bob:x:1001:
 carol:x:1002:
+nobody:x:65534:
 ";
 
     const SHADOW: &str = "\
@@ -369,7 +373,20 @@ carol::20060:0:99999:7:::
     fn people_sort_above_the_accounts_nobody_made() {
         let users = parse(PASSWD, GROUP, Some(SHADOW));
         let order: Vec<&str> = users.iter().map(|u| u.name.as_str()).collect();
-        assert_eq!(order, ["alice", "bob", "carol", "root", "bin", "qemu"]);
+        assert_eq!(
+            order,
+            ["alice", "bob", "carol", "root", "bin", "qemu", "nobody"]
+        );
+    }
+
+    /// The person test is a range, not a floor. `nobody` sits at 65534 — the
+    /// kernel overflow UID, above `useradd`'s allocation ceiling — and a
+    /// floor-only test files it among the people of every node.
+    #[test]
+    fn the_kernel_overflow_account_is_not_a_person() {
+        let users = parse(PASSWD, GROUP, Some(SHADOW));
+        let nobody = users.iter().find(|u| u.name == "nobody").unwrap();
+        assert!(nobody.system, "{nobody:?}");
     }
 
     #[test]

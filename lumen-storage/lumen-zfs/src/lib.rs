@@ -47,6 +47,6 @@ pub use model::{
     BlockDevice, Compression, Dataset, DatasetKind, LumenBrick, Pool, PoolHealth, PoolRequest,
     SnapshotInfo, VdevKind, VolumeRequest, DEFAULT_ASHIFT, ISO_MOUNT_ROOT, LUMEN_PREFIX,
 };
-pub use service::{DevicesResponse, PoolView, StorageService};
+pub use service::{BrickClearance, DevicesResponse, PoolView, StorageService};
 pub use state::{PoolContents, StorageState};
 pub use validate::{Acknowledgements, PoolCreate, ValidationCode, ValidationError};

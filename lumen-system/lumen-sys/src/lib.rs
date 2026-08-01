@@ -56,7 +56,7 @@ pub use error::{Result, SysError};
 pub use exec::{Exec, MockExec, Outcome, Request, SystemdRun, UnavailableExec};
 pub use model::{
     valid_user_name, LocalUser, LoginState, NewUser, PowerAction, UserPatch, ADMIN_GROUP,
-    DEFAULT_SHELL, FIRST_HUMAN_UID, MIN_PASSWORD_LEN,
+    DEFAULT_SHELL, FIRST_HUMAN_UID, LAST_HUMAN_UID, MIN_PASSWORD_LEN,
 };
 pub use service::{
     Action, DeleteUserResponse, PowerView, SysService, UserActions, UserView, UsersResponse,

@@ -151,11 +151,35 @@ pub async fn set_power(
     let request: PowerRequest = required_body(raw)?;
     guard_cluster_power(&state, request.i_understand_the_cluster_loses_quorum).await?;
     match request.at {
-        Some(at) => Ok(Json(state.sys.power_at(request.action, at).await?).into_response()),
+        Some(at) => Ok(Json(
+            state
+                .sys
+                .power_at(request.action, at)
+                .await
+                .map_err(refusal_said_aloud)?,
+        )
+        .into_response()),
         None => {
-            state.sys.power_now(request.action).await?;
+            state
+                .sys
+                .power_now(request.action)
+                .await
+                .map_err(refusal_said_aloud)?;
             Ok(axum::http::StatusCode::ACCEPTED.into_response())
         }
+    }
+}
+
+/// A power backend error is a refusal with the reason attached — "the node
+/// refused to restart: access denied" is logind's own sentence, written for
+/// the operator holding the dialog. The generic `Backend` → 500 mapping
+/// would swallow it into "Internal server error.", which is exactly the
+/// wrong behavior on the one page whose point is that a node that refuses
+/// says so (the reasoning `backend::logind` chose `Reboot(false)` for).
+fn refusal_said_aloud(err: lumen_sys::SysError) -> ApiError {
+    match err {
+        lumen_sys::SysError::Backend(inner) => ApiError::Conflict(format!("{inner:#}")),
+        other => other.into(),
     }
 }
 
@@ -216,5 +240,7 @@ pub async fn cancel_power(
     _session: Session,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<PowerView>, ApiError> {
-    Ok(Json(state.sys.cancel_power().await?))
+    Ok(Json(
+        state.sys.cancel_power().await.map_err(refusal_said_aloud)?,
+    ))
 }

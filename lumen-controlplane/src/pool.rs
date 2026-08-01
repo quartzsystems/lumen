@@ -43,6 +43,10 @@ pub enum PoolPresence {
         /// This node's daemon's control surface — loopback — for serving
         /// peer verbs against the one daemon this machine may speak to.
         control: SocketAddr,
+        /// The brick paths the drop-in serves from, as written there — what
+        /// [`PoolPresence::brick_clearance`] hands the storage domain so
+        /// its wipe guard can tell this pool's bricks from leftovers.
+        bricks: Vec<String>,
     },
 }
 
@@ -106,6 +110,11 @@ impl PoolPresence {
             // machine page then call the same thing by the same name.
             service: Arc::new(PoolService::new(Arc::new(fleet), &assignment)),
             control: config.control,
+            bricks: config
+                .bricks
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
         }
     }
 
@@ -114,6 +123,20 @@ impl PoolPresence {
         match self {
             PoolPresence::Present { service, .. } => Some(service),
             _ => None,
+        }
+    }
+
+    /// What the storage domain's wipe guard needs to know from here: no
+    /// pool means every brick found on a disk is a leftover; a broken
+    /// drop-in means nothing can be told; a serving pool names its bricks
+    /// so everything else clears.
+    pub fn brick_clearance(&self) -> lumen_zfs::BrickClearance {
+        match self {
+            PoolPresence::Absent => lumen_zfs::BrickClearance::NoPool,
+            PoolPresence::Broken(_) => lumen_zfs::BrickClearance::Unknown,
+            PoolPresence::Present { bricks, .. } => {
+                lumen_zfs::BrickClearance::PoolBricks(bricks.clone())
+            }
         }
     }
 }

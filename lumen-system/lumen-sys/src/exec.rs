@@ -516,7 +516,9 @@ fn apply(files: &crate::state::AccountFiles, request: &Request) {
             let uid = passwd
                 .lines()
                 .filter_map(|line| line.split(':').nth(2)?.parse::<u32>().ok())
-                .filter(|uid| *uid >= crate::model::FIRST_HUMAN_UID)
+                .filter(|uid| {
+                    (crate::model::FIRST_HUMAN_UID..=crate::model::LAST_HUMAN_UID).contains(uid)
+                })
                 .max()
                 .map(|max| max + 1)
                 .unwrap_or(crate::model::FIRST_HUMAN_UID);

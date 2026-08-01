@@ -170,6 +170,7 @@ fn pooled() -> (Arc<MockFleet>, PoolPresence) {
         PoolPresence::Present {
             service,
             control: "127.0.0.1:1".parse().unwrap(),
+            bricks: vec!["/dev/disk/by-id/scsi-fixture".into()],
         },
     )
 }
@@ -527,7 +528,14 @@ async fn a_peer_verb_reaches_this_nodes_real_daemon_and_nothing_else_does() {
     let control = real_daemon_control(&dir.0);
     let (fleet, _unused) = pooled();
     let service = Arc::new(PoolService::new(fleet, "alpha"));
-    let (router, _dir) = router_with("peer", PoolPresence::Present { service, control });
+    let (router, _dir) = router_with(
+        "peer",
+        PoolPresence::Present {
+            service,
+            control,
+            bricks: vec!["/dev/disk/by-id/scsi-fixture".into()],
+        },
+    );
 
     // A peer ticket is the authentication; the verb is a closed enum the
     // route deserializes before anything runs.

@@ -151,6 +151,25 @@ impl MockBackend {
         }
     }
 
+    /// A disk carrying a LumenFS brick and nothing else — claimed by its
+    /// own superblock, exactly what a reinstalled node's data disks look
+    /// like. `pool_uuid` is the brick's pool, lowercase hex.
+    pub fn brick_disk(name: &str, size: u64, pool_uuid: &str) -> BlockDevice {
+        let brick = crate::model::LumenBrick {
+            pool_uuid: pool_uuid.into(),
+            brick_uuid: "cd".repeat(16),
+            tier: 0,
+            wal_holder: true,
+        };
+        BlockDevice {
+            in_use: true,
+            claimed: true,
+            used_by: Some(crate::devices::brick_claim(&brick)),
+            lumenfs: Some(brick),
+            ..Self::free_disk(name, size)
+        }
+    }
+
     /// The disk the appliance is running from — the one a pool must never be
     /// built on by accident.
     pub fn busy_disk(name: &str, size: u64) -> BlockDevice {
@@ -243,6 +262,9 @@ impl ZfsBackend for MockBackend {
             disk.in_use = false;
             disk.used_by = None;
             disk.wipeable = false;
+            // The identity sectors are zeroed too: the next scan sees no
+            // brick, exactly as the real backend's dd leaves it.
+            disk.lumenfs = None;
         }
         inner.wiped.push(device.name.clone());
         Ok(())

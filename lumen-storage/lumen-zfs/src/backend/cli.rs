@@ -68,6 +68,7 @@ const DEADLINE: Duration = Duration::from_secs(30);
 /// be resolving a program out of this daemon's `PATH`.
 const WIPEFS: &str = "/usr/sbin/wipefs";
 const BLOCKDEV: &str = "/usr/sbin/blockdev";
+const DD: &str = "/usr/bin/dd";
 
 pub struct CliBackend {
     zfs: String,
@@ -415,6 +416,27 @@ impl ZfsBackend for CliBackend {
     }
 
     async fn wipe_disk(&self, device: &BlockDevice) -> Result<()> {
+        // A LumenFS superblock first, by force: `wipefs` cannot see one —
+        // the format is ours, not in its signature table — so on a brick
+        // the "clear the signatures" step below would report success and
+        // leave the identity standing, and the next scan would call the
+        // disk claimed again. The same dd the pool destroy workflow runs,
+        // for the same reason.
+        if device.lumenfs.is_some() {
+            self.run_privileged_program(
+                format!("zero the brick identity on {}", device.kernel_path),
+                DD,
+                vec![
+                    "if=/dev/zero".into(),
+                    format!("of={}", device.kernel_path),
+                    "bs=4096".into(),
+                    "count=4".into(),
+                    "conv=fsync".into(),
+                ],
+            )
+            .await?;
+        }
+
         // Every partition, then the disk. In that order and never the other
         // way round: clearing the table first makes the partitions disappear
         // as devices, and the ZFS labels on them survive to be found by the

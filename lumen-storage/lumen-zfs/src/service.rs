@@ -113,6 +113,32 @@ pub struct IsosResponse {
     pub images: Vec<IsoView>,
 }
 
+/// What this node's own LumenFS pool configuration says about bricks — the
+/// one fact the wipe guard cannot read off a platter. The scan marks every
+/// brick claimed because it cannot tell a serving brick from an abandoned
+/// one; this is the layer above saying which is which, the same way
+/// `pool_members` is what tells a live ZFS member from a reclaimable disk.
+///
+/// A reinstalled node is the case this exists for: the OS is fresh, the old
+/// pool's superblocks are still in the first sectors of its data disks, and
+/// without this the operator's only path to their own drives is a shell.
+#[derive(Debug, Clone, Default)]
+pub enum BrickClearance {
+    /// Nobody has said. Refuse every brick — the safe reading, and the
+    /// default, so a construction that never wires the fact keeps today's
+    /// behavior.
+    #[default]
+    Unknown,
+    /// No pool is configured on this node: any brick found on a disk is a
+    /// leftover, clearable with the acknowledgement.
+    NoPool,
+    /// The paths this node's pool daemon is configured on. Those bricks are
+    /// the pool's — destroy the pool instead — and any other brick (another
+    /// deployment's disk slotted in, a stale path the pool moved off) is a
+    /// leftover.
+    PoolBricks(Vec<String>),
+}
+
 pub struct StorageService {
     backend: Arc<dyn ZfsBackend>,
     node: String,
@@ -124,6 +150,10 @@ pub struct StorageService {
     /// destroy. Read once at startup — it cannot change without a reboot, and
     /// a reboot restarts this daemon.
     root_pool: Option<String>,
+    /// See [`BrickClearance`]. Read once at startup like `root_pool`, and
+    /// just as safely: the pool configuration only changes through workflows
+    /// that restart this daemon.
+    bricks: BrickClearance,
 }
 
 impl StorageService {
@@ -134,7 +164,14 @@ impl StorageService {
             gate: Mutex::new(()),
             isos: IsoLibrary::default(),
             root_pool: crate::state::root_pool(),
+            bricks: BrickClearance::default(),
         }
+    }
+
+    /// The same service told what the pool configuration says about bricks.
+    pub fn with_brick_clearance(mut self, bricks: BrickClearance) -> Self {
+        self.bricks = bricks;
+        self
     }
 
     /// Pretend the appliance is installed on this pool. For tests, which have
@@ -214,7 +251,13 @@ impl StorageService {
                     device.used_by = Some(format!("in pool {pool}"));
                     device.wipeable = false;
                 }
-                None => device.wipeable = device.looks_wipeable(),
+                // A brick the pool configuration disowns gets the button an
+                // ordinary claimed disk does not — the abandoned-brick case
+                // `brick_release` exists for, offered where the operator is
+                // looking rather than discovered by a refusal.
+                None => {
+                    device.wipeable = device.looks_wipeable() || self.brick_release(device).is_ok()
+                }
             }
         }
         Ok(DevicesResponse {
@@ -281,12 +324,10 @@ impl StorageService {
             )));
         }
         if device.claimed {
-            return Err(ZfsError::Conflict(format!(
-                "\"{}\" is in use — {}. Clearing it would pull the disk out from under whatever \
-                 has it open.",
-                device.name,
-                device.used_by.as_deref().unwrap_or("something has it open")
-            )));
+            // The one claim that may be cleared through here: a LumenFS
+            // brick the pool configuration disowns. Everything else keeps
+            // the refusal.
+            self.brick_release(device)?;
         }
         // No check on the partition count. See the note above: the disk that
         // needs this most is the one that already reads as empty.
@@ -306,6 +347,57 @@ impl StorageService {
                     device.name
                 ))
             })
+    }
+
+    /// Whether a claimed disk's claim is a brick this service may clear —
+    /// `Ok(())` licenses the wipe, the error is the sentence the operator
+    /// gets.
+    ///
+    /// The brick must be the disk's *only* claim: `used_by` is exactly the
+    /// probe's sentence and nothing else is on the disk. A brick that is
+    /// also mounted, partitioned, or in a zpool is a disk telling two
+    /// stories, and a wipe decided on one of them would be decided on half
+    /// the facts. Foreign-format bricks stay refused too — this release
+    /// cannot read their superblock, so it cannot say whose they are.
+    fn brick_release(&self, device: &BlockDevice) -> Result<()> {
+        let in_use = || {
+            ZfsError::Conflict(format!(
+                "\"{}\" is in use — {}. Clearing it would pull the disk out from under whatever \
+                 has it open.",
+                device.name,
+                device.used_by.as_deref().unwrap_or("something has it open")
+            ))
+        };
+        let brick = device.lumenfs.as_ref().ok_or_else(in_use)?;
+        let sole_claim = device.partitions == 0
+            && device.used_by.as_deref() == Some(crate::devices::brick_claim(brick).as_str());
+        if !sole_claim {
+            return Err(in_use());
+        }
+        match &self.bricks {
+            BrickClearance::NoPool => Ok(()),
+            BrickClearance::PoolBricks(paths) => {
+                if paths
+                    .iter()
+                    .any(|p| *p == device.path || *p == device.kernel_path)
+                {
+                    Err(ZfsError::Conflict(format!(
+                        "\"{}\" is a brick of the pool this node serves. Destroy the pool first — \
+                         clearing a brick out from under a live pool loses the pool, not just \
+                         the disk.",
+                        device.name
+                    )))
+                } else {
+                    Ok(())
+                }
+            }
+            BrickClearance::Unknown => Err(ZfsError::Conflict(format!(
+                "\"{}\" is a LumenFS brick, and this node's pool configuration cannot be read, \
+                 so whether the pool is serving from it cannot be told. Repair or destroy the \
+                 pool first.",
+                device.name
+            ))),
+        }
     }
 
     /// Build a pool.
@@ -1275,6 +1367,93 @@ mod tests {
         let err = service.wipe_disk("sdb", acknowledged()).await.unwrap_err();
         assert!(err.to_string().contains("tank"), "{err}");
         assert!(backend.wiped().is_empty(), "the pool was not touched");
+    }
+
+    /// The reinstalled node's own disks. The OS is fresh, the old pool's
+    /// superblocks are still in the first sectors, and the scan rightly
+    /// calls them claimed — but the pool configuration disowning them is
+    /// what turns "claimed" into "leftover", and the listing offers the
+    /// button instead of leaving the operator at a shell.
+    #[tokio::test]
+    async fn an_abandoned_brick_clears_when_no_pool_is_configured() {
+        const TB: u64 = 1_000_000_000_000;
+        let backend = Arc::new(
+            MockBackend::appliance().with_disks(vec![MockBackend::brick_disk(
+                "nvme0n1",
+                TB,
+                &"ab".repeat(16),
+            )]),
+        );
+        let service = StorageService::new(backend.clone())
+            .with_root_pool(Some("boot".into()))
+            .with_brick_clearance(BrickClearance::NoPool);
+
+        let devices = service.block_devices().await.unwrap().devices;
+        let nvme = devices.iter().find(|d| d.name == "nvme0n1").unwrap();
+        assert!(nvme.in_use, "still claimed until actually cleared");
+        assert!(nvme.wipeable, "{nvme:?}");
+
+        let cleared = service.wipe_disk("nvme0n1", acknowledged()).await.unwrap();
+        assert!(!cleared.in_use, "{cleared:?}");
+        assert!(cleared.lumenfs.is_none(), "the identity went with the wipe");
+        assert_eq!(backend.wiped(), vec!["nvme0n1"]);
+    }
+
+    /// With a pool configured, its own bricks stay refused — that wipe is
+    /// the destroy workflow's — while a stranger's brick (another
+    /// deployment's disk slotted in) is still a leftover.
+    #[tokio::test]
+    async fn a_serving_pools_brick_is_refused_and_a_strangers_clears() {
+        const TB: u64 = 1_000_000_000_000;
+        let own = MockBackend::brick_disk("nvme0n1", TB, &"ab".repeat(16));
+        let conf_path = own.path.clone();
+        let backend = Arc::new(MockBackend::appliance().with_disks(vec![
+            own,
+            MockBackend::brick_disk("nvme1n1", TB, &"ef".repeat(16)),
+        ]));
+        let service = StorageService::new(backend.clone())
+            .with_root_pool(Some("boot".into()))
+            .with_brick_clearance(BrickClearance::PoolBricks(vec![conf_path]));
+
+        let devices = service.block_devices().await.unwrap().devices;
+        let find = |name: &str| devices.iter().find(|d| d.name == name).unwrap();
+        assert!(!find("nvme0n1").wipeable, "{:?}", find("nvme0n1"));
+        assert!(find("nvme1n1").wipeable, "{:?}", find("nvme1n1"));
+
+        let err = service
+            .wipe_disk("nvme0n1", acknowledged())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Destroy the pool first"), "{err}");
+        service.wipe_disk("nvme1n1", acknowledged()).await.unwrap();
+        assert_eq!(backend.wiped(), vec!["nvme1n1"]);
+    }
+
+    /// Nobody told the service what the pool configuration says — the
+    /// default, and what a broken configuration maps to. Refusing is the
+    /// only safe reading, and the sentence says what to fix.
+    #[tokio::test]
+    async fn an_untold_service_refuses_every_brick() {
+        const TB: u64 = 1_000_000_000_000;
+        let backend = Arc::new(
+            MockBackend::appliance().with_disks(vec![MockBackend::brick_disk(
+                "nvme0n1",
+                TB,
+                &"ab".repeat(16),
+            )]),
+        );
+        let service = StorageService::new(backend.clone()).with_root_pool(Some("boot".into()));
+
+        let devices = service.block_devices().await.unwrap().devices;
+        let nvme = devices.iter().find(|d| d.name == "nvme0n1").unwrap();
+        assert!(!nvme.wipeable, "{nvme:?}");
+
+        let err = service
+            .wipe_disk("nvme0n1", acknowledged())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot be read"), "{err}");
+        assert!(backend.wiped().is_empty());
     }
 
     /// The disk this exists for is the one that already reads as empty.

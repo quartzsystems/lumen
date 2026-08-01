@@ -14,6 +14,13 @@ use serde::{Deserialize, Serialize};
 /// built from, and `useradd` uses the same number when it allocates one.
 pub const FIRST_HUMAN_UID: u32 = 1000;
 
+/// Above this, an account belongs to the system again: `UID_MAX` from the
+/// same `/etc/login.defs`, the top of `useradd`'s allocation range. The
+/// floor alone is not the person test — `nobody` sits at 65534, the kernel
+/// overflow UID, and files itself among the people of any node that only
+/// checks the floor.
+pub const LAST_HUMAN_UID: u32 = 60000;
+
 /// The group that grants administrative rights. The `lumen` realm authenticates
 /// against PAM, which is to say against the node's own accounts, so "can
 /// administer this appliance" is a question about this group and not about a
@@ -87,9 +94,11 @@ pub struct LocalUser {
     /// In [`ADMIN_GROUP`], and therefore able to administer this appliance.
     pub administrator: bool,
     pub login: LoginState,
-    /// Belongs to a package rather than to a person: a UID below
-    /// [`FIRST_HUMAN_UID`]. `root` is one of these and is shown anyway, because
-    /// it is the account an operator is most likely to be signed in as.
+    /// Belongs to a package rather than to a person: a UID outside
+    /// [`FIRST_HUMAN_UID`]`..=`[`LAST_HUMAN_UID`] — below is the packages',
+    /// above is the kernel's (`nobody` at 65534). `root` is one of these and
+    /// is shown anyway, because it is the account an operator is most likely
+    /// to be signed in as.
     pub system: bool,
     /// Days since the epoch when the password was last set, from
     /// `/etc/shadow`. Absent when there is no password or the file is

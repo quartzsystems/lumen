@@ -101,6 +101,17 @@ enum BrickProbe {
     Known(LumenBrick),
 }
 
+/// The `used_by` sentence a known brick contributes — one definition,
+/// because the wipe guard's "is the brick the *only* claim on this disk"
+/// question is answered by comparing `used_by` against exactly this.
+pub(crate) fn brick_claim(brick: &LumenBrick) -> String {
+    format!(
+        "LumenFS brick (pool {}, tier {})",
+        &brick.pool_uuid[..8],
+        brick.tier
+    )
+}
+
 /// Read the disk's own first sector and ask whether a brick superblock is
 /// in it. Failure to open or read is an ordinary "no": a scan must never
 /// error a whole disk list because one device refused a read.
@@ -189,11 +200,7 @@ fn scan(roots: &DeviceRoots) -> Vec<BlockDevice> {
             // bricks through its own guards.
             let lumenfs = match lumenfs_probe(&roots.dev.join(&name)) {
                 BrickProbe::Known(brick) => {
-                    used_by.push(format!(
-                        "LumenFS brick (pool {}, tier {})",
-                        &brick.pool_uuid[..8],
-                        brick.tier
-                    ));
+                    used_by.push(brick_claim(&brick));
                     Some(brick)
                 }
                 BrickProbe::Foreign(version) => {
