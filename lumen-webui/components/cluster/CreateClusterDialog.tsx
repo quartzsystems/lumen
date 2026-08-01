@@ -542,12 +542,12 @@ export function CreateClusterDialog({
             )}
             <dt>Core</dt>
             <dd className="qz-mono">
-              {coreSubnet} · MTU {coreMtu}
+              {coreSubnet} - MTU {coreMtu}
             </dd>
             <dt>Management</dt>
             <dd className="qz-mono">
               {managementSubnet || "—"}
-              {vip ? ` · VIP ${vip}` : ""}
+              {vip ? ` - VIP ${vip}` : ""}
             </dd>
           </dl>
           <div className="surface p-4">
@@ -570,10 +570,10 @@ export function CreateClusterDialog({
                     <tr key={node}>
                       <td className="mono">{node}</td>
                       <td className="mono">
-                        {draft.core_interface} · {draft.core_address}
+                        {draft.core_interface} - {draft.core_address}
                       </td>
                       <td className="mono">
-                        {draft.management_interface} · {draft.management_address}
+                        {draft.management_interface} - {draft.management_address}
                       </td>
                       <td className="mono">{draft.bmc_address}</td>
                     </tr>
@@ -664,7 +664,7 @@ export function ProgressRow({ step }: { step: StepProgress }) {
       <span className={`state-dot-${tone} mt-[5px]`} />
       <span className="text-[var(--qz-fg-2)]">
         {STEP_LABEL[step.step] ?? step.step}
-        {step.node && <span className="qz-mono text-[var(--qz-fg-3)]"> · {step.node}</span>}
+        {step.node && <span className="qz-mono text-[var(--qz-fg-3)]"> - {step.node}</span>}
       </span>
       <span className="text-[12px] text-[var(--qz-fg-4)] ml-auto text-right max-w-[300px]">
         {step.state === "unwound" ? "unwound" : (step.detail ?? step.state)}

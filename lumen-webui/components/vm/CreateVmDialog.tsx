@@ -25,6 +25,8 @@ import {
   fetchOsCatalog,
   formatBytes,
   validationErrorsOf,
+  NIC_MODEL_LABEL,
+  SCSI_CONTROLLER_LABEL,
   VIDEO_HINT,
   VIDEO_LABEL,
   type BootDevice,
@@ -36,9 +38,14 @@ import {
   type NicModel,
   type OsCatalog,
   type OsVariant,
+  type ScsiController,
   type VideoModel,
   type VmView,
 } from "@/lib/vmClient";
+
+/// The EFI-storage choice that means "the cluster's replicated storage"
+/// rather than a named local pool.
+const REPLICATED_STORAGE = "__replicated__";
 
 type Tab = "general" | "os" | "system" | "disks" | "cpu" | "memory" | "network" | "confirm";
 
@@ -68,6 +75,9 @@ const TAB_OF_FIELD: Record<string, Tab> = {
   firmware: "system",
   machine: "system",
   video: "system",
+  scsi_controller: "system",
+  tpm: "system",
+  efi_disk: "system",
   pool: "disks",
   size_gib: "disks",
   vcpus: "cpu",
@@ -76,6 +86,7 @@ const TAB_OF_FIELD: Record<string, Tab> = {
   memory_mib: "memory",
   bridge: "network",
   vlan_tag: "network",
+  mac: "network",
 };
 
 /// Every field the dialog collects. Numbers stay strings so a half-typed one
@@ -97,6 +108,13 @@ interface Draft {
   machine: string;
   video: VideoModel;
   guestAgent: boolean;
+  scsiController: ScsiController;
+  tpm: boolean;
+  /// Put the UEFI variable store on chosen storage instead of the
+  /// hypervisor-managed file.
+  addEfiDisk: boolean;
+  /// A pool name, or REPLICATED_STORAGE for the cluster's pooled storage.
+  efiStorage: string;
   pool: string;
   sizeGib: string;
   bus: DiskBus;
@@ -112,6 +130,9 @@ interface Draft {
   bridge: string;
   nicModel: NicModel;
   vlanTag: string;
+  /// A hardware address to honor a reservation with; empty derives a stable
+  /// one from the VMID.
+  macAddress: string;
   startNow: boolean;
 }
 
@@ -137,6 +158,10 @@ const emptyDraft = (): Draft => ({
   machine: "q35",
   video: "virtio",
   guestAgent: true,
+  scsiController: "virtio-scsi-single",
+  tpm: false,
+  addEfiDisk: false,
+  efiStorage: "",
   pool: "",
   sizeGib: "32",
   bus: "virtio-blk",
@@ -149,6 +174,7 @@ const emptyDraft = (): Draft => ({
   bridge: "",
   nicModel: "virtio",
   vlanTag: "",
+  macAddress: "",
   startNow: false,
 });
 
@@ -228,7 +254,11 @@ export function CreateVmDialog({
         const response = await fetchPools();
         const found = response.nodes.flatMap((node) => node.pools);
         setPools(found);
-        setDraft((d) => ({ ...d, pool: d.pool || (found[0]?.name ?? "") }));
+        setDraft((d) => ({
+          ...d,
+          pool: d.pool || (found[0]?.name ?? ""),
+          efiStorage: d.efiStorage || (found[0]?.name ?? ""),
+        }));
       } catch {
         setPools([]);
       }
@@ -335,6 +365,15 @@ export function CreateVmDialog({
       const tag = numberOf(d.vlanTag);
       if (tag === undefined || tag < 1 || tag > 4094) found.vlan_tag = "Use a tag from 1 to 4094.";
     }
+    if (
+      d.macAddress.trim() !== "" &&
+      !/^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$/.test(d.macAddress.trim())
+    ) {
+      found.mac = "Use six two-digit hex octets, like 52:54:00:12:34:56.";
+    }
+    if (d.firmware === "uefi" && d.addEfiDisk && d.efiStorage === "") {
+      found.efi_disk = "Choose where the EFI variable store lives.";
+    }
     return found;
   }, []);
 
@@ -424,6 +463,14 @@ export function CreateVmDialog({
         cpu_model: cpuModel,
         machine: draft.machine || undefined,
         firmware: draft.firmware,
+        scsi_controller: draft.scsiController,
+        tpm: draft.firmware === "uefi" && draft.tpm,
+        efi_disk:
+          draft.firmware === "uefi" && draft.addEfiDisk
+            ? draft.efiStorage === REPLICATED_STORAGE
+              ? { replicated: true }
+              : { pool: draft.efiStorage }
+            : undefined,
         video: draft.video,
         boot_order: bootOrder,
         guest_agent: draft.guestAgent,
@@ -454,6 +501,7 @@ export function CreateVmDialog({
                 bridge: draft.bridge,
                 model: draft.nicModel,
                 vlan_tag: numberOf(draft.vlanTag),
+                mac: draft.macAddress.trim() || undefined,
               },
             ]
           : [],
@@ -570,48 +618,125 @@ export function CreateVmDialog({
 
           {tab === "system" && (
             <>
-              <Field
-                label="Firmware"
-                htmlFor="vm-firmware"
-                hint="Chosen once, at creation — a machine cannot change firmware later."
-              >
-                <SelectInput
-                  id="vm-firmware"
-                  value={draft.firmware}
-                  onChange={(v) => set("firmware", v as Firmware)}
+              {/* Two columns, the way Proxmox lays this tab out: the machine's
+                  fabric on the left, its attached oddments on the right. */}
+              <div className="grid gap-4 items-start" style={{ gridTemplateColumns: "1fr 1fr" }}>
+                <Field label="Graphics Card" htmlFor="vm-video" hint={VIDEO_HINT[draft.video]}>
+                  <SelectInput
+                    id="vm-video"
+                    value={draft.video}
+                    onChange={(v) => set("video", v as VideoModel)}
+                  >
+                    {(Object.keys(VIDEO_LABEL) as VideoModel[]).map((model) => (
+                      <option key={model} value={model}>
+                        {VIDEO_LABEL[model]}
+                      </option>
+                    ))}
+                  </SelectInput>
+                </Field>
+                <Field
+                  label="SCSI Controller"
+                  htmlFor="vm-scsi"
+                  hint="What scsi-bus disks sit behind. Single gives each disk its own controller and I/O thread."
                 >
-                  <option value="uefi">UEFI (OVMF)</option>
-                  <option value="bios">Legacy BIOS (SeaBIOS)</option>
-                </SelectInput>
-              </Field>
-              <Field
-                label="Machine type"
-                htmlFor="vm-machine"
-                hint="q35 is the modern chipset. i440fx is for a guest too old to know it."
-              >
-                <SelectInput
-                  id="vm-machine"
-                  value={draft.machine}
-                  mono
-                  onChange={(v) => set("machine", v)}
+                  <SelectInput
+                    id="vm-scsi"
+                    value={draft.scsiController}
+                    onChange={(v) => set("scsiController", v as ScsiController)}
+                  >
+                    {(Object.keys(SCSI_CONTROLLER_LABEL) as ScsiController[]).map((model) => (
+                      <option key={model} value={model}>
+                        {SCSI_CONTROLLER_LABEL[model]}
+                      </option>
+                    ))}
+                  </SelectInput>
+                </Field>
+
+                <Field
+                  label="Machine Type"
+                  htmlFor="vm-machine"
+                  hint="q35 is the modern chipset. i440fx is for a guest too old to know it."
                 >
-                  <option value="q35">q35</option>
-                  <option value="pc">i440fx</option>
-                </SelectInput>
-              </Field>
-              <Field label="Graphics card" htmlFor="vm-video" hint={VIDEO_HINT[draft.video]}>
-                <SelectInput
-                  id="vm-video"
-                  value={draft.video}
-                  onChange={(v) => set("video", v as VideoModel)}
+                  <SelectInput
+                    id="vm-machine"
+                    value={draft.machine}
+                    mono
+                    onChange={(v) => set("machine", v)}
+                  >
+                    <option value="q35">q35</option>
+                    <option value="pc">i440fx</option>
+                  </SelectInput>
+                </Field>
+                <label className="flex items-center gap-[10px] cursor-pointer select-none pt-[26px]">
+                  <Switch on={draft.guestAgent} onChange={(v) => set("guestAgent", v)} />
+                  <span className="text-[13px] text-[var(--qz-fg-2)]">QEMU Agent</span>
+                </label>
+
+                <Field
+                  label="Firmware"
+                  htmlFor="vm-firmware"
+                  hint="Chosen once, at creation — a machine cannot change firmware later."
                 >
-                  {(Object.keys(VIDEO_LABEL) as VideoModel[]).map((model) => (
-                    <option key={model} value={model}>
-                      {VIDEO_LABEL[model]}
-                    </option>
-                  ))}
-                </SelectInput>
-              </Field>
+                  <SelectInput
+                    id="vm-firmware"
+                    value={draft.firmware}
+                    onChange={(v) => set("firmware", v as Firmware)}
+                  >
+                    <option value="uefi">UEFI (OVMF)</option>
+                    <option value="bios">Legacy BIOS (SeaBIOS)</option>
+                  </SelectInput>
+                </Field>
+                <label
+                  className={`flex items-center gap-[10px] select-none pt-[26px] ${
+                    draft.firmware === "uefi" ? "cursor-pointer" : "opacity-40"
+                  }`}
+                  title={
+                    draft.firmware === "uefi"
+                      ? "An emulated TPM 2.0 — what Secure Boot attestation and a Windows 11 installer ask for"
+                      : "A TPM needs UEFI firmware"
+                  }
+                >
+                  <Switch
+                    on={draft.firmware === "uefi" && draft.tpm}
+                    onChange={(v) => set("tpm", v)}
+                  />
+                  <span className="text-[13px] text-[var(--qz-fg-2)]">Add TPM</span>
+                </label>
+
+                {draft.firmware === "uefi" && (
+                  <>
+                    <label
+                      className="flex items-center gap-[10px] cursor-pointer select-none pt-[6px]"
+                      title="Put the UEFI variable store on storage you choose, instead of a file the hypervisor manages outside every pool"
+                    >
+                      <Switch on={draft.addEfiDisk} onChange={(v) => set("addEfiDisk", v)} />
+                      <span className="text-[13px] text-[var(--qz-fg-2)]">Add EFI Disk</span>
+                    </label>
+                    <div className={draft.addEfiDisk ? "" : "opacity-40 pointer-events-none"}>
+                      <Field label="EFI Storage" htmlFor="vm-efi-storage" error={errorOf("efi_disk")}>
+                        <SelectInput
+                          id="vm-efi-storage"
+                          value={draft.efiStorage}
+                          mono
+                          invalid={!!errorOf("efi_disk")}
+                          onChange={(v) => mark("efiStorage", v)}
+                        >
+                          {(pools ?? []).map((pool) => (
+                            <option key={pool.name} value={pool.name}>
+                              {pool.name}
+                            </option>
+                          ))}
+                          {hasPool && (
+                            <option value={REPLICATED_STORAGE}>
+                              Replicated — the cluster&apos;s pooled storage
+                            </option>
+                          )}
+                        </SelectInput>
+                      </Field>
+                    </div>
+                  </>
+                )}
+              </div>
               {/* Legal, and the hypervisor will define it — but it is a black
                   console rather than an error, which is the kind of thing this
                   dialog should say before it happens rather than after. */}
@@ -622,10 +747,6 @@ export function CreateVmDialog({
                   from the first frame.
                 </Callout>
               )}
-              <label className="flex items-center gap-[10px] cursor-pointer select-none">
-                <Switch on={draft.guestAgent} onChange={(v) => set("guestAgent", v)} />
-                <span className="text-[13px] text-[var(--qz-fg-2)]">Guest agent channel</span>
-              </label>
             </>
           )}
 
@@ -730,7 +851,11 @@ export function CreateVmDialog({
                     {cpus?.host_passthrough !== false && (
                       <option value={HOST_PASSTHROUGH}>Host passthrough</option>
                     )}
-                    {(cpus?.models.length ?? 0) > 0 && (
+                    {/* Only models this node's silicon can actually run: a
+                        machine defined against anything else is a machine
+                        that will not start, and the picker should not offer
+                        one. */}
+                    {(cpus?.models.some((m) => m.usable) ?? false) && (
                       <optgroup label="Runs on this node">
                         {cpus?.models
                           .filter((m) => m.usable)
@@ -739,18 +864,6 @@ export function CreateVmDialog({
                               {m.name}
                               {m.vendor ? ` (${m.vendor})` : ""}
                               {m.deprecated ? " — deprecated" : ""}
-                            </option>
-                          ))}
-                      </optgroup>
-                    )}
-                    {(cpus?.models.some((m) => !m.usable) ?? false) && (
-                      <optgroup label="Not runnable on this node">
-                        {cpus?.models
-                          .filter((m) => !m.usable)
-                          .map((m) => (
-                            <option key={m.name} value={m.name}>
-                              {m.name}
-                              {m.vendor ? ` (${m.vendor})` : ""}
                             </option>
                           ))}
                       </optgroup>
@@ -768,7 +881,7 @@ export function CreateVmDialog({
                   />
                 </Field>
                 <div className="text-[13px] text-[var(--qz-fg-3)] pb-[9px]">
-                  Total cores{" "}
+                  Total Cores:{" "}
                   <span className="qz-mono font-semibold text-[var(--qz-accent)]">
                     {totalCores || "—"}
                   </span>
@@ -842,15 +955,16 @@ export function CreateVmDialog({
                       <SelectInput
                         id="vm-nic-model"
                         value={draft.nicModel}
-                        mono
                         onChange={(v) => set("nicModel", v as NicModel)}
                       >
-                        <option value="virtio">virtio</option>
-                        <option value="e1000e">e1000e</option>
-                        <option value="rtl8139">rtl8139</option>
+                        {(Object.keys(NIC_MODEL_LABEL) as NicModel[]).map((model) => (
+                          <option key={model} value={model}>
+                            {NIC_MODEL_LABEL[model]}
+                          </option>
+                        ))}
                       </SelectInput>
                     </Field>
-                    <Field label="VLAN tag" htmlFor="vm-vlan" error={errorOf("vlan_tag")}>
+                    <Field label="VLAN Tag" htmlFor="vm-vlan" error={errorOf("vlan_tag")}>
                       <TextInput
                         id="vm-vlan"
                         value={draft.vlanTag}
@@ -859,6 +973,21 @@ export function CreateVmDialog({
                         invalid={!!errorOf("vlan_tag")}
                         placeholder="none"
                         onChange={(v) => mark("vlanTag", v)}
+                      />
+                    </Field>
+                    <Field
+                      label="MAC Address"
+                      htmlFor="vm-mac"
+                      error={errorOf("mac")}
+                      hint="Left empty, a stable one is derived from the VM ID — so a network reservation keeps working after a rebuild."
+                    >
+                      <TextInput
+                        id="vm-mac"
+                        value={draft.macAddress}
+                        mono
+                        invalid={!!errorOf("mac")}
+                        placeholder="auto"
+                        onChange={(v) => mark("macAddress", v)}
                       />
                     </Field>
                   </div>
@@ -885,22 +1014,38 @@ export function CreateVmDialog({
                 </dd>
                 <dt>Firmware</dt>
                 <dd>{draft.firmware === "uefi" ? "UEFI" : "Legacy BIOS"}</dd>
+                {draft.firmware === "uefi" && draft.addEfiDisk && (
+                  <>
+                    <dt>EFI Disk</dt>
+                    <dd className="qz-mono">
+                      {draft.efiStorage === REPLICATED_STORAGE ? "replicated" : draft.efiStorage}
+                    </dd>
+                  </>
+                )}
+                {draft.firmware === "uefi" && draft.tpm && (
+                  <>
+                    <dt>TPM</dt>
+                    <dd>TPM 2.0</dd>
+                  </>
+                )}
+                <dt>SCSI Controller</dt>
+                <dd>{SCSI_CONTROLLER_LABEL[draft.scsiController]}</dd>
                 <dt>Graphics</dt>
                 <dd>{VIDEO_LABEL[draft.video]}</dd>
                 <dt>Processors</dt>
                 <dd className="qz-mono">
-                  {draft.sockets} × {draft.cores} = {totalCores} · {draft.cpuType}
+                  {draft.sockets} × {draft.cores} = {totalCores} - {draft.cpuType}
                 </dd>
                 <dt>Memory</dt>
                 <dd className="qz-mono">{draft.memoryMib} MiB</dd>
                 <dt>Disk</dt>
                 <dd className="qz-mono">
-                  {draft.pool ? `${draft.pool} · ${draft.sizeGib} GiB · ${draft.bus}` : "none"}
+                  {draft.pool ? `${draft.pool} - ${draft.sizeGib} GiB - ${draft.bus}` : "none"}
                 </dd>
                 <dt>Network</dt>
                 <dd className="qz-mono">
                   {draft.bridge
-                    ? `${draft.bridge} · ${draft.nicModel}${draft.vlanTag ? ` · VLAN ${draft.vlanTag}` : ""}`
+                    ? `${draft.bridge} - ${draft.nicModel}${draft.vlanTag ? ` - VLAN ${draft.vlanTag}` : ""}${draft.macAddress.trim() ? ` - ${draft.macAddress.trim().toLowerCase()}` : ""}`
                     : "none"}
                 </dd>
               </dl>

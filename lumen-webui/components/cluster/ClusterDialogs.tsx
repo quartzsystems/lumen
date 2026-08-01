@@ -367,7 +367,9 @@ export function MaintenanceDialog({
   // this dialog and come back, and the work does not stop when they do.
   const poll = useCallback(async () => {
     try {
-      const latest = await fetchDrain();
+      // Named, because the drain runs on the node it is about — which may
+      // not be the node this console is talking to.
+      const latest = await fetchDrain(node);
       if (latest && latest.node === node) setProgress(latest);
     } catch {
       // A feed that cannot be read is not worth an error banner while the

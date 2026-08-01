@@ -127,8 +127,8 @@ export function VmOverview({
             {vm.nics.map((nic) => (
               <Fact key={nic.id} label={nic.bridge}>
                 <Mono>{nic.id}</Mono>
-                <span className="qz-dim"> · {nic.model}</span>
-                {nic.vlan_tag ? <span className="qz-dim"> · VLAN {nic.vlan_tag}</span> : null}
+                <span className="qz-dim"> - {nic.model}</span>
+                {nic.vlan_tag ? <span className="qz-dim"> - VLAN {nic.vlan_tag}</span> : null}
               </Fact>
             ))}
           </Facts>

@@ -135,7 +135,24 @@ impl PoolPresence {
             PoolPresence::Absent => lumen_zfs::BrickClearance::NoPool,
             PoolPresence::Broken(_) => lumen_zfs::BrickClearance::Unknown,
             PoolPresence::Present { bricks, .. } => {
-                lumen_zfs::BrickClearance::PoolBricks(bricks.clone())
+                // The drop-in names one `/dev/disk/by-id` alias per brick,
+                // but a disk carries several and the scan is free to report
+                // a different one — equality on the alias alone disowned a
+                // serving pool's own bricks and offered them the wipe meant
+                // for leftovers. Resolving to the kernel device makes every
+                // alias agree; the configured spelling stays alongside for
+                // the disk that cannot be resolved right now.
+                let paths = bricks
+                    .iter()
+                    .flat_map(|brick| {
+                        std::fs::canonicalize(brick)
+                            .ok()
+                            .map(|dev| dev.to_string_lossy().into_owned())
+                            .into_iter()
+                            .chain(std::iter::once(brick.clone()))
+                    })
+                    .collect();
+                lumen_zfs::BrickClearance::PoolBricks(paths)
             }
         }
     }

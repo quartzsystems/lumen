@@ -39,6 +39,11 @@ Requires:       qemu-kvm
 # Firmware images for machines that start the modern way. The management
 # daemon defines every machine to use them by default.
 Requires:       edk2-ovmf
+# The emulated TPM a machine may be given. A separate process the hypervisor
+# starts per machine; without the package, defining a machine with one fails
+# at start with a sentence about a missing emulator.
+Requires:       swtpm
+Requires:       swtpm-tools
 # The guest description database. A data package, not a library: the
 # management daemon reads its files directly, so nothing links against it and
 # nothing generates bindings for it. Without it the console has no list of

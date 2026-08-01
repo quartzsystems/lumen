@@ -23,6 +23,8 @@ import {
   type NodePowerAction,
   type UnassignedNodeView,
 } from "@/lib/clusterClient";
+import { fetchInventory, type InventoryResponse } from "@/lib/inventoryClient";
+import { ringsByNode } from "@/lib/networkStatus";
 
 const POLL_MS = 5000;
 
@@ -38,6 +40,7 @@ type NodeRow =
 export default function NodesPage() {
   const { setToast } = useConsole();
   const [environment, setEnvironment] = useState<EnvironmentResponse | null>(null);
+  const [inventory, setInventory] = useState<InventoryResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
   // The fencing dialogs: a guarded live test, and the break-glass confirm.
@@ -62,6 +65,14 @@ export default function NodesPage() {
       // A 401 has already redirected to /login.
       if (err instanceof ApiError && err.status === 401) return;
       setError(err instanceof Error ? err.message : "Could not read the environment.");
+    }
+    try {
+      // corosync answers for the node it runs on and no other, so the
+      // cluster view alone shows rings for one row. The inventory asks
+      // every member for its own; a failure here just keeps the fallback.
+      setInventory(await fetchInventory());
+    } catch {
+      /* the cluster view's local rings still show */
     }
   }, []);
 
@@ -92,17 +103,20 @@ export default function NodesPage() {
   const rows = useMemo<NodeRow[]>(() => {
     if (!environment) return [];
     return [
-      ...environment.clusters.flatMap((cluster) =>
-        cluster.nodes.map<NodeRow>((node) => ({
+      ...environment.clusters.flatMap((cluster) => {
+        // Each member's own report of its rings, where it gave one — the
+        // cluster view only ever carries the local node's.
+        const rings = ringsByNode(cluster, inventory);
+        return cluster.nodes.map<NodeRow>((node) => ({
           kind: "member",
           cluster: cluster.name,
           unreachable: Boolean(cluster.error),
-          node,
-        })),
-      ),
+          node: { ...node, rings: rings.get(node.node) ?? node.rings },
+        }));
+      }),
       ...environment.unassigned.map<NodeRow>((node) => ({ kind: "unassigned", node })),
     ];
-  }, [environment]);
+  }, [environment, inventory]);
 
   return (
     <Page>
@@ -478,28 +492,26 @@ function NodesTable({
                 Confirm dead
               </button>
             )}
-            {/* Only on this node's own row: a drain moves machines, and only
-                the node running them can move them. Offered even when the
-                cluster is unreachable if the node is already out of service,
-                because getting *back* is the one thing an operator must never
-                be locked out of. */}
-            {row.node.local &&
-              !row.node.unclean &&
-              (!row.unreachable || row.node.maintenance) && (
-                <button
-                  type="button"
-                  className="btn btn-sm"
-                  title={
-                    row.node.maintenance
-                      ? `Let Pacemaker run things on ${row.node.node} again`
-                      : `Move the machines off ${row.node.node} and hold it out of service`
-                  }
-                  onClick={() => onMaintenance(row.cluster, row.node)}
-                >
-                  <Wrench size={13} className="mr-[6px]" />
-                  {row.node.maintenance ? "Return to service" : "Maintenance"}
-                </button>
-              )}
+            {/* On every member's row: the drain still runs on the node it is
+                about — a remote row just sends the instruction to begin over
+                the peer channel. Offered even when the cluster is unreachable
+                if the node is already out of service, because getting *back*
+                is the one thing an operator must never be locked out of. */}
+            {!row.node.unclean && (!row.unreachable || row.node.maintenance) && (
+              <button
+                type="button"
+                className="btn btn-sm"
+                title={
+                  row.node.maintenance
+                    ? `Let Pacemaker run things on ${row.node.node} again`
+                    : `Move the machines off ${row.node.node} and hold it out of service`
+                }
+                onClick={() => onMaintenance(row.cluster, row.node)}
+              >
+                <Wrench size={13} className="mr-[6px]" />
+                {row.node.maintenance ? "Return to service" : "Maintenance"}
+              </button>
+            )}
             {!row.unreachable && !row.node.unclean && row.node.fence && (
               <span title={`Live-test the fencing of ${row.node.node}`}>
                 <Button
@@ -510,13 +522,13 @@ function NodesTable({
                 />
               </span>
             )}
-            {/* The hard power path, on every row but this node's: the command
-                goes to that node's BMC through its fence device, so it works
-                when the node's own operating system does not. A node powers
-                *itself* down through Maintenance, where its machines are moved
-                off first — which is why the local row shows the wrench and
-                these two instead. */}
-            {!row.node.local && row.node.fence && (
+            {/* The hard power path, on every row: the command goes to the
+                node's BMC through a fence device, so it works when the
+                node's own operating system does not. The local node cannot
+                command its own BMC — the answer would go down with it — so
+                its control plane relays the request through a cluster-mate's
+                fence path. */}
+            {row.node.fence && (
               <>
                 <span title={`Power-cycle ${row.node.node} at its BMC`}>
                   <Button

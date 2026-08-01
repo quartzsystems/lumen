@@ -327,12 +327,34 @@ fn kernel_name(source: &str) -> Option<String> {
 ///
 /// `/dev/disk/by-id` holds several links per disk — by WWN, by model and
 /// serial, sometimes by path. The model-and-serial one is the readable one, so
-/// it wins; `wwn-` is the fallback, and `-part` links are skipped because they
-/// point at partitions rather than at disks.
+/// it wins; `-part` links are skipped because they point at partitions rather
+/// than at disks.
+///
+/// The choice must also not depend on directory order: udev mints the same
+/// set of links on every node, and "first non-WWN seen" had two nodes of one
+/// pool calling the same disk model by two different names.
 fn stable_paths(by_id: &Path) -> HashMap<String, String> {
+    /// Lower is better. Generated identifiers are ranked by how little a
+    /// human can do with them: a model-and-serial name reads back to a disk
+    /// in a rack, an `eui`/`uuid`/generic-`nvme.` string does not, and a
+    /// bare WWN least of all.
+    fn rank(link: &str) -> u8 {
+        if link.starts_with("wwn-") {
+            3
+        } else if link.starts_with("nvme-eui.") || link.starts_with("nvme-uuid.") {
+            2
+        } else if link.starts_with("nvme-nvme.") {
+            1
+        } else {
+            0
+        }
+    }
+
     let Ok(entries) = std::fs::read_dir(by_id) else {
         return HashMap::new();
     };
+    // Keyed by rank then name, so equal-rank links (a model-serial name with
+    // and without the namespace suffix) resolve the same way on every node.
     let mut best: HashMap<String, String> = HashMap::new();
 
     for entry in entries.flatten() {
@@ -346,14 +368,15 @@ fn stable_paths(by_id: &Path) -> HashMap<String, String> {
         let Some(device) = target.file_name().map(|n| n.to_string_lossy().into_owned()) else {
             continue;
         };
-        let path = format!("/dev/disk/by-id/{link}");
-        match best.get(&device) {
-            // A name with a serial in it beats a bare WWN, which is a number
-            // nobody can match to a disk in a rack.
-            Some(existing) if !existing.contains("/wwn-") => {}
-            _ => {
-                best.insert(device, path);
+        let better = match best.get(&device) {
+            Some(existing) => {
+                let existing = existing.trim_start_matches("/dev/disk/by-id/");
+                (rank(&link), link.as_str()) < (rank(existing), existing)
             }
+            None => true,
+        };
+        if better {
+            best.insert(device, format!("/dev/disk/by-id/{link}"));
         }
     }
     best

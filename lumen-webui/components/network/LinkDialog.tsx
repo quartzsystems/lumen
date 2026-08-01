@@ -442,7 +442,7 @@ export function LinkDialog({
                     </span>
                     <span className="text-[12px] text-[var(--qz-fg-4)]">
                       {link.altname ?? link.kind}
-                      {link.carrier ? "" : " · no carrier"}
+                      {link.carrier ? "" : " - no carrier"}
                     </span>
                   </CheckRow>
                 ))}

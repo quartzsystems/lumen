@@ -35,9 +35,9 @@ use crate::domain_caps::CpuModels;
 use crate::domain_xml;
 use crate::error::{Result, VirtError};
 use crate::model::{
-    generate_mac, valid_vm_name, BootDevice, CacheMode, CpuModel, CpuTopology, DiskBus, Firmware,
-    NicModel, VideoModel, VmCdrom, VmConfig, VmDisk, VmNic, DEFAULT_MEMORY_MIB, DEFAULT_VCPUS,
-    FIRST_VMID, LAST_VMID,
+    generate_mac, normalize_mac, valid_vm_name, BootDevice, CacheMode, CpuModel, CpuTopology,
+    DiskBus, Firmware, NicModel, ScsiController, VideoModel, VmCdrom, VmConfig, VmDisk, VmNic,
+    DEFAULT_MEMORY_MIB, DEFAULT_VCPUS, FIRST_VMID, LAST_VMID,
 };
 use crate::osinfo::{self, OsCatalog};
 use crate::state::{DomainState, HostInfo, ObservedDomain};
@@ -238,6 +238,13 @@ pub struct VmView {
     pub topology: Option<CpuTopology>,
     pub machine: String,
     pub firmware: Firmware,
+    /// The controller the machine's `scsi`-bus disks sit behind.
+    pub scsi_controller: ScsiController,
+    /// Whether the machine carries an emulated TPM 2.0.
+    pub tpm: bool,
+    /// The block device holding the UEFI variable store, when the operator
+    /// chose where it lives. Absent means the hypervisor manages one.
+    pub nvram: Option<String>,
     /// The graphics card, which is what the console page is looking at.
     pub video: VideoModel,
     /// Whether the stored document actually gives the machine a screen.
@@ -419,6 +426,17 @@ pub struct VmCreate {
     pub machine: Option<String>,
     #[serde(default)]
     pub firmware: Firmware,
+    /// The controller the machine's `scsi`-bus disks sit behind. Absent
+    /// takes the default, which is one virtio-scsi controller per disk.
+    #[serde(default)]
+    pub scsi_controller: Option<ScsiController>,
+    /// An emulated TPM 2.0.
+    #[serde(default)]
+    pub tpm: bool,
+    /// Put the UEFI variable store on a volume of the operator's choosing
+    /// instead of a file the hypervisor manages. UEFI machines only.
+    #[serde(default)]
+    pub efi_disk: Option<EfiDiskCreate>,
     #[serde(default)]
     pub video: VideoModel,
     #[serde(default)]
@@ -506,7 +524,30 @@ pub struct NicCreate {
     pub model: NicModel,
     #[serde(default)]
     pub vlan_tag: Option<u16>,
+    /// The hardware address, when the operator has a reservation to honor.
+    /// Absent, a stable one is derived from the VMID and the adapter index.
+    #[serde(default)]
+    pub mac: Option<String>,
 }
+
+/// Where the UEFI variable store lives. The same two answers a data disk
+/// has: a named local pool, or the cluster's replicated storage.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EfiDiskCreate {
+    /// The pool a local vars volume lives in. Unused for a replicated one.
+    #[serde(default)]
+    pub pool: Option<String>,
+    /// Back the store with the cluster's pooled storage, so it migrates
+    /// with the machine the way its replicated disks do.
+    #[serde(default)]
+    pub replicated: bool,
+}
+
+/// The UEFI variable store's size. OVMF's 4 MiB vars template fits with
+/// room; the volume is tiny either way, and a fixed size means the store
+/// never becomes a thing an operator is asked to size.
+const EFI_VARS_BYTES: u64 = 4 * 1024 * 1024;
 
 /// POST /api/vms/{vmid}/migrate — the machine's one home moved. There is no
 /// `VmView` in the answer on purpose: after a migration this node has no
@@ -881,6 +922,9 @@ impl VirtService {
             topology: config.topology,
             machine: config.machine.clone(),
             firmware: config.firmware,
+            scsi_controller: config.scsi_controller,
+            tpm: config.tpm,
+            nvram: config.nvram.clone(),
             video: config.video,
             has_screen,
             boot_order: config.boot_order.clone(),
@@ -984,6 +1028,10 @@ impl VirtService {
                 .machine
                 .unwrap_or_else(|| VmConfig::default().machine),
             firmware: request.firmware,
+            scsi_controller: request.scsi_controller.unwrap_or_default(),
+            tpm: request.tpm,
+            // Filled in below once the vars volume exists.
+            nvram: None,
             video: request.video,
             boot_order: request
                 .boot_order
@@ -1014,8 +1062,23 @@ impl VirtService {
         // Adapters cost nothing to build, so they exist before validation and
         // are checked with everything else.
         for (index, nic) in request.nics.iter().enumerate() {
+            let id = match nic.mac.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+                Some(mac) => normalize_mac(mac).ok_or_else(|| {
+                    VirtError::invalid(
+                        ValidationError::new(
+                            ValidationCode::InvalidMac,
+                            format!(
+                                "\"{mac}\" is not a usable hardware address — six two-digit hex \
+                                 octets, and not a multicast one."
+                            ),
+                        )
+                        .at(config.name.clone(), "mac"),
+                    )
+                })?,
+                None => generate_mac(vmid, index as u32),
+            };
             config.nics.push(VmNic {
-                id: generate_mac(vmid, index as u32),
+                id,
                 model: nic.model,
                 bridge: nic.bridge.clone(),
                 vlan_tag: nic.vlan_tag,
@@ -1023,10 +1086,36 @@ impl VirtService {
             });
         }
 
+        // The variable store is a UEFI fact; asking for one on a BIOS
+        // machine is a contradiction to refuse, not a field to ignore.
+        if request.efi_disk.is_some() && request.firmware != Firmware::Uefi {
+            return Err(VirtError::invalid(
+                ValidationError::new(
+                    ValidationCode::EfiRequiresUefi,
+                    "An EFI variable store needs UEFI firmware — a BIOS machine has nowhere to \
+                     read it from.",
+                )
+                .at(config.name.clone(), "efi_disk"),
+            ));
+        }
+        if let Some(efi) = &request.efi_disk {
+            if !efi.replicated && efi.pool.as_deref().is_none_or(str::is_empty) {
+                return Err(VirtError::invalid(
+                    ValidationError::new(
+                        ValidationCode::UnknownPool,
+                        "Choose a pool for the EFI variable store, or make it replicated.",
+                    )
+                    .at(config.name.clone(), "efi_disk"),
+                ));
+            }
+        }
+
         // A replicated disk's pools are its members' business, validated by
         // the storage domain when it is made — only the local disks are
-        // checked against this node's pools.
-        let planned: Vec<PlannedDisk> = request
+        // checked against this node's pools. The vars volume is planned like
+        // any other local disk, so an absent pool refuses before anything is
+        // created.
+        let mut planned: Vec<PlannedDisk> = request
             .disks
             .iter()
             .filter(|disk| !disk.replicated)
@@ -1035,6 +1124,14 @@ impl VirtService {
                 size: disk.size_gib.saturating_mul(GIB),
             })
             .collect();
+        if let Some(efi) = &request.efi_disk {
+            if let (false, Some(pool)) = (efi.replicated, efi.pool.as_deref()) {
+                planned.push(PlannedDisk {
+                    pool: pool.to_string(),
+                    size: EFI_VARS_BYTES,
+                });
+            }
+        }
 
         let facts = self.facts(None).await?;
         let errors = validate(&config, &planned, &facts);
@@ -1096,6 +1193,51 @@ impl VirtService {
                 boot_index: None,
             });
             created.push(backing);
+        }
+
+        // The variable store, on the storage the operator chose. The
+        // firmware still copies its vars template in at first start; only
+        // where the copy lives changes.
+        if let Some(efi) = &request.efi_disk {
+            let name = format!("vm-{vmid}-efivars");
+            if efi.replicated {
+                match self
+                    .volumes
+                    .create_disk(&lumen_pool::VmDiskRequest {
+                        name: name.clone(),
+                        size_bytes: EFI_VARS_BYTES,
+                    })
+                    .await
+                {
+                    Ok(replicated) => {
+                        config.nvram = Some(replicated.device.clone());
+                        created.push(Backing::Replicated {
+                            device: replicated.device,
+                            name: replicated.name,
+                        });
+                    }
+                    Err(err) => {
+                        self.remove_backings(&created).await;
+                        return Err(err.into());
+                    }
+                }
+            } else {
+                let pool = efi.pool.as_deref().unwrap_or_default();
+                match self
+                    .storage
+                    .create_volume(pool, &name, EFI_VARS_BYTES, None)
+                    .await
+                {
+                    Ok(volume) => {
+                        config.nvram = Some(self.storage.device_path(&volume.name));
+                        created.push(Backing::Zvol(volume.name));
+                    }
+                    Err(err) => {
+                        self.remove_backings(&created).await;
+                        return Err(err.into());
+                    }
+                }
+            }
         }
 
         if let Err(err) = self.backend.define(&domain_xml::render(&config)).await {
@@ -1331,14 +1473,22 @@ impl VirtService {
         self.backend.undefine(&name).await?;
 
         // Both kinds of backing leave with the machine: local zvols by their
-        // dataset path, replicated volumes resolved from their device.
+        // dataset path, replicated volumes resolved from their device. The
+        // variable store is a backing like any other — undefine's NVRAM flag
+        // only removes a vars file the hypervisor manages, never a volume.
         let mut backings: Vec<Backing> = Vec::new();
-        for disk in &machine.config.disks {
-            if let Some(volume) = volume_of(&disk.source) {
+        let sources = machine
+            .config
+            .disks
+            .iter()
+            .map(|disk| disk.source.clone())
+            .chain(machine.config.nvram.clone());
+        for source in sources {
+            if let Some(volume) = volume_of(&source) {
                 backings.push(Backing::Zvol(volume));
-            } else if let Ok(Some(replicated)) = self.volumes.disk_of(&disk.source).await {
+            } else if let Ok(Some(replicated)) = self.volumes.disk_of(&source).await {
                 backings.push(Backing::Replicated {
-                    device: disk.source.clone(),
+                    device: source.clone(),
                     name: replicated.name,
                 });
             }
@@ -1408,6 +1558,13 @@ impl VirtService {
         for disk in &config.disks {
             if self.volumes.disk_of(&disk.source).await?.is_some() {
                 self.volumes.ensure_local_device(&disk.source).await?;
+            }
+        }
+        // The variable store rides the same rule: a replicated one is only a
+        // device where its daemon serves it.
+        if let Some(nvram) = &config.nvram {
+            if self.volumes.disk_of(nvram).await?.is_some() {
+                self.volumes.ensure_local_device(nvram).await?;
             }
         }
         self.backend.start(&config.name).await?;
@@ -1820,17 +1977,34 @@ impl VirtService {
         let machine = self.machine(vmid).await?;
         let mut config = machine.config.clone();
 
-        // The first index whose address this machine does not already use, so
-        // removing an adapter frees its address for the next one.
-        let index = (0u32..)
-            .find(|index| {
-                let mac = generate_mac(vmid, *index);
-                !config.nics.iter().any(|n| n.id.eq_ignore_ascii_case(&mac))
-            })
-            .expect("an unbounded search always finds a free address");
+        let id = match request.mac.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+            Some(mac) => normalize_mac(mac).ok_or_else(|| {
+                VirtError::invalid(
+                    ValidationError::new(
+                        ValidationCode::InvalidMac,
+                        format!(
+                            "\"{mac}\" is not a usable hardware address — six two-digit hex \
+                             octets, and not a multicast one."
+                        ),
+                    )
+                    .at(config.name.clone(), "mac"),
+                )
+            })?,
+            None => {
+                // The first index whose address this machine does not already
+                // use, so removing an adapter frees its address for the next.
+                let index = (0u32..)
+                    .find(|index| {
+                        let mac = generate_mac(vmid, *index);
+                        !config.nics.iter().any(|n| n.id.eq_ignore_ascii_case(&mac))
+                    })
+                    .expect("an unbounded search always finds a free address");
+                generate_mac(vmid, index)
+            }
+        };
 
         let nic = VmNic {
-            id: generate_mac(vmid, index),
+            id,
             model: request.model,
             bridge: request.bridge.clone(),
             vlan_tag: request.vlan_tag,
@@ -2248,6 +2422,9 @@ mod tests {
             topology: None,
             machine: None,
             firmware: Firmware::Uefi,
+            scsi_controller: None,
+            tpm: false,
+            efi_disk: None,
             video: VideoModel::default(),
             boot_order: None,
             start_on_boot: false,
@@ -2269,6 +2446,7 @@ mod tests {
                 bridge: "br0".into(),
                 model: NicModel::Virtio,
                 vlan_tag: None,
+                mac: None,
             }],
             start: false,
         }
@@ -2736,6 +2914,7 @@ mod tests {
                     bridge: "br0".into(),
                     model: NicModel::Virtio,
                     vlan_tag: Some(100),
+                    mac: None,
                 },
             )
             .await

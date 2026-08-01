@@ -307,8 +307,8 @@ export function CreateLumenPoolDialog({
                         </span>
                         <span className="text-[12px] text-[var(--qz-fg-4)]">
                           {formatBytes(row.device.size)}
-                          {row.device.model && ` · ${row.device.model}`}
-                          {row.device.rotational ? " · spinning" : " · solid state"}
+                          {row.device.model && ` - ${row.device.model}`}
+                          {row.device.rotational ? " - spinning" : " - solid state"}
                         </span>
                         {row.device.in_use && (
                           <span
@@ -369,7 +369,7 @@ export function CreateLumenPoolDialog({
                   <td className="py-2 text-[var(--qz-fg-3)]">
                     {seat.bricks.map((brick) => (
                       <div key={brick.disk} className="qz-mono text-[12px]">
-                        {brick.disk} · tier {brick.tier}
+                        {brick.disk} - tier {brick.tier}
                       </div>
                     ))}
                   </td>

@@ -252,6 +252,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(peer::exit_maintenance),
         )
         .route("/api/peer/system/restart", post(peer::restart))
+        .route("/api/peer/node/power", post(peer::power))
         .route("/api/peer/storage/wipe", post(peer::wipe_disk))
         .route("/api/peer/cluster/teardown", post(peer::teardown))
         .route("/api/peer/cluster/reconfigure", post(peer::reconfigure))

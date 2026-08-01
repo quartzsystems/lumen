@@ -45,6 +45,21 @@ pub struct VmConfig {
     pub machine: String,
     #[serde(default)]
     pub firmware: Firmware,
+    /// The controller the machine's `scsi`-bus disks sit behind. Kept in the
+    /// document's Lumen metadata so the choice survives a machine that has no
+    /// SCSI disk yet.
+    #[serde(default)]
+    pub scsi_controller: ScsiController,
+    /// An emulated TPM 2.0, which is what Secure Boot attestation and a
+    /// Windows 11 installer ask for. Needs `swtpm` on the node.
+    #[serde(default)]
+    pub tpm: bool,
+    /// The block device holding the UEFI variable store, when the operator
+    /// chose where it lives. Absent, the hypervisor manages a vars file of
+    /// its own — which works, but lives outside every pool. UEFI only;
+    /// [`VmConfig::normalized`] clears it on a BIOS machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nvram: Option<String>,
     /// The display adapter the guest sees, and therefore what the console
     /// shows. Unlike firmware this can be changed later — it costs a restart,
     /// not a reinstall.
@@ -102,6 +117,9 @@ impl Default for VmConfig {
             topology: None,
             machine: default_machine(),
             firmware: Firmware::default(),
+            scsi_controller: ScsiController::default(),
+            tpm: false,
+            nvram: None,
             video: VideoModel::default(),
             boot_order: vec![BootDevice::Disk],
             start_on_boot: false,
@@ -462,29 +480,95 @@ pub struct VmCdrom {
 /// The bus every optical drive uses. Not a choice, for the reason above.
 pub const CDROM_BUS: DiskBus = DiskBus::Sata;
 
+/// The SCSI controller model, offered the way Proxmox offers it — because
+/// that is the list an operator arriving here already knows. Each variant
+/// names the libvirt controller model that emulates it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScsiController {
+    /// One virtio-scsi controller per disk, each on its own I/O thread — so
+    /// one busy disk cannot starve another. The modern default.
+    #[default]
+    VirtioScsiSingle,
+    /// One shared virtio-scsi controller for every disk.
+    VirtioScsi,
+    /// LSI 53C895A — the compatibility answer for a guest too old to carry a
+    /// virtio driver.
+    Lsi,
+    /// MegaRAID SAS 1078, for a guest with only a megaraid driver.
+    Megasas,
+    /// VMware PVSCSI, for a guest that came from ESXi with its tools still
+    /// installed.
+    Pvscsi,
+}
+
+impl ScsiController {
+    /// How the choice is spelled in the document's Lumen metadata and on the
+    /// wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScsiController::VirtioScsiSingle => "virtio-scsi-single",
+            ScsiController::VirtioScsi => "virtio-scsi",
+            ScsiController::Lsi => "lsi",
+            ScsiController::Megasas => "megasas",
+            ScsiController::Pvscsi => "pvscsi",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "virtio-scsi-single" => Some(ScsiController::VirtioScsiSingle),
+            "virtio-scsi" => Some(ScsiController::VirtioScsi),
+            "lsi" => Some(ScsiController::Lsi),
+            "megasas" => Some(ScsiController::Megasas),
+            "pvscsi" => Some(ScsiController::Pvscsi),
+            _ => None,
+        }
+    }
+
+    /// The `model` attribute the `<controller>` element carries.
+    pub fn libvirt_model(self) -> &'static str {
+        match self {
+            ScsiController::VirtioScsiSingle | ScsiController::VirtioScsi => "virtio-scsi",
+            ScsiController::Lsi => "lsilogic",
+            ScsiController::Megasas => "lsisas1078",
+            ScsiController::Pvscsi => "vmpvscsi",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NicModel {
     #[default]
     Virtio,
+    /// Intel 82540EM — the card every operating system since 2002 knows.
+    E1000,
+    /// Intel 82574L — e1000's PCIe successor, and what q35 firmware expects.
     E1000e,
     Rtl8139,
+    /// VMware vmxnet3, for a guest that came from ESXi.
+    Vmxnet3,
 }
 
 impl NicModel {
     pub fn as_str(self) -> &'static str {
         match self {
             NicModel::Virtio => "virtio",
+            NicModel::E1000 => "e1000",
             NicModel::E1000e => "e1000e",
             NicModel::Rtl8139 => "rtl8139",
+            NicModel::Vmxnet3 => "vmxnet3",
         }
     }
 
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "virtio" => Some(NicModel::Virtio),
+            "e1000" => Some(NicModel::E1000),
             "e1000e" => Some(NicModel::E1000e),
             "rtl8139" => Some(NicModel::Rtl8139),
+            "vmxnet3" => Some(NicModel::Vmxnet3),
             _ => None,
         }
     }
@@ -525,6 +609,29 @@ pub fn generate_mac(vmid: u32, index: u32) -> String {
         (vmid >> 8) & 0xff,
         vmid & 0xff,
         index & 0xff
+    )
+}
+
+/// A hardware address an operator typed, canonicalized to lowercase
+/// colon-separated form — or nothing, if it is not one.
+///
+/// Multicast addresses are refused: the low bit of the first octet makes an
+/// address a group, and a guest given one gets an adapter switches will not
+/// deliver ordinary traffic to.
+pub fn normalize_mac(mac: &str) -> Option<String> {
+    let octets: Vec<u8> = mac
+        .split(':')
+        .map(|part| u8::from_str_radix(part, 16).ok().filter(|_| part.len() == 2))
+        .collect::<Option<Vec<u8>>>()?;
+    if octets.len() != 6 || octets[0] & 0x01 != 0 {
+        return None;
+    }
+    Some(
+        octets
+            .iter()
+            .map(|octet| format!("{octet:02x}"))
+            .collect::<Vec<_>>()
+            .join(":"),
     )
 }
 

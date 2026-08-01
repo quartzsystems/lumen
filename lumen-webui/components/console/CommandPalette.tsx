@@ -49,7 +49,7 @@ export function CommandPalette({
       ...machines.map((vm) => ({
         id: `vm-${vm.vmid}`,
         section: "Machines",
-        label: `${vm.vmid} · ${vm.name}`,
+        label: `${vm.vmid} - ${vm.name}`,
         href: vmHref(vm.vmid),
         keywords: `${vm.name} ${vm.vmid} ${vm.state} ${vm.tags.join(" ")}`,
       })),

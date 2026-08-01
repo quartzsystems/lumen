@@ -266,6 +266,37 @@ pub async fn exit_maintenance(
     Ok(Json(serde_json::json!({ "in_service": true })))
 }
 
+/// POST /api/peer/node/power — cut or cycle a member's power through THIS
+/// node's fence device.
+///
+/// Exists for one caller: a node asked to hard-power itself. It cannot — the
+/// answer would go down with it — so its control plane relays the request to
+/// a member whose fence path reaches the target's BMC. The acknowledgement
+/// was collected on the node the operator asked; what crosses the wire is an
+/// instruction already acknowledged.
+pub async fn power(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<PeerPowerRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let action = match request.action {
+        crate::api::cluster::NodePowerAction::Off => lumen_cluster::HardPower::Off,
+        crate::api::cluster::NodePowerAction::Cycle => lumen_cluster::HardPower::Cycle,
+    };
+    state.cluster.power_member(&request.node, action, true).await?;
+    Ok(Json(
+        serde_json::json!({ "node": request.node, "action": request.action }),
+    ))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerPowerRequest {
+    pub node: String,
+    #[serde(default)]
+    pub action: crate::api::cluster::NodePowerAction,
+}
+
 /// POST /api/peer/system/restart — restart this node now.
 ///
 /// The quorum guard is the same one the operator-facing power route uses, and

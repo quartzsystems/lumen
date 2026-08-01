@@ -73,7 +73,7 @@ export function ringState(
   const silent = members.length - observed;
   return silent === 0
     ? { tone: "ok", status: "Connected" }
-    : { tone: "ok", status: `Connected · ${silent} unknown` };
+    : { tone: "ok", status: `Connected - ${silent} unknown` };
 }
 
 /// The cluster VIP, as Pacemaker has it — not as the definition claims it.
@@ -96,8 +96,8 @@ export function vipState(cluster: ClusterView, vip: VipView): RingStatus {
   if (active && !failed && !blocked) return { tone: "ok", status: "Started" };
 
   const detail = reason ?? role ?? "Stopped";
-  if (blocked) return { tone: "crit", status: `Blocked · ${detail}` };
-  if (failed) return { tone: "crit", status: `Failed · ${detail}` };
+  if (blocked) return { tone: "crit", status: `Blocked - ${detail}` };
+  if (failed) return { tone: "crit", status: `Failed - ${detail}` };
   return { tone: "crit", status: detail };
 }
 

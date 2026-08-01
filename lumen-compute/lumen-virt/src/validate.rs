@@ -59,6 +59,10 @@ pub enum ValidationCode {
     InvalidVlanTag,
     /// Two disks with the same target, or two adapters with the same address.
     DuplicateDevice,
+    /// A hardware address that is not six hex octets, or is multicast.
+    InvalidMac,
+    /// An EFI variable store asked for on a BIOS machine.
+    EfiRequiresUefi,
     /// Something that takes a running machine down, or removes data, without
     /// the caller saying so.
     UnacknowledgedDestructiveOperation,
@@ -82,6 +86,8 @@ impl ValidationCode {
             ValidationCode::DiskExceedsPool => "disk_exceeds_pool",
             ValidationCode::InvalidVlanTag => "invalid_vlan_tag",
             ValidationCode::DuplicateDevice => "duplicate_device",
+            ValidationCode::InvalidMac => "invalid_mac",
+            ValidationCode::EfiRequiresUefi => "efi_requires_uefi",
             ValidationCode::UnacknowledgedDestructiveOperation => {
                 "unacknowledged_destructive_operation"
             }

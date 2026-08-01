@@ -33,8 +33,8 @@ use quick_xml::Reader;
 
 use crate::error::{Result, VirtError};
 use crate::model::{
-    BootDevice, CacheMode, CpuModel, CpuTopology, DiskBus, Firmware, NicModel, VideoModel, VmCdrom,
-    VmConfig, VmDisk, VmNic, CDROM_BUS,
+    BootDevice, CacheMode, CpuModel, CpuTopology, DiskBus, Firmware, NicModel, ScsiController,
+    VideoModel, VmCdrom, VmConfig, VmDisk, VmNic, CDROM_BUS,
 };
 
 /// The namespace Lumen's own per-machine data lives in. Versioned in the URI
@@ -253,6 +253,17 @@ fn render_document(config: &VmConfig, uuid: Option<&str>) -> String {
         "  <vcpu placement='static'>{}</vcpu>",
         config.vcpus.max(1)
     );
+    // One I/O thread per SCSI disk, for the "single" controller layout: each
+    // controller gets its own, so one busy disk cannot starve another.
+    let scsi_disks = config
+        .disks
+        .iter()
+        .filter(|d| d.bus == DiskBus::VirtioScsi)
+        .count();
+    let single = config.scsi_controller == ScsiController::VirtioScsiSingle && scsi_disks > 0;
+    if single {
+        let _ = writeln!(out, "  <iothreads>{scsi_disks}</iothreads>");
+    }
     render_cpu(&mut out, &config);
     render_os(&mut out, &config);
 
@@ -265,11 +276,35 @@ fn render_document(config: &VmConfig, uuid: Option<&str>) -> String {
     out.push_str("  <on_crash>destroy</on_crash>\n");
 
     out.push_str("  <devices>\n");
-    if config.disks.iter().any(|d| d.bus == DiskBus::VirtioScsi) {
-        out.push_str("    <controller type='scsi' index='0' model='virtio-scsi'/>\n");
+    if scsi_disks > 0 {
+        if single {
+            // One controller per disk. The disks below address themselves to
+            // their controller, because with several to choose from the
+            // hypervisor's auto-placement would put every disk on the first.
+            for index in 0..scsi_disks {
+                let _ = writeln!(
+                    out,
+                    "    <controller type='scsi' index='{index}' model='virtio-scsi'>\n      \
+                     <driver iothread='{}'/>\n    </controller>",
+                    index + 1
+                );
+            }
+        } else {
+            let _ = writeln!(
+                out,
+                "    <controller type='scsi' index='0' model='{}'/>",
+                config.scsi_controller.libvirt_model()
+            );
+        }
     }
+    let mut scsi_index = 0usize;
     for disk in &config.disks {
-        render_disk(&mut out, disk);
+        let controller = (single && disk.bus == DiskBus::VirtioScsi).then(|| {
+            let this = scsi_index;
+            scsi_index += 1;
+            this
+        });
+        render_disk_on(&mut out, disk, controller);
     }
     for cdrom in &config.cdroms {
         render_cdrom(&mut out, cdrom);
@@ -338,6 +373,14 @@ fn render_document(config: &VmConfig, uuid: Option<&str>) -> String {
     );
     out.push_str("    <memballoon model='virtio'/>\n");
     out.push_str("    <rng model='virtio'>\n      <backend model='random'>/dev/urandom</backend>\n    </rng>\n");
+    // An emulated TPM 2.0 over CRB, the interface current guests expect. The
+    // hypervisor runs `swtpm` underneath and owns its state the way it owns
+    // the machine's nvram.
+    if config.tpm {
+        out.push_str(
+            "    <tpm model='tpm-crb'>\n      <backend type='emulator' version='2.0'/>\n    </tpm>\n",
+        );
+    }
     out.push_str("  </devices>\n");
     out.push_str("</domain>\n");
     out
@@ -365,6 +408,16 @@ fn render_metadata(out: &mut String, config: &VmConfig, started_at: Option<u64>)
         // Present means on; absent means off. A boolean that is always
         // written invites a third state nobody meant.
         out.push_str("      <lumen:ha>1</lumen:ha>\n");
+    }
+    // The controller choice lives here rather than only in the
+    // `<controller>` element, because a machine with no SCSI disk yet emits
+    // no controller — and the choice must survive until its first one.
+    if config.scsi_controller != ScsiController::default() {
+        let _ = writeln!(
+            out,
+            "      <lumen:scsi>{}</lumen:scsi>",
+            config.scsi_controller.as_str()
+        );
     }
     if let Some(started) = started_at {
         let _ = writeln!(out, "      <lumen:started>{started}</lumen:started>");
@@ -459,10 +512,28 @@ fn render_os(out: &mut String, config: &VmConfig) {
         "    <type arch='x86_64' machine='{}'>hvm</type>",
         text(&config.machine)
     );
+    // The variable store on a volume the operator chose. Firmware selection
+    // still picks the image and copies its vars template in; only where the
+    // copy lives changes — onto a device a pool replicates and backs up,
+    // rather than a file of the hypervisor's own.
+    if config.firmware == Firmware::Uefi {
+        if let Some(nvram) = config.nvram.as_deref().filter(|path| !path.is_empty()) {
+            out.push_str("    <nvram type='block'>\n");
+            let _ = writeln!(out, "      <source dev='{}'/>", text(nvram));
+            out.push_str("    </nvram>\n");
+        }
+    }
     out.push_str("  </os>\n");
 }
 
 fn render_disk(out: &mut String, disk: &VmDisk) {
+    render_disk_on(out, disk, None);
+}
+
+/// One disk, addressed to its own controller when the "single" layout gives
+/// it one — with several controllers to choose from, the hypervisor's
+/// auto-placement would put every disk on the first.
+fn render_disk_on(out: &mut String, disk: &VmDisk, controller: Option<usize>) {
     out.push_str("    <disk type='block' device='disk'>\n");
     let discard = if disk.discard { " discard='unmap'" } else { "" };
     let _ = writeln!(
@@ -477,6 +548,12 @@ fn render_disk(out: &mut String, disk: &VmDisk) {
         text(&disk.id),
         disk.bus.as_str()
     );
+    if let Some(controller) = controller {
+        let _ = writeln!(
+            out,
+            "      <address type='drive' controller='{controller}' bus='0' target='0' unit='0'/>"
+        );
+    }
     if let Some(order) = disk.boot_index {
         let _ = writeln!(out, "      <boot order='{order}'/>");
     }
@@ -646,6 +723,16 @@ fn read(xml: &str) -> Result<(ParsedDomain, Option<u32>)> {
     // heads on the same machine rather than a second opinion about the card.
     let mut video: Option<VideoModel> = None;
 
+    // The SCSI controller: Lumen's metadata is the authority, and the
+    // `<controller>` elements are the fallback for a document that predates
+    // the metadata — where per-disk controllers, or a driver with an I/O
+    // thread, are the "single" layout's signature.
+    let mut scsi_meta: Option<ScsiController> = None;
+    let mut scsi_controllers = 0usize;
+    let mut scsi_model: Option<String> = None;
+    let mut scsi_iothread = false;
+    let mut nvram_is_block = false;
+
     let mut disk = PartialDisk::default();
     let mut nic = PartialNic::default();
     let mut disks: Vec<(VmDisk, Option<u32>)> = Vec::new();
@@ -677,6 +764,33 @@ fn read(xml: &str) -> Result<(ParsedDomain, Option<u32>)> {
                             config.machine = machine;
                         }
                     }
+                    // Only a block-backed store is a choice this appliance
+                    // made; the hypervisor's own managed vars file comes back
+                    // as text inside a plain <nvram>, and must not be read as
+                    // one — redefining it as a block device would point the
+                    // firmware at a path that is not a device.
+                    "domain/os/nvram" => {
+                        nvram_is_block = attr(e, "type").as_deref() == Some("block");
+                    }
+                    "domain/os/nvram/source" => {
+                        if nvram_is_block {
+                            config.nvram = attr(e, "dev");
+                        }
+                    }
+                    "domain/devices/controller" => {
+                        if attr(e, "type").as_deref() == Some("scsi") {
+                            scsi_controllers += 1;
+                            if scsi_model.is_none() {
+                                scsi_model = attr(e, "model");
+                            }
+                        }
+                    }
+                    "domain/devices/controller/driver" => {
+                        if attr(e, "iothread").is_some() {
+                            scsi_iothread = true;
+                        }
+                    }
+                    "domain/devices/tpm" => config.tpm = true,
                     "domain/cpu" => cpu_mode = attr(e, "mode"),
                     "domain/cpu/topology" => {
                         config.topology = Some(CpuTopology {
@@ -836,6 +950,9 @@ fn read(xml: &str) -> Result<(ParsedDomain, Option<u32>)> {
                     "domain/cpu/model" => cpu_named = Some(value),
                     "domain/metadata/vm/vmid" => vmid = value.parse().ok(),
                     "domain/metadata/vm/ha" => config.ha = value.trim() == "1",
+                    "domain/metadata/vm/scsi" => {
+                        scsi_meta = ScsiController::parse(value.trim());
+                    }
                     "domain/metadata/vm/description" => config.description = Some(value),
                     "domain/metadata/vm/tags" => {
                         config.tags = value
@@ -865,6 +982,20 @@ fn read(xml: &str) -> Result<(ParsedDomain, Option<u32>)> {
         (Some("custom"), Some(name)) => CpuModel::Named(name),
         _ => CpuModel::HostModel,
     };
+    config.scsi_controller = scsi_meta.unwrap_or_else(|| {
+        if scsi_iothread || scsi_controllers > 1 {
+            ScsiController::VirtioScsiSingle
+        } else if scsi_controllers == 1 {
+            match scsi_model.as_deref() {
+                Some("lsilogic") => ScsiController::Lsi,
+                Some("lsisas1078") => ScsiController::Megasas,
+                Some("vmpvscsi") => ScsiController::Pvscsi,
+                _ => ScsiController::VirtioScsi,
+            }
+        } else {
+            ScsiController::default()
+        }
+    });
 
     // Boot order comes back out of the numbers on the devices themselves: the
     // device classes in the order their lowest-numbered member boots.
@@ -968,6 +1099,11 @@ impl VmConfig {
     /// configuration — which is what the round-trip tests assert.
     pub fn normalized(&self) -> VmConfig {
         let mut config = self.clone();
+        // A variable store is a UEFI fact; on a BIOS machine the document
+        // would not carry it, so neither may the normalized configuration.
+        if config.firmware != Firmware::Uefi {
+            config.nvram = None;
+        }
         let mut order = 1u32;
 
         // Devices keep whatever relative order they were given: an explicit
@@ -1071,6 +1207,9 @@ mod tests {
             }),
             machine: "q35".into(),
             firmware: Firmware::Uefi,
+            scsi_controller: ScsiController::default(),
+            tpm: false,
+            nvram: None,
             video: VideoModel::Virtio,
             boot_order: vec![BootDevice::Disk, BootDevice::Network],
             start_on_boot: false,
@@ -1189,6 +1328,66 @@ mod tests {
             }),
             ("a drive named in the boot order that is not there", |c| {
                 c.boot_order = vec![BootDevice::Cdrom, BootDevice::Disk]
+            }),
+            ("an emulated TPM", |c| c.tpm = true),
+            ("the newest and oldest adapter models", |c| {
+                c.nics[0].model = NicModel::Vmxnet3;
+                c.nics.push(VmNic {
+                    id: generate_mac(101, 1),
+                    model: NicModel::E1000,
+                    bridge: "br0".into(),
+                    vlan_tag: None,
+                    boot_index: None,
+                });
+            }),
+            ("a variable store on a chosen volume", |c| {
+                c.nvram = Some("/dev/zvol/boot/lumen/vm-101-efivars".into())
+            }),
+            // A BIOS machine cannot carry one; normalized() drops it, and
+            // the round trip must agree.
+            ("a variable store on a BIOS machine", |c| {
+                c.firmware = Firmware::Bios;
+                c.nvram = Some("/dev/zvol/boot/lumen/vm-101-efivars".into());
+            }),
+            ("one shared virtio-scsi controller", |c| {
+                c.scsi_controller = ScsiController::VirtioScsi;
+                c.disks.push(disk(
+                    "sda",
+                    "/dev/zvol/boot/lumen/vm-101-disk-1",
+                    DiskBus::VirtioScsi,
+                ));
+            }),
+            ("a controller per disk", |c| {
+                c.scsi_controller = ScsiController::VirtioScsiSingle;
+                c.disks.push(disk(
+                    "sda",
+                    "/dev/zvol/boot/lumen/vm-101-disk-1",
+                    DiskBus::VirtioScsi,
+                ));
+                c.disks.push(disk(
+                    "sdb",
+                    "/dev/zvol/boot/lumen/vm-101-disk-2",
+                    DiskBus::VirtioScsi,
+                ));
+            }),
+            ("a compatibility controller with no scsi disk yet", |c| {
+                c.scsi_controller = ScsiController::Lsi
+            }),
+            ("a megaraid controller", |c| {
+                c.scsi_controller = ScsiController::Megasas;
+                c.disks.push(disk(
+                    "sda",
+                    "/dev/zvol/boot/lumen/vm-101-disk-1",
+                    DiskBus::VirtioScsi,
+                ));
+            }),
+            ("a pvscsi controller", |c| {
+                c.scsi_controller = ScsiController::Pvscsi;
+                c.disks.push(disk(
+                    "sda",
+                    "/dev/zvol/boot/lumen/vm-101-disk-1",
+                    DiskBus::VirtioScsi,
+                ));
             }),
         ];
 

@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::Deserialize;
@@ -140,6 +140,56 @@ pub async fn power_node(
         NodePowerAction::Off => lumen_cluster::HardPower::Off,
         NodePowerAction::Cycle => lumen_cluster::HardPower::Cycle,
     };
+    // A node cannot command its own BMC — the answer would go down with it —
+    // so the request rides a cluster-mate's fence path instead. The
+    // acknowledgement is demanded here first, so the relay never carries an
+    // unacknowledged cut.
+    if node == state.cluster.node() {
+        if !request.i_understand_this_cuts_the_power {
+            return Err(ApiError::Conflict(
+                "This takes the power away at the machine — every virtual machine on it stops \
+                 where it is, with no shutdown. Acknowledge that first."
+                    .to_string(),
+            ));
+        }
+        let record = state.cluster.environment_record()?.ok_or_else(|| {
+            ApiError::Conflict("This node has not joined an environment.".to_string())
+        })?;
+        let assignment = record
+            .node(&node)
+            .and_then(|n| n.cluster.clone())
+            .ok_or_else(|| {
+                ApiError::Conflict(format!(
+                    "\"{node}\" is not in a cluster, so no member holds a fence device for it."
+                ))
+            })?;
+        let mates: Vec<_> = record
+            .nodes
+            .iter()
+            .filter(|n| n.cluster.as_deref() == Some(assignment.as_str()) && n.name != node)
+            .collect();
+        if mates.is_empty() {
+            return Err(ApiError::Conflict(format!(
+                "\"{node}\" is the only member of its cluster — no other member can reach its BMC."
+            )));
+        }
+        // Any mate's fence path will do; the first that answers wins, and
+        // the last refusal is the one worth reporting when none does.
+        let mut refusal = None;
+        for mate in mates {
+            match state.peers.power(mate, &node, action).await {
+                Ok(()) => {
+                    return Ok(Json(serde_json::json!({
+                        "node": node,
+                        "action": request.action,
+                        "via": mate.name,
+                    })))
+                }
+                Err(err) => refusal = Some(err),
+            }
+        }
+        return Err(refusal.expect("at least one mate was tried").into());
+    }
     state
         .cluster
         .power_member(&node, action, request.i_understand_this_cuts_the_power)
@@ -576,12 +626,17 @@ impl Default for MaintenanceRequest {
     }
 }
 
-/// POST /api/environment/clusters/{name}/nodes/{node}/maintenance — take this
+/// POST /api/environment/clusters/{name}/nodes/{node}/maintenance — take the
 /// node out of service, and drain it unless told not to.
+///
+/// The work always happens on the node it is about — its machines can only
+/// be moved by the node running them. When that node is not this one, what
+/// crosses the wire is only the instruction to begin, over the same peer
+/// verbs the rolling update uses; every guard is the target's own.
 ///
 /// 202 with the drain's first progress: the flag and standby are done by the
 /// time this answers, the machines are still moving. Poll
-/// `GET /api/environment/maintenance`.
+/// `GET /api/environment/maintenance?node={node}`.
 pub async fn enter_maintenance(
     session: Session,
     State(state): State<Arc<AppState>>,
@@ -589,7 +644,20 @@ pub async fn enter_maintenance(
     raw: Body,
 ) -> Result<(StatusCode, Json<crate::maintenance::MaintenanceProgress>), ApiError> {
     let request: MaintenanceRequest = body(raw)?;
-    guard_cluster(&state, &name, &node)?;
+    let member = member_of(&state, &name, &node)?;
+    if node != state.cluster.node() {
+        // The peer verb always drains: holding a node out of service
+        // without moving its machines is only useful on the node one is
+        // standing on, and the verb exists for the drain.
+        if !request.evacuate {
+            return Err(ApiError::Conflict(format!(
+                "Maintenance without a drain runs on the node it is about — open the console \
+                 of \"{node}\"."
+            )));
+        }
+        let progress = state.peers.enter_maintenance(&member, &principal(&session)).await?;
+        return Ok((StatusCode::ACCEPTED, Json(progress)));
+    }
     let progress =
         crate::maintenance::begin(&state, &principal(&session), request.evacuate).await?;
     let status = if request.evacuate {
@@ -607,39 +675,65 @@ pub async fn exit_maintenance(
     session: Session,
     State(state): State<Arc<AppState>>,
     Path((name, node)): Path<(String, String)>,
-) -> Result<Json<lumen_cluster::MaintenanceView>, ApiError> {
-    guard_cluster(&state, &name, &node)?;
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let member = member_of(&state, &name, &node)?;
+    if node != state.cluster.node() {
+        state.peers.exit_maintenance(&member, &principal(&session)).await?;
+        return Ok(Json(serde_json::json!({ "in_service": true })));
+    }
+    let view = crate::maintenance::end(&state, &principal(&session)).await?;
     Ok(Json(
-        crate::maintenance::end(&state, &principal(&session)).await?,
+        serde_json::to_value(view).unwrap_or_else(|_| serde_json::json!({ "in_service": true })),
     ))
 }
 
-/// GET /api/environment/maintenance — the drain of this node, while there is
-/// one to report. `null` when this node has never been drained since the
-/// control plane started.
+/// The drain query: which node's drain, when not this one's.
+#[derive(Debug, Default, Deserialize)]
+pub struct DrainQuery {
+    pub node: Option<String>,
+}
+
+/// GET /api/environment/maintenance — the drain of the named node (this one
+/// when unnamed), while there is one to report. `null` when that node has
+/// never been drained since its control plane started.
 pub async fn drain_progress(
     _session: Session,
     State(state): State<Arc<AppState>>,
-) -> Json<Option<crate::maintenance::MaintenanceProgress>> {
-    Json(state.drain.get())
+    Query(query): Query<DrainQuery>,
+) -> Result<Json<Option<crate::maintenance::MaintenanceProgress>>, ApiError> {
+    match query.node {
+        Some(ref node) if node != state.cluster.node() => {
+            let record = state.cluster.environment_record()?.ok_or_else(|| {
+                ApiError::Conflict("This node has not joined an environment.".to_string())
+            })?;
+            let member = record.node(node).cloned().ok_or_else(|| {
+                ApiError::Conflict(format!("\"{node}\" is not in the environment."))
+            })?;
+            Ok(Json(state.peers.drain_progress(&member).await?))
+        }
+        _ => Ok(Json(state.drain.get())),
+    }
 }
 
 /// Both maintenance routes carry a cluster and a node in the path for the
 /// same reason every other cluster route does — so the URL says what it is
-/// about. Only one pairing is answerable: this node, in the cluster it is
-/// actually in.
-fn guard_cluster(state: &AppState, cluster: &str, node: &str) -> Result<(), ApiError> {
-    if node != state.cluster.node() {
-        return Err(ApiError::Conflict(format!(
-            "Maintenance runs on the node it is about — its machines can only be moved by the \
-             node running them. Open the console of \"{node}\"."
-        )));
-    }
+/// about. This checks the pairing is real and hands back the member's record
+/// entry: the address a remote instruction travels to.
+fn member_of(
+    state: &AppState,
+    cluster: &str,
+    node: &str,
+) -> Result<lumen_cluster::EnvironmentNode, ApiError> {
     let membership = state.cluster.environment_record()?.ok_or_else(|| {
         ApiError::Conflict("This node has not joined an environment.".to_string())
     })?;
-    match membership.node(node).and_then(|n| n.cluster.as_deref()) {
-        Some(actual) if actual == cluster => Ok(()),
+    let Some(member) = membership.node(node) else {
+        return Err(ApiError::Conflict(format!(
+            "\"{node}\" is not in the environment."
+        )));
+    };
+    match member.cluster.as_deref() {
+        Some(actual) if actual == cluster => Ok(member.clone()),
         Some(actual) => Err(ApiError::Conflict(format!(
             "\"{node}\" is a member of \"{actual}\", not \"{cluster}\"."
         ))),

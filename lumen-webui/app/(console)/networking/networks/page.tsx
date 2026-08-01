@@ -171,7 +171,7 @@ function networkRows(
         // than a second Management network.
         subnet: null,
         addresses: [],
-        detail: `${network.bridge} · ${vlanText(network)}`,
+        detail: `${network.bridge} - ${vlanText(network)}`,
         tone: state.tone,
         status: state.status,
         members: nodes,

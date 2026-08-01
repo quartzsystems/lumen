@@ -543,6 +543,31 @@ impl crate::inventory::InventoryPeers for HttpPeerChannel {
         Ok(())
     }
 
+    async fn power(
+        &self,
+        via: &EnvironmentNode,
+        target: &str,
+        action: lumen_cluster::HardPower,
+    ) -> Result<(), ClusterError> {
+        let action = match action {
+            lumen_cluster::HardPower::Off => "off",
+            lumen_cluster::HardPower::Cycle => "cycle",
+        };
+        let _: serde_json::Value = self
+            .call(
+                &via.address,
+                "/api/peer/node/power",
+                &serde_json::json!({ "node": target, "action": action }),
+                self.ca_client_config()?,
+                Some(self.peer_ticket()?),
+                // An IPMI chassis command is quick, but the BMC it lands on
+                // answers at firmware speed.
+                SLOW_CALL_DEADLINE,
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn restart(&self, node: &EnvironmentNode) -> Result<(), ClusterError> {
         // The member answers before it goes: `systemctl reboot` returns and
         // the machine follows a moment later, which is long enough for the

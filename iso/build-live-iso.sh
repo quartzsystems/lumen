@@ -59,7 +59,7 @@ TARGET_PACKAGES=(
     grub2-efi-x64 shim-x64 grub2-tools grubby efibootmgr
     e2fsprogs dosfstools NetworkManager chrony firewalld openssh-server
     policycoreutils selinux-policy-targeted
-    libvirt-daemon-kvm qemu-kvm edk2-ovmf osinfo-db
+    libvirt-daemon-kvm qemu-kvm edk2-ovmf osinfo-db swtpm swtpm-tools
     # The cluster stack: corosync/pacemaker from the HighAvailability repo,
     # the fence agent from AppStream. Presets ship in lumen-storage keeping
     # the daemons off until a cluster exists.

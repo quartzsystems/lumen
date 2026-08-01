@@ -118,6 +118,25 @@ pub trait InventoryPeers: Send + Sync {
     /// that succeeds is one the member agreed was safe — the coordinator's
     /// belief about the cluster carries no weight over the member's own.
     async fn restart(&self, node: &EnvironmentNode) -> Result<(), ClusterError>;
+
+    /// Cut or cycle `target`'s power through `via`'s fence device.
+    ///
+    /// The path a node takes to its own BMC: commanding it directly would
+    /// kill the answer mid-flight, so the request rides another member's
+    /// fence path instead. Every guard is `via`'s — it refuses a target it
+    /// holds no fence device for the same way the local route does.
+    async fn power(
+        &self,
+        via: &EnvironmentNode,
+        target: &str,
+        action: lumen_cluster::HardPower,
+    ) -> Result<(), ClusterError> {
+        let _ = (target, action);
+        Err(ClusterError::Conflict(format!(
+            "There is no way to reach \"{}\" from here.",
+            via.name
+        )))
+    }
 }
 
 /// A control plane with no peer channel behind it: it can answer for itself

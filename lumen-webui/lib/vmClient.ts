@@ -10,7 +10,11 @@ export type Firmware = "uefi" | "bios";
 export type BootDevice = "disk" | "cdrom" | "network";
 export type DiskBus = "virtio-blk" | "virtio-scsi" | "sata";
 export type CacheMode = "none" | "writeback" | "writethrough" | "directsync" | "unsafe";
-export type NicModel = "virtio" | "e1000e" | "rtl8139";
+export type NicModel = "virtio" | "e1000" | "e1000e" | "rtl8139" | "vmxnet3";
+/// The controller the machine's `scsi`-bus disks sit behind, offered the way
+/// Proxmox offers it. `virtio-scsi-single` is one controller per disk, each
+/// on its own I/O thread.
+export type ScsiController = "virtio-scsi-single" | "virtio-scsi" | "lsi" | "megasas" | "pvscsi";
 /// The guest's display adapter, and so what the console viewer is looking at.
 /// `virtio` is the best picture where the guest has the driver; `vga` is the
 /// one that draws without any driver at all, which is what to reach for when
@@ -157,6 +161,12 @@ export interface VmView {
   topology: CpuTopology | null;
   machine: string;
   firmware: Firmware;
+  scsi_controller: ScsiController;
+  /// Whether the machine carries an emulated TPM 2.0.
+  tpm: boolean;
+  /// The block device holding the UEFI variable store, when the operator
+  /// chose where it lives. Null means the hypervisor manages one.
+  nvram: string | null;
   video: VideoModel;
   /// Whether the machine's stored document actually gives it a screen.
   ///
@@ -256,6 +266,16 @@ export interface NicCreate {
   bridge: string;
   model?: NicModel;
   vlan_tag?: number;
+  /// A hardware address to honor a reservation with. Absent, a stable one is
+  /// derived from the VMID and the adapter index.
+  mac?: string;
+}
+
+/// Where the UEFI variable store lives: a named local pool, or the cluster's
+/// replicated storage.
+export interface EfiDiskCreate {
+  pool?: string;
+  replicated?: boolean;
 }
 
 /// An optical drive to define. The image is named by the storage it is in and
@@ -276,6 +296,9 @@ export interface VmCreate {
   topology?: CpuTopology;
   machine?: string;
   firmware?: Firmware;
+  scsi_controller?: ScsiController;
+  tpm?: boolean;
+  efi_disk?: EfiDiskCreate;
   video?: VideoModel;
   boot_order?: BootDevice[];
   start_on_boot?: boolean;
@@ -288,6 +311,24 @@ export interface VmCreate {
   /// Start it as soon as it is defined.
   start?: boolean;
 }
+
+/// How each SCSI controller reads in a picker.
+export const SCSI_CONTROLLER_LABEL: Record<ScsiController, string> = {
+  "virtio-scsi-single": "VirtIO SCSI single",
+  "virtio-scsi": "VirtIO SCSI",
+  lsi: "LSI 53C895A",
+  megasas: "MegaRAID SAS 1078",
+  pvscsi: "VMware PVSCSI",
+};
+
+/// How each adapter model reads in a picker.
+export const NIC_MODEL_LABEL: Record<NicModel, string> = {
+  virtio: "VirtIO (paravirtualized)",
+  e1000: "Intel E1000",
+  e1000e: "Intel E1000E",
+  rtl8139: "Realtek RTL8139",
+  vmxnet3: "VMware vmxnet3",
+};
 
 export interface VmPatch {
   name?: string;

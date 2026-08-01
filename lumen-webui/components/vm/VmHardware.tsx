@@ -37,6 +37,8 @@ import {
   formatBytes,
   formatMib,
   migrateVm,
+  NIC_MODEL_LABEL,
+  SCSI_CONTROLLER_LABEL,
   updateVm,
   validationErrorsOf,
   VIDEO_HINT,
@@ -268,16 +270,32 @@ export function VmHardware({
       value: <span className="qz-mono">{vm.machine}</span>,
       actions: editPencil("machine", "machine type"),
     },
-    // Derived, not stored: the controller exists in the machine's document
-    // exactly when a disk rides the virtio-scsi bus.
-    ...(vm.disks.some((disk) => disk.bus === "virtio-scsi")
+    {
+      key: "scsi-controller",
+      icon: Cable,
+      device: "SCSI Controller",
+      text: SCSI_CONTROLLER_LABEL[vm.scsi_controller],
+      value: SCSI_CONTROLLER_LABEL[vm.scsi_controller],
+    },
+    ...(vm.tpm
       ? [
           {
-            key: "scsi-controller",
+            key: "tpm",
             icon: Cable,
-            device: "SCSI Controller",
-            text: "VirtIO SCSI",
-            value: "VirtIO SCSI",
+            device: "TPM",
+            text: "TPM 2.0",
+            value: "TPM 2.0 (emulated)",
+          } satisfies HardwareRow,
+        ]
+      : []),
+    ...(vm.nvram
+      ? [
+          {
+            key: "efi-disk",
+            icon: HardDrive,
+            device: "EFI Disk",
+            text: vm.nvram,
+            value: <span className="qz-mono truncate">{vm.nvram}</span>,
           } satisfies HardwareRow,
         ]
       : []),
@@ -308,7 +326,7 @@ export function VmHardware({
                   : "Served by the cluster's pooled storage."
               }
             >
-              {pooled ? `Pooled · ${pooled.health.toLowerCase()}` : "Pooled"}
+              {pooled ? `Pooled - ${pooled.health.toLowerCase()}` : "Pooled"}
             </span>
           )}
         </span>
@@ -833,6 +851,7 @@ function AddNicDialog({
   const [bridge, setBridge] = useState("");
   const [model, setModel] = useState<NicModel>("virtio");
   const [vlanTag, setVlanTag] = useState("");
+  const [mac, setMac] = useState("");
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
 
@@ -862,9 +881,15 @@ function AddNicDialog({
       setErrors({ vlan_tag: "Use a tag from 1 to 4094." });
       return;
     }
+    if (mac.trim() !== "" && !/^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$/.test(mac.trim())) {
+      setErrors({ mac: "Use six two-digit hex octets, like 52:54:00:12:34:56." });
+      return;
+    }
     setSaving(true);
     try {
-      await onAdded(await attachNic(vm.vmid, { bridge, model, vlan_tag: tag }));
+      await onAdded(
+        await attachNic(vm.vmid, { bridge, model, vlan_tag: tag, mac: mac.trim() || undefined }),
+      );
     } catch (err) {
       const detail = validationErrorsOf(err);
       const found: Record<string, string> = {};
@@ -918,12 +943,14 @@ function AddNicDialog({
               mono
               onChange={(v) => setModel(v as NicModel)}
             >
-              <option value="virtio">virtio</option>
-              <option value="e1000e">e1000e</option>
-              <option value="rtl8139">rtl8139</option>
+              {(Object.keys(NIC_MODEL_LABEL) as NicModel[]).map((candidate) => (
+                <option key={candidate} value={candidate}>
+                  {NIC_MODEL_LABEL[candidate]}
+                </option>
+              ))}
             </SelectInput>
           </Field>
-          <Field label="VLAN tag" htmlFor="nic-vlan" error={errors.vlan_tag}>
+          <Field label="VLAN Tag" htmlFor="nic-vlan" error={errors.vlan_tag}>
             <TextInput
               id="nic-vlan"
               value={vlanTag}
@@ -935,6 +962,21 @@ function AddNicDialog({
             />
           </Field>
         </div>
+        <Field
+          label="MAC Address"
+          htmlFor="nic-mac"
+          error={errors.mac}
+          hint="Left empty, a stable one is derived from the VM ID."
+        >
+          <TextInput
+            id="nic-mac"
+            value={mac}
+            mono
+            invalid={!!errors.mac}
+            placeholder="auto"
+            onChange={setMac}
+          />
+        </Field>
         {errors.form && <ErrorText msg={errors.form} />}
         <ModalFooter
           onCancel={onClose}

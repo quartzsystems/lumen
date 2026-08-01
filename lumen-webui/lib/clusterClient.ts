@@ -493,10 +493,12 @@ export const enterMaintenance = (
 export const exitMaintenance = (cluster: string, node: string): Promise<MaintenanceView> =>
   apiFetch<MaintenanceView>(maintenancePath(cluster, node), { method: "DELETE" });
 
-/// The drain of the node this console is talking to, or null if it has not
-/// been drained since its control plane started.
-export const fetchDrain = (): Promise<MaintenanceProgress | null> =>
-  apiFetch<MaintenanceProgress | null>("/environment/maintenance");
+/// The drain of the named node — this console's own when unnamed — or null
+/// if it has not been drained since its control plane started.
+export const fetchDrain = (node?: string): Promise<MaintenanceProgress | null> =>
+  apiFetch<MaintenanceProgress | null>(
+    node ? `/environment/maintenance?node=${encodeURIComponent(node)}` : "/environment/maintenance",
+  );
 
 export const confirmNodeDead = (cluster: string, node: string): Promise<{ confirmed: boolean }> =>
   post(

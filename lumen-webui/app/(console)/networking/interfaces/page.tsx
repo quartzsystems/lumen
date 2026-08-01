@@ -639,7 +639,7 @@ function ActiveCell({ link }: { link: LinkView }) {
       // The full NetworkManager state is still one hover away.
       title={
         link.kind === "ethernet" && !link.carrier
-          ? `${link.oper_state} · no carrier`
+          ? `${link.oper_state} - no carrier`
           : link.oper_state
       }
     >

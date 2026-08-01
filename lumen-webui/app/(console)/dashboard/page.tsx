@@ -814,8 +814,8 @@ function NetworkRowView({ row, named }: { row: NetworkRow; named: boolean }) {
       <td>
         <Status tone={row.tone} label={row.status} />
       </td>
-      <td className="mono truncate" title={named ? `${row.cluster} · ${row.name}` : row.name}>
-        {named && <span className="qz-dim">{row.cluster} · </span>}
+      <td className="mono truncate" title={named ? `${row.cluster} - ${row.name}` : row.name}>
+        {named && <span className="qz-dim">{row.cluster} - </span>}
         {row.name}
       </td>
       <td>
@@ -826,10 +826,10 @@ function NetworkRowView({ row, named }: { row: NetworkRow; named: boolean }) {
       </td>
       <td
         className="mono truncate"
-        title={[row.address, row.alsoAt].filter(Boolean).join(" · ") || undefined}
+        title={[row.address, row.alsoAt].filter(Boolean).join(" - ") || undefined}
       >
         {row.address ?? <span className="qz-dim">—</span>}
-        {row.alsoAt && <span className="qz-dim"> · {row.alsoAt}</span>}
+        {row.alsoAt && <span className="qz-dim"> - {row.alsoAt}</span>}
       </td>
     </tr>
   );

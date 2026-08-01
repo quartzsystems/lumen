@@ -222,7 +222,7 @@ const clusterColumns: Column<ClusterView>[] = [
         {cluster.preferred_node && (
           <span className="qz-mono text-[12px] text-[var(--qz-fg-4)]">
             {" "}
-            · prefers {cluster.preferred_node}
+            - prefers {cluster.preferred_node}
           </span>
         )}
       </span>
