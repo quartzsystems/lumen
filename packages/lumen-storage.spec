@@ -22,6 +22,7 @@ Source2:        lumen-cluster.xml
 Source3:        lumen-replication.xml
 Source4:        lumen-pool.xml
 Source5:        50-lumen-pool.conf
+Source6:        lumen-pool.conf
 
 Requires:       systemd
 # The pool tooling the management daemon reads through, and which the
@@ -90,6 +91,12 @@ install -D -p -m 0644 %{SOURCE4} \
 # higher-sorting file they add, so this never becomes a modified config file.
 install -D -p -m 0644 %{SOURCE5} \
     %{buildroot}%{_prefix}/lib/sysctl.d/50-lumen-pool.conf
+# The guest device interface those vdisks are served through. The daemon's
+# own unit loads the module when it starts, but the pool-create preflight
+# asks each member for /dev/ublk-control before any pool exists — so the
+# module has to be a boot-time fact, not a side effect of the first export.
+install -D -p -m 0644 %{SOURCE6} \
+    %{buildroot}%{_prefix}/lib/modules-load.d/lumen-pool.conf
 
 %files
 %{_prefix}/lib/systemd/system-preset/50-lumen-storage.preset
@@ -98,6 +105,7 @@ install -D -p -m 0644 %{SOURCE5} \
 %{_prefix}/lib/firewalld/services/lumen-replication.xml
 %{_prefix}/lib/firewalld/services/lumen-pool.xml
 %{_prefix}/lib/sysctl.d/50-lumen-pool.conf
+%{_prefix}/lib/modules-load.d/lumen-pool.conf
 
 # A preset file is only advice until something acts on it, and nothing on an
 # installed node ever runs `systemctl preset-all` again. This is that something:
@@ -115,8 +123,17 @@ install -D -p -m 0644 %{SOURCE5} \
 # is what makes "installed everywhere, running nowhere" the recorded default
 # rather than an accident of nothing having enabled them yet.
 %systemd_post corosync.service pacemaker.service pcsd.service
+# The modules-load drop-in above speaks at the next boot; a node that takes
+# this package as an update should not need one to pass the pool preflight.
+# In the installer's chroot there is no running kernel to load into, so
+# failure is expected there and ignored.
+/usr/sbin/modprobe ublk_drv >/dev/null 2>&1 || :
 
 %changelog
+* Fri Jul 31 2026 Quartz Systems Engineering <engineering@quartz.systems> - 0.3.8-1
+- Load the ublk module at boot: the pool-create preflight asks for
+  /dev/ublk-control before any pool exists, so the daemon's own unit
+  loading it on start was one workflow too late
 * Sun Jul 27 2026 Quartz Systems Engineering <engineering@quartz.systems> - 0.6.0-1
 - Cluster and replication stack: corosync, pacemaker, the one fence agent,
   and the DRBD module and userland, with presets keeping the daemons off

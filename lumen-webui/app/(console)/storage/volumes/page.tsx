@@ -17,7 +17,9 @@ import { ReplicatedVolumesSection } from "@/components/storage/ReplicatedVolumes
 /// absent rather than empty, which is the honest shape: replication and
 /// pooling are cluster features and a standalone appliance has no half of
 /// either to show. A cluster runs one engine or the other, so at most one
-/// section appears.
+/// carries data — but before either exists, the pool invitation and the
+/// empty replicated table show together, which is why the sections get a
+/// real gap between them.
 export default function VolumesPage() {
   return (
     <Page>
@@ -26,8 +28,10 @@ export default function VolumesPage() {
         description="Cluster-owned storage: one disk on several members at once, and which member is serving it."
       />
       <PageBody>
-        <PooledStorageSection />
-        <ReplicatedVolumesSection />
+        <div className="flex flex-col gap-6">
+          <PooledStorageSection />
+          <ReplicatedVolumesSection />
+        </div>
       </PageBody>
     </Page>
   );
