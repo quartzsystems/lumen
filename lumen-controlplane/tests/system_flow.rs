@@ -182,6 +182,7 @@ async fn harness(tag: &str, signed_in_as: &str) -> Harness {
         )),
         pool_peers: std::sync::Arc::new(lumen_controlplane::inventory::NoPeers),
         pool_job: Default::default(),
+        import: Default::default(),
     }));
 
     let response = router

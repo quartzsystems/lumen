@@ -5,6 +5,7 @@
 //!   model.rs        what a machine is
 //!   state.rs        what the hypervisor says about the machines it holds
 //!   domain_xml.rs   the domain document, both directions, with round-trip tests
+//!   ovf.rs          what machine a VMware appliance archive describes
 //!   validate.rs     pure rules over a machine and the node it would run on
 //!   backend/        the hypervisor's own library, plus mock/ and unavailable/
 //!   service.rs      the one entry point the control plane calls
@@ -35,6 +36,7 @@ pub mod domain_xml;
 pub mod error;
 pub mod model;
 pub mod osinfo;
+pub mod ovf;
 pub mod service;
 pub mod state;
 pub mod validate;
@@ -47,6 +49,7 @@ pub use model::{
     LAST_VMID,
 };
 pub use osinfo::{OsCatalog, OsFamily, OsVariant, OSINFO_DB_ROOT, WINDOWS_FAMILY};
+pub use ovf::{read_appliance, OvaAppliance, OvaDisk, OvaNic};
 pub use service::{ConsoleProtocol, ConsoleTarget, PushedFile, VirtService, MAX_GUEST_FILE_BYTES};
 pub use state::{DomainRuntime, DomainState, HostInfo, ObservedDomain};
 pub use validate::{Acknowledgements, ValidationCode, ValidationError};

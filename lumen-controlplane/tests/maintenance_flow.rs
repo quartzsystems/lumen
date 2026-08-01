@@ -236,6 +236,7 @@ fn build(
         )),
         pool_peers: std::sync::Arc::new(lumen_controlplane::inventory::NoPeers),
         pool_job: Default::default(),
+        import: Default::default(),
     });
     Harness {
         router: app(state.clone()),

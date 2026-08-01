@@ -24,15 +24,17 @@ StateDirectory=lumen-controlplane
 StateDirectoryMode=0700
 Environment=LUMEN_CP_STATE_DIR=/var/lib/lumen-controlplane
 
-# Hardening — the daemon needs its state dir writable, and the media library.
-# NoNewPrivileges is deliberately absent: PAM stacks (faillock, audit) may need
-# privilege transitions.
+# Hardening — the daemon needs its state dir writable, the media library, and
+# the import spool. NoNewPrivileges is deliberately absent: PAM stacks
+# (faillock, audit) may need privilege transitions.
 ProtectSystem=strict
-# The one relaxation, and it is one directory: uploaded installation images are
-# files rather than volumes, so unlike every other write in this daemon they
-# cannot go through /dev/zfs. The leading "-" keeps a node with no media
-# library from failing to start. Everything else stays read-only.
+# Two relaxations, each one directory of files rather than volumes: uploaded
+# installation images, and uploaded machine archives waiting to be imported.
+# Neither write can go through /dev/zfs the way every other write in this
+# daemon does. The leading "-" keeps a node missing either directory from
+# failing to start. Everything else stays read-only.
 ReadWritePaths=-/var/lib/lumen/iso
+ReadWritePaths=-/var/lib/lumen/import
 ProtectHome=yes
 PrivateTmp=yes
 ProtectKernelTunables=yes

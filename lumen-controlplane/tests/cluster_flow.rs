@@ -162,6 +162,7 @@ fn harness_with_storage(
         )),
         pool_peers: std::sync::Arc::new(lumen_controlplane::inventory::NoPeers),
         pool_job: Default::default(),
+        import: Default::default(),
     };
     Harness {
         router: app(Arc::new(state)),
@@ -965,6 +966,7 @@ async fn a_cluster_create_reports_per_node_per_step_progress_and_completes() {
         )),
         pool_peers: std::sync::Arc::new(lumen_controlplane::inventory::NoPeers),
         pool_job: Default::default(),
+        import: Default::default(),
     }));
 
     let cookie = sign_in(&router).await;

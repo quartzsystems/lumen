@@ -102,6 +102,7 @@ fn test_app() -> axum::Router {
         )),
         pool_peers: std::sync::Arc::new(lumen_controlplane::inventory::NoPeers),
         pool_job: Default::default(),
+        import: Default::default(),
     };
     app(Arc::new(state))
 }

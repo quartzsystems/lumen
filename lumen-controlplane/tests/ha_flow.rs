@@ -205,6 +205,7 @@ fn harness(tag: &str, cluster_backend: ClusterMockBackend) -> Harness {
         )),
         pool_peers: std::sync::Arc::new(lumen_controlplane::inventory::NoPeers),
         pool_job: Default::default(),
+        import: Default::default(),
     });
     Harness {
         state,

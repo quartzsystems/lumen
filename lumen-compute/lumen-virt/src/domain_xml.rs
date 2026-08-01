@@ -1057,7 +1057,7 @@ pub fn started_from_metadata(metadata_xml: &str) -> Option<u64> {
 /// Local name of a possibly-namespaced element: `lumen:vmid` is `vmid`. The
 /// prefix a document uses for our namespace is not ours to depend on — the
 /// hypervisor is free to rewrite it.
-fn local_name(raw: &[u8]) -> String {
+pub(crate) fn local_name(raw: &[u8]) -> String {
     let name = String::from_utf8_lossy(raw);
     match name.rsplit_once(':') {
         Some((_, local)) => local.to_string(),
@@ -1065,7 +1065,7 @@ fn local_name(raw: &[u8]) -> String {
     }
 }
 
-fn attr(element: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
+pub(crate) fn attr(element: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
     element.attributes().flatten().find_map(|a| {
         (local_name(a.key.as_ref()) == name)
             .then(|| a.unescape_value().ok().map(|v| v.into_owned()))

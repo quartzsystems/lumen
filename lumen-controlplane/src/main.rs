@@ -299,6 +299,7 @@ async fn main() -> Result<()> {
         pool_deploy: Arc::new(lumen_pool::PoolDeploy::new(exec.clone())),
         pool_peers: peers,
         pool_job: Default::default(),
+        import: Default::default(),
         updates,
         tasks: lumen_controlplane::tasks::TaskLog::open(state_dir.join("vm-tasks.jsonl")),
         drain: Default::default(),

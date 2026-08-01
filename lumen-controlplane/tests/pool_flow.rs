@@ -145,6 +145,7 @@ fn router_with_deploy(
         pool_deploy: Arc::new(lumen_pool::PoolDeploy::new(deploy_exec.clone())),
         pool_peers: Arc::new(lumen_controlplane::inventory::NoPeers),
         pool_job: Default::default(),
+        import: Default::default(),
     }));
     (router, state_dir, deploy_exec)
 }

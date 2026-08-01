@@ -12,6 +12,7 @@ import {
   Plus,
   Settings2,
   Trash2,
+  Upload,
 } from "lucide-react";
 import { Page, PageBody, PageHeader } from "@/components/PageHeader";
 import { DataTable, Dash, type Column, type FilterDef } from "@/components/console/DataTable";
@@ -20,6 +21,7 @@ import { ModalShell, ModalHeader } from "@/components/ui/Modal";
 import { ModalFooter } from "@/components/ui/formkit";
 import { Switch } from "@/components/ui/Switch";
 import { CreateVmDialog } from "@/components/vm/CreateVmDialog";
+import { ImportVmDialog } from "@/components/vm/ImportVmDialog";
 import { LifecycleControls } from "@/components/vm/LifecycleControls";
 import { VmConsole } from "@/components/vm/VmConsole";
 import { StateBadge, Tags } from "@/components/vm/VmBits";
@@ -83,6 +85,7 @@ function VirtualMachines() {
   const { nodes, vms, loading, error, refresh, setPaused, setSelected } = useVms();
 
   const [creating, setCreating] = useState(false);
+  const [importing, setImporting] = useState(false);
   const [deleting, setDeleting] = useState<VmView | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -106,9 +109,9 @@ function VirtualMachines() {
   // Polling pauses while a dialog is open, so a refresh cannot yank the form
   // out from under the operator mid-edit.
   useEffect(() => {
-    setPaused(creating || deleting !== null);
+    setPaused(creating || importing || deleting !== null);
     return () => setPaused(false);
-  }, [creating, deleting, setPaused]);
+  }, [creating, importing, deleting, setPaused]);
 
   const go = useCallback(
     (vmid: number | null, to: SectionId = "overview") => {
@@ -261,9 +264,19 @@ function VirtualMachines() {
                       rows={node.vms}
                       busy={busy}
                       toolbar={
-                        <Button kind="primary" size="sm" icon={Plus} onClick={() => setCreating(true)}>
-                          Create
-                        </Button>
+                        <div className="flex items-center gap-2">
+                          <Button
+                            kind="secondary"
+                            size="sm"
+                            icon={Upload}
+                            onClick={() => setImporting(true)}
+                          >
+                            Import
+                          </Button>
+                          <Button kind="primary" size="sm" icon={Plus} onClick={() => setCreating(true)}>
+                            Create
+                          </Button>
+                        </div>
                       }
                       onRefresh={refresh}
                       onOpen={(vm) => go(vm.vmid)}
@@ -285,6 +298,17 @@ function VirtualMachines() {
             setToast(`${vm.name} created as machine ${vm.vmid}.`);
             await refresh();
             go(vm.vmid);
+          }}
+        />
+      )}
+
+      {importing && (
+        <ImportVmDialog
+          onClose={() => setImporting(false)}
+          onImported={async (vmid) => {
+            setImporting(false);
+            await refresh();
+            if (vmid !== null) go(vmid);
           }}
         />
       )}

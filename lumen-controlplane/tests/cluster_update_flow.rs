@@ -558,6 +558,7 @@ async fn harness(tag: &str, peers: Vec<Arc<FakeMember>>, local: MockUpdates) -> 
         )),
         pool_peers: std::sync::Arc::new(lumen_controlplane::inventory::NoPeers),
         pool_job: Default::default(),
+        import: Default::default(),
     }));
 
     let response = router
@@ -1477,6 +1478,7 @@ async fn a_node_with_no_environment_answers_with_itself() {
         )),
         pool_peers: std::sync::Arc::new(lumen_controlplane::inventory::NoPeers),
         pool_job: Default::default(),
+        import: Default::default(),
     }));
 
     let response = router

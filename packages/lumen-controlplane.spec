@@ -39,6 +39,12 @@ Requires:       systemd
 # chpasswd. Present on every install, and named because the daemon runs them
 # by absolute path.
 Requires:       shadow-utils
+# Importing a machine from a VMware archive shells out to qemu-img to fill
+# the machine's volumes from the archived disks. It ships in its own package
+# that NOTHING else on the appliance requires — qemu-kvm arrives without it —
+# so it must be named here or every node simply lacks the tool and imports
+# fail at the fill step.
+Requires:       qemu-img
 # Loading the module below needs semodule, and the module is what makes the
 # delegation above work at all under Enforcing.
 Requires:       policycoreutils
@@ -94,6 +100,11 @@ install -D -p -m 0644 %{SOURCE3} %{buildroot}%{_unitdir}/lumen-controlplane.serv
 install -D -p -m 0644 %{SOURCE4} %{buildroot}%{_prefix}/lib/firewalld/services/lumen-controlplane.xml
 install -D -p -m 0644 %{SOURCE5} %{buildroot}%{_datadir}/selinux/packages/%{name}/lumen-controlplane.pp
 install -d -m 0700 %{buildroot}%{_sharedstatedir}/lumen-controlplane
+# The import spool: uploaded machine archives wait here between upload and
+# commit. A plain directory on the root filesystem — unlike the media library
+# nothing in it outlives its import — but it must exist when the unit starts,
+# because ReadWritePaths only opens a hole for a path that is already there.
+install -d -m 0700 %{buildroot}%{_sharedstatedir}/lumen/import
 
 %post
 %systemd_post lumen-controlplane.service
@@ -142,6 +153,8 @@ fi
 %{_prefix}/lib/firewalld/services/lumen-controlplane.xml
 %{_datadir}/selinux/packages/%{name}/
 %dir %attr(0700,root,root) %{_sharedstatedir}/lumen-controlplane
+%dir %{_sharedstatedir}/lumen
+%dir %attr(0700,root,root) %{_sharedstatedir}/lumen/import
 
 %changelog
 * Fri Jul 24 2026 Quartz Systems Engineering <engineering@quartz.systems> - 0.3.0-1

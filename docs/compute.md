@@ -462,6 +462,11 @@ entry carrying `code`, `vm`, `field`, and `message`.
 | GET | `/api/vms/next-id` | The identifier a machine created now would get |
 | GET | `/api/vms/cpu-models` | Processor models this node can run |
 | GET | `/api/vms/os-catalog` | Guest operating systems this node knows |
+| GET | `/api/vms/import` | Archives waiting in the spool, each with its machine |
+| PUT | `/api/vms/import/:name` | Upload an OVA; answers with the machine inside it |
+| POST | `/api/vms/import/:name` | Start the import — 202, watched on the pending feed |
+| GET | `/api/vms/import/pending` | The running (or last finished) import |
+| DELETE | `/api/vms/import/:name` | Remove one spooled archive |
 | GET | `/api/storage/pools` | Pools, grouped by node |
 | GET | `/api/storage/pools/:pool/volumes` | Datasets and volumes under a pool |
 | GET | `/api/storage/iso` | Media libraries and every image in them |
@@ -549,6 +554,61 @@ cannot name a path; `VirtService::resolve_media` asks the storage domain to
 build one and then checks the file is actually there, because a machine defined
 against media that is not present boots to a firmware prompt with nothing to
 explain it.
+
+---
+
+## Importing a machine
+
+An OVA — what vCenter and ESXi export — is a plain tar: one `.ovf` XML
+descriptor, the VMDK disks it names (stream-compressed), and a manifest of
+checksums. Importing one is three acts, and none of them needed new
+architecture.
+
+**The upload** streams to `/var/lib/lumen/import` with exactly the media
+library's discipline: raw body, no size limit, `.part` until whole, refused
+when empty. The spool is a plain directory rather than a dataset because
+nothing in it outlives its import; it is the unit's second and last
+`ReadWritePaths` relaxation, and the package owns the directory since
+`ReadWritePaths` only opens a hole for a path that exists at unit start. The
+answer to the upload is not a receipt but the parsed machine, so the console
+goes straight to "where should its pieces land?". An archive that cannot be
+read as an OVA is removed in the same breath — it can never be imported, and
+spooling it would only offer the same refusal again tomorrow.
+
+**The reading** (`lumen-virt/src/ovf.rs`) walks the tar headers without
+unpacking anything — the one member ever read into memory is the descriptor,
+and each disk is resolved to an offset and length inside the archive. The
+walk is hand-rolled: it is a dozen header fields, and the one subtlety (a
+member over 8 GiB carries its size in base-256, which a VMDK routinely does)
+is tested. The descriptor maps onto the machine model with almost no
+translation because the model already speaks VMware's dialect — `pvscsi`,
+`vmxnet3`, the EFI/BIOS choice. Hardware that cannot be carried is said out
+loud in a `warnings` list, never dropped silently. Firmware defaults to BIOS
+when the descriptor is silent, because that is VMware's default and an
+imported machine under the wrong firmware does not boot — the one place the
+import's defaults deliberately differ from the create dialog's.
+
+**The commit** (`lumen-controlplane/src/vm_import.rs`) is a background job in
+the pool workflows' shape — atomically claimed slot, 202, a pending feed of
+steps — and it composes what already exists: define the machine through the
+same `VirtService::create` every machine goes through (blank volumes at the
+descriptor's capacities, `start: false`), then fill each volume with
+`qemu-img convert -n`, whose source is a stacked block-layer spec (`vmdk`
+over `raw` with `offset`/`size` over `file`) reading the compressed VMDK in
+place — the spool holds one copy of the bytes, not two. There is no format
+plumbing on the other end because every disk this appliance gives a machine
+is a raw block device, zvol and replicated volume alike. A fill that fails
+removes the machine and its volumes again; a start that fails after every
+disk is filled does not, because the import succeeded and removing a whole
+machine over a start refusal would destroy exactly what was just built.
+
+The proposal keeps the source's own hardware — its SCSI controller, its
+adapter models, its MAC addresses — so the guest's existing drivers and the
+network's reservations survive first boot. Switching to virtio is a
+post-import choice, made once the drivers are in. The converter is a seam
+(`Convert`), so the flow tests inject a recorder and `make test` needs no
+qemu-img; the real one is a package dependency the spec names explicitly,
+because nothing else on the appliance pulls it in.
 
 ---
 

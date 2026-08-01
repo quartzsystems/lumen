@@ -172,6 +172,7 @@ fn harness(tag: &str, membership: &EnvironmentMembership) -> Harness {
         )),
         pool_peers: std::sync::Arc::new(lumen_controlplane::inventory::NoPeers),
         pool_job: Default::default(),
+        import: Default::default(),
     }));
     Harness {
         router,

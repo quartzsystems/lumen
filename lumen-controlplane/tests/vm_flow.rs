@@ -157,6 +157,7 @@ async fn harness(tag: &str) -> Harness {
         )),
         pool_peers: std::sync::Arc::new(lumen_controlplane::inventory::NoPeers),
         pool_job: Default::default(),
+        import: Default::default(),
     }));
 
     // Sign in once; every machine and storage route requires the session.

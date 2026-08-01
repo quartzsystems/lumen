@@ -146,6 +146,7 @@ async fn harness(tag: &str, mock: MockUpdates) -> Harness {
         )),
         pool_peers: std::sync::Arc::new(lumen_controlplane::inventory::NoPeers),
         pool_job: Default::default(),
+        import: Default::default(),
     }));
 
     let response = router

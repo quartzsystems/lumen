@@ -190,7 +190,7 @@ pub async fn get(
 /// design: a peer that is down misses this push and is caught up by the
 /// next define, and failing the operator's action over HA prep would make
 /// the preparation more important than the machine.
-async fn sync_definition(state: &AppState, vmid: u32) {
+pub(crate) async fn sync_definition(state: &AppState, vmid: u32) {
     match state.virt.definition(vmid).await {
         Ok(xml) => {
             if let Err(err) = state.cluster.replicate_definition(vmid, &xml).await {

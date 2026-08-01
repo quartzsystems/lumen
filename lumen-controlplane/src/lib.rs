@@ -13,6 +13,7 @@ pub mod security;
 pub mod tasks;
 pub mod tls;
 pub mod updates;
+pub mod vm_import;
 pub mod web;
 
 use std::sync::Arc;
@@ -82,6 +83,10 @@ pub struct AppState {
     pub updates: Arc<UpdateService>,
     /// What has been done to each machine — the console's Tasks table.
     pub tasks: tasks::TaskLog,
+    /// Importing machines from VMware archives: the spool the uploads land
+    /// in, the converter that fills disks from them, and the one-at-a-time
+    /// job slot — one field, because they are one feature.
+    pub import: vm_import::ImportState,
     /// The drain of this node, while one is running. Node-local by nature:
     /// only the node running the machines can move them.
     pub drain: maintenance::DrainHandle,

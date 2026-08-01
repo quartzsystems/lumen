@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod cluster;
 pub mod console;
+pub mod imports;
 pub mod network;
 pub mod nodes;
 pub mod peer;
@@ -65,6 +66,19 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/vms/next-id", get(vms::next_id))
         .route("/api/vms/cpu-models", get(vms::cpu_models))
         .route("/api/vms/os-catalog", get(vms::os_catalog))
+        // Importing a machine from a VMware archive. The upload streams the
+        // archive to the spool the way an installation image streams to the
+        // media library — the same no-limit reasoning as that route — and
+        // answers with the machine the archive describes; the commit is a
+        // 202 watched through the pending feed, the pool workflows' shape.
+        .route("/api/vms/import", get(imports::list))
+        .route("/api/vms/import/pending", get(imports::progress))
+        .route(
+            "/api/vms/import/{name}",
+            put(imports::upload).layer(axum::extract::DefaultBodyLimit::disable()),
+        )
+        .route("/api/vms/import/{name}", post(imports::commit))
+        .route("/api/vms/import/{name}", delete(imports::remove))
         .route("/api/vms/{vmid}", get(vms::get))
         .route("/api/vms/{vmid}", patch(vms::update))
         .route("/api/vms/{vmid}", delete(vms::delete))
