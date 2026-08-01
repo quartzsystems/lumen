@@ -328,19 +328,69 @@ const memberColumns = (unreachable: boolean): Column<ClusterNodeView>[] => [
     key: "fence",
     header: "Fencing",
     value: (node) =>
-      node.fence ? (node.fence.failed ? "failing" : node.fence.last_test ? "tested" : "untested") : "",
+      node.fence
+        ? node.fence.failed
+          ? "failing"
+          : !node.fence.active
+            ? "stopped"
+            : node.fence.last_test
+              ? "tested"
+              : "untested"
+        : "",
     sortable: true,
-    width: 150,
+    width: 170,
+    // Live state first, the recorded test second: a device whose monitor is
+    // failing — or that Pacemaker has stopped after too many failures — is
+    // the fact an operator acts on now, and "Tested" over a stopped device
+    // was how a broken fence path read as fine. The tooltip names the IPMI
+    // target, because "against which BMC" is the first debugging question.
     render: (node) => {
       if (!node.fence) return <Dash />;
-      if (node.fence.failed) return <span className="badge badge-crit">BMC unreachable</span>;
-      if (!node.fence.last_test) return <span className="badge badge-warn">Untested</span>;
+      const ipmi = node.fence.bmc_address
+        ? `fence_ipmilan against ${node.fence.bmc_address}${
+            node.fence.bmc_username ? ` as ${node.fence.bmc_username}` : ""
+          }`
+        : undefined;
+      if (node.fence.failed) {
+        return (
+          <span
+            className="badge badge-crit"
+            title={ipmi ? `${ipmi} — the monitor is failing.` : undefined}
+          >
+            BMC unreachable
+          </span>
+        );
+      }
+      if (!node.fence.active) {
+        return (
+          <span
+            className="badge badge-crit"
+            title={
+              ipmi
+                ? `${ipmi} — the device is stopped, so this node cannot be fenced. ` +
+                  `Fix the BMC path, then clean the resource up.`
+                : undefined
+            }
+          >
+            Stopped
+          </span>
+        );
+      }
+      if (!node.fence.last_test) {
+        return (
+          <span className="badge badge-warn" title={ipmi}>
+            Healthy · untested
+          </span>
+        );
+      }
       return (
         <span
-          className="qz-dim"
-          title={`Last test ${new Date(node.fence.last_test.at * 1000).toLocaleString()}`}
+          className={node.fence.last_test.passed ? "qz-dim" : "badge badge-warn"}
+          title={`${ipmi ? `${ipmi} — ` : ""}last test ${new Date(
+            node.fence.last_test.at * 1000,
+          ).toLocaleString()}`}
         >
-          {node.fence.last_test.passed ? "Tested" : "Test failed"}
+          {node.fence.last_test.passed ? "Healthy · tested" : "Healthy · test failed"}
         </span>
       );
     },

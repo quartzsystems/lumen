@@ -249,14 +249,6 @@ impl InventoryPeers for FakePeers {
         unreachable!("the update tests never ask for an inventory")
     }
 
-    async fn create_pool(
-        &self,
-        _node: &EnvironmentNode,
-        _request: &lumen_zfs::PoolCreate,
-    ) -> Result<(), ClusterError> {
-        unreachable!("the update tests never build a pool")
-    }
-
     async fn wipe_disk(
         &self,
         _node: &EnvironmentNode,

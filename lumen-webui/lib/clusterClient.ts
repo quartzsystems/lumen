@@ -37,6 +37,11 @@ export interface FenceDeviceState {
   active: boolean;
   failed: boolean;
   last_test: FenceTest | null;
+  /// The IPMI target the device is aimed at, from the cluster record —
+  /// "which BMC is this failing against" is the first thing an operator
+  /// debugging fencing needs.
+  bmc_address?: string;
+  bmc_username?: string;
 }
 
 /// A node the operator has taken out of service. Read off the replicated

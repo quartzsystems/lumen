@@ -66,30 +66,6 @@ pub async fn inventory(
     Ok(Json(crate::inventory::local(&state).await))
 }
 
-/// POST /api/peer/storage/pool — build a pool here, on this node's own
-/// disks.
-///
-/// The acknowledgement is not taken from the wire: the operator's consent was
-/// given to the coordinator, which is where it belongs, and a peer route that
-/// accepted "yes, erase them" from a body would be a second, quieter way to
-/// reformat a node's disks.
-pub async fn create_pool(
-    _peer: PeerSession,
-    State(state): State<Arc<AppState>>,
-    Json(request): Json<lumen_zfs::PoolCreate>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    state
-        .storage
-        .create_pool(
-            request,
-            lumen_zfs::Acknowledgements {
-                may_lose_data: true,
-            },
-        )
-        .await?;
-    Ok(Json(serde_json::json!({ "built": true })))
-}
-
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WipeDiskRequest {
@@ -101,10 +77,9 @@ pub struct WipeDiskRequest {
 /// POST /api/peer/storage/wipe — clear one disk here, on behalf of an
 /// operator working from another member's console.
 ///
-/// The acknowledgement is not taken from the wire, for the same reason
-/// `create_pool` does not take it: consent was given to the console the
-/// operator is looking at, and a peer route that accepted it from a body
-/// would be a second, quieter way to clear a node's disks.
+/// The acknowledgement is not taken from the wire: consent was given to
+/// the console the operator is looking at, and a peer route that accepted
+/// it from a body would be a second, quieter way to clear a node's disks.
 ///
 /// Every guard that matters is still this node's. A disk holding a pool, a
 /// mount, or swap is refused here regardless of what the caller believes,

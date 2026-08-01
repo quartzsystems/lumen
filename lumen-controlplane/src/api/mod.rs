@@ -110,12 +110,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         // one unassigned node; see src/api/cluster.rs and docs/cluster.md.
         .route("/api/environment", get(cluster::environment))
         .route("/api/environment/inventory", get(cluster::inventory))
-        // One pool name, built on several members at once — what the drive
-        // picker across nodes submits. Each pool is still that node's own.
-        .route(
-            "/api/environment/storage/pools",
-            post(cluster::create_cluster_pool),
-        )
         // Clearing one member's disk from any member's console. The disk
         // picker spans the environment, so the operation that unblocks it has
         // to as well — see the handler for why the node is in the path.
@@ -251,7 +245,6 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(peer::exit_maintenance),
         )
         .route("/api/peer/system/restart", post(peer::restart))
-        .route("/api/peer/storage/pool", post(peer::create_pool))
         .route("/api/peer/storage/wipe", post(peer::wipe_disk))
         .route("/api/peer/cluster/teardown", post(peer::teardown))
         .route("/api/peer/cluster/reconfigure", post(peer::reconfigure))

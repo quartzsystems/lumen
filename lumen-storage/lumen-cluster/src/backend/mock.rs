@@ -407,6 +407,8 @@ fn healthy_cluster(name: &str, nodes: &[&str], two_node: bool) -> ClusterState {
                     at: 1_753_000_000,
                     passed: true,
                 }),
+                bmc_address: None,
+                bmc_username: None,
             })
             .collect(),
         // A healthy fixture's address is up on the first member. Tests that
@@ -618,6 +620,8 @@ impl ClusterBackend for MockBackend {
                     active: true,
                     failed: false,
                     last_test: None,
+                    bmc_address: None,
+                    bmc_username: None,
                 });
             }
         }

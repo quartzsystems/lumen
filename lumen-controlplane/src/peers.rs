@@ -425,26 +425,6 @@ impl crate::inventory::InventoryPeers for HttpPeerChannel {
         .await
     }
 
-    async fn create_pool(
-        &self,
-        node: &EnvironmentNode,
-        request: &lumen_zfs::PoolCreate,
-    ) -> Result<(), ClusterError> {
-        let _: serde_json::Value = self
-            .call(
-                &node.address,
-                "/api/peer/storage/pool",
-                request,
-                self.ca_client_config()?,
-                Some(self.peer_ticket()?),
-                // `zpool create` labels every disk it is given; a shelf of
-                // spinning disks takes its time.
-                SLOW_CALL_DEADLINE,
-            )
-            .await?;
-        Ok(())
-    }
-
     async fn wipe_disk(
         &self,
         node: &EnvironmentNode,

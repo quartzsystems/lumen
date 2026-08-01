@@ -52,42 +52,6 @@ export interface InventoryResponse {
 export const fetchInventory = (): Promise<InventoryResponse> =>
   apiFetch<InventoryResponse>("/environment/inventory");
 
-/// One member's share of a cluster-wide pool build.
-export interface PoolSeat {
-  node: string;
-  disks: string[];
-}
-
-/// Build one identically named pool across several members at once.
-///
-/// There is no cluster-wide pool at the end of this. Each member gets its
-/// own, on its own disks, listed and destroyed on its own Storage page. What
-/// it buys is that the names match — a replicated volume names one pool and
-/// means it on every member holding a replica, and doing this by hand across
-/// consoles is where the names drift apart.
-export interface ClusterPoolCreate {
-  name: string;
-  vdev: VdevKind;
-  compression: Compression;
-  ashift?: number;
-  seats: PoolSeat[];
-  i_understand_this_erases_the_disks: boolean;
-}
-
-export interface ClusterPoolOutcome {
-  name: string;
-  /// The members that got one, in the order they were built.
-  built: string[];
-}
-
-export const createClusterPool = (
-  request: ClusterPoolCreate,
-): Promise<ClusterPoolOutcome> =>
-  apiFetch<ClusterPoolOutcome>("/environment/storage/pools", {
-    method: "POST",
-    body: JSON.stringify(request),
-  });
-
 // --- display helpers ---------------------------------------------------------
 
 /// Every member's links, flattened, each carrying the node it belongs to.

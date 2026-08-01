@@ -2793,14 +2793,27 @@ fn now_unix() -> u64 {
         .as_secs()
 }
 
-/// Lay the recorded fence tests over the observed devices. The record wins
-/// where it has an answer; a device the record has never heard of keeps
-/// whatever the backend said — which for the real backend is "never tested".
+/// Lay the record's facts over the observed devices: the recorded fence
+/// tests (the record wins where it has an answer; a device it has never
+/// heard of keeps whatever the backend said — for the real backend, "never
+/// tested"), and each device's IPMI target — crm_mon reports a device's
+/// state but never its arguments, and the console showing "failing" without
+/// saying against which BMC sends the operator to a terminal for the first
+/// fact they need.
 fn overlay_fence_tests(state: &mut ClusterState, record: Option<&ClusterRecord>) {
     let Some(record) = record else { return };
     for device in &mut state.fence_devices {
         if let Some(test) = record.fence_tests.get(&device.target) {
             device.last_test = Some(*test);
+        }
+        if let Some(member) = record
+            .definition
+            .nodes
+            .iter()
+            .find(|node| node.name == device.target)
+        {
+            device.bmc_address = Some(member.bmc.address.clone());
+            device.bmc_username = Some(member.bmc.username.clone());
         }
     }
 }

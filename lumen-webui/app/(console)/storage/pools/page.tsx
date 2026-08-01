@@ -7,7 +7,6 @@ import { DataTable, Dash, type Column, type FilterDef } from "@/components/conso
 import { Button } from "@/components/ui/Button";
 import { Meter } from "@/components/vm/VmBits";
 import { CreatePoolDialog, DestroyPoolDialog } from "@/components/storage/CreatePoolDialog";
-import { PoolAcrossNodesDialog } from "@/components/storage/PoolAcrossNodesDialog";
 import {
   fetchInventory,
   poolsByMember,
@@ -44,7 +43,6 @@ export default function PoolsPage() {
   const [inventory, setInventory] = useState<InventoryResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
-  const [poolingAcrossNodes, setPoolingAcrossNodes] = useState(false);
   const [destroying, setDestroying] = useState<PoolView | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -66,10 +64,10 @@ export default function PoolsPage() {
   useEffect(() => {
     // Polling pauses while a dialog is open, so a refresh cannot move the
     // picker out from under the operator mid-choice.
-    if (creating || destroying || poolingAcrossNodes) return;
+    if (creating || destroying) return;
     const timer = setInterval(() => void load(), POLL_MS);
     return () => clearInterval(timer);
-  }, [load, creating, destroying, poolingAcrossNodes]);
+  }, [load, creating, destroying]);
 
   const rows = useMemo(() => poolsByMember(inventory), [inventory]);
   // Every pool name in the environment. A create is refused for a name this
@@ -144,12 +142,7 @@ export default function PoolsPage() {
           {/* Only once there is more than one member. On a standalone
               appliance the table below is the whole truth, and a "cluster
               total" of one node's pools is noise. */}
-          {(inventory?.members.length ?? 0) > 1 && (
-            <ClusterCapacity
-              inventory={inventory}
-              onPoolAcrossNodes={() => setPoolingAcrossNodes(true)}
-            />
-          )}
+          {(inventory?.members.length ?? 0) > 1 && <ClusterCapacity inventory={inventory} />}
 
           {inventory !== null && (
             <PoolTable
@@ -170,18 +163,6 @@ export default function PoolsPage() {
           onCreated={async (pool) => {
             setCreating(false);
             setToast(`${pool.name} created — ${formatBytes(pool.size)}.`);
-            await load();
-          }}
-        />
-      )}
-
-      {poolingAcrossNodes && (
-        <PoolAcrossNodesDialog
-          inventory={inventory}
-          onClose={() => setPoolingAcrossNodes(false)}
-          onCreated={async (message) => {
-            setPoolingAcrossNodes(false);
-            setToast(message);
             await load();
           }}
         />
@@ -309,20 +290,13 @@ const columns: Column<OwnedPool>[] = [
   },
 ];
 
-/// What the members' pools add up to, and the way in to building more.
+/// What the members' pools add up to.
 ///
 /// Every figure here is raw capacity, said so in the panel rather than only
-/// in a tooltip. A replicated volume consumes its full size on every member
-/// holding a replica, so the sum of the pools is what the hardware is — not
-/// what a machine may be given. An operator who reads it as usable will size
-/// their volumes wrong by exactly the replica count.
-function ClusterCapacity({
-  inventory,
-  onPoolAcrossNodes,
-}: {
-  inventory: InventoryResponse | null;
-  onPoolAcrossNodes: () => void;
-}) {
+/// in a tooltip. A pooled disk consumes its full size on every member, so
+/// the sum of the pools is what the hardware is — not what a machine may be
+/// given.
+function ClusterCapacity({ inventory }: { inventory: InventoryResponse | null }) {
   const total = pooledStorage(inventory);
   const used = total.size > 0 ? (total.allocated / total.size) * 100 : 0;
 
@@ -335,13 +309,9 @@ function ClusterCapacity({
           </h2>
           <p className="text-[12px] text-[var(--qz-fg-4)] mt-1 mb-0">
             {total.pools} {total.pools === 1 ? "pool" : "pools"} on {total.counted} of {total.of}{" "}
-            members. Raw capacity — a replicated volume costs its full size on every member holding
-            a replica.
+            members. Raw capacity — a pooled disk costs its full size on every member.
           </p>
         </div>
-        <Button kind="primary" size="sm" icon={Plus} onClick={onPoolAcrossNodes}>
-          Pool drives across nodes
-        </Button>
       </header>
 
       <div className="grid gap-4" style={{ gridTemplateColumns: "repeat(3, 1fr)" }}>

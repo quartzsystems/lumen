@@ -769,6 +769,8 @@ fn parse_crm_mon(xml: &str) -> Result<(Vec<NodeState>, Vec<FenceDeviceState>, Op
                                 active: flag("active"),
                                 failed: flag("failed"),
                                 last_test: None,
+                                bmc_address: None,
+                                bmc_username: None,
                             });
                         } else if agent == IPADDR2_AGENT {
                             // The one address resource this appliance creates.

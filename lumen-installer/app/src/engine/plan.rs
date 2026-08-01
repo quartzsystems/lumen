@@ -242,6 +242,24 @@ pub fn build_plan(cfg: &InstallConfig, pins: &BuildPins) -> Vec<Step> {
              lumen-release lumen-networking lumen-storage lumen-compute \
              lumen-controlplane"
             )),
+            // The repository configuration, named on its own because nothing
+            // requires it: every other lumen package arrives through a
+            // Requires chain, but lumen-repo is deliberately standalone (a
+            // site running its own mirror replaces it), so leaving it off
+            // this list is a node that installs cleanly and is never offered
+            // an update — found on the first fresh install anyone checked.
+            // Conditional because a build without the signing key ships media
+            // without the package (packages/build-rpms.sh), and a contributor
+            // install must not fail over a repository it never had.
+            sh(format!(
+                "if ls {MEDIA}/lumen/lumen-repo-*.rpm >/dev/null 2>&1; then \
+             dnf -y --installroot={TARGET} --releasever=10 \
+             --disablerepo='*' \
+             --repofrompath=lumen,{MEDIA}/lumen \
+             --setopt=lumen.gpgcheck=0 \
+             install lumen-repo; \
+             else echo 'lumen-repo is not on this media; the node will not be offered Lumen updates'; fi"
+            )),
         ],
     });
 
@@ -726,6 +744,28 @@ mod tests {
             .position(|s| s.contains("dnf -y --installroot"))
             .expect("plan must contain the dnf install action");
         assert!(seed < dnf, "machine-id must be seeded before dnf runs");
+    }
+
+    /// The repository package is named on its own because nothing requires
+    /// it — leaving it off the plan was a node that installed cleanly and
+    /// was never offered an update, found on the first fresh install
+    /// anyone checked.
+    #[test]
+    fn the_repository_package_is_installed_when_the_media_carries_it() {
+        let plan = build_plan(&test_cfg(), &BuildPins::default());
+        let script = plan
+            .iter()
+            .flat_map(|s| &s.actions)
+            .find_map(|a| match a {
+                Action::Shell(s) if s.contains("lumen-repo") => Some(s),
+                _ => None,
+            })
+            .expect("plan must install lumen-repo when the media has it");
+        // Conditional on the media actually carrying the package: a build
+        // without the signing key ships none, and a contributor install
+        // must not fail over a repository it never had.
+        assert!(script.contains("if ls"), "{script}");
+        assert!(script.contains("install lumen-repo"), "{script}");
     }
 
     #[test]

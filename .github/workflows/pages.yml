@@ -59,6 +59,13 @@ on:
         required: true
       LUMEN_GPG_PASSPHRASE:
         required: true
+  # A release made or edited by hand republishes too. This is not redundant
+  # with the workflow_call above: a release cut through the UI — or assets
+  # re-uploaded to one — never runs release.yml, and GitHub deliberately
+  # does not fire this event for releases created by a workflow's own token,
+  # so exactly one of the two paths runs for any given release.
+  release:
+    types: [published, edited]
   workflow_dispatch:
 
 permissions:

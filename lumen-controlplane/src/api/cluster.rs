@@ -62,24 +62,6 @@ pub async fn inventory(
     Json(crate::inventory::environment(&state).await)
 }
 
-/// POST /api/environment/storage/pools — build one identically named pool
-/// across several members at once.
-///
-/// Not a cluster-wide pool: each member ends up with its own, on its own
-/// disks, listed and destroyed on its own Storage page. What this saves is
-/// the trip to every console, and what it prevents is the names drifting
-/// apart — a replicated volume names one pool and means it on every member
-/// holding a replica.
-pub async fn create_cluster_pool(
-    _session: Session,
-    State(state): State<Arc<AppState>>,
-    raw: Body,
-) -> Result<(StatusCode, Json<crate::inventory::ClusterPoolOutcome>), ApiError> {
-    let request: crate::inventory::ClusterPoolCreate = required_body(raw)?;
-    let outcome = crate::inventory::create_cluster_pool(&state, &request).await?;
-    Ok((StatusCode::CREATED, Json(outcome)))
-}
-
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WipeDiskRequest {

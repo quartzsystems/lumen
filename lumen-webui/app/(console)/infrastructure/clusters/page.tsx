@@ -248,9 +248,6 @@ function ClusterCard({
             </>
           )}
         </dd>
-        <dt>Replication</dt>
-        {/* Replicated volumes land with a later stage; a dash is honest. */}
-        <dd>—</dd>
         <dt>Fencing</dt>
         <dd>
           {cluster.error ? (

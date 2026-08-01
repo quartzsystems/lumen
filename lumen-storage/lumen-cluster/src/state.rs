@@ -104,6 +104,14 @@ pub struct FenceDeviceState {
     /// The last guarded live fence test in this direction, if one was ever
     /// run. `None` pins the persistent untested-fencing warning.
     pub last_test: Option<FenceTest>,
+    /// The IPMI target the device is aimed at, joined from the cluster
+    /// record at assembly — crm_mon reports a device's state but never its
+    /// arguments, and "which BMC is this failing against" is the first
+    /// thing an operator debugging fencing needs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bmc_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bmc_username: Option<String>,
 }
 
 /// The cluster VIP resource, as Pacemaker reports it.

@@ -42,19 +42,6 @@ use crate::AppState;
 pub trait InventoryPeers: Send + Sync {
     async fn fetch(&self, node: &EnvironmentNode) -> Result<NodeInventory, ClusterError>;
 
-    /// Build a pool on one member, from disks that member owns.
-    ///
-    /// The cluster does not own the pool that results — it is that node's
-    /// pool, listed and destroyed on its own Storage page, exactly as the
-    /// bond and the bridge are that node's links. What the cluster provides
-    /// is the one operation an operator would otherwise do by visiting every
-    /// console in turn.
-    async fn create_pool(
-        &self,
-        node: &EnvironmentNode,
-        request: &lumen_zfs::PoolCreate,
-    ) -> Result<(), ClusterError>;
-
     /// Clear one disk on one member.
     ///
     /// The exception to this module's own rule that writing belongs to the
@@ -146,17 +133,6 @@ impl InventoryPeers for NoPeers {
     async fn fetch(&self, node: &EnvironmentNode) -> Result<NodeInventory, ClusterError> {
         Err(ClusterError::Conflict(format!(
             "This control plane has no peer channel, so \"{}\" could not be asked.",
-            node.name
-        )))
-    }
-
-    async fn create_pool(
-        &self,
-        node: &EnvironmentNode,
-        _request: &lumen_zfs::PoolCreate,
-    ) -> Result<(), ClusterError> {
-        Err(ClusterError::Conflict(format!(
-            "This control plane has no peer channel, so nothing could be built on \"{}\".",
             node.name
         )))
     }
@@ -296,93 +272,6 @@ pub struct InventoryResponse {
     pub members: Vec<MemberInventory>,
 }
 
-/// Build the same pool on every named member.
-///
-/// Sequential, not concurrent, and deliberately: this reformats disks. A
-/// failure part-way should stop rather than press on to the next member, and
-/// the operator should be able to read the outcome as "these worked, this one
-/// did not, nothing after it was attempted".
-pub async fn create_cluster_pool(
-    state: &Arc<AppState>,
-    request: &ClusterPoolCreate,
-) -> Result<ClusterPoolOutcome, ClusterError> {
-    if !request.i_understand_this_erases_the_disks {
-        return Err(ClusterError::Conflict(
-            "Building a pool reformats every disk it is given. Acknowledge that first.".to_string(),
-        ));
-    }
-    if request.seats.is_empty() {
-        return Err(ClusterError::Conflict(
-            "No member was given any disks, so there is nothing to build.".to_string(),
-        ));
-    }
-
-    let nodes = state.cluster.environment_nodes()?;
-    let local_name = state.cluster.node().to_string();
-    let mut built = Vec::new();
-
-    for seat in &request.seats {
-        if seat.disks.is_empty() {
-            return Err(ClusterError::Conflict(format!(
-                "\"{}\" was given no disks. Leave a member out entirely rather than \
-                 building it an empty pool.",
-                seat.node
-            )));
-        }
-        let pool = lumen_zfs::PoolCreate {
-            name: request.name.clone(),
-            vdev: request.vdev,
-            disks: seat.disks.clone(),
-            ashift: request.ashift,
-            compression: request.compression,
-            autotrim: true,
-        };
-
-        let outcome = if seat.node == local_name {
-            // This node builds its own through the storage domain directly,
-            // for the same reason the inventory read does: only the caller
-            // holds the service.
-            state
-                .storage
-                .create_pool(
-                    pool,
-                    lumen_zfs::Acknowledgements {
-                        may_lose_data: true,
-                    },
-                )
-                .await
-                .map(|_| ())
-                .map_err(|err| ClusterError::Conflict(err.to_string()))
-        } else {
-            let Some(member) = nodes.iter().find(|node| node.name == seat.node) else {
-                return Err(ClusterError::NotFound(format!(
-                    "\"{}\" is not a node in this environment.",
-                    seat.node
-                )));
-            };
-            state.peers.create_pool(member, &pool).await
-        };
-
-        if let Err(err) = outcome {
-            return Err(ClusterError::Conflict(format!(
-                "\"{}\" could not build the pool: {err}. {} Nothing after it was attempted.",
-                seat.node,
-                if built.is_empty() {
-                    "No member has one yet.".to_string()
-                } else {
-                    format!("{} already has one.", built.join(", "))
-                }
-            )));
-        }
-        built.push(seat.node.clone());
-    }
-
-    Ok(ClusterPoolOutcome {
-        name: request.name.clone(),
-        built,
-    })
-}
-
 /// Clear one disk on one member of the environment.
 ///
 /// Routed here rather than left to `/api/storage/devices/{disk}/wipe` because
@@ -494,52 +383,6 @@ pub async fn environment(state: &Arc<AppState>) -> InventoryResponse {
     InventoryResponse {
         members: futures_util::future::join_all(calls).await,
     }
-}
-
-/// One member's share of a cluster-wide pool build: which of its disks go in.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PoolSeat {
-    pub node: String,
-    /// Disks as the picker reported them; each member resolves its own to
-    /// stable `/dev/disk/by-id` paths before anything is built.
-    pub disks: Vec<String>,
-}
-
-/// Build one identically named pool across several members at once.
-///
-/// This is the "pool the drives across the nodes" operation, and it is worth
-/// being exact about what it is not: there is no cluster-wide pool. Each
-/// member ends up with its own ZFS pool of the same name, on its own disks,
-/// listed and destroyed on its own Storage page. What that buys is
-/// replicated volumes — a volume placed on two members needs a pool of the
-/// same name on both, and doing that by hand across consoles is where the
-/// names drift apart.
-///
-/// A member whose pool cannot be built fails the call. Pools already built
-/// elsewhere stay, because they are that node's and are useful on their own;
-/// the error names the member so a retry can finish the job.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClusterPoolCreate {
-    /// The pool name, identical on every member — what makes a replicated
-    /// volume able to name one place and mean all of them.
-    pub name: String,
-    #[serde(default)]
-    pub vdev: lumen_zfs::VdevKind,
-    #[serde(default)]
-    pub compression: lumen_zfs::Compression,
-    #[serde(default)]
-    pub ashift: Option<u8>,
-    pub seats: Vec<PoolSeat>,
-    /// The operator has been told this reformats every disk listed.
-    #[serde(default)]
-    pub i_understand_this_erases_the_disks: bool,
-}
-
-/// What one cluster-wide pool build did, per member.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClusterPoolOutcome {
-    pub name: String,
-    pub built: Vec<String>,
 }
 
 /// This node's own inventory, assembled from the three domains that own the
