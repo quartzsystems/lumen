@@ -437,10 +437,13 @@ export function CreateVmDialog({
       if (draft.addVirtio && draft.virtioStorage && draft.virtioImage) {
         cdroms.push({ storage: draft.virtioStorage, image: draft.virtioImage });
       }
-      // Media first when there is any: a machine created to install an
-      // operating system should boot the installer, not the empty disk.
+      // Disk first, media second — even for an install. The firmware falls
+      // through anything it cannot boot, so the blank disk yields to the
+      // installer on day one, and the machine boots its own OS from the
+      // first restart after the install writes a bootloader. Media-first
+      // would boot the DVD forever, which nobody wants twice.
       const bootOrder: BootDevice[] =
-        cdroms.length > 0 ? ["cdrom", "disk", "network"] : ["disk", "network"];
+        cdroms.length > 0 ? ["disk", "cdrom", "network"] : ["disk", "network"];
 
       const cpuModel: CpuModel =
         draft.cpuType === HOST_MODEL

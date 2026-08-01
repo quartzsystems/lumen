@@ -420,6 +420,27 @@ export const attachNic = (vmid: number, body: NicCreate): Promise<VmUpdateRespon
 export const detachNic = (vmid: number, id: string): Promise<VmUpdateResponse> =>
   del<VmUpdateResponse>(`/vms/${vmid}/nics/${encodeURIComponent(id)}`);
 
+/// Add an optical drive — empty when no image is named, which is a real
+/// request.
+export const attachCdrom = (vmid: number, body: CdromCreate): Promise<VmUpdateResponse> =>
+  post<VmUpdateResponse>(`/vms/${vmid}/cdroms`, body);
+
+/// What is in the drive's tray. An empty body ejects; the drive stays.
+export const setCdromMedia = (
+  vmid: number,
+  id: string,
+  body: CdromCreate,
+): Promise<VmUpdateResponse> =>
+  apiFetch<VmUpdateResponse>(`/vms/${vmid}/cdroms/${encodeURIComponent(id)}`, {
+    method: "PUT",
+    body: JSON.stringify(body),
+  });
+
+/// Remove the drive itself. The image in its tray belongs to the media
+/// library and is untouched.
+export const detachCdrom = (vmid: number, id: string): Promise<VmUpdateResponse> =>
+  del<VmUpdateResponse>(`/vms/${vmid}/cdroms/${encodeURIComponent(id)}`);
+
 // --- the task log ------------------------------------------------------------
 
 export type TaskStatus = "ok" | "error";

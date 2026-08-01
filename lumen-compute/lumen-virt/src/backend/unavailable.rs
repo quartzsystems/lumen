@@ -79,6 +79,9 @@ impl VirtBackend for UnavailableBackend {
     async fn detach_device_live(&self, _name: &str, _device_xml: &str) -> Result<()> {
         self.error()
     }
+    async fn update_device_live(&self, _name: &str, _device_xml: &str) -> Result<()> {
+        self.error()
+    }
     async fn set_memory_live(&self, _name: &str, _mib: u64) -> Result<()> {
         self.error()
     }

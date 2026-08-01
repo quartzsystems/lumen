@@ -15,7 +15,7 @@ use axum::extract::{Path, Query, State};
 use axum::Json;
 
 use lumen_virt::service::{
-    DiskCreate, NicCreate, VmCreate, VmDeleteResponse, VmMigrateResponse, VmPatch,
+    CdromCreate, DiskCreate, NicCreate, VmCreate, VmDeleteResponse, VmMigrateResponse, VmPatch,
     VmUpdateResponse, VmView, VmsResponse,
 };
 use lumen_virt::{Acknowledgements, CpuModels, OsCatalog, PushedFile, MAX_GUEST_FILE_BYTES};
@@ -492,6 +492,71 @@ pub async fn detach_nic(
     let detail = format!("Detach network adapter {id}");
     let result = state.virt.detach_nic(vmid, &id).await;
     record(&state, &session, vmid, "detach-nic", detail, &result);
+    if result.is_ok() {
+        sync_definition(&state, vmid).await;
+    }
+    Ok(Json(result?))
+}
+
+/// What a cdrom request is about, for the task log's one sentence.
+fn media_words(request: &CdromCreate) -> String {
+    match request.image.as_deref() {
+        Some(image) => format!("with {image}"),
+        None => "empty".to_string(),
+    }
+}
+
+/// POST /api/vms/{vmid}/cdroms — add an optical drive, empty or loaded. An
+/// absent body is an empty drive, which is a real thing to ask for.
+pub async fn attach_cdrom(
+    session: Session,
+    State(state): State<Arc<AppState>>,
+    Path(vmid): Path<u32>,
+    raw: Body,
+) -> Result<Json<VmUpdateResponse>, ApiError> {
+    let request: CdromCreate = body(raw)?;
+    let detail = format!("Add a CD/DVD drive, {}", media_words(&request));
+    let result = state.virt.attach_cdrom(vmid, request).await;
+    record(&state, &session, vmid, "attach-cdrom", detail, &result);
+    if result.is_ok() {
+        sync_definition(&state, vmid).await;
+    }
+    Ok(Json(result?))
+}
+
+/// PUT /api/vms/{vmid}/cdroms/{id} — what is in the tray. An absent body or
+/// an empty one ejects.
+pub async fn set_cdrom_media(
+    session: Session,
+    State(state): State<Arc<AppState>>,
+    Path((vmid, id)): Path<(u32, String)>,
+    raw: Body,
+) -> Result<Json<VmUpdateResponse>, ApiError> {
+    let request: CdromCreate = body(raw)?;
+    let detail = match request.image.as_deref() {
+        Some(image) => format!("Put {image} in drive {id}"),
+        None => format!("Eject drive {id}"),
+    };
+    let result = state.virt.set_cdrom_media(vmid, &id, request).await;
+    record(&state, &session, vmid, "cdrom-media", detail, &result);
+    if result.is_ok() {
+        sync_definition(&state, vmid).await;
+    }
+    Ok(Json(result?))
+}
+
+/// DELETE /api/vms/{vmid}/cdroms/{id} — remove the drive. The image in its
+/// tray belongs to the media library and is untouched.
+pub async fn detach_cdrom(
+    session: Session,
+    State(state): State<Arc<AppState>>,
+    Path((vmid, id)): Path<(u32, String)>,
+    raw: Body,
+) -> Result<Json<VmUpdateResponse>, ApiError> {
+    node_only(raw)?;
+    let detail = format!("Remove CD/DVD drive {id}");
+    let result = state.virt.detach_cdrom(vmid, &id).await;
+    record(&state, &session, vmid, "detach-cdrom", detail, &result);
     if result.is_ok() {
         sync_definition(&state, vmid).await;
     }

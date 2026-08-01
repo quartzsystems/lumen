@@ -501,7 +501,7 @@ pub struct DiskCreate {
 /// its file name, never by a path: a path from the console would be a path the
 /// console chose, and the one rule about where media may live belongs in the
 /// storage domain.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CdromCreate {
     /// The pool whose media library the image is in. Absent leaves the drive
@@ -2064,6 +2064,140 @@ impl VirtService {
         })
     }
 
+    /// Add an optical drive, empty or with an image already in the tray. The
+    /// image is named by storage and file name like at create — the storage
+    /// domain owns where media may live, and this is the only door.
+    ///
+    /// The live attach is attempted and its refusal reported honestly: SATA
+    /// has no hotplug on this machine type, so a running guest usually takes
+    /// the drive at its next restart, and the answer says so in the
+    /// hypervisor's own words rather than pretending it appeared.
+    pub async fn attach_cdrom(&self, vmid: u32, request: CdromCreate) -> Result<VmUpdateResponse> {
+        let _guard = self.gate.lock().await;
+        let machine = self.machine(vmid).await?;
+        let mut config = machine.config.clone();
+
+        let source = self.resolve_media(&request).await?;
+        let cdrom = VmCdrom {
+            id: config.next_cdrom_target(),
+            source,
+            boot_index: None,
+        };
+        config.cdroms.push(cdrom.clone());
+
+        self.backend
+            .define(&domain_xml::redefine(
+                &config,
+                machine.observed.uuid.as_deref(),
+            ))
+            .await?;
+        let (applied_live, pending_reboot) = self
+            .live_device(&machine, true, &domain_xml::cdrom_fragment(&cdrom), &cdrom.id)
+            .await;
+
+        tracing::info!(vmid, cdrom = %cdrom.id, "optical drive attached");
+        Ok(VmUpdateResponse {
+            vm: self.get(vmid).await?,
+            applied_live,
+            pending_reboot,
+        })
+    }
+
+    /// Change what is in a drive's tray: another image, or nothing — ejecting
+    /// is a real request, and what a machine wants once its installer is done.
+    ///
+    /// On a running machine this is an update of the device it already has,
+    /// not an unplug: the hypervisor swaps the medium the way a finger on a
+    /// physical tray would, which SATA is perfectly happy to do live even
+    /// though it refuses hotplug of the drive itself.
+    pub async fn set_cdrom_media(
+        &self,
+        vmid: u32,
+        id: &str,
+        request: CdromCreate,
+    ) -> Result<VmUpdateResponse> {
+        let _guard = self.gate.lock().await;
+        let machine = self.machine(vmid).await?;
+        let mut config = machine.config.clone();
+        let position = config
+            .cdroms
+            .iter()
+            .position(|c| c.id == id)
+            .ok_or_else(|| {
+                VirtError::NotFound(format!("\"{id}\" is not an optical drive on this machine."))
+            })?;
+
+        let source = self.resolve_media(&request).await?;
+        config.cdroms[position].source = source;
+        let cdrom = config.cdroms[position].clone();
+
+        self.backend
+            .define(&domain_xml::redefine(
+                &config,
+                machine.observed.uuid.as_deref(),
+            ))
+            .await?;
+
+        let what = match cdrom.source.as_deref() {
+            Some(_) => "media changed",
+            None => "media ejected",
+        };
+        let (applied_live, pending_reboot) = if machine.observed.state.is_running() {
+            match self
+                .backend
+                .update_device_live(&machine.config.name, &domain_xml::cdrom_fragment(&cdrom))
+                .await
+            {
+                Ok(()) => (vec![format!("\"{id}\" {what}")], Vec::new()),
+                Err(err) => (
+                    Vec::new(),
+                    vec![format!(
+                        "\"{id}\" {what} when the machine restarts ({err})"
+                    )],
+                ),
+            }
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        tracing::info!(vmid, cdrom = %id, what, "optical drive media set");
+        Ok(VmUpdateResponse {
+            vm: self.get(vmid).await?,
+            applied_live,
+            pending_reboot,
+        })
+    }
+
+    /// Remove an optical drive altogether. Nothing to purge: the image in the
+    /// tray belongs to the media library, not to this machine.
+    pub async fn detach_cdrom(&self, vmid: u32, id: &str) -> Result<VmUpdateResponse> {
+        let _guard = self.gate.lock().await;
+        let machine = self.machine(vmid).await?;
+        let cdrom = machine.config.cdrom(id).cloned().ok_or_else(|| {
+            VirtError::NotFound(format!("\"{id}\" is not an optical drive on this machine."))
+        })?;
+
+        let (applied_live, pending_reboot) = self
+            .live_device(&machine, false, &domain_xml::cdrom_fragment(&cdrom), id)
+            .await;
+
+        let mut config = machine.config.clone();
+        config.cdroms.retain(|c| c.id != id);
+        self.backend
+            .define(&domain_xml::redefine(
+                &config,
+                machine.observed.uuid.as_deref(),
+            ))
+            .await?;
+
+        tracing::info!(vmid, cdrom = %id, "optical drive detached");
+        Ok(VmUpdateResponse {
+            vm: self.get(vmid).await?,
+            applied_live,
+            pending_reboot,
+        })
+    }
+
     // --- files into a guest -----------------------------------------------
 
     /// Write a file into a running guest, through the guest's own agent.
@@ -3276,6 +3410,77 @@ mod tests {
         assert_eq!(vm.boot_order, vec![BootDevice::Cdrom, BootDevice::Disk]);
         assert_eq!(vm.cdroms[0].boot_index, Some(1));
         assert_eq!(vm.disks[0].boot_index, Some(3));
+    }
+
+    /// The drive's life after create: added, loaded, ejected, removed — the
+    /// install-then-run story, without redefining the machine by hand.
+    #[tokio::test]
+    async fn an_optical_drive_can_be_added_loaded_ejected_and_removed() {
+        let h = harness("cdrom-verbs").await;
+        seed_image(&h, "boot", "almalinux-10.iso").await;
+        let vm = h.service.create(create("web01")).await.unwrap();
+        assert!(vm.cdroms.is_empty());
+
+        // Added empty: a drive with nothing in it is a real device.
+        let empty = CdromCreate {
+            storage: None,
+            image: None,
+            source: None,
+        };
+        let response = h.service.attach_cdrom(vm.vmid, empty.clone()).await.unwrap();
+        assert_eq!(response.vm.cdroms.len(), 1);
+        assert_eq!(response.vm.cdroms[0].source, None);
+        let id = response.vm.cdroms[0].id.clone();
+
+        // Media in — named by storage and file, exactly as at create...
+        let response = h
+            .service
+            .set_cdrom_media(
+                vm.vmid,
+                &id,
+                CdromCreate {
+                    storage: Some("boot".into()),
+                    image: Some("almalinux-10.iso".into()),
+                    source: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(response.vm.cdroms[0]
+            .source
+            .as_deref()
+            .unwrap()
+            .ends_with("almalinux-10.iso"));
+
+        // ...and out again. Ejecting keeps the drive.
+        let response = h
+            .service
+            .set_cdrom_media(vm.vmid, &id, empty.clone())
+            .await
+            .unwrap();
+        assert_eq!(response.vm.cdroms.len(), 1);
+        assert_eq!(response.vm.cdroms[0].source, None);
+
+        // A path named directly is refused here exactly as at create — the
+        // storage domain owns where media may live.
+        assert!(h
+            .service
+            .set_cdrom_media(
+                vm.vmid,
+                &id,
+                CdromCreate {
+                    storage: None,
+                    image: None,
+                    source: Some("/etc/shadow".into()),
+                },
+            )
+            .await
+            .is_err());
+
+        // Removed, and a second removal says there is nothing there.
+        let response = h.service.detach_cdrom(vm.vmid, &id).await.unwrap();
+        assert!(response.vm.cdroms.is_empty());
+        assert!(h.service.detach_cdrom(vm.vmid, &id).await.is_err());
     }
 
     /// The drive is empty, which is a real thing to ask for, and stays a drive.

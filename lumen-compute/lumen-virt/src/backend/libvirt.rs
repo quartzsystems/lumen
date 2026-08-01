@@ -362,6 +362,14 @@ impl VirtBackend for LibvirtBackend {
         .await
     }
 
+    async fn update_device_live(&self, name: &str, device_xml: &str) -> Result<()> {
+        let xml = device_xml.to_string();
+        self.with_domain(name, move |domain| {
+            domain.update_device_flags(&xml, LIVE_ONLY).map(|_| ())
+        })
+        .await
+    }
+
     async fn set_memory_live(&self, name: &str, mib: u64) -> Result<()> {
         let kib = mib.saturating_mul(1024);
         self.with_domain(name, move |domain| {

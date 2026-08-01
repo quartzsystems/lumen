@@ -102,6 +102,11 @@ pub trait VirtBackend: Send + Sync {
     /// Detach a device from the machine that is running right now.
     async fn detach_device_live(&self, name: &str, device_xml: &str) -> Result<()>;
 
+    /// Update a device the running machine already has — how media changes
+    /// in an optical drive without unplugging it. The hypervisor matches on
+    /// the target name and refuses anything but the source changing.
+    async fn update_device_live(&self, name: &str, device_xml: &str) -> Result<()>;
+
     /// Change the memory of the running machine. The hypervisor allows this
     /// only within the maximum the machine was started with, and says so when
     /// it does not — which is exactly the "waiting for a restart" answer.

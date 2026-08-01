@@ -460,6 +460,10 @@ impl VirtBackend for MockBackend {
         self.inner.lock().unwrap().live("detach", name)
     }
 
+    async fn update_device_live(&self, name: &str, _device_xml: &str) -> Result<()> {
+        self.inner.lock().unwrap().live("update", name)
+    }
+
     async fn set_memory_live(&self, name: &str, mib: u64) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
         inner.live("memory", name)?;

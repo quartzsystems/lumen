@@ -26,11 +26,13 @@ import { RowActions } from "@/components/console/RowActions";
 import { fetchEnvironment } from "@/lib/clusterClient";
 import { fetchPooledStorage, type PooledStorageView } from "@/lib/poolClient";
 import { fetchInterfaces } from "@/lib/networkClient";
-import { fetchPools, type PoolView } from "@/lib/storageClient";
+import { fetchIsos, fetchPools, type IsoView, type PoolView } from "@/lib/storageClient";
 import {
+  attachCdrom,
   attachDisk,
   attachNic,
   cpuModelLabel,
+  detachCdrom,
   detachDisk,
   detachNic,
   fetchCpuModels,
@@ -39,6 +41,7 @@ import {
   migrateVm,
   NIC_MODEL_LABEL,
   SCSI_CONTROLLER_LABEL,
+  setCdromMedia,
   updateVm,
   validationErrorsOf,
   VIDEO_HINT,
@@ -48,6 +51,7 @@ import {
   type DiskBus,
   type NicModel,
   type VideoModel,
+  type VmCdrom,
   type VmPatch,
   type VmUpdateResponse,
   type VmView,
@@ -116,8 +120,10 @@ export function VmHardware({
   busy: boolean;
   onChanged: (message: string) => Promise<void> | void;
 }) {
-  const [adding, setAdding] = useState<"disk" | "nic" | null>(null);
+  const [adding, setAdding] = useState<"disk" | "nic" | "cdrom" | null>(null);
   const [editing, setEditing] = useState<SizingKey | null>(null);
+  /// The drive whose tray is being changed, when one is.
+  const [editingCdrom, setEditingCdrom] = useState<VmCdrom | null>(null);
   const [working, setWorking] = useState(false);
   const [migrating, setMigrating] = useState(false);
   /// The pool serving this machine's /dev/ublkb disks — sizes for the
@@ -345,10 +351,6 @@ export function VmHardware({
         />
       ),
     })),
-    // Read-only for now: a drive is defined with the machine, and changing
-    // what is in one after the fact needs an eject/insert the API does not
-    // have yet. Shown regardless, because a machine that boots off media an
-    // operator cannot see is a machine nobody can explain.
     ...vm.cdroms.map((cdrom) => ({
       key: `cdrom-${cdrom.id}`,
       icon: Disc,
@@ -358,6 +360,18 @@ export function VmHardware({
         <span className="qz-mono" title={cdrom.source ?? undefined}>
           {cdrom.source ? cdrom.source.split("/").pop() : "empty"}
         </span>
+      ),
+      actions: (
+        <RowActions
+          label={`drive ${cdrom.id}`}
+          onEdit={() => setEditingCdrom(cdrom)}
+          editDisabled={disabled}
+          editTitle="Change or eject what is in the drive."
+          deleteDisabled={disabled}
+          onDelete={() =>
+            run(() => detachCdrom(vm.vmid, cdrom.id), `Drive ${cdrom.id} removed`)
+          }
+        />
       ),
     })),
     ...vm.nics.map((nic, index) => ({
@@ -429,6 +443,15 @@ export function VmHardware({
             >
               Add adapter
             </Button>
+            <Button
+              kind="secondary"
+              size="sm"
+              icon={Plus}
+              disabled={disabled}
+              onClick={() => setAdding("cdrom")}
+            >
+              Add CD/DVD
+            </Button>
             {allReplicated && (
               <span
                 title={
@@ -470,6 +493,21 @@ export function VmHardware({
           onAdded={async (response) => {
             setAdding(null);
             await report(response, "Adapter attached");
+          }}
+        />
+      )}
+      {(adding === "cdrom" || editingCdrom) && (
+        <CdromMediaDialog
+          vm={vm}
+          drive={editingCdrom}
+          onClose={() => {
+            setAdding(null);
+            setEditingCdrom(null);
+          }}
+          onDone={async (response, what) => {
+            setAdding(null);
+            setEditingCdrom(null);
+            await report(response, what);
           }}
         />
       )}
@@ -832,6 +870,115 @@ function AddDiskDialog({
           saving={saving}
           savingLabel="Creating…"
           submitLabel="Add disk"
+        />
+      </form>
+    </ModalShell>
+  );
+}
+
+/// One dialog for both halves of a drive's life: adding one (no `drive`),
+/// and changing what is in the tray of one the machine already has. The
+/// choice is the same either way — an image from the media library, or
+/// nothing, because an empty drive is a real thing to ask for and ejecting
+/// is how installation media leaves.
+function CdromMediaDialog({
+  vm,
+  drive,
+  onClose,
+  onDone,
+}: {
+  vm: VmView;
+  drive: VmCdrom | null;
+  onClose: () => void;
+  onDone: (response: VmUpdateResponse, what: string) => Promise<void>;
+}) {
+  const [isos, setIsos] = useState<IsoView[] | null>(null);
+  // `storage name`, or "" for an empty tray — a separator no dataset
+  // name can carry, so the two halves split back apart safely.
+  const [choice, setChoice] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        const response = await fetchIsos();
+        setIsos(response.images);
+        if (drive?.source) {
+          const current = response.images.find((image) => image.path === drive.source);
+          if (current) setChoice(`${current.storage} ${current.name}`);
+        }
+      } catch {
+        setIsos([]);
+      }
+    })();
+  }, [drive]);
+
+  const submit = async () => {
+    setSaving(true);
+    setError(null);
+    // The FIRST space is the separator: a pool name cannot carry one, an
+    // image name can.
+    const separator = choice.indexOf(" ");
+    const image = separator > 0 ? choice.slice(separator + 1) : undefined;
+    const body = separator > 0 ? { storage: choice.slice(0, separator), image } : {};
+    try {
+      const response = drive
+        ? await setCdromMedia(vm.vmid, drive.id, body)
+        : await attachCdrom(vm.vmid, body);
+      const what = drive
+        ? image
+          ? `${image} put in ${drive.id}`
+          : `${drive.id} ejected`
+        : "CD/DVD drive added";
+      await onDone(response, what);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Something went wrong.");
+      setSaving(false);
+    }
+  };
+
+  return (
+    <ModalShell onClose={onClose}>
+      <ModalHeader
+        title={drive ? `CD/DVD Drive (${drive.id})` : "Add a CD/DVD drive"}
+        subtitle={
+          drive
+            ? "What is in the tray. The hypervisor swaps media on a running machine; adding or removing the drive itself waits for a restart."
+            : "The drive can start empty, or with an image from the media library already in it."
+        }
+        onClose={onClose}
+      />
+      <form
+        className="flex flex-col gap-4"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void submit();
+        }}
+      >
+        <Field
+          label="Image"
+          htmlFor="cdrom-image"
+          hint="Images live in a pool's media library — upload them on the Storage page."
+        >
+          <SelectInput id="cdrom-image" value={choice} mono onChange={setChoice}>
+            <option value="">{drive ? "Empty — eject" : "Empty drive"}</option>
+            {(isos ?? []).map((image) => (
+              <option
+                key={`${image.storage} ${image.name}`}
+                value={`${image.storage} ${image.name}`}
+              >
+                {image.name} — {image.storage}, {formatBytes(image.size)}
+              </option>
+            ))}
+          </SelectInput>
+        </Field>
+        {error && <ErrorText msg={error} />}
+        <ModalFooter
+          onCancel={onClose}
+          saving={saving}
+          savingLabel="Saving…"
+          submitLabel={drive ? "Save" : "Add drive"}
         />
       </form>
     </ModalShell>

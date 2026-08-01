@@ -111,6 +111,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/vms/{vmid}/disks/{id}", delete(vms::detach_disk))
         .route("/api/vms/{vmid}/nics", post(vms::attach_nic))
         .route("/api/vms/{vmid}/nics/{id}", delete(vms::detach_nic))
+        .route("/api/vms/{vmid}/cdroms", post(vms::attach_cdrom))
+        .route("/api/vms/{vmid}/cdroms/{id}", put(vms::set_cdrom_media))
+        .route("/api/vms/{vmid}/cdroms/{id}", delete(vms::detach_cdrom))
         // The same log as /api/vms/{vmid}/tasks, unfiltered and windowed —
         // what the dashboard shows as activity across every machine. Not
         // under /api/vms because it is not about one machine.
