@@ -14,8 +14,8 @@ use crate::model::{
     MAX_CLUSTER_NODES, MIN_CLUSTER_NODES,
 };
 use crate::networks::{
-    AddressedMember, ClusterNetworks, CoreNetwork, ExternalNetwork, ManagementNetwork, Subnet,
-    Uplink, VlanMode,
+    AddressedMember, ClusterNetworks, CoreNetwork, ExternalNetwork, ManagementNetwork, NetworkType,
+    Subnet, Uplink,
 };
 
 /// `i_understand_this_may_lose_data` from a request body, in the repo's
@@ -402,8 +402,12 @@ pub struct MemberCreate {
 pub struct ExternalCreate {
     pub name: String,
     pub bridge: String,
-    #[serde(flatten)]
-    pub vlan: VlanMode,
+    #[serde(default, rename = "type")]
+    pub network_type: NetworkType,
+    #[serde(default)]
+    pub vlan: Option<u16>,
+    #[serde(default)]
+    pub bond: Option<lumen_net::BondMode>,
     pub uplinks: Vec<Uplink>,
 }
 
@@ -548,7 +552,9 @@ impl ClusterCreate {
                 .map(|external| ExternalNetwork {
                     name: external.name.clone(),
                     bridge: external.bridge.clone(),
-                    vlan: external.vlan.clone(),
+                    network_type: external.network_type,
+                    vlan: external.vlan,
+                    bond: external.bond,
                     uplinks: external.uplinks.clone(),
                 })
                 .collect(),

@@ -600,6 +600,54 @@ External networks and the cluster VIP change freely, Core changes in the
 ways that do not touch the ring's addressing, and Management does not
 change at all.
 
+**What an External network is** is three fields and a seat per member. `type`
+is `layer2`, `layer3`, or `vxlan`; only Layer 2 is built today, and a create
+asking for either of the others is refused in so many words rather than
+accepted and quietly realized as something else. They are named in the record
+and offered — disabled — by the console because the choice belongs to the
+network's definition rather than to a later migration: a record that cannot
+say which kind a network is, is a record every future reader has to guess at.
+
+A Layer 2 network's `vlan` is optional and is the whole of its VLAN
+semantics. Set, the member builds `<uplink>.<vlan>` and bridges *that*: the
+bridge carries untagged frames and the tag is put on and taken off underneath,
+which is what makes it an access network onto that one VLAN. Absent, the
+member bridges the uplink directly with VLAN filtering on, and every tag
+reaches the machines. This replaces an earlier `mode: trunk | access` pair,
+which said the same two things at more length — and whose trunk-side `allowed`
+list was validated but never pushed to a host, so it named VLANs nothing
+enforced. Records written in the old form still decode: a recorded `access`
+becomes that VLAN and a recorded `trunk` becomes no VLAN, which is what it
+already meant on the wire.
+
+**Uplinks are per member and plural.** `uplinks[].interfaces` is the list of
+ports that member carries the network on, because both facts are about
+cabling: the same network can arrive on `nic1` here and `nic3` there, and a
+member with two spare ports can have redundancy where a member with one
+cannot. One port is used as-is. Two or more are bonded first — the member
+builds `bn-<network>` from `bond` (`802.3ad`, `active-backup`, or
+`balance-xor`, one choice for the network because it is a fact about the
+switches) and everything above names the bond instead of a NIC, so a bonded
+access network is ports → `bn-guests` → `bn-guests.40` → the bridge. The mode
+carries the only knobs that are not safely defaulted; `miimon=100`, LACP's
+fast rate and layer3+4 hashing, and active-backup's primary (the first port
+the operator picked, so the resting state is the one they cabled for) come
+with it, and the bond is an ordinary link on Interfaces afterwards like any
+other. A single port builds no bond at all rather than a bond of one, which
+would be a link with an extra name and no redundancy.
+
+The bond's name is derived rather than stored, so it is identical on every
+member and two nodes' Interfaces pages agree about one thing. The prefix is
+`bn-` rather than `bond-` because of what rides on top: an access network's
+VLAN interface is `<bond>.<vlan>`, the kernel takes 15 characters for that
+name too, and a four-digit tag costs five of them — `bond-` would leave five
+characters for the network's name and refuse "guests" on VLAN 4094. A name
+that still will not fit is refused up front, by the console before the request
+and by the workflow before any member is asked, with the two ways out named:
+a shorter network name, or a bond built on Interfaces first and picked as the
+uplink. Truncating instead is how two networks end up sharing one bond name
+on a box where the second silently fails to build.
+
 **External networks** change the way they are defined: `PUT
 /api/environment/clusters/{name}/networks/external/{network}` rebuilds the
 bridge on every member and only then rewrites the record. Same order and

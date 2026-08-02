@@ -1,4 +1,5 @@
 import { apiFetch } from "@/lib/authClient";
+import type { BondMode } from "@/lib/networkClient";
 
 // Typed view of /api/environment, modelled on lib/nodeClient.ts: exported
 // interfaces plus thin functions, no logic. Field names mirror lumen-cluster's
@@ -172,20 +173,56 @@ export interface ManagementNetwork {
   members: AddressedMember[];
 }
 
-/// One node's uplink into an External network.
+/// One node's uplink into an External network. More than one interface is a
+/// bond: the member bonds the listed ports and carries the network on the
+/// bond.
 export interface Uplink {
   node: string;
-  interface: string;
+  interfaces: string[];
 }
 
+/// What an External network is made of. Only `layer2` is buildable today; the
+/// other two are offered disabled, because the choice belongs to the network's
+/// definition rather than to a later migration.
+export type NetworkType = "layer2" | "layer3" | "vxlan";
+
 /// An External network: VM traffic over an identically named bridge on every
-/// member, no host addressing. The VLAN mode is flattened onto the object,
-/// exactly as lumen-cluster serializes it.
-export type ExternalNetwork = {
+/// member, no host addressing.
+///
+/// `vlan` absent leaves the bridge VLAN-aware, passing every tag through to
+/// the machines; set, it makes the network an access port onto that one VLAN.
+/// `bond` is absent unless some member carries the network on more than one
+/// port.
+export interface ExternalNetwork {
   name: string;
   bridge: string;
+  type: NetworkType;
+  vlan?: number;
+  bond?: BondMode;
   uplinks: Uplink[];
-} & ({ mode: "trunk"; allowed: number[] } | { mode: "access"; vlan: number });
+}
+
+/// The bond a member builds when it carries a network on more than one port.
+///
+/// Mirrors lumen-cluster's `bond_name_for`: derived from the network's name
+/// rather than sent, so it is the same on every member. Duplicated here rather
+/// than fetched because the dialog has to *show* the name while the operator
+/// is still typing one — and because a name that cannot fit should be said so
+/// before the request, not after the first member refuses it.
+export const bondNameFor = (network: string): string =>
+  `bn-${network
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "")}`;
+
+/// Whether a derived bond name — and the VLAN interface that would ride on
+/// it — fit the 15 characters the kernel takes for a link name.
+export const bondNameFits = (bond: string, vlan?: number): boolean => {
+  if (bond.length <= "bn-".length) return false;
+  const longest = vlan === undefined ? bond.length : bond.length + 1 + String(vlan).length;
+  return longest <= 15;
+};
 
 /// Everything a cluster's members share, as one document.
 export interface ClusterNetworks {
@@ -231,11 +268,7 @@ export const updateCoreNetwork = (
 /// resolve, which is the failure HA exists to prevent. The dialog collects an
 /// uplink for every member for that reason, and the backend refuses anything
 /// short.
-export type ExternalNetworkCreate = {
-  name: string;
-  bridge: string;
-  uplinks: Uplink[];
-} & ({ mode: "trunk"; allowed: number[] } | { mode: "access"; vlan: number });
+export type ExternalNetworkCreate = ExternalNetwork;
 
 /// Define an External network and realize its bridge on every member.
 ///

@@ -61,8 +61,9 @@ pub use model::{
     COROSYNC_PORT, FENCE_RACE_DELAY_SECS, MAX_CLUSTER_NODES, MIN_CLUSTER_NODES,
 };
 pub use networks::{
-    valid_bridge_name, AddressedMember, ClusterNetworks, CoreNetwork, CoreNetworkUpdate,
-    ExternalNetwork, ManagementNetwork, Subnet, Uplink, VlanMode,
+    bond_name_fits, bond_name_for, valid_bridge_name, AddressedMember, ClusterNetworks,
+    CoreNetwork, CoreNetworkUpdate, ExternalNetwork, ManagementNetwork, NetworkType, Subnet,
+    Uplink,
 };
 pub use service::{
     quorum_survives_loss, AddNodePlan, ClusterHealth, ClusterNodeView, ClusterService, ClusterView,

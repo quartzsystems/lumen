@@ -14,8 +14,8 @@ use tower::ServiceExt;
 
 use lumen_cluster::backend::mock::{environment_membership, membership_of, MockBackend};
 use lumen_cluster::networks::{
-    AddressedMember, ClusterNetworks, CoreNetwork, ExternalNetwork, ManagementNetwork, Uplink,
-    VlanMode,
+    AddressedMember, ClusterNetworks, CoreNetwork, ExternalNetwork, ManagementNetwork, NetworkType,
+    Uplink,
 };
 use lumen_cluster::{
     BmcConfig, ClusterDefinition, ClusterRecord, ClusterService, EnvironmentMembership, JoinToken,
@@ -464,17 +464,17 @@ fn membership_with_networks() -> EnvironmentMembership {
             external: vec![ExternalNetwork {
                 name: "vm-lan".into(),
                 bridge: "vmbr1".into(),
-                vlan: VlanMode::Trunk {
-                    allowed: vec![10, 20],
-                },
+                network_type: NetworkType::Layer2,
+                vlan: Some(20),
+                bond: None,
                 uplinks: vec![
                     Uplink {
                         node: "alpha-1".into(),
-                        interface: "nic2".into(),
+                        interfaces: vec!["nic2".into()],
                     },
                     Uplink {
                         node: "alpha-2".into(),
-                        interface: "nic2".into(),
+                        interfaces: vec!["nic2".into()],
                     },
                 ],
             }],
@@ -512,18 +512,20 @@ async fn the_typed_networks_are_read_off_the_replicated_record() {
     assert_eq!(body["management"]["subnet"], "192.168.10.0/24");
     assert_eq!(body["management"]["vip"], "192.168.10.100");
     assert_eq!(body["management"]["members"][1]["interface"], "br0");
-    // The VLAN mode is flattened onto the External object — the wire shape
-    // the console's ExternalNetwork type mirrors.
+    // The type, the VLAN and the per-member ports sit directly on the External
+    // object — the wire shape the console's ExternalNetwork type mirrors. The
+    // bond is absent because no member is bonded, which is what makes an
+    // unbonded network's record say nothing about bonding.
     assert_eq!(
         body["external"][0],
         serde_json::json!({
             "name": "vm-lan",
             "bridge": "vmbr1",
-            "mode": "trunk",
-            "allowed": [10, 20],
+            "type": "layer2",
+            "vlan": 20,
             "uplinks": [
-                { "node": "alpha-1", "interface": "nic2" },
-                { "node": "alpha-2", "interface": "nic2" },
+                { "node": "alpha-1", "interfaces": ["nic2"] },
+                { "node": "alpha-2", "interfaces": ["nic2"] },
             ],
         })
     );
@@ -1068,11 +1070,10 @@ async fn an_external_network_is_built_on_every_member_before_it_is_recorded() {
         Some(serde_json::json!({
             "name": "vm-net",
             "bridge": "vmbr1",
-            "mode": "trunk",
-            "allowed": [10, 20],
+            "type": "layer2",
             "uplinks": [
-                { "node": "alpha-1", "interface": "nic3" },
-                { "node": "alpha-2", "interface": "nic3" },
+                { "node": "alpha-1", "interfaces": ["nic3"] },
+                { "node": "alpha-2", "interfaces": ["nic3"] },
             ],
         })),
     )
@@ -1080,16 +1081,20 @@ async fn an_external_network_is_built_on_every_member_before_it_is_recorded() {
     assert_eq!(status, StatusCode::CREATED, "{answer}");
     assert_eq!(answer["name"], "vm-net");
 
-    // Built on both members, as a trunk — VLAN aware, no VLAN interface
-    // underneath, because the tags are meant to reach the machines.
+    // Built on both members with no VLAN asked for — VLAN aware, no VLAN
+    // interface underneath, because the tags are meant to reach the machines.
     let built = harness.peers.bridges();
     assert_eq!(built.len(), 2, "one bridge per member");
     assert!(built.iter().any(|(node, _)| node == "alpha-1"));
     assert!(built.iter().any(|(node, _)| node == "alpha-2"));
     for (_, seat) in &built {
         assert_eq!(seat.bridge.name, "vmbr1");
-        assert!(seat.bridge.vlan_filtering, "a trunk is VLAN aware");
-        assert!(seat.vlan.is_none(), "a trunk needs no VLAN interface");
+        assert!(
+            seat.bridge.vlan_filtering,
+            "no VLAN asked for is VLAN aware"
+        );
+        assert!(seat.vlan.is_none(), "no VLAN asked for needs no interface");
+        assert!(seat.bond.is_none(), "one port is not a bond");
         assert_eq!(seat.bridge.ports, vec!["nic3".to_string()]);
     }
 
@@ -1131,11 +1136,11 @@ async fn an_access_network_bridges_a_vlan_interface_rather_than_the_uplink() {
         Some(serde_json::json!({
             "name": "office",
             "bridge": "vmbr2",
-            "mode": "access",
+            "type": "layer2",
             "vlan": 30,
             "uplinks": [
-                { "node": "alpha-1", "interface": "nic3" },
-                { "node": "alpha-2", "interface": "nic3" },
+                { "node": "alpha-1", "interfaces": ["nic3"] },
+                { "node": "alpha-2", "interfaces": ["nic3"] },
             ],
         })),
     )
@@ -1152,6 +1157,326 @@ async fn an_access_network_bridges_a_vlan_interface_rather_than_the_uplink() {
         assert_eq!(seat.bridge.ports, vec!["nic3.30".to_string()]);
         assert!(!seat.bridge.vlan_filtering);
     }
+}
+
+/// Two ports on a member is a bond, and everything above it names the bond
+/// rather than a NIC. The stack is what this checks: ports into the bond, bond
+/// into the VLAN interface, VLAN interface into the bridge — a seat that got
+/// any of those edges wrong would build three links that are not connected to
+/// each other.
+#[tokio::test]
+async fn two_uplinks_on_a_member_are_bonded_and_everything_above_rides_the_bond() {
+    let harness = harness(
+        "external-bond",
+        MockBackend::environment(),
+        MockPeers::new(),
+        Some(&alpha_with_record()),
+    );
+    let cookie = sign_in(&harness.router).await;
+
+    let (status, answer) = request(
+        &harness.router,
+        Method::POST,
+        "/api/environment/clusters/alpha/networks/external",
+        Some(&cookie),
+        None,
+        Some(serde_json::json!({
+            "name": "guests",
+            "bridge": "vmbr5",
+            "type": "layer2",
+            "vlan": 40,
+            "bond": "802.3ad",
+            "uplinks": [
+                { "node": "alpha-1", "interfaces": ["nic3", "nic4"] },
+                // Cabling is per node: the same network arrives on a different
+                // pair here, and on this member it is a single port.
+                { "node": "alpha-2", "interfaces": ["nic3"] },
+            ],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+
+    let built = harness.peers.bridges();
+    let (_, bonded) = built
+        .iter()
+        .find(|(node, _)| node == "alpha-1")
+        .expect("alpha-1 builds a seat");
+    let bond = bonded.bond.as_ref().expect("two ports is a bond");
+    assert_eq!(bond.name, "bn-guests");
+    assert_eq!(bond.ports, vec!["nic3".to_string(), "nic4".to_string()]);
+    assert_eq!(bond.mode, lumen_net::BondMode::Ieee8023ad);
+    // The defaults that make the chosen mode behave the way its name implies.
+    assert_eq!(bond.miimon, Some(100));
+    assert_eq!(bond.lacp_rate, Some(lumen_net::LacpRate::Fast));
+    assert_eq!(
+        bond.xmit_hash_policy,
+        Some(lumen_net::XmitHashPolicy::Layer3Plus4)
+    );
+    assert_eq!(bond.primary, None, "LACP has no preferred port");
+    // The stack above it, each layer naming the one below.
+    let vlan = bonded.vlan.as_ref().expect("a VLAN was asked for");
+    assert_eq!(vlan.parent, "bn-guests");
+    assert_eq!(vlan.name, "bn-guests.40");
+    assert_eq!(bonded.bridge.ports, vec!["bn-guests.40".to_string()]);
+
+    // The single-port member builds no bond at all, and its VLAN sits on the
+    // NIC — the same network, realized differently because it is cabled
+    // differently.
+    let (_, single) = built
+        .iter()
+        .find(|(node, _)| node == "alpha-2")
+        .expect("alpha-2 builds a seat");
+    assert!(single.bond.is_none(), "one port is not a bond");
+    assert_eq!(single.vlan.as_ref().unwrap().name, "nic3.40");
+    assert_eq!(single.bridge.name, "vmbr5", "one bridge name everywhere");
+}
+
+/// Active/backup gets a preferred port rather than flapping to whichever link
+/// came up last after a maintenance window.
+#[tokio::test]
+async fn an_active_backup_bond_rests_on_the_port_the_operator_picked_first() {
+    let harness = harness(
+        "external-bond-ab",
+        MockBackend::environment(),
+        MockPeers::new(),
+        Some(&alpha_with_record()),
+    );
+    let cookie = sign_in(&harness.router).await;
+
+    let (status, answer) = request(
+        &harness.router,
+        Method::POST,
+        "/api/environment/clusters/alpha/networks/external",
+        Some(&cookie),
+        None,
+        Some(serde_json::json!({
+            "name": "guests",
+            "bridge": "vmbr5",
+            "type": "layer2",
+            "bond": "active-backup",
+            "uplinks": [
+                { "node": "alpha-1", "interfaces": ["nic3", "nic4"] },
+                { "node": "alpha-2", "interfaces": ["nic4", "nic3"] },
+            ],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+
+    for (node, seat) in harness.peers.bridges() {
+        let bond = seat.bond.as_ref().expect("two ports is a bond");
+        let first = if node == "alpha-1" { "nic3" } else { "nic4" };
+        assert_eq!(bond.primary.as_deref(), Some(first));
+        assert_eq!(bond.lacp_rate, None, "active-backup does not negotiate");
+    }
+}
+
+/// A bond has to be named before it is built, and the name has to survive the
+/// VLAN interface that rides on it. Refused up front rather than truncated
+/// into a collision on every member.
+#[tokio::test]
+async fn a_bonded_network_whose_name_outgrows_the_kernel_is_refused_and_builds_nothing() {
+    let harness = harness(
+        "external-bond-long",
+        MockBackend::environment(),
+        MockPeers::new(),
+        Some(&alpha_with_record()),
+    );
+    let cookie = sign_in(&harness.router).await;
+
+    let (status, answer) = request(
+        &harness.router,
+        Method::POST,
+        "/api/environment/clusters/alpha/networks/external",
+        Some(&cookie),
+        None,
+        Some(serde_json::json!({
+            "name": "guest-traffic-north",
+            "bridge": "vmbr6",
+            "type": "layer2",
+            "vlan": 40,
+            "bond": "802.3ad",
+            "uplinks": [
+                { "node": "alpha-1", "interfaces": ["nic3", "nic4"] },
+                { "node": "alpha-2", "interfaces": ["nic3", "nic4"] },
+            ],
+        })),
+    )
+    .await;
+    assert_ne!(status, StatusCode::CREATED, "{answer}");
+    assert!(
+        harness.peers.bridges().is_empty(),
+        "nothing may have been built"
+    );
+
+    // The same network unbonded has no such problem: the limit is the bond's,
+    // not the network's.
+    let (status, answer) = request(
+        &harness.router,
+        Method::POST,
+        "/api/environment/clusters/alpha/networks/external",
+        Some(&cookie),
+        None,
+        Some(serde_json::json!({
+            "name": "guest-traffic-north",
+            "bridge": "vmbr6",
+            "type": "layer2",
+            "vlan": 40,
+            "uplinks": [
+                { "node": "alpha-1", "interfaces": ["nic3"] },
+                { "node": "alpha-2", "interfaces": ["nic3"] },
+            ],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+}
+
+/// Network names are unique per cluster, but the bond's name folds case and
+/// punctuation — so two distinct names can derive one bond, which on a bonded
+/// member is two networks fighting over one link.
+#[tokio::test]
+async fn two_networks_whose_names_derive_one_bond_are_refused() {
+    let harness = harness(
+        "external-bond-clash",
+        MockBackend::environment(),
+        MockPeers::new(),
+        Some(&alpha_with_record()),
+    );
+    let cookie = sign_in(&harness.router).await;
+
+    let define = |name: &str, bridge: &str| {
+        serde_json::json!({
+            "name": name,
+            "bridge": bridge,
+            "type": "layer2",
+            "bond": "802.3ad",
+            "uplinks": [
+                { "node": "alpha-1", "interfaces": ["nic3", "nic4"] },
+                { "node": "alpha-2", "interfaces": ["nic3", "nic4"] },
+            ],
+        })
+    };
+
+    let (status, answer) = request(
+        &harness.router,
+        Method::POST,
+        "/api/environment/clusters/alpha/networks/external",
+        Some(&cookie),
+        None,
+        Some(define("vm-net", "vmbr1")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+
+    // A different name, a different bridge — and the same derived bond.
+    let (status, answer) = request(
+        &harness.router,
+        Method::POST,
+        "/api/environment/clusters/alpha/networks/external",
+        Some(&cookie),
+        None,
+        Some(define("VM Net", "vmbr2")),
+    )
+    .await;
+    assert_ne!(status, StatusCode::CREATED, "{answer}");
+    assert!(
+        answer["error"].as_str().unwrap().contains("bn-vm-net"),
+        "the error names the bond they would share: {answer}"
+    );
+}
+
+/// Layer 3 and VXLAN are named in the record and offered by the console, but
+/// the appliance cannot build either yet. A create asking for one is told so,
+/// rather than accepted and quietly realized as something else.
+#[tokio::test]
+async fn a_network_type_the_appliance_cannot_build_is_refused_in_so_many_words() {
+    let harness = harness(
+        "external-kind",
+        MockBackend::environment(),
+        MockPeers::new(),
+        Some(&alpha_with_record()),
+    );
+    let cookie = sign_in(&harness.router).await;
+
+    for kind in ["layer3", "vxlan"] {
+        let (status, answer) = request(
+            &harness.router,
+            Method::POST,
+            "/api/environment/clusters/alpha/networks/external",
+            Some(&cookie),
+            None,
+            Some(serde_json::json!({
+                "name": format!("routed-{kind}"),
+                "bridge": "vmbr7",
+                "type": kind,
+                "uplinks": [
+                    { "node": "alpha-1", "interfaces": ["nic3"] },
+                    { "node": "alpha-2", "interfaces": ["nic3"] },
+                ],
+            })),
+        )
+        .await;
+        assert_ne!(status, StatusCode::CREATED, "{answer}");
+        assert!(
+            harness.peers.bridges().is_empty(),
+            "nothing may have been built for {kind}"
+        );
+    }
+}
+
+/// The membership records on running appliances name one interface per seat
+/// and tag their VLAN mode. Reading them back through the real router is what
+/// says the upgrade keeps the External networks a cluster already has.
+#[tokio::test]
+async fn a_network_recorded_in_the_older_form_is_still_served() {
+    let mut membership = alpha_with_record();
+    let record = membership
+        .clusters
+        .iter_mut()
+        .find(|c| c.definition.name == "alpha")
+        .expect("alpha");
+    record.networks.external.push(
+        serde_json::from_value(serde_json::json!({
+            "name": "legacy",
+            "bridge": "vmbr9",
+            "mode": "access",
+            "vlan": 77,
+            "uplinks": [
+                { "node": "alpha-1", "interface": "nic2" },
+                { "node": "alpha-2", "interface": "nic2" },
+            ],
+        }))
+        .expect("the older recorded form still decodes"),
+    );
+
+    let harness = harness(
+        "external-legacy",
+        MockBackend::environment(),
+        MockPeers::new(),
+        Some(&membership),
+    );
+    let cookie = sign_in(&harness.router).await;
+    let (status, networks) = request(
+        &harness.router,
+        Method::GET,
+        "/api/environment/clusters/alpha/networks",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{networks}");
+    let legacy = &networks["external"][0];
+    assert_eq!(legacy["name"], "legacy");
+    assert_eq!(legacy["type"], "layer2");
+    assert_eq!(legacy["vlan"], 77);
+    assert_eq!(
+        legacy["uplinks"][0],
+        serde_json::json!({ "node": "alpha-1", "interfaces": ["nic2"] }),
+        "the seat is served in the shape the console now reads"
+    );
 }
 
 /// Every member or none. A definition missing a member is refused before
@@ -1176,9 +1501,8 @@ async fn an_external_network_missing_a_member_is_refused_and_builds_nothing() {
         Some(serde_json::json!({
             "name": "half",
             "bridge": "vmbr3",
-            "mode": "trunk",
-            "allowed": [],
-            "uplinks": [{ "node": "alpha-1", "interface": "nic3" }],
+            "type": "layer2",
+            "uplinks": [{ "node": "alpha-1", "interfaces": ["nic3"] }],
         })),
     )
     .await;
@@ -1210,11 +1534,10 @@ async fn a_member_that_cannot_build_the_bridge_fails_the_definition() {
         Some(serde_json::json!({
             "name": "doomed",
             "bridge": "vmbr4",
-            "mode": "trunk",
-            "allowed": [],
+            "type": "layer2",
             "uplinks": [
-                { "node": "alpha-1", "interface": "nic3" },
-                { "node": "alpha-2", "interface": "nic3" },
+                { "node": "alpha-1", "interfaces": ["nic3"] },
+                { "node": "alpha-2", "interfaces": ["nic3"] },
             ],
         })),
     )
@@ -1566,18 +1889,18 @@ async fn changing_an_external_network_rebuilds_it_on_every_member() {
         Some(serde_json::json!({
             "name": "vm-lan",
             "bridge": "vmbr9",
-            "mode": "access",
+            "type": "layer2",
             "vlan": 30,
             "uplinks": [
-                { "node": "alpha-1", "interface": "nic4" },
-                { "node": "alpha-2", "interface": "nic4" },
+                { "node": "alpha-1", "interfaces": ["nic4"] },
+                { "node": "alpha-2", "interfaces": ["nic4"] },
             ],
         })),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{answer}");
     assert_eq!(answer["bridge"], "vmbr9");
-    assert_eq!(answer["mode"], "access");
+    assert_eq!(answer["vlan"], 30);
 
     // Rebuilt on both, and as an access network this time: the bridge sits on
     // a VLAN interface rather than on the raw uplink.

@@ -681,11 +681,17 @@ function NoNetworksYet({ reason }: { reason: "standalone" | "no-cluster" }) {
 }
 
 
-/// The VLAN semantics, spelled the way the definition means them.
-const vlanText = (network: ExternalNetwork): string =>
-  network.mode === "trunk"
-    ? network.allowed.length > 0
-      ? `Trunk — VLANs ${network.allowed.join(", ")}`
-      : "Trunk"
-    : `Access — VLAN ${network.vlan}`;
+/// What the definition means, spelled out: the kind of network, what it does
+/// with tags, and whether any member is carrying it on a bond.
+const vlanText = (network: ExternalNetwork): string => {
+  const kind = network.type === "layer2" ? "Layer 2" : network.type === "layer3" ? "Layer 3" : "VXLAN";
+  const tags =
+    network.vlan === undefined ? "untagged, tags passed through" : `VLAN ${network.vlan}`;
+  // Named only when some member has one — a network where nobody is bonded
+  // has nothing to say about bonding.
+  const bond = network.uplinks.some((uplink) => uplink.interfaces.length > 1)
+    ? ` - bonded ${network.bond === "802.3ad" ? "LACP" : network.bond}`
+    : "";
+  return `${kind} - ${tags}${bond}`;
+};
 

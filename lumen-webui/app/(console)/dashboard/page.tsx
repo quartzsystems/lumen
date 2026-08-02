@@ -271,12 +271,9 @@ export default function DashboardPage() {
           cluster: cluster.name,
           name: external.name,
           kind: "External",
-          qualifier:
-            external.mode === "trunk"
-              ? external.allowed.length > 0
-                ? `Trunk ${external.allowed.join(", ")}`
-                : "Trunk"
-              : `VLAN ${external.vlan}`,
+          // An untagged network passes every tag through to the machines, so
+          // there is no one VLAN to name here.
+          qualifier: external.vlan === undefined ? "Untagged" : `VLAN ${external.vlan}`,
           // No host addressing by definition, and nothing watches an External
           // bridge yet — so the row claims neither.
           address: null,

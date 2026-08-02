@@ -29,8 +29,8 @@ use crate::join::{
 };
 use crate::model::Regime;
 use crate::networks::{
-    valid_bridge_name, validate_networks, ClusterNetworks, CoreNetwork, CoreNetworkUpdate,
-    ExternalNetwork, VlanMode,
+    bond_name_fits, bond_name_for, valid_bridge_name, validate_networks, ClusterNetworks,
+    CoreNetwork, CoreNetworkUpdate, ExternalNetwork, Uplink,
 };
 use crate::state::{
     hostname, ClusterState, FenceDeviceState, FenceTest, QuorumState, RingLink, VipState,
@@ -515,35 +515,84 @@ impl ClusterService {
         })
     }
 
-    /// What one member has to build for an External network, given the port
+    /// What one member has to build for an External network, given the ports
     /// that member carries it on.
     ///
-    /// A trunk bridges the uplink directly and turns on VLAN filtering, which
-    /// is what "VLAN aware" means: tagged frames reach the machines. An
-    /// access network bridges `nic.N` instead — the bridge itself carries
-    /// untagged frames, and the tag is put on and taken off by the VLAN
-    /// interface underneath. Bridging the raw uplink for an access network
-    /// would put the machines on whatever the switch sends untagged, which is
-    /// not the VLAN that was asked for.
-    fn external_seat(network: &ExternalNetwork, interface: &str) -> crate::join::ExternalSeat {
+    /// Three layers, bottom-up, each optional but for the last.
+    ///
+    /// More than one port is a bond, and everything above it names the bond
+    /// instead of a NIC. One port skips that layer entirely rather than
+    /// building a bond of one: a single-port bond is a link with an extra name
+    /// and no redundancy, and the operator who later cables a second port can
+    /// say so then.
+    ///
+    /// No VLAN bridges the uplink directly and turns on VLAN filtering, which
+    /// is what "VLAN aware" means: tagged frames reach the machines. A VLAN
+    /// bridges `nic.N` instead — the bridge itself carries untagged frames,
+    /// and the tag is put on and taken off by the VLAN interface underneath.
+    /// Bridging the raw uplink for an access network would put the machines on
+    /// whatever the switch sends untagged, which is not the VLAN that was
+    /// asked for.
+    fn external_seat(network: &ExternalNetwork, uplink: &Uplink) -> crate::join::ExternalSeat {
         let comment = Some(format!("External network \"{}\"", network.name));
+
+        // The bond, when the seat has more than one port. Its mode carries
+        // the only knobs that are not safely defaulted; the rest are the
+        // settings that make each mode behave the way its name implies, and
+        // are editable per node on Interfaces afterwards like any other bond.
+        let bond = uplink.bonded().then(|| {
+            let mode = network.bond.unwrap_or_default();
+            lumen_net::Bond {
+                name: bond_name_for(&network.name),
+                mode,
+                ports: uplink.interfaces.clone(),
+                // A link that goes down without the bond noticing is a bond
+                // that keeps hashing onto a dead port.
+                miimon: Some(100),
+                lacp_rate: matches!(mode, lumen_net::BondMode::Ieee8023ad)
+                    .then_some(lumen_net::LacpRate::Fast),
+                xmit_hash_policy: matches!(
+                    mode,
+                    lumen_net::BondMode::Ieee8023ad | lumen_net::BondMode::BalanceXor
+                )
+                .then_some(lumen_net::XmitHashPolicy::Layer3Plus4),
+                // Active-backup with no preference flaps to whichever port
+                // came up last after a maintenance window; naming the first
+                // one the operator picked makes the resting state the one
+                // they cabled for.
+                primary: matches!(mode, lumen_net::BondMode::ActiveBackup)
+                    .then(|| uplink.interfaces[0].clone()),
+                comment: comment.clone(),
+                ..lumen_net::Bond::default()
+            }
+        });
+
+        // What the layer above rides on: the bond when there is one, the sole
+        // port when there is not.
+        let carrier = match &bond {
+            Some(bond) => bond.name.clone(),
+            None => uplink.interfaces[0].clone(),
+        };
+
         match network.vlan {
-            VlanMode::Trunk { .. } => crate::join::ExternalSeat {
+            None => crate::join::ExternalSeat {
+                bond,
                 vlan: None,
                 bridge: lumen_net::Bridge {
                     name: network.bridge.clone(),
-                    ports: vec![interface.to_string()],
+                    ports: vec![carrier],
                     vlan_filtering: true,
                     comment,
                     ..lumen_net::Bridge::default()
                 },
             },
-            VlanMode::Access { vlan } => {
-                let name = format!("{interface}.{vlan}");
+            Some(vlan) => {
+                let name = format!("{carrier}.{vlan}");
                 crate::join::ExternalSeat {
+                    bond,
                     vlan: Some(lumen_net::Vlan {
                         name: name.clone(),
-                        parent: interface.to_string(),
+                        parent: carrier,
                         vlan_id: vlan,
                         comment: comment.clone(),
                         ..lumen_net::Vlan::default()
@@ -624,6 +673,9 @@ impl ClusterService {
             )));
         }
 
+        Self::check_external_shape(&network)?;
+        Self::check_bond_name_free(&network, &record.networks.external, None)?;
+
         // Every member or none, checked before anything is built rather than
         // discovered halfway through.
         let members = Self::check_uplinks(&membership, cluster, &network)?;
@@ -633,11 +685,9 @@ impl ClusterService {
         // Management one — and takes its uplink as its only port.
         for member in &members {
             let uplink = network
-                .uplinks
-                .iter()
-                .find(|up| up.node == member.name)
+                .uplink(&member.name)
                 .expect("every member was checked to have one above");
-            let seat = Self::external_seat(&network, &uplink.interface);
+            let seat = Self::external_seat(&network, uplink);
             if let Err(err) = self.peers.create_bridge(member, &seat).await {
                 return Err(ClusterError::Conflict(format!(
                     "\"{}\" could not build the bridge, so the network was not defined: {err}. \
@@ -736,14 +786,15 @@ impl ClusterService {
             )));
         }
 
+        Self::check_external_shape(&network)?;
+        Self::check_bond_name_free(&network, &record.networks.external, Some(name))?;
+
         let members = Self::check_uplinks(&membership, cluster, &network)?;
         for member in &members {
             let uplink = network
-                .uplinks
-                .iter()
-                .find(|up| up.node == member.name)
+                .uplink(&member.name)
                 .expect("every member was checked to have one above");
-            let seat = Self::external_seat(&network, &uplink.interface);
+            let seat = Self::external_seat(&network, uplink);
             if let Err(err) = self.peers.create_bridge(member, &seat).await {
                 return Err(ClusterError::Conflict(format!(
                     "\"{}\" could not build the network as changed, so the change was not \
@@ -1140,13 +1191,25 @@ impl ClusterService {
             .cloned()
             .collect();
         for member in &members {
-            if !network.uplinks.iter().any(|up| up.node == member.name) {
-                return Err(ClusterError::Conflict(format!(
-                    "\"{}\" has no uplink for this network. An External network is defined on \
-                     every member or on none — a machine that fails over onto a member without \
-                     it comes up with no network.",
-                    member.name
-                )));
+            match network.uplink(&member.name) {
+                None => {
+                    return Err(ClusterError::Conflict(format!(
+                        "\"{}\" has no uplink for this network. An External network is defined on \
+                         every member or on none — a machine that fails over onto a member \
+                         without it comes up with no network.",
+                        member.name
+                    )));
+                }
+                // A seat with no ports is the same hole wearing a node's name.
+                Some(uplink) if uplink.interfaces.is_empty() => {
+                    return Err(ClusterError::Conflict(format!(
+                        "\"{}\" has a seat on this network with no port on it. An External \
+                         network is defined on every member or on none — a machine that fails \
+                         over onto a member without it comes up with no network.",
+                        member.name
+                    )));
+                }
+                Some(_) => {}
             }
         }
         for uplink in &network.uplinks {
@@ -1156,8 +1219,107 @@ impl ClusterService {
                     uplink.node
                 )));
             }
+            for (index, port) in uplink.interfaces.iter().enumerate() {
+                if uplink.interfaces[..index].contains(port) {
+                    return Err(ClusterError::Conflict(format!(
+                        "\"{}\" names \"{port}\" twice. A bond of one port listed twice is one \
+                         port with no redundancy, which is not what picking two looks like.",
+                        uplink.node
+                    )));
+                }
+            }
         }
         Ok(members)
+    }
+
+    /// Whether this network's derived bond name is already another network's.
+    ///
+    /// Names are unique per cluster and the bond's is derived from the name,
+    /// which is *nearly* enough — but the derivation folds case and
+    /// punctuation, so "vm net" and "vm-net" are two networks that would both
+    /// build `bn-vm-net`. On a bonded member that is two networks fighting
+    /// over one link, and the second one to be built loses. Caught here rather
+    /// than by the member, which would only notice after the first members had
+    /// already built their half.
+    ///
+    /// `existing` is the cluster's other networks; `renaming` is the name this
+    /// definition already goes by, so an edit does not collide with itself.
+    fn check_bond_name_free(
+        network: &ExternalNetwork,
+        existing: &[ExternalNetwork],
+        renaming: Option<&str>,
+    ) -> Result<()> {
+        if !network.any_bonded() {
+            return Ok(());
+        }
+        let bond = bond_name_for(&network.name);
+        let clash = existing.iter().find(|other| {
+            Some(other.name.as_str()) != renaming
+                && other.any_bonded()
+                && bond_name_for(&other.name) == bond
+        });
+        if let Some(other) = clash {
+            return Err(ClusterError::Conflict(format!(
+                "Bonding this network's ports would build \"{bond}\" on each member, which is \
+                 already the bond \"{}\" builds — the two names differ only in case or \
+                 punctuation, which the bond's name does not keep. Give this one a more distinct \
+                 name.",
+                other.name
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether an External network's definition is one the appliance can
+    /// build at all, before any member is asked to try.
+    ///
+    /// Separate from [`Self::check_uplinks`] because it is about the network
+    /// rather than the membership: nothing here needs to know which cluster it
+    /// is for, and a definition that fails these checks would fail on every
+    /// member for the same reason.
+    fn check_external_shape(network: &ExternalNetwork) -> Result<()> {
+        if !network.network_type.buildable() {
+            return Err(ClusterError::Conflict(format!(
+                "{} networks are not built by this appliance yet. Layer 2 is what an External \
+                 network can be today — a bridge on the members' uplinks, optionally tagged into \
+                 one VLAN.",
+                network.network_type.as_str()
+            )));
+        }
+        if let Some(vlan) = network.vlan {
+            if !(1..=4094).contains(&vlan) {
+                return Err(ClusterError::Conflict(format!(
+                    "VLAN {vlan} is not in 1–4094."
+                )));
+            }
+        }
+        if network.any_bonded() {
+            if network.bond.is_none() {
+                return Err(ClusterError::Conflict(
+                    "This network bonds more than one port on a member, so it needs a bonding \
+                     mode — LACP where the switch runs it, active/backup where it does not."
+                        .to_string(),
+                ));
+            }
+            // The bond's name is derived, so a name that will not fit is a
+            // fact about this network the operator can only fix by renaming
+            // it — and hearing that now beats hearing "cannot build" from the
+            // first member.
+            let bond = bond_name_for(&network.name);
+            if !bond_name_fits(&bond, network.vlan) {
+                let longest = match network.vlan {
+                    Some(vlan) => format!("{bond}.{vlan}"),
+                    None => bond.clone(),
+                };
+                return Err(ClusterError::Conflict(format!(
+                    "Bonding this network's ports would build \"{bond}\" on each member, and \
+                     \"{longest}\" is longer than the 15 characters the kernel allows a link \
+                     name. Give the network a shorter name, or build the bond on Interfaces \
+                     first and pick it as the uplink."
+                )));
+            }
+        }
+        Ok(())
     }
 
     // --- environment membership -------------------------------------------
@@ -1576,14 +1738,17 @@ impl ClusterService {
             }
             return Ok(());
         }
-        // An access network's port is the VLAN interface, which does not
-        // exist yet — so the port check applies to whatever the seat is
-        // actually built on: the VLAN's parent when there is one, the
-        // bridge's port when there is not.
-        let physical: Vec<&String> = match &seat.vlan {
-            Some(vlan) => vec![&vlan.parent],
-            None => bridge.ports.iter().collect(),
+        // What this seat is actually built on. The bridge's port may be a
+        // VLAN interface and the VLAN's parent may be a bond, and neither
+        // exists yet — so the checks below walk down to the ports that do.
+        let physical: Vec<&String> = match (&seat.bond, &seat.vlan) {
+            (Some(bond), _) => bond.ports.iter().collect(),
+            (None, Some(vlan)) => vec![&vlan.parent],
+            (None, None) => bridge.ports.iter().collect(),
         };
+        // A bond swallows its ports whole, exactly as a bridge does, so the
+        // addressing rule below applies to a bonded seat at every layer.
+        let consuming = seat.bond.is_some() || seat.vlan.is_none();
         for port in physical {
             let Some(link) = observed.link(port) else {
                 return Err(ClusterError::Conflict(format!(
@@ -1595,16 +1760,62 @@ impl ClusterService {
             // swallowed without moving the addressing first. A VLAN interface
             // is the exception — it shares its parent rather than consuming
             // it, which is exactly why an access network is built that way.
-            if seat.vlan.is_none() && !link.addresses.is_empty() {
+            if consuming && !link.addresses.is_empty() {
                 return Err(ClusterError::Conflict(format!(
-                    "\"{port}\" already carries {} — a bridge takes its port over, so move the \
-                     addressing off it first.",
-                    link.addresses.join(", ")
+                    "\"{port}\" already carries {} — {}, so move the addressing off it first.",
+                    link.addresses.join(", "),
+                    if seat.bond.is_some() {
+                        "a bond takes its ports over"
+                    } else {
+                        "a bridge takes its port over"
+                    }
                 )));
             }
+            // A port already in someone else's bond or bridge cannot be in
+            // this one. Worth its own refusal because the fix is different:
+            // the operator does not move an address, they pick the controller
+            // itself as the uplink.
+            if let Some(controller) = &link.controller {
+                let ours = seat.bond.as_ref().is_some_and(|b| &b.name == controller);
+                if !ours {
+                    return Err(ClusterError::Conflict(format!(
+                        "\"{port}\" is already a port of \"{controller}\" — pick \"{controller}\" \
+                         as this node's uplink instead of the ports underneath it."
+                    )));
+                }
+            }
         }
-        // The VLAN interface first: the bridge names it as its port, so it
-        // has to exist before the bridge that claims it.
+        // Bottom-up from here: each layer names the one below it, so the one
+        // below has to exist first.
+        if let Some(bond) = &seat.bond {
+            match observed.link(&bond.name) {
+                None => {
+                    self.network
+                        .create_bond(bond.clone())
+                        .await
+                        .map_err(ClusterError::from)?;
+                }
+                // Already built, by an earlier attempt or by hand. Same test
+                // as the bridge's: the ports are what make it the right bond.
+                Some(existing) => {
+                    if existing.kind != lumen_net::LinkKind::Bond {
+                        return Err(ClusterError::Conflict(format!(
+                            "This node already has a link called \"{}\", and it is not a bond.",
+                            bond.name
+                        )));
+                    }
+                    for port in &bond.ports {
+                        if !existing.ports.contains(port) {
+                            return Err(ClusterError::Conflict(format!(
+                                "This node already has a bond called \"{}\" and \"{port}\" is not \
+                                 one of its ports.",
+                                bond.name
+                            )));
+                        }
+                    }
+                }
+            }
+        }
         if let Some(vlan) = &seat.vlan {
             if observed.link(&vlan.name).is_none() {
                 self.network

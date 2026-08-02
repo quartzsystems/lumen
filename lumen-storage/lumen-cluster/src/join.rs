@@ -249,17 +249,27 @@ pub struct JoinGrant {
 }
 
 /// One member's realization of an External network: the bridge machines
-/// attach to, and — for an access network — the VLAN interface it sits on.
+/// attach to, the bond underneath it when the member carries the network on
+/// more than one port, and — for an access network — the VLAN interface in
+/// between.
 ///
-/// The VLAN is part of the same payload rather than a second call because
-/// the two are one thing on the wire. An access network's bridge carries
-/// untagged frames *from a tagged uplink*, which on Linux means the bridge's
-/// port is `nic.N`, not `nic`. Building the bridge alone would put the
-/// machines on whatever the switch sends untagged — usually the native VLAN,
-/// and never the one that was asked for.
+/// All three travel in one payload rather than as three calls because they
+/// are one thing on the wire. An access network's bridge carries untagged
+/// frames *from a tagged uplink*, which on Linux means the bridge's port is
+/// `nic.N`, not `nic`. Building the bridge alone would put the machines on
+/// whatever the switch sends untagged — usually the native VLAN, and never
+/// the one that was asked for. The bond is the same argument one layer down:
+/// a seat whose bond arrived separately is a seat that can be built onto a
+/// port the bond was about to swallow.
+///
+/// They are also built bottom-up for that reason — bond, then VLAN, then
+/// bridge — and each names the one below it as its parent or port.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalSeat {
-    /// Built first when present; the bridge's port is then its name.
+    /// Built first when present; whatever comes next rides on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bond: Option<lumen_net::Bond>,
+    /// Built next when present; the bridge's port is then its name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vlan: Option<lumen_net::Vlan>,
     pub bridge: lumen_net::Bridge,
