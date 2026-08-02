@@ -247,7 +247,10 @@ body {
 .qz-table td.qz-sticky-actions { position: sticky; right: 0; }
 .qz-table th.qz-sticky-actions { z-index: 2; }
 .qz-table td.qz-sticky-actions {
-  background: var(--qz-surface);
+  /* Opaque so columns scrolling beneath stay hidden, but the page bg —
+     not surface — because ordinary cells are transparent over the page
+     and a lighter sticky cell reads as a differently-colored column. */
+  background: var(--qz-bg);
   border-left: 1px solid var(--qz-divider);
 }
 .qz-table tbody tr:hover td.qz-sticky-actions {

@@ -1098,15 +1098,62 @@ impl Daemon {
                     }
                     let space = engine.pool().space();
                     if space.segments_free < space.segments_total / 4 {
-                        engine.collect_garbage().map(|_| ())
+                        engine.collect_garbage().map(|_| None)
                     } else if ticks.is_multiple_of(CHECKPOINT_TICKS) {
-                        engine.checkpoint()
+                        // Two-phase: the buffered half here, the drain
+                        // below with the lock free. The measured cost of
+                        // the old way was the engine frozen up to a
+                        // second per checkpoint while dirty writeback hit
+                        // the platters — every guest write and peer
+                        // apply queued behind it.
+                        match engine.checkpoint_begin()? {
+                            Some(ticket) => Ok(Some(ticket)),
+                            // No detached barriers (a simulated disk):
+                            // single-phase, whose folds the begin above
+                            // already paid for.
+                            None => engine.checkpoint().map(|_| None),
+                        }
                     } else {
-                        Ok(())
+                        Ok(None)
                     }
                 });
-                if let Err(err) = outcome {
-                    eprintln!("maintenance failed: {err}");
+                let ticket = match outcome {
+                    Ok(ticket) => ticket,
+                    Err(err) => {
+                        eprintln!("maintenance failed: {err}");
+                        continue;
+                    }
+                };
+                let Some(mut ticket) = ticket else { continue };
+                // The drain, off the lock: guest writes and peer applies
+                // flow while the platters catch up. Concurrent for the
+                // same reason BrickSet::flush is — the slowest brick,
+                // not the sum.
+                let flushers = std::mem::take(&mut ticket.flushers);
+                let mut drained = true;
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = flushers
+                        .into_iter()
+                        .map(|flush| scope.spawn(flush))
+                        .collect();
+                    for handle in handles {
+                        if handle.join().expect("a checkpoint drain panicked").is_err() {
+                            drained = false;
+                        }
+                    }
+                });
+                if !drained {
+                    // Dropped, not committed: an anchor over an undrained
+                    // snapshot would promise a durability nobody
+                    // delivered. The bricks stay dirty; the next tick
+                    // retries and surfaces a persistent error in-lock.
+                    eprintln!("checkpoint drain failed; ticket dropped");
+                    continue;
+                }
+                if let Err(err) =
+                    maint_shared.with_engine(|engine| engine.checkpoint_commit(ticket))
+                {
+                    eprintln!("checkpoint commit failed: {err}");
                 }
             }
         }));

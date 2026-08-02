@@ -138,4 +138,12 @@ impl Disk for FileDisk {
         // block device the two are the same barrier.
         self.file.sync_data().map_err(io_failed)
     }
+
+    fn flush_handle(&self) -> Option<crate::disk::FlushHandle> {
+        // A dup'd descriptor reaches the same open file description and,
+        // on a block device, the same write cache — its sync_data is the
+        // same barrier `flush` runs, minus the need to hold the disk.
+        let file = self.file.try_clone().ok()?;
+        Some(Box::new(move || file.sync_data().map_err(io_failed)))
+    }
 }

@@ -142,6 +142,21 @@ struct SnapshotState {
     root: Option<BlockHash>,
 }
 
+/// An open two-phase checkpoint: everything the drain and the commit
+/// need, captured under the lock by [`Pool::checkpoint_begin`]. The
+/// `flushers` are the phase between — run them all, off the lock, before
+/// offering the ticket back to [`Pool::checkpoint_commit`]; a ticket
+/// whose flushers did not all succeed must be dropped, not committed.
+pub struct CheckpointTicket {
+    manifest_hash: [u8; 32],
+    cursor: u64,
+    seq: u64,
+    epoch: u64,
+    era: u64,
+    generation: u64,
+    pub flushers: Vec<crate::disk::FlushHandle>,
+}
+
 pub struct Pool<D: Disk> {
     store: BrickSet<D>,
     wal: Wal,
@@ -1133,7 +1148,10 @@ impl<D: Disk> Pool<D> {
     /// the WAL's history. Two flushes; see the module header for why the
     /// order cannot lie — the first now spans every dirty brick, and
     /// nothing is anchored until all of them have answered.
-    pub fn checkpoint(&mut self) -> Result<()> {
+    /// The buffered half of a checkpoint: fold every dirty map into its
+    /// tree and write the manifest — everything that must see a
+    /// consistent pool, none of it waiting on a platter.
+    fn fold_and_manifest(&mut self) -> Result<[u8; 32]> {
         let mut ids: Vec<u64> = self.vdisks.keys().copied().collect();
         ids.sort_unstable();
 
@@ -1159,19 +1177,22 @@ impl<D: Disk> Pool<D> {
 
         // A placed pool always writes its manifest — the map inside is
         // durable state even when no vdisk exists yet.
-        let manifest_hash =
-            if self.vdisks.is_empty() && self.snapshots.is_empty() && self.placement.is_none() {
-                [0u8; 32]
-            } else {
-                let manifest = encode_manifest(
-                    &ids,
-                    &self.vdisks,
-                    &self.snapshots,
-                    &self.leases,
-                    self.placement.as_ref().map(|placement| &placement.map),
-                );
-                *self.store.put(0, &manifest)?.as_bytes()
-            };
+        if self.vdisks.is_empty() && self.snapshots.is_empty() && self.placement.is_none() {
+            Ok([0u8; 32])
+        } else {
+            let manifest = encode_manifest(
+                &ids,
+                &self.vdisks,
+                &self.snapshots,
+                &self.leases,
+                self.placement.as_ref().map(|placement| &placement.map),
+            );
+            Ok(*self.store.put(0, &manifest)?.as_bytes())
+        }
+    }
+
+    pub fn checkpoint(&mut self) -> Result<()> {
+        let manifest_hash = self.fold_and_manifest()?;
         self.store.flush()?;
 
         self.wal.retire_to_cursor();
@@ -1188,6 +1209,69 @@ impl<D: Disk> Pool<D> {
             roster,
         })?;
         self.store.flush()
+    }
+
+    /// Open a two-phase checkpoint: the buffered half runs now, under
+    /// whatever lock owns this pool, and the ticket carries everything
+    /// the drain and the commit need. The caller runs every flusher —
+    /// off the lock, that being the point — then offers the ticket to
+    /// [`Pool::checkpoint_commit`]. `None` means a brick could not give
+    /// a detached barrier (the simulator); take the single-phase
+    /// [`Pool::checkpoint`] instead — the folds already done here make
+    /// it no more expensive.
+    ///
+    /// An abandoned ticket costs nothing but the work: the folds are
+    /// exactly what a checkpoint does anyway, no anchor was written, and
+    /// the un-retired WAL still replays everything the old anchor lacks.
+    pub fn checkpoint_begin(&mut self) -> Result<Option<CheckpointTicket>> {
+        let manifest_hash = self.fold_and_manifest()?;
+        // Handles come AFTER the folds: the tree and manifest writes
+        // above are precisely what phase B's drain must cover.
+        let Some(flushers) = self.store.flush_handles() else {
+            return Ok(None);
+        };
+        let (cursor, seq) = self.wal.position();
+        Ok(Some(CheckpointTicket {
+            manifest_hash,
+            cursor,
+            seq,
+            epoch: self.wal.epoch(),
+            era: self.era,
+            generation: self.anchor_generation,
+            flushers,
+        }))
+    }
+
+    /// Close a two-phase checkpoint. The anchor written here names the
+    /// ticket's snapshot — manifest and WAL cursor as of `begin` — which
+    /// is durable only because the caller drained the ticket's flushers
+    /// first; the trailing in-lock flush covers the anchor itself and
+    /// whatever landed since the drain, and is cheap for exactly that
+    /// reason. Returns `false` without writing when the world moved —
+    /// an era, epoch, or another checkpoint crossed between the phases —
+    /// because an anchor naming a stale snapshot of a changed history is
+    /// how acknowledged writes get forgotten.
+    pub fn checkpoint_commit(&mut self, ticket: CheckpointTicket) -> Result<bool> {
+        if ticket.era != self.era
+            || ticket.epoch != self.wal.epoch()
+            || ticket.generation != self.anchor_generation
+        {
+            return Ok(false);
+        }
+        self.wal.retire_to(ticket.cursor);
+        self.anchor_generation += 1;
+        let roster = self.store.roster();
+        self.store.wal_brick_mut().write_anchor(&Anchor {
+            generation: self.anchor_generation,
+            wal_replay_offset: ticket.cursor,
+            wal_replay_seq: ticket.seq,
+            wal_epoch: ticket.epoch,
+            era: self.era,
+            manifest_hash: ticket.manifest_hash,
+            roster,
+        })?;
+        self.store.flush()?;
+        Ok(true)
     }
 
     /// Collect garbage: checkpoint, mark everything reachable from the
@@ -1964,6 +2048,98 @@ mod tests {
     }
 
     fn reopen(pool: Pool<SimDisk>) -> Pool<SimDisk> {
+        Pool::open(Brick::open(pool.into_brick().into_disk()).unwrap()).unwrap()
+    }
+
+    /// A real file, because the two-phase checkpoint only exists where a
+    /// disk can offer a detached barrier — the simulator cannot, by
+    /// design, and takes the single-phase path.
+    struct FileScratch(std::path::PathBuf);
+    impl Drop for FileScratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn file_pool(name: &str) -> (Pool<crate::FileDisk>, FileScratch) {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "lumen-fs-twophase-{}-{name}.brick",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(8 * KIB * KIB).unwrap();
+        drop(file);
+        let disk = crate::FileDisk::open(&path).unwrap();
+        let pool = Pool::create(Brick::format(disk, params()).unwrap()).unwrap();
+        (pool, FileScratch(path))
+    }
+
+    fn drain(ticket: &mut CheckpointTicket) {
+        for flush in std::mem::take(&mut ticket.flushers) {
+            flush().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_two_phase_checkpoint_lands_like_a_single_phase_one() {
+        let (mut pool, _scratch) = file_pool("lands");
+        pool.create_vdisk(7, 40 * BLOCK as u64, 0).unwrap();
+        pool.write_block(7, 3, b"two-phase payload").unwrap();
+        let mut ticket = pool
+            .checkpoint_begin()
+            .unwrap()
+            .expect("files offer barriers");
+        drain(&mut ticket);
+        assert!(pool.checkpoint_commit(ticket).unwrap());
+        let pool = reopen_file(pool);
+        assert_eq!(
+            pool.read_block(7, 3).unwrap().unwrap(),
+            b"two-phase payload"
+        );
+    }
+
+    #[test]
+    fn a_ticket_crossed_by_another_checkpoint_is_refused() {
+        let (mut pool, _scratch) = file_pool("stale");
+        pool.create_vdisk(7, 40 * BLOCK as u64, 0).unwrap();
+        pool.write_block(7, 0, b"first").unwrap();
+        let mut ticket = pool
+            .checkpoint_begin()
+            .unwrap()
+            .expect("files offer barriers");
+        // Another checkpoint lands between the phases — the ticket's
+        // snapshot no longer describes the anchored history.
+        pool.checkpoint().unwrap();
+        drain(&mut ticket);
+        assert!(!pool.checkpoint_commit(ticket).unwrap());
+        // Refused, not corrupted: the pool still reopens on the
+        // crossing checkpoint's anchor.
+        let pool = reopen_file(pool);
+        assert_eq!(pool.read_block(7, 0).unwrap().unwrap(), b"first");
+    }
+
+    #[test]
+    fn a_dropped_ticket_loses_nothing() {
+        let (mut pool, _scratch) = file_pool("dropped");
+        pool.create_vdisk(7, 40 * BLOCK as u64, 0).unwrap();
+        pool.write_block(7, 1, b"before the begin").unwrap();
+        let ticket = pool
+            .checkpoint_begin()
+            .unwrap()
+            .expect("files offer barriers");
+        // A failed drain drops the ticket on the floor: no anchor moved,
+        // no WAL retired — the old anchor plus replay still owns it all.
+        drop(ticket);
+        pool.write_block(7, 2, b"after the drop").unwrap();
+        pool.flush().unwrap();
+        let pool = reopen_file(pool);
+        assert_eq!(pool.read_block(7, 1).unwrap().unwrap(), b"before the begin");
+        assert_eq!(pool.read_block(7, 2).unwrap().unwrap(), b"after the drop");
+    }
+
+    fn reopen_file(pool: Pool<crate::FileDisk>) -> Pool<crate::FileDisk> {
         Pool::open(Brick::open(pool.into_brick().into_disk()).unwrap()).unwrap()
     }
 

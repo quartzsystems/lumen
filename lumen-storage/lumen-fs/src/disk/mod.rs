@@ -21,6 +21,11 @@ pub mod file;
 /// The tortured thing: the deterministic crash-simulation disk.
 pub mod sim;
 
+/// A disk's durability barrier, detached from the disk's `&mut`: callable
+/// while somebody else holds the disk, because a barrier only waits — it
+/// never changes what the bytes are.
+pub type FlushHandle = Box<dyn Fn() -> Result<()> + Send>;
+
 // `Send` because the engine that owns disks lives behind a mutex shared
 // across threads, and a multi-brick flush syncs bricks concurrently —
 // both already demand it of any real implementation.
@@ -38,4 +43,13 @@ pub trait Disk: Send {
     /// The durability barrier. Everything written before this call is on
     /// stable storage when it returns.
     fn flush(&mut self) -> Result<()>;
+
+    /// A [`FlushHandle`] for this disk, or `None` if it cannot offer one
+    /// (the simulator: its durability is a model, not a syscall). The
+    /// two-phase checkpoint drains writeback through these outside the
+    /// engine lock; a `None` anywhere sends the caller back to the
+    /// in-lock single-phase path.
+    fn flush_handle(&self) -> Option<FlushHandle> {
+        None
+    }
 }

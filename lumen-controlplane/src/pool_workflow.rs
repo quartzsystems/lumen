@@ -42,8 +42,12 @@ use crate::AppState;
 const PEER_PORT: u16 = 7800;
 
 /// How long a freshly started daemon gets to answer its loopback control
-/// socket before the prepare is called a failure.
-const DAEMON_ANSWER_DEADLINE: Duration = Duration::from_secs(15);
+/// socket before the prepare is called a failure. Opening a seat is a
+/// scan of every brick and grows with the set: a six-brick seat measured
+/// ~18s freshly formatted and minutes when aged — 15s failed a real
+/// create. The poll answers the moment the daemon does, so the slack
+/// costs nothing when the open is quick.
+const DAEMON_ANSWER_DEADLINE: Duration = Duration::from_secs(180);
 
 /// How long a restarted control plane gets to come back and answer for its
 /// pool before the adopt step is called a failure.

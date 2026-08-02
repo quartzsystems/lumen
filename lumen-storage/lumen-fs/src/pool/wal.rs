@@ -278,6 +278,14 @@ impl Wal {
         self.replay_start = self.cursor;
     }
 
+    /// The two-phase checkpoint's retirement: to the cursor captured when
+    /// the checkpoint *began*, because that is the position its anchor
+    /// names. Frames appended since stay live — the anchor knows nothing
+    /// of them, so recovery must still replay them.
+    pub fn retire_to(&mut self, cursor: u64) {
+        self.replay_start = cursor;
+    }
+
     /// What the anchor should record as the replay position and seq.
     pub fn position(&self) -> (u64, u64) {
         (self.cursor, self.next_seq)

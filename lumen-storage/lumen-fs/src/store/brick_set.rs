@@ -348,6 +348,22 @@ impl<D: Disk> BrickSet<D> {
 
     /// The acknowledgement barrier: everything put since the last flush is
     /// durable when this returns, on every brick it touched.
+    /// Detached barriers for every brick that is dirty right now — the
+    /// two-phase checkpoint's phase-B workload. `None` if any dirty brick
+    /// cannot offer one (the simulator): the caller falls back to the
+    /// in-lock single-phase checkpoint. Dirty flags are NOT cleared —
+    /// only an in-lock [`BrickSet::flush`] may clear them, because a flag
+    /// cleared for a write the external barrier missed would let a later
+    /// guest flush skip a brick that still owes a sync.
+    pub fn flush_handles(&self) -> Option<Vec<crate::disk::FlushHandle>> {
+        self.bricks
+            .iter()
+            .zip(self.dirty.iter())
+            .filter(|(_, dirty)| **dirty)
+            .map(|(brick, _)| brick.flush_handle())
+            .collect()
+    }
+
     pub fn flush(&mut self) -> Result<()> {
         // A guest flush dirties at most a data brick and the WAL brick,
         // and for one or two the spawn costs more than the second sync —

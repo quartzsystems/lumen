@@ -1462,6 +1462,17 @@ impl<D: Disk> ReplNode<D> {
         self.pool.checkpoint()
     }
 
+    /// The two-phase checkpoint's halves — see [`crate::pool::Pool::checkpoint_begin`].
+    /// The engine adds nothing of its own: replication state rides the
+    /// same WAL and manifest the pool already snapshots.
+    pub fn checkpoint_begin(&mut self) -> Result<Option<crate::pool::CheckpointTicket>> {
+        self.pool.checkpoint_begin()
+    }
+
+    pub fn checkpoint_commit(&mut self, ticket: crate::pool::CheckpointTicket) -> Result<bool> {
+        self.pool.checkpoint_commit(ticket)
+    }
+
     /// Local collection, legal at any point in a resync on either end:
     /// the per-session pins are part of the mark, so neither an offer nor
     /// a half-fetched fragment nor a payload waiting on its op can be
@@ -1499,9 +1510,7 @@ impl<D: Disk> ReplNode<D> {
                 .into_iter()
                 .map(|(tier, _, payload)| (tier, payload))
                 .collect();
-            self.session(from)
-                .backlog
-                .push(PeerMessage::Payloads(wire));
+            self.session(from).backlog.push(PeerMessage::Payloads(wire));
             return Ok(());
         }
         for (tier, hash, payload) in blocks {

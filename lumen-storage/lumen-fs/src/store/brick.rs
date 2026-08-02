@@ -578,6 +578,12 @@ impl<D: Disk> Brick<D> {
         self.disk.flush()
     }
 
+    /// The disk's detached barrier, if it offers one — see
+    /// [`crate::disk::Disk::flush_handle`].
+    pub fn flush_handle(&self) -> Option<crate::disk::FlushHandle> {
+        self.disk.flush_handle()
+    }
+
     /// The WAL area's bounds: `(start, size)`.
     pub fn wal_bounds(&self) -> (u64, u64) {
         (self.sb.wal_start, self.sb.wal_size)
