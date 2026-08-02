@@ -405,7 +405,14 @@ fn default_true() -> bool {
 }
 
 /// POST /api/vms.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// Serializable as well as deserializable, like the four request types below
+/// it: a console can ask another member to define a machine, and what crosses
+/// the wire is this request re-serialized whole. The target deserializes it
+/// with the same `deny_unknown_fields` rules it would apply to a request typed
+/// at its own console, which is what makes a forwarded create no different
+/// from a local one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VmCreate {
     pub name: String,
@@ -472,7 +479,7 @@ pub struct VmCreate {
 
 /// A disk to create and attach. The size is in GiB because that is the unit an
 /// operator thinks in; everything below this line is bytes.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiskCreate {
     /// The pool a local disk's zvol lives in. Unused — and allowed empty —
@@ -501,7 +508,7 @@ pub struct DiskCreate {
 /// its file name, never by a path: a path from the console would be a path the
 /// console chose, and the one rule about where media may live belongs in the
 /// storage domain.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CdromCreate {
     /// The pool whose media library the image is in. Absent leaves the drive
@@ -516,7 +523,7 @@ pub struct CdromCreate {
     pub source: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NicCreate {
     pub bridge: String,
@@ -532,7 +539,7 @@ pub struct NicCreate {
 
 /// Where the UEFI variable store lives. The same two answers a data disk
 /// has: a named local pool, or the cluster's replicated storage.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EfiDiskCreate {
     /// The pool a local vars volume lives in. Unused for a replicated one.
@@ -560,7 +567,7 @@ pub struct VmMigrateResponse {
 }
 
 /// PATCH /api/vms/{vmid}. Absent fields are left alone.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VmPatch {
     pub name: Option<String>,

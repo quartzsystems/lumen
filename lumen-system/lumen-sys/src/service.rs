@@ -16,7 +16,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::backend::{PowerBackend, ScheduledPower};
@@ -103,7 +103,12 @@ pub struct UsersResponse {
 }
 
 /// What the node's power state is, and what may be done to it.
-#[derive(Debug, Clone, Serialize)]
+///
+/// Deserializable as well as serializable, unlike the account views beside it,
+/// and for one reason: the environment's Maintenance page reads every member's
+/// power state, and the other members' answers arrive here over the peer
+/// surface as exactly this shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PowerView {
     pub node: String,
     /// Seconds since the node booted. Absent when `/proc/uptime` is
@@ -117,7 +122,7 @@ pub struct PowerView {
     pub horizon_secs: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScheduledView {
     pub action: PowerAction,
     pub at: u64,

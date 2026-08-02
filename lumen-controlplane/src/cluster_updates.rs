@@ -728,6 +728,25 @@ async fn walk(state: &Arc<AppState>, order: Vec<String>, by: &str, rolling: bool
                     step.detail = Some(reason.clone());
                 });
                 let done: Vec<&String> = order.iter().take_while(|name| *name != node).collect();
+                // Written down before the refusal is published, because the
+                // log outlives this record: the walk's own progress lives in
+                // this process's memory and the log is on disk, so this is
+                // what an operator still has after the coordinator restarts.
+                state.tasks.event(
+                    if rolling { "rolling-update" } else { "update-all" },
+                    format!(
+                        "{} across {} node{}",
+                        if rolling {
+                            "Roll every node through a restart"
+                        } else {
+                            "Install updates on every node"
+                        },
+                        order.len(),
+                        if order.len() == 1 { "" } else { "s" }
+                    ),
+                    by.to_string(),
+                    Some(format!("stopped at {node}: {reason}")),
+                );
                 state.roll.finish(
                     WorkflowPhase::Failed,
                     Some(format!(
@@ -753,6 +772,26 @@ async fn walk(state: &Arc<AppState>, order: Vec<String>, by: &str, rolling: bool
         }
     }
 
+    // The walk's own entry. Each member has already written down what it
+    // installed — the peer apply runs through that member's own
+    // `crate::updates::begin`, which logs there — so this one says the thing
+    // no member can: that somebody updated the environment, and it finished.
+    state.tasks.event(
+        if rolling { "rolling-update" } else { "update-all" },
+        format!(
+            "{} across {} node{}: {}",
+            if rolling {
+                "Rolled every node through a restart"
+            } else {
+                "Installed updates on every node"
+            },
+            order.len(),
+            if order.len() == 1 { "" } else { "s" },
+            order.join(", ")
+        ),
+        by.to_string(),
+        None,
+    );
     state.roll.finish(WorkflowPhase::Complete, None);
 }
 

@@ -100,6 +100,137 @@ pub enum NetworkVerb {
     },
 }
 
+/// One act on one machine, named — the closed set a console can ask the
+/// member that owns a machine to perform.
+///
+/// The same shape as [`NetworkVerb`] and for the same reasons, but the thing
+/// it makes possible is different in kind. A network write is forwarded
+/// because the operator may be sitting at the wrong console; a machine verb is
+/// forwarded because **the machine is somewhere else**, and an appliance whose
+/// console can only start the machines that happen to share a node with it is
+/// an appliance that makes an operator learn the layout before they can use
+/// it.
+///
+/// Every guard stays the target's. Whether a machine may start, whether a disk
+/// may be detached, whether a running guest may be cut off without warning are
+/// all decided by the hypervisor that has it — this carries the instruction
+/// and nothing else. The acknowledgements ride along for the reason
+/// `NetworkVerb::Apply` carries its own: they are validator inputs that are
+/// legitimately false, and dropping them would leave the target unable to
+/// refuse the thing nobody agreed to.
+///
+/// The console's viewer is deliberately **not** here. A VNC stream is a socket
+/// on the node holding the machine, not a request/response, and relaying one
+/// through this enum would mean a second console protocol. A machine on
+/// another member is viewed from that member's console, which the UI says.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "verb", content = "with", rename_all = "snake_case")]
+pub enum VmVerb {
+    /// One machine, in full — the detail page's read.
+    Get { vmid: u32 },
+    /// One machine's history, newest first.
+    Tasks { vmid: u32 },
+    Create(Box<lumen_virt::service::VmCreate>),
+    Update {
+        vmid: u32,
+        patch: Box<lumen_virt::service::VmPatch>,
+    },
+    Delete {
+        vmid: u32,
+        purge_disks: bool,
+        may_lose_data: bool,
+    },
+    Start {
+        vmid: u32,
+    },
+    Shutdown {
+        vmid: u32,
+    },
+    Stop {
+        vmid: u32,
+        may_lose_data: bool,
+    },
+    Reboot {
+        vmid: u32,
+    },
+    Reset {
+        vmid: u32,
+        may_lose_data: bool,
+    },
+    /// Live-migrate. Named from the *machine's* node, so a console anywhere
+    /// asks the node that has it to hand it over — which is the only node that
+    /// can.
+    Migrate {
+        vmid: u32,
+        target: String,
+    },
+    AttachDisk {
+        vmid: u32,
+        disk: Box<lumen_virt::service::DiskCreate>,
+    },
+    DetachDisk {
+        vmid: u32,
+        id: String,
+        purge_disks: bool,
+        may_lose_data: bool,
+    },
+    AttachNic {
+        vmid: u32,
+        nic: Box<lumen_virt::service::NicCreate>,
+    },
+    DetachNic {
+        vmid: u32,
+        id: String,
+    },
+    AttachCdrom {
+        vmid: u32,
+        cdrom: Box<lumen_virt::service::CdromCreate>,
+    },
+    SetCdromMedia {
+        vmid: u32,
+        id: String,
+        media: Box<lumen_virt::service::CdromCreate>,
+    },
+    DetachCdrom {
+        vmid: u32,
+        id: String,
+    },
+}
+
+impl VmVerb {
+    /// The machine it is about, when it is about an existing one. `None` for a
+    /// create, which is the one verb with no machine to route by.
+    pub fn vmid(&self) -> Option<u32> {
+        match self {
+            VmVerb::Create(_) => None,
+            VmVerb::Get { vmid }
+            | VmVerb::Tasks { vmid }
+            | VmVerb::Update { vmid, .. }
+            | VmVerb::Delete { vmid, .. }
+            | VmVerb::Start { vmid }
+            | VmVerb::Shutdown { vmid }
+            | VmVerb::Stop { vmid, .. }
+            | VmVerb::Reboot { vmid }
+            | VmVerb::Reset { vmid, .. }
+            | VmVerb::Migrate { vmid, .. }
+            | VmVerb::AttachDisk { vmid, .. }
+            | VmVerb::DetachDisk { vmid, .. }
+            | VmVerb::AttachNic { vmid, .. }
+            | VmVerb::DetachNic { vmid, .. }
+            | VmVerb::AttachCdrom { vmid, .. }
+            | VmVerb::SetCdromMedia { vmid, .. }
+            | VmVerb::DetachCdrom { vmid, .. } => Some(*vmid),
+        }
+    }
+
+    /// Whether it changes anything. The reads are forwarded on the same
+    /// channel — one relay rather than two — but only the writes are worth a
+    /// generous deadline.
+    pub fn is_slow(&self) -> bool {
+        !matches!(self, VmVerb::Get { .. } | VmVerb::Tasks { .. })
+    }
+}
+
 impl NetworkVerb {
     /// Whether the verb applies a change and waits on NetworkManager —
     /// checkpoints, activations, a live rename — rather than editing a
@@ -201,6 +332,68 @@ pub trait InventoryPeers: Send + Sync {
     /// that succeeds is one the member agreed was safe — the coordinator's
     /// belief about the cluster carries no weight over the member's own.
     async fn restart(&self, node: &EnvironmentNode) -> Result<(), ClusterError>;
+
+    /// One member's uptime, its own clock, and anything it is committed to.
+    ///
+    /// The read behind the environment's Maintenance table, and cheap enough
+    /// to be one round trip per member on every page load — logind is asked
+    /// what it has scheduled, and nothing leaves the node.
+    async fn power_state(
+        &self,
+        node: &EnvironmentNode,
+    ) -> Result<lumen_sys::service::PowerView, ClusterError>;
+
+    /// Commit one member to a restart or a shutdown, now or at a moment.
+    ///
+    /// The member applies its own quorum guard, exactly as [`Self::restart`]
+    /// does. `None` comes back for an immediate one: the node is going down
+    /// and has nothing truthful to report about the state it will be in.
+    async fn set_power(
+        &self,
+        node: &EnvironmentNode,
+        action: lumen_sys::model::PowerAction,
+        at: Option<u64>,
+        by: &str,
+    ) -> Result<Option<lumen_sys::service::PowerView>, ClusterError>;
+
+    /// Call off what one member has scheduled.
+    async fn cancel_power(
+        &self,
+        node: &EnvironmentNode,
+    ) -> Result<lumen_sys::service::PowerView, ClusterError>;
+
+    /// One member's most recent log entries, newest first.
+    ///
+    /// A window rather than the whole log: the caller is showing a page of
+    /// activity across every member, and the far end of one member's history
+    /// is not what any of them are looking at.
+    async fn tasks(
+        &self,
+        node: &EnvironmentNode,
+        limit: usize,
+    ) -> Result<Vec<crate::tasks::TaskRecord>, ClusterError>;
+
+    /// The machines one member has, exactly as that member serialized them.
+    ///
+    /// Its own answer about its own hypervisor — no member can speak for
+    /// another's domains, which is why the environment-wide list is a fan-out
+    /// and not a lookup in a record somebody keeps. Relayed untouched, like
+    /// the verb answers below: the console's view of a machine is that
+    /// member's view of it, not this node's re-telling.
+    async fn vms(&self, node: &EnvironmentNode) -> Result<serde_json::Value, ClusterError>;
+
+    /// Run one machine verb on the member that owns the machine — the
+    /// compute half of the federation's proxied write, answering with exactly
+    /// the JSON that member's own console route would have returned.
+    ///
+    /// `by` is the operator's principal, carried so that member's own log
+    /// names the person rather than only the node that relayed the request.
+    async fn vm_verb(
+        &self,
+        node: &EnvironmentNode,
+        verb: &VmVerb,
+        by: &str,
+    ) -> Result<serde_json::Value, ClusterError>;
 
     /// Run one networking verb on one member — the federation's proxied
     /// write, and the answer is exactly the JSON that member's own console
@@ -319,6 +512,51 @@ impl InventoryPeers for NoPeers {
 
     async fn restart(&self, node: &EnvironmentNode) -> Result<(), ClusterError> {
         Err(no_channel(node, "restarted"))
+    }
+
+    async fn power_state(
+        &self,
+        node: &EnvironmentNode,
+    ) -> Result<lumen_sys::service::PowerView, ClusterError> {
+        Err(no_channel(node, "asked about its power"))
+    }
+
+    async fn set_power(
+        &self,
+        node: &EnvironmentNode,
+        _action: lumen_sys::model::PowerAction,
+        _at: Option<u64>,
+        _by: &str,
+    ) -> Result<Option<lumen_sys::service::PowerView>, ClusterError> {
+        Err(no_channel(node, "restarted or shut down"))
+    }
+
+    async fn cancel_power(
+        &self,
+        node: &EnvironmentNode,
+    ) -> Result<lumen_sys::service::PowerView, ClusterError> {
+        Err(no_channel(node, "told to call it off"))
+    }
+
+    async fn tasks(
+        &self,
+        node: &EnvironmentNode,
+        _limit: usize,
+    ) -> Result<Vec<crate::tasks::TaskRecord>, ClusterError> {
+        Err(no_channel(node, "asked for its log"))
+    }
+
+    async fn vms(&self, node: &EnvironmentNode) -> Result<serde_json::Value, ClusterError> {
+        Err(no_channel(node, "asked for its machines"))
+    }
+
+    async fn vm_verb(
+        &self,
+        node: &EnvironmentNode,
+        _verb: &VmVerb,
+        _by: &str,
+    ) -> Result<serde_json::Value, ClusterError> {
+        Err(no_channel(node, "asked to act on one of its machines"))
     }
 
     async fn network(

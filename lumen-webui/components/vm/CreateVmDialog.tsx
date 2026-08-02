@@ -7,6 +7,7 @@ import { Switch } from "@/components/ui/Switch";
 import { Tabs, type TabItem } from "@/components/ui/Tabs";
 import { ErrorText, Field, SelectInput, TextInput } from "@/components/ui/formkit";
 import { Button } from "@/components/ui/Button";
+import { useDeploymentScope } from "@/lib/deploymentScope";
 import { fetchInterfaces } from "@/lib/networkClient";
 import { fetchPooledStorage } from "@/lib/poolClient";
 import {
@@ -204,6 +205,7 @@ export function CreateVmDialog({
   onClose: () => void;
   onCreated: (vm: VmView) => void;
 }) {
+  const scope = useDeploymentScope();
   const [tab, setTab] = useState<Tab>("general");
   const [draft, setDraft] = useState<Draft>(emptyDraft);
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -539,7 +541,15 @@ export function CreateVmDialog({
     <ModalShell onClose={onClose} maxWidth={760}>
       <ModalHeader
         title="Create Virtual Machine"
-        subtitle="The machine is defined on this node as soon as you finish."
+        // Which node, by name, once there is more than one — the pools, the
+        // bridges, and the processor models this dialog offers are all that
+        // node's, and in a cluster an operator has to know which console they
+        // are creating from. On one appliance the name is noise.
+        subtitle={
+          scope.clustered && scope.node
+            ? `The machine is defined on ${scope.node} as soon as you finish, from that node's pools and bridges.`
+            : "The machine is defined as soon as you finish."
+        }
         onClose={onClose}
       />
 

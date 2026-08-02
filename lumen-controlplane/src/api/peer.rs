@@ -300,6 +300,145 @@ pub struct PeerPowerRequest {
     pub action: crate::api::cluster::NodePowerAction,
 }
 
+/// POST /api/peer/vms — the machines this node has.
+///
+/// Its own hypervisor's answer about its own domains. The environment-wide
+/// list is every member's answer to this, gathered at one moment.
+pub async fn vms(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<lumen_virt::service::NodeVms>, ApiError> {
+    Ok(Json(crate::cluster_vms::local(&state).await?))
+}
+
+/// POST /api/peer/vms/verb — act on one of this node's machines, on behalf of
+/// an operator working from another member's console.
+///
+/// Every guard is this node's: whether the machine may start, whether its disk
+/// may be detached, whether a running guest may be cut off. The relay carries
+/// the instruction and the name to file it under, and nothing else — the
+/// acknowledgements inside the verb are validator inputs this node still gets
+/// to act on, exactly as `network_verb` beside it does.
+pub async fn vm_verb(
+    peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<PeerVmVerb>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let by = match request.by.as_deref() {
+        Some(principal) => format!("{principal} via {}", peer.0),
+        None => peer.0.clone(),
+    };
+    Ok(Json(
+        crate::api::vms::run_verb(&state, &by, request.verb).await?,
+    ))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerVmVerb {
+    pub verb: crate::inventory::VmVerb,
+    /// Who asked, as the relaying console knows them. A label for this node's
+    /// log, as on the apply route — not a permission.
+    #[serde(default)]
+    pub by: Option<String>,
+}
+
+/// POST /api/peer/tasks — this node's most recent log entries, newest first.
+///
+/// The window is the caller's, capped here: a member asked for its log must
+/// not be talked into serializing the whole of it on every poll of somebody
+/// else's page.
+pub async fn tasks(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<PeerTaskWindow>,
+) -> Json<serde_json::Value> {
+    let limit = request
+        .limit
+        .unwrap_or(crate::api::vms::DEFAULT_TASK_LIMIT)
+        .min(crate::api::vms::MAX_TASK_LIMIT);
+    Json(serde_json::json!({ "tasks": state.tasks.recent(limit) }))
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerTaskWindow {
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// POST /api/peer/system/power — this node's uptime, clock, and schedule.
+///
+/// The read behind the environment's Maintenance table. A POST rather than a
+/// GET because the whole peer surface is: it is authenticated by a ticket in
+/// the body, not by anything a GET could carry.
+pub async fn power_state(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<lumen_sys::service::PowerView>, ApiError> {
+    Ok(Json(state.sys.power().await?))
+}
+
+/// POST /api/peer/system/power/set — restart or shut this node down, on behalf
+/// of an operator working from another member's console.
+///
+/// Every guard is this node's. Whether its cluster can spare it is a question
+/// about *this* node's quorum, asked here with this node's view of it, and the
+/// coordinator's belief about it carries no weight — the same rule
+/// [`restart`] below already follows.
+///
+/// The acknowledgement that overrides that guard is deliberately not taken
+/// from the wire, for the reason [`apply_updates`] gives about the kernel:
+/// consent was given to the console the operator is looking at, and a peer
+/// route that accepted "yes, lose quorum" from a body would be a second,
+/// quieter way to stop a cluster. An operator who means it can say so on the
+/// node's own page, where they are the ones being told what it costs.
+///
+/// Answers the node's power view for a schedule and `null` for an immediate
+/// one — the node is going down, and there is nothing truthful to say about
+/// the state it will be in when it does.
+pub async fn set_power(
+    peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<PeerSetPowerRequest>,
+) -> Result<Json<Option<lumen_sys::service::PowerView>>, ApiError> {
+    let by = match request.by.as_deref() {
+        Some(principal) => format!("{principal} via {}", peer.0),
+        None => peer.0.clone(),
+    };
+    tracing::info!(
+        "{by} asked this node to {} {}",
+        request.action.as_sentence(),
+        match request.at {
+            Some(at) => format!("at {at}"),
+            None => "now".to_string(),
+        }
+    );
+    Ok(Json(
+        crate::api::system::power_locally(&state, request.action, request.at, false).await?,
+    ))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerSetPowerRequest {
+    pub action: lumen_sys::model::PowerAction,
+    /// Seconds since the epoch. Absent means now.
+    #[serde(default)]
+    pub at: Option<u64>,
+    /// Who asked. A label for this node's journal, as on the apply route.
+    #[serde(default)]
+    pub by: Option<String>,
+}
+
+/// POST /api/peer/system/power/cancel — call off what this node has scheduled.
+pub async fn cancel_power(
+    _peer: PeerSession,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<lumen_sys::service::PowerView>, ApiError> {
+    Ok(Json(crate::api::system::cancel_locally(&state).await?))
+}
+
 /// POST /api/peer/system/restart — restart this node now.
 ///
 /// The quorum guard is the same one the operator-facing power route uses, and

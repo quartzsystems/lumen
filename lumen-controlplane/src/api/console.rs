@@ -84,6 +84,18 @@ pub async fn info(
     State(state): State<Arc<AppState>>,
     Path(vmid): Path<u32>,
 ) -> Result<Json<ConsoleInfo>, ApiError> {
+    // The one thing about a machine that is not relayed to the member holding
+    // it. A screen is a socket on that node, not a request and an answer, and
+    // proxying the stream would mean a second console protocol carrying RFB
+    // between two control planes. The refusal names the node instead, which is
+    // what an operator needs to do the thing themselves.
+    if let Some(owner) = crate::cluster_vms::owner_of(&state, vmid).await {
+        return Err(ApiError::Conflict(format!(
+            "Machine {vmid} is running on \"{}\", and its screen is served by that node. Open it \
+             from \"{}\"'s console.",
+            owner.name, owner.name
+        )));
+    }
     let target = state.virt.console(vmid).await?;
     Ok(Json(ConsoleInfo {
         websocket: format!("/api/vms/{vmid}/console/ws"),

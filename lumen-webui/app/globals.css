@@ -251,7 +251,6 @@ body {
      not surface — because ordinary cells are transparent over the page
      and a lighter sticky cell reads as a differently-colored column. */
   background: var(--qz-bg);
-  border-left: 1px solid var(--qz-divider);
 }
 .qz-table tbody tr:hover td.qz-sticky-actions {
   background: color-mix(in oklab, white 4%, var(--qz-surface));

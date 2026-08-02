@@ -95,7 +95,8 @@ distinction, and a copy-pasteable `curl` walkthrough):
 | `/api/vms/:vmid/console`                | GET    | Where the console is, or why there is none   |
 | `/api/vms/:vmid/console/ws`             | GET    | The console stream — a WebSocket             |
 | `/api/vms/:vmid/tasks`                  | GET    | What has been done to this machine, newest first |
-| `/api/tasks`                            | GET    | The same log across every machine; `?limit=` windows it |
+| `/api/tasks`                            | GET    | The same log across every machine on this node; `?limit=` windows it |
+| `/api/environment/tasks`                | GET    | Every member's log, each member's window newest-first |
 | `/api/nodes`                            | GET    | Each node's processors, memory, and what is running against them |
 | `/api/storage/pools`                    | GET    | Pools, grouped by node                       |
 | `/api/storage/pools`                    | POST   | Build a pool                                 |
@@ -116,6 +117,9 @@ model, the privileged-execution mechanism, and a `curl` walkthrough):
 | `/api/system/power`                     | GET    | Uptime, the node's clock, anything scheduled |
 | `/api/system/power`                     | POST   | Restart or shut down — now, or at `at`       |
 | `/api/system/power`                     | DELETE | Call off whatever is scheduled               |
+| `/api/environment/power`                | GET    | Every member's uptime, clock, and schedule   |
+| `/api/environment/power`                | POST   | Restart or shut one member down — `node` in the body |
+| `/api/environment/power`                | DELETE | Call off one member's schedule               |
 
 A volume still has no endpoint of its own: one is created *for a machine*, so
 it is reached through `/api/vms/:vmid/disks`. A pool is not created for

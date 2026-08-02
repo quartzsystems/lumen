@@ -443,8 +443,8 @@ entry carrying `code`, `vm`, `field`, and `message`.
 
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
-| GET | `/api/vms` | All machines, grouped by node |
-| GET | `/api/vms/:vmid` | One machine, full detail |
+| GET | `/api/vms` | Every member's machines, grouped by node |
+| GET | `/api/vms/:vmid` | One machine, full detail, wherever it is |
 | POST | `/api/vms` | Define the machine and the volumes its disks live on |
 | PATCH | `/api/vms/:vmid` | Update; reports what applied live and what waits |
 | DELETE | `/api/vms/:vmid` | Undefine; `purge_disks` off by default |
@@ -478,6 +478,49 @@ There is deliberately **no** endpoint that creates, imports, or destroys a
 pool, and `vm_flow::there_is_no_way_to_create_or_destroy_a_pool` asserts that
 none appears by accident. The media library is the one storage *write* the
 console has, for the reason below.
+
+### A machine is wherever it is
+
+Every route in that table above the media rows is addressed **by machine, not
+by node**, and means the same thing from every console in the environment. A
+request for a machine this node does not have is resolved to the member that
+does and relayed there, through a closed verb enum
+(`crate::inventory::VmVerb`) on `POST /api/peer/vms/verb` — the same shape
+`api/network.rs` uses to forward a link's configuration, for a sharper reason.
+A link is on the node an operator wants to configure; a *machine* is wherever
+it last migrated to, and an appliance whose console can only start the machines
+that happen to share a node with it makes an operator learn the layout before
+they can use it.
+
+Resolution is by identifier and costs nothing in the ordinary case: this node
+is asked first, and only a miss fans out to the members. An explicit `node` in
+the body still wins for the caller that knows — including `POST /api/vms`,
+which is the one verb with no machine to resolve by and so the one where naming
+the node is the only way to mean another member.
+
+Every guard stays with the hypervisor that has the machine. What crosses the
+wire is the instruction and the operator's principal — carried so that member's
+own task log names the person and not merely the node that relayed them.
+Whether the machine may start, whether the disk may go, whether a running guest
+may be cut off are all still decided by the node that would have to do it, and
+the answer the console gets is that member's answer, relayed untouched.
+
+`GET /api/vms/next-id` therefore scans **every** member. Node-local uniqueness
+stopped being enough the moment one console could see them all: two nodes each
+allocating 101 would put two machines with one identifier in one table, and
+give each a machine that can never migrate to the other's node.
+
+**Two things are deliberately not relayed.**
+
+- `GET /api/vms/:vmid/console` and its stream. A screen is a socket on the node
+  holding the machine, not a request and an answer, and proxying it would mean
+  a second console protocol carrying RFB between two control planes. The route
+  refuses for a machine elsewhere and **names the node**, so an operator is told
+  where to go rather than handed a viewer that goes grey.
+- `PUT /api/vms/:vmid/files`. The body is bytes rather than a verb, and the
+  transfer is already buffered whole — putting it inside a JSON envelope to
+  cross the cluster would copy it twice on the road that is already the wrong
+  one for anything large. Refused by name, same as the console.
 
 ---
 

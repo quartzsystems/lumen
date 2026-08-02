@@ -303,6 +303,34 @@ the operator types the node's name — rather than as an acknowledgement field,
 because unlike stopping a machine this is something the console can neither
 undo nor report the result of.
 
+### Any node's power, from any node's console
+
+`/api/system/power` still means *this appliance*, and every write on that prefix
+still does. Beside it is `/api/environment/power`, addressed by node in the
+body: a `GET` for every member's uptime, clock, and schedule, a `POST` to commit
+one of them, a `DELETE` to call one off. The Maintenance page reads the first
+and its table's buttons send the other two.
+
+Addressed in the body rather than in the path because
+`/api/environment/nodes/{node}/power` already means something else, and means it
+more violently: that one cuts a member's power through a **fence device**, for a
+node that has stopped answering. These are the graceful pair — logind's own
+restart, on a node that is still listening.
+
+The guards do not move. Whether a cluster can spare a member is a question about
+that member's quorum, asked with that member's view of it, so
+`guard_cluster_power` runs on the node being restarted and not on the one
+relaying the request — the same rule the rolling update's peer restart already
+follows. The acknowledgement that overrides it deliberately does **not** cross
+the wire, for the reason `apply_updates` gives about the kernel: consent was
+given to a console, and a peer route that accepted "yes, lose quorum" from a
+body would be a second, quieter way to stop a cluster.
+
+There is deliberately no button that restarts every node at once. A restart is
+one node going down at a moment somebody chose; taking a whole cluster through
+restarts one at a time is a rolling update, and that lives on the Updates page
+with the drain and the quorum guard it needs.
+
 ### The disk picker exists so a pool is never built on the wrong disk
 
 `zpool create` destroys whatever was on the disks it is given. A picker that

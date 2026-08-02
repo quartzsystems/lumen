@@ -218,15 +218,27 @@ pub async fn begin(
     state.update_job.set(progress.clone());
 
     let background = state.clone();
+    let owner = by.to_string();
     tokio::spawn(async move {
-        run(&background, request).await;
+        run(&background, request, &owner).await;
     });
     Ok(progress)
 }
 
 /// The transaction proper.
-async fn run(state: &Arc<AppState>, request: ApplyRequest) {
+///
+/// One log entry, written when it is over rather than when it begins. A
+/// transaction that is running is already on the Updates page, with its
+/// elapsed time and the node it is on; what the log is for is the question
+/// asked afterwards — what was installed here, when, and by whom — and that
+/// has no answer until the package manager has one.
+async fn run(state: &Arc<AppState>, request: ApplyRequest, by: &str) {
     let handle = state.update_job.clone();
+    let what = if request.platform {
+        "the kernel and storage modules"
+    } else {
+        "updates"
+    };
     match state.updates.apply(request).await {
         Ok(report) => {
             // Read the kernel state afterwards rather than assuming: whether a
@@ -237,6 +249,19 @@ async fn run(state: &Arc<AppState>, request: ApplyRequest) {
                 changed = report.changed.len(),
                 "update finished on {}",
                 state.updates.node()
+            );
+            state.tasks.event(
+                "update",
+                match report.changed.len() {
+                    0 => format!("Installed {what} — nothing changed"),
+                    count => format!(
+                        "Installed {what} — {count} package{}: {}",
+                        if count == 1 { "" } else { "s" },
+                        report.changed.join(", ")
+                    ),
+                },
+                by.to_string(),
+                None,
             );
             handle.finish(
                 WorkflowPhase::Complete,
@@ -249,6 +274,12 @@ async fn run(state: &Arc<AppState>, request: ApplyRequest) {
         Err(err) => {
             tracing::error!("update failed: {err}");
             let reboot = state.updates.view().await.ok().map(|view| view.reboot);
+            state.tasks.event(
+                "update",
+                format!("Install {what}"),
+                by.to_string(),
+                Some(err.to_string()),
+            );
             handle.finish(
                 WorkflowPhase::Failed,
                 Some(err.to_string()),

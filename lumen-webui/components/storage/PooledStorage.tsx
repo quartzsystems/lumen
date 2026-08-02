@@ -32,31 +32,23 @@ import { formatBytes } from "@/lib/vmClient";
 
 const POLL_MS = 5000;
 
-/// The LumenFS pool: pooled, deduplicated storage owned by the cluster,
-/// serving each machine disk as the same `/dev/ublkb<id>` on every member.
+/// The pool, read once and kept current.
 ///
-/// The section owns its own data and renders nothing at all on a
-/// standalone node — absent rather than empty. The one exception is a pool
-/// configuration that exists but could not be assembled: that is a broken
-/// deployment, and it renders as its own sentence, because "nothing to
-/// show" and "your deployment is broken" must never look alike.
-export function PooledStorageSection() {
-  const { setToast } = useConsole();
+/// Two sections read the same answer from two different pages — the pool
+/// itself lives under Pools, and the disks it serves live under Volumes — so
+/// the reading is here and each page holds its own copy. One extra request per
+/// open, and neither page can be made to wait on the other's state.
+///
+/// `paused` stops the poll while a dialog is open, so a refresh cannot move
+/// what the operator is pointing at mid-choice.
+function usePooledStorage(paused: boolean) {
   const [pool, setPool] = useState<PooledStorageView | null>(null);
   const [broken, setBroken] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  /// Whether the first answer has arrived. Until it has, the section
-  /// renders nothing — "still loading" must never look like "no pool",
+  /// Whether the first answer has arrived. Until it has, the sections
+  /// render nothing — "still loading" must never look like "no pool",
   /// or every page open starts with an invitation to create one.
   const [loaded, setLoaded] = useState(false);
-  const [snapshotting, setSnapshotting] = useState<PoolVdisk | null>(null);
-  const [creating, setCreating] = useState(false);
-  const [destroying, setDestroying] = useState(false);
-  /// The orphaned disk being reaped, when one is.
-  const [reaping, setReaping] = useState<PoolVdisk | null>(null);
-  /// Whether the empty-state create card may render: this node is in a
-  /// cluster, because the pool spans one.
-  const [eligible, setEligible] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -76,6 +68,38 @@ export function PooledStorageSection() {
     void load();
   }, [load]);
 
+  useEffect(() => {
+    if (paused) return;
+    const timer = setInterval(() => void load(), POLL_MS);
+    return () => clearInterval(timer);
+  }, [load, paused]);
+
+  return { pool, broken, error, loaded, load };
+}
+
+/// The LumenFS pool: pooled, deduplicated storage owned by the cluster,
+/// serving each machine disk as the same `/dev/ublkb<id>` on every member.
+///
+/// This is the pool itself — its members, its replication, and the two things
+/// that can be done to the whole of it. The disks it holds are volumes and are
+/// listed with the other volumes, on their own page: a machine disk is the
+/// same kind of object whether the pool serving it is this one or a node's own
+/// ZFS, and an operator looking for one should not have to know which.
+///
+/// The section owns its own data and renders nothing at all on a
+/// standalone node — absent rather than empty. The one exception is a pool
+/// configuration that exists but could not be assembled: that is a broken
+/// deployment, and it renders as its own sentence, because "nothing to
+/// show" and "your deployment is broken" must never look alike.
+export function PooledStorageSection() {
+  const { setToast } = useConsole();
+  const [creating, setCreating] = useState(false);
+  const [destroying, setDestroying] = useState(false);
+  /// Whether the empty-state create card may render: this node is in a
+  /// cluster, because the pool spans one.
+  const [eligible, setEligible] = useState(false);
+  const { pool, broken, error, loaded, load } = usePooledStorage(creating || destroying);
+
   // Read once: whether a create is even offerable here. The fact changes
   // only through workflows that reload this page anyway.
   useEffect(() => {
@@ -92,22 +116,6 @@ export function PooledStorageSection() {
       }
     })();
   }, []);
-
-  useEffect(() => {
-    // Polling pauses while a dialog is open, so a refresh cannot move
-    // what the operator is pointing at mid-choice.
-    if (snapshotting || creating || destroying || reaping) return;
-    const timer = setInterval(() => void load(), POLL_MS);
-    return () => clearInterval(timer);
-  }, [load, snapshotting, creating, destroying, reaping]);
-
-  // Keep the dialog's row current across reloads: it shows the snapshot
-  // list, which its own actions change.
-  useEffect(() => {
-    if (!snapshotting || !pool) return;
-    const fresh = pool.vdisks.find((v) => v.vdisk === snapshotting.vdisk);
-    if (fresh && fresh !== snapshotting) setSnapshotting(fresh);
-  }, [pool, snapshotting]);
 
   if (!pool && !broken && !error) {
     // No pool here. On a clustered node that is an invitation, not an
@@ -246,43 +254,100 @@ export function PooledStorageSection() {
             rowId={(member) => member.name}
             emptyMessage="No members answered."
           />
-          <DataTable
-            rows={pool.vdisks}
-            columns={vdiskColumns(pool)}
-            rowId={(vdisk) => String(vdisk.vdisk)}
-            emptyMessage="The pool holds no disks yet — they are created with a machine."
-            actions={(vdisk) => (
-              <div className="flex items-center gap-1 justify-end">
-                <span title="Snapshots: instant, crash-consistent, on both members at once">
-                  <Button
-                    kind="ghost"
-                    size="sm"
-                    icon={Camera}
-                    onClick={() => setSnapshotting(vdisk)}
-                  />
-                </span>
-                <span
-                  title={
-                    vdisk.exported_on.length > 0
-                      ? "Served right now — stop the machine using it first."
-                      : vdisk.disk === null
-                        ? "Not a machine disk; the pool's own bookkeeping."
-                        : `Delete ${diskLabel(vdisk)} — for a volume its machine left behind.`
-                  }
-                >
-                  <Button
-                    kind="ghost"
-                    size="sm"
-                    icon={Trash2}
-                    disabled={vdisk.exported_on.length > 0 || vdisk.disk === null}
-                    onClick={() => setReaping(vdisk)}
-                  />
-                </span>
-              </div>
-            )}
-          />
+          <p className="text-[12px] text-[var(--qz-fg-4)] m-0">
+            The {pool.vdisks.length} disk{pool.vdisks.length === 1 ? "" : "s"} this pool serves are
+            under Storage → Volumes, with their snapshots.
+          </p>
         </>
       )}
+
+      {destroying && (
+        <DestroyLumenPoolDialog
+          vdisks={pool?.vdisks.length ?? 0}
+          broken={broken}
+          onClose={() => setDestroying(false)}
+          onDestroyed={() => {
+            setToast("The pool is gone; every brick was wiped.");
+            setDestroying(false);
+            void load();
+          }}
+        />
+      )}
+    </section>
+  );
+}
+
+/// The disks the pool serves — the volumes half of the same answer.
+///
+/// On the Volumes page beside the nodes' own ZFS volumes, because a machine
+/// disk is a machine disk: which engine serves it is a property of the disk,
+/// not a different kind of object. Renders nothing when there is no pool, and
+/// says nothing about the pool's health — that is next door, under Pools,
+/// where the thing it is about lives.
+export function PooledVolumesSection() {
+  const { setToast } = useConsole();
+  const [snapshotting, setSnapshotting] = useState<PoolVdisk | null>(null);
+  /// The orphaned disk being reaped, when one is.
+  const [reaping, setReaping] = useState<PoolVdisk | null>(null);
+  const { pool, load } = usePooledStorage(snapshotting !== null || reaping !== null);
+
+  // Keep the dialog's row current across reloads: it shows the snapshot
+  // list, which its own actions change.
+  useEffect(() => {
+    if (!snapshotting || !pool) return;
+    const fresh = pool.vdisks.find((v) => v.vdisk === snapshotting.vdisk);
+    if (fresh && fresh !== snapshotting) setSnapshotting(fresh);
+  }, [pool, snapshotting]);
+
+  if (!pool) return null;
+
+  return (
+    <section className="flex flex-col gap-2">
+      <div className="flex items-center gap-3">
+        <h2 className="text-[13px] font-semibold text-[var(--qz-fg-2)] m-0">
+          Pooled — {pool.name}
+        </h2>
+        <span
+          className="text-[12px] text-[var(--qz-fg-3)]"
+          title="Served as the same device on every member, so a machine using one can start anywhere."
+        >
+          {pool.vdisks.length} {pool.vdisks.length === 1 ? "disk" : "disks"}
+        </span>
+      </div>
+
+      <DataTable
+        rows={pool.vdisks}
+        columns={vdiskColumns(pool)}
+        rowId={(vdisk) => String(vdisk.vdisk)}
+        storageKey="volumes-pooled"
+        searchPlaceholder="Search disks…"
+        emptyMessage="The pool holds no disks yet — they are created with a machine."
+        onRefresh={load}
+        actions={(vdisk) => (
+          <div className="flex items-center gap-1 justify-end">
+            <span title="Snapshots: instant, crash-consistent, on both members at once">
+              <Button kind="ghost" size="sm" icon={Camera} onClick={() => setSnapshotting(vdisk)} />
+            </span>
+            <span
+              title={
+                vdisk.exported_on.length > 0
+                  ? "Served right now — stop the machine using it first."
+                  : vdisk.disk === null
+                    ? "Not a machine disk; the pool's own bookkeeping."
+                    : `Delete ${diskLabel(vdisk)} — for a volume its machine left behind.`
+              }
+            >
+              <Button
+                kind="ghost"
+                size="sm"
+                icon={Trash2}
+                disabled={vdisk.exported_on.length > 0 || vdisk.disk === null}
+                onClick={() => setReaping(vdisk)}
+              />
+            </span>
+          </div>
+        )}
+      />
 
       {snapshotting && (
         <PoolSnapshotsDialog
@@ -304,19 +369,6 @@ export function PooledStorageSection() {
           onReaped={() => {
             setToast(`${diskLabel(reaping)} deleted on every member.`);
             setReaping(null);
-            void load();
-          }}
-        />
-      )}
-
-      {destroying && (
-        <DestroyLumenPoolDialog
-          vdisks={pool?.vdisks.length ?? 0}
-          broken={broken}
-          onClose={() => setDestroying(false)}
-          onDestroyed={() => {
-            setToast("The pool is gone; every brick was wiped.");
-            setDestroying(false);
             void load();
           }}
         />

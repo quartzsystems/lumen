@@ -2,9 +2,9 @@
 
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { ApiError } from "@/lib/authClient";
-import { fetchVms, type NodeVms, type VmView } from "@/lib/vmClient";
+import { fetchVms, type NodeVms, type SilentMember, type VmView } from "@/lib/vmClient";
 
-/// The node's machines, read once for the whole console.
+/// The environment's machines, read once for the whole console.
 ///
 /// Machines are runtime data, not navigation: they change while the operator
 /// is looking at them, and three separate consumers want them — the sidebar's
@@ -19,6 +19,11 @@ interface VmState {
   /// Why the list is empty, when that is the reason. A node whose hypervisor
   /// is down still has a console, and it says so.
   error: string | null;
+  /// Members that could not be asked. Their machines are missing from the
+  /// list, which is a different thing from their not existing — and on a page
+  /// that is now the whole environment's, it is the difference between "that
+  /// machine is gone" and "that node is not answering".
+  unreachable: SilentMember[];
   refresh: () => Promise<void>;
   /// Stop polling while a dialog is open, so a refresh cannot yank a form out
   /// from under the operator mid-edit.
@@ -40,6 +45,7 @@ const VmContext = createContext<VmState | null>(null);
 
 export function VmProvider({ children }: { children: React.ReactNode }) {
   const [nodes, setNodes] = useState<NodeVms[]>([]);
+  const [unreachable, setUnreachable] = useState<SilentMember[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<number | null>(null);
@@ -49,12 +55,13 @@ export function VmProvider({ children }: { children: React.ReactNode }) {
     try {
       const response = await fetchVms();
       setNodes(response.nodes);
+      setUnreachable(response.unreachable ?? []);
       setError(null);
     } catch (err) {
       // A 401 has already redirected to /login; anything else is worth saying
       // out loud rather than rendering as "no machines".
       if (err instanceof ApiError && err.status === 401) return;
-      setError(err instanceof Error ? err.message : "Could not read the machines on this node.");
+      setError(err instanceof Error ? err.message : "Could not read the machines.");
     } finally {
       setLoading(false);
     }
@@ -80,6 +87,7 @@ export function VmProvider({ children }: { children: React.ReactNode }) {
         vms,
         loading,
         error,
+        unreachable,
         refresh,
         setPaused: (paused) => {
           pausedRef.current = paused;

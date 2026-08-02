@@ -299,6 +299,34 @@ restart, says that nodes with only userland updates are not taken down for them,
 and calls out the coordinating node before the operator starts rather than
 leaving it to be discovered at the end.
 
+### Every install is written down
+
+A transaction that has finished leaves an entry in the node's own log — the one
+`crate::tasks` keeps, which until now held only what was asked of machines. An
+update belongs to no machine, so `TaskRecord::vmid` became optional and
+`TaskLog::event` is how something that happened *to the node* is recorded; a
+record already on disk carries its `vmid` and keeps meaning what it meant.
+
+One entry, written when it is over rather than when it begins. A transaction
+that is running is already on this page, with its elapsed time and the node it
+is on; what a log is for is the question asked afterwards — what was installed
+here, when, and by whom — and that has no answer until the package manager has
+one.
+
+An environment-wide update writes one more, on the node that drove it, saying
+the thing no member can say for itself: that somebody updated the environment,
+and how it ended. Each member has already recorded its own install, because the
+peer apply runs through that member's own `crate::updates::begin`. The walk's
+entry is deliberately written *before* the refusal is published, because the
+log outlives the record: the walk's progress lives in one process's memory and
+the log is on disk, so this is what an operator still has after the coordinator
+restarts itself.
+
+`System → Logs` is where they are read, every member's at once — see
+`GET /api/environment/tasks`.
+
+---
+
 ## Updating every node
 
 `src/cluster_updates.rs`. Reading is a concurrent fan-out; **installing is a

@@ -1,5 +1,8 @@
 pub mod api;
+pub mod cluster_power;
+pub mod cluster_tasks;
 pub mod cluster_updates;
+pub mod cluster_vms;
 pub mod config;
 pub mod error;
 pub mod ha;

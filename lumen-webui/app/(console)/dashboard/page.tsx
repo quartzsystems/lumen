@@ -554,7 +554,10 @@ export default function DashboardPage() {
             </DashPanel>
           </div>
 
-          <DashPanel title="Logs">
+          {/* This panel reads *this node's* log, because that is the read a
+              dashboard can afford on a poll. The whole of it — every node,
+              interleaved — is one click away on the page that owns it. */}
+          <DashPanel title="Logs" action={<MoreLink href="/system/logs">All nodes</MoreLink>}>
             {tasks === null ? (
               <PanelEmpty>Reading the log…</PanelEmpty>
             ) : tasks.length === 0 ? (
@@ -576,9 +579,12 @@ export default function DashboardPage() {
                     <tr
                       key={task.id}
                       // The whole of a machine's history is one click away, on
-                      // the machine it belongs to.
-                      onClick={() =>
-                        router.push(`/virtual-machines?vm=${task.vmid}&section=tasks`)
+                      // the machine it belongs to. An entry about the node
+                      // itself belongs to no machine and goes nowhere.
+                      onClick={
+                        task.vmid == null
+                          ? undefined
+                          : () => router.push(`/virtual-machines?vm=${task.vmid}&section=tasks`)
                       }
                     >
                       <td>
@@ -591,8 +597,15 @@ export default function DashboardPage() {
                         )}
                       </td>
                       <td className="mono">{formatTime(task.time)}</td>
-                      <td className="mono truncate" title={nameOf(task.vmid) ?? undefined}>
-                        {nameOf(task.vmid) ?? task.vmid}
+                      <td
+                        className="mono truncate"
+                        title={task.vmid == null ? undefined : (nameOf(task.vmid) ?? undefined)}
+                      >
+                        {task.vmid == null ? (
+                          <span className="qz-dim">the node</span>
+                        ) : (
+                          (nameOf(task.vmid) ?? task.vmid)
+                        )}
                       </td>
                       <td className="mono">{task.action}</td>
                       <td className="mono">{task.user}</td>

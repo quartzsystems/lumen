@@ -141,6 +141,49 @@ export const powerAt = (action: PowerAction, at: number): Promise<PowerView> =>
 
 export const cancelPower = (): Promise<PowerView> => del<PowerView>("/system/power");
 
+// --- the environment ---------------------------------------------------------
+
+/// One member as the Maintenance table carries it.
+///
+/// `reachable: false` with an `error` is a member that is in the environment
+/// and could not be asked — which on this page is also the expected state of a
+/// node doing exactly what the operator just told it to.
+export interface MemberPower {
+  node: string;
+  local: boolean;
+  reachable: boolean;
+  error?: string | null;
+  power?: PowerView | null;
+}
+
+export interface EnvironmentPower {
+  members: MemberPower[];
+}
+
+/// Every member's uptime, clock, and schedule. One round trip per member and
+/// nothing leaves the cluster, so this is safe on every page load.
+export const fetchEnvironmentPower = (): Promise<EnvironmentPower> =>
+  apiFetch<EnvironmentPower>("/environment/power");
+
+/// Restart or shut one member down now.
+///
+/// Answers 202 with no body, whichever node it was: there is nothing truthful
+/// to put in one about a node that is going down, and when the node is this
+/// one the connection carrying it is about to go away.
+export const powerNodeNow = (node: string, action: PowerAction): Promise<void> =>
+  post<void>("/environment/power", { node, action });
+
+/// The same, at a moment. Answers that member's own power view.
+export const powerNodeAt = (
+  node: string,
+  action: PowerAction,
+  at: number,
+): Promise<PowerView> => post<PowerView>("/environment/power", { node, action, at });
+
+/// Call off what one member has scheduled.
+export const cancelNodePower = (node: string): Promise<PowerView> =>
+  del<PowerView>("/environment/power", { node });
+
 // --- display helpers ---------------------------------------------------------
 
 /// How a login state reads, and what to do about it. The remedy is the point:

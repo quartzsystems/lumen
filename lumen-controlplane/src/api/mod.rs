@@ -124,6 +124,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         // what the dashboard shows as activity across every machine. Not
         // under /api/vms because it is not about one machine.
         .route("/api/tasks", get(vms::recent_tasks))
+        // The same log again, from every member at once — the Logs page. Under
+        // /api/environment because that is what it is about; the handler stays
+        // beside its node-local twin.
+        .route("/api/environment/tasks", get(vms::environment_tasks))
         // The nodes themselves: what each has, and what is running on it. The
         // dashboard's compute panel and the Infrastructure section read this.
         .route("/api/nodes", get(nodes::list))
@@ -166,6 +170,19 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/environment/updates/progress",
             get(updates::cluster_progress),
+        )
+        // A member's power the graceful way: logind's own restart, shutdown,
+        // and schedule, on a node that is still listening. Addressed by node
+        // in the body — the path above already means the fence device, which
+        // is the other thing entirely. See src/cluster_power.rs.
+        .route("/api/environment/power", get(system::environment_power))
+        .route(
+            "/api/environment/power",
+            post(system::set_environment_power),
+        )
+        .route(
+            "/api/environment/power",
+            delete(system::cancel_environment_power),
         )
         .route("/api/environment/tokens", post(cluster::mint_token))
         .route("/api/environment/join", post(cluster::join))
@@ -290,6 +307,18 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(peer::exit_maintenance),
         )
         .route("/api/peer/system/restart", post(peer::restart))
+        // The graceful power trio, for one caller: an operator restarting,
+        // shutting down, or scheduling a member from another member's console.
+        // The guards are the target's own; see src/cluster_power.rs.
+        .route("/api/peer/tasks", post(peer::tasks))
+        // The compute half of the federation: this member's machines, and one
+        // closed verb run against them on an operator's behalf. Every guard is
+        // this member's; see src/api/vms.rs.
+        .route("/api/peer/vms", post(peer::vms))
+        .route("/api/peer/vms/verb", post(peer::vm_verb))
+        .route("/api/peer/system/power", post(peer::power_state))
+        .route("/api/peer/system/power/set", post(peer::set_power))
+        .route("/api/peer/system/power/cancel", post(peer::cancel_power))
         .route("/api/peer/node/power", post(peer::power))
         .route("/api/peer/storage/wipe", post(peer::wipe_disk))
         .route("/api/peer/cluster/teardown", post(peer::teardown))

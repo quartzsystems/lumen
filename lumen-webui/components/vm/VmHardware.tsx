@@ -24,9 +24,9 @@ import { Switch } from "@/components/ui/Switch";
 import { DataTable, type Column } from "@/components/console/DataTable";
 import { RowActions } from "@/components/console/RowActions";
 import { fetchEnvironment } from "@/lib/clusterClient";
+import { fetchInventory } from "@/lib/inventoryClient";
 import { fetchPooledStorage, type PooledStorageView } from "@/lib/poolClient";
-import { fetchInterfaces } from "@/lib/networkClient";
-import { fetchIsos, fetchPools, type IsoView, type PoolView } from "@/lib/storageClient";
+import { fetchIsos, type IsoView, type PoolView } from "@/lib/storageClient";
 import {
   attachCdrom,
   attachDisk,
@@ -518,8 +518,9 @@ export function VmHardware({
           onClose={() => setMigrating(false)}
           onMigrated={async (target) => {
             setMigrating(false);
-            // The machine has one home now, and it is not this node — the
-            // reload drops it from this console's list.
+            // The machine has one home now and it is a different one. It stays
+            // in this console's list — the list is the environment's — and the
+            // reload is what moves its Node column.
             await onChanged(`${vm.name} migrated to ${target}.`);
           }}
         />
@@ -753,11 +754,17 @@ function AddDiskDialog({
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
 
+  // The pools of the node **the machine is on**, not of the node serving this
+  // console. A local disk is a zvol on the machine's own node, so offering
+  // this node's pools for a machine that lives elsewhere would be offering
+  // names its hypervisor has never heard of — the attach would be refused
+  // there, correctly, and the operator would have no idea why.
   useEffect(() => {
     void (async () => {
       try {
-        const response = await fetchPools();
-        const found = response.nodes.flatMap((node) => node.pools);
+        const inventory = await fetchInventory();
+        const home = inventory.members.find((member) => member.node === vm.node);
+        const found = home?.inventory?.pools ?? [];
         setPools(found);
         setPool(found[0]?.name ?? "");
       } catch {
@@ -770,7 +777,7 @@ function AddDiskDialog({
         /* a standalone node simply has no replicated choice */
       }
     })();
-  }, []);
+  }, [vm.node]);
 
   const submit = async () => {
     const size = numberOf(sizeGib);
@@ -1002,12 +1009,16 @@ function AddNicDialog({
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
 
+  // The bridges of the node the machine is on, for the reason the disk
+  // dialog reads that node's pools: an adapter is plugged into a bridge that
+  // exists on the hypervisor running the machine, and this console may be
+  // somewhere else entirely.
   useEffect(() => {
     void (async () => {
       try {
-        const response = await fetchInterfaces();
-        const found = response.nodes
-          .flatMap((node) => node.interfaces)
+        const inventory = await fetchInventory();
+        const home = inventory.members.find((member) => member.node === vm.node);
+        const found = (home?.inventory?.interfaces ?? [])
           .filter((link) => link.kind === "bridge")
           .map((link) => link.name);
         setBridges(found);
@@ -1016,7 +1027,7 @@ function AddNicDialog({
         setBridges([]);
       }
     })();
-  }, []);
+  }, [vm.node]);
 
   const submit = async () => {
     if (!bridge) {

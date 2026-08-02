@@ -146,27 +146,62 @@ pub async fn set_power(
     State(state): State<Arc<AppState>>,
     raw: Body,
 ) -> Result<axum::response::Response, ApiError> {
-    use axum::response::IntoResponse;
-
     let request: PowerRequest = required_body(raw)?;
-    guard_cluster_power(&state, request.i_understand_the_cluster_loses_quorum).await?;
-    match request.at {
-        Some(at) => Ok(Json(
+    let committed = power_locally(
+        &state,
+        request.action,
+        request.at,
+        request.i_understand_the_cluster_loses_quorum,
+    )
+    .await?;
+    Ok(power_response(committed))
+}
+
+/// Commit *this* node to a restart or a shutdown, guard included.
+///
+/// Shared by the three callers that can reach this node's power: its own
+/// route above, the environment route addressed at this node by name, and the
+/// peer route another member's console relays through. All three must apply
+/// the same guard and turn the same backend refusal into the same sentence,
+/// and the way to be sure of that is for there to be one of them.
+///
+/// `None` is an immediate one, which has no view to answer with — the node is
+/// going down and there is nothing truthful to say about the state it will be
+/// in when it does.
+pub(crate) async fn power_locally(
+    state: &Arc<AppState>,
+    action: PowerAction,
+    at: Option<u64>,
+    acknowledged: bool,
+) -> Result<Option<PowerView>, ApiError> {
+    guard_cluster_power(state, acknowledged).await?;
+    match at {
+        Some(at) => Ok(Some(
             state
                 .sys
-                .power_at(request.action, at)
+                .power_at(action, at)
                 .await
                 .map_err(refusal_said_aloud)?,
-        )
-        .into_response()),
+        )),
         None => {
             state
                 .sys
-                .power_now(request.action)
+                .power_now(action)
                 .await
                 .map_err(refusal_said_aloud)?;
-            Ok(axum::http::StatusCode::ACCEPTED.into_response())
+            Ok(None)
         }
+    }
+}
+
+/// The one shape both power routes answer in: the view for a schedule, and a
+/// bare `202` for a node that is going down now.
+fn power_response(committed: Option<PowerView>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    match committed {
+        Some(view) => Json(view).into_response(),
+        None => axum::http::StatusCode::ACCEPTED.into_response(),
     }
 }
 
@@ -240,7 +275,89 @@ pub async fn cancel_power(
     _session: Session,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<PowerView>, ApiError> {
+    Ok(Json(cancel_locally(&state).await?))
+}
+
+/// Call off *this* node's schedule. Shared by the same three callers
+/// [`power_locally`] is.
+pub(crate) async fn cancel_locally(state: &Arc<AppState>) -> Result<PowerView, ApiError> {
+    state.sys.cancel_power().await.map_err(refusal_said_aloud)
+}
+
+// --- the environment ---------------------------------------------------------
+//
+// The same three questions asked of every member, and answered for whichever
+// one the operator named. A separate set of routes rather than a widening of
+// the three above, for the reason `inventory` gives: `/api/system/...` means
+// *this appliance*, and every write already on that prefix is written against
+// that meaning.
+//
+// Addressed by node in the body rather than in the path, because
+// `/api/environment/nodes/{node}/power` already means something else and means
+// it more violently: that one cuts a member's power through a fence device,
+// for a node that has stopped answering. These routes are the graceful pair —
+// logind's own restart, on a node that is still listening.
+
+/// POST and DELETE /api/environment/power.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnvironmentPowerRequest {
+    /// Which member. Its own name, as the environment record spells it.
+    node: String,
+    #[serde(default)]
+    action: Option<PowerAction>,
+    /// Seconds since the epoch. Absent means now.
+    #[serde(default)]
+    at: Option<u64>,
+    #[serde(default)]
+    i_understand_the_cluster_loses_quorum: bool,
+}
+
+/// GET /api/environment/power — every member's uptime, clock, and schedule.
+///
+/// A member that could not be asked comes back carrying the reason rather than
+/// being dropped from the list. On this page that matters more than most: a
+/// member that has stopped answering may be one an operator restarted thirty
+/// seconds ago, and a table that silently lost the row would be hiding the
+/// consequence of the last thing they did.
+pub async fn environment_power(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+) -> Json<crate::cluster_power::EnvironmentPower> {
+    Json(crate::cluster_power::environment(&state).await)
+}
+
+/// POST /api/environment/power — restart or shut one member down, now or at a
+/// moment.
+pub async fn set_environment_power(
+    session: Session,
+    State(state): State<Arc<AppState>>,
+    raw: Body,
+) -> Result<axum::response::Response, ApiError> {
+    let request: EnvironmentPowerRequest = required_body(raw)?;
+    let action = request.action.ok_or_else(|| {
+        ApiError::BadRequest("Say whether to restart or shut the node down.".to_string())
+    })?;
+    let committed = crate::cluster_power::set(
+        &state,
+        &request.node,
+        action,
+        request.at,
+        request.i_understand_the_cluster_loses_quorum,
+        &format!("{}@{}", session.0.sub, session.0.realm),
+    )
+    .await?;
+    Ok(power_response(committed))
+}
+
+/// DELETE /api/environment/power — call off what one member has scheduled.
+pub async fn cancel_environment_power(
+    _session: Session,
+    State(state): State<Arc<AppState>>,
+    raw: Body,
+) -> Result<Json<PowerView>, ApiError> {
+    let request: EnvironmentPowerRequest = required_body(raw)?;
     Ok(Json(
-        state.sys.cancel_power().await.map_err(refusal_said_aloud)?,
+        crate::cluster_power::cancel(&state, &request.node).await?,
     ))
 }

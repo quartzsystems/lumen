@@ -587,6 +587,120 @@ impl crate::inventory::InventoryPeers for HttpPeerChannel {
         Ok(())
     }
 
+    async fn power_state(
+        &self,
+        node: &EnvironmentNode,
+    ) -> Result<lumen_sys::service::PowerView, ClusterError> {
+        self.call(
+            &node.address,
+            "/api/peer/system/power",
+            &serde_json::json!({}),
+            self.ca_client_config()?,
+            Some(self.peer_ticket()?),
+            CALL_DEADLINE,
+        )
+        .await
+    }
+
+    async fn set_power(
+        &self,
+        node: &EnvironmentNode,
+        action: lumen_sys::model::PowerAction,
+        at: Option<u64>,
+        by: &str,
+    ) -> Result<Option<lumen_sys::service::PowerView>, ClusterError> {
+        // The member answers before it goes, the same way the rolling update's
+        // restart does: `systemctl reboot` returns and the machine follows a
+        // moment later, which is long enough for the response to be flushed. A
+        // call that does not answer is reported as a failure rather than
+        // assumed to be a restart in progress — the two look identical from
+        // here, and only one of them is safe to build on.
+        self.call(
+            &node.address,
+            "/api/peer/system/power/set",
+            &serde_json::json!({ "action": action, "at": at, "by": by }),
+            self.ca_client_config()?,
+            Some(self.peer_ticket()?),
+            CALL_DEADLINE,
+        )
+        .await
+    }
+
+    async fn cancel_power(
+        &self,
+        node: &EnvironmentNode,
+    ) -> Result<lumen_sys::service::PowerView, ClusterError> {
+        self.call(
+            &node.address,
+            "/api/peer/system/power/cancel",
+            &serde_json::json!({}),
+            self.ca_client_config()?,
+            Some(self.peer_ticket()?),
+            CALL_DEADLINE,
+        )
+        .await
+    }
+
+    async fn tasks(
+        &self,
+        node: &EnvironmentNode,
+        limit: usize,
+    ) -> Result<Vec<crate::tasks::TaskRecord>, ClusterError> {
+        #[derive(serde::Deserialize)]
+        struct Answer {
+            tasks: Vec<crate::tasks::TaskRecord>,
+        }
+        let answer: Answer = self
+            .call(
+                &node.address,
+                "/api/peer/tasks",
+                &serde_json::json!({ "limit": limit }),
+                self.ca_client_config()?,
+                Some(self.peer_ticket()?),
+                CALL_DEADLINE,
+            )
+            .await?;
+        Ok(answer.tasks)
+    }
+
+    async fn vms(&self, node: &EnvironmentNode) -> Result<serde_json::Value, ClusterError> {
+        self.call(
+            &node.address,
+            "/api/peer/vms",
+            &serde_json::json!({}),
+            self.ca_client_config()?,
+            Some(self.peer_ticket()?),
+            CALL_DEADLINE,
+        )
+        .await
+    }
+
+    async fn vm_verb(
+        &self,
+        node: &EnvironmentNode,
+        verb: &crate::inventory::VmVerb,
+        by: &str,
+    ) -> Result<serde_json::Value, ClusterError> {
+        // A read of one machine is a question for libvirt; a start, a
+        // migration, or a disk attach is work on storage and a hypervisor that
+        // takes its own time. The deadline follows the verb, as the network
+        // relay's does.
+        let deadline = if verb.is_slow() {
+            SLOW_CALL_DEADLINE
+        } else {
+            CALL_DEADLINE
+        };
+        self.call(
+            &node.address,
+            "/api/peer/vms/verb",
+            &serde_json::json!({ "verb": verb, "by": by }),
+            self.ca_client_config()?,
+            Some(self.peer_ticket()?),
+            deadline,
+        )
+        .await
+    }
+
     async fn network(
         &self,
         node: &EnvironmentNode,

@@ -737,10 +737,12 @@ async fn a_volume_is_only_ever_reached_through_the_machine_it_belongs_to() {
 // --- cross-node guard ----------------------------------------------------------
 
 #[tokio::test]
-async fn a_request_for_another_node_is_refused_clearly() {
-    // The networking routes forward a named node's request to that member;
-    // a machine write never does — its machines can only be moved by the
-    // node running them — so the guard here refuses rather than routes.
+async fn a_request_for_a_node_that_is_not_a_member_is_refused_clearly() {
+    // A machine write *is* forwarded now — to the member that has the machine,
+    // through the same closed verb the networking routes use for links. What
+    // is still refused, and refused by name, is a node this appliance has
+    // never heard of: this one has joined no environment, so every name but
+    // its own is one it cannot reach.
     let h = harness("other-node").await;
     let (status, body) = h
         .post(
@@ -750,14 +752,23 @@ async fn a_request_for_another_node_is_refused_clearly() {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(
-        body["error"].as_str().unwrap().contains("cannot be sent"),
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("not a member of this environment"),
         "{body}"
     );
 
     // …and on the routes whose body carries nothing else.
     h.create_web01().await;
-    let (status, _) = h.post("/api/vms/100/start", r#"{"node":"lumen02"}"#).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, body) = h.post("/api/vms/100/start", r#"{"node":"lumen02"}"#).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // Naming no node at all still means "wherever this machine is", which on
+    // an appliance with no environment is here — the ordinary path, and the
+    // one every console request takes.
+    let (status, body) = h.post("/api/vms/100/start", "{}").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 // --- the console viewer -------------------------------------------------------

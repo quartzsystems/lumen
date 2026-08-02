@@ -12,6 +12,7 @@ import {
   LayoutDashboard,
   Network,
   Route,
+  ScrollText,
   Server,
   ServerCog,
   Settings,
@@ -101,6 +102,7 @@ export const NAV: NavItem[] = [
       { id: "authentication", label: "Authentication", href: "/system/authentication", icon: KeyRound },
       { id: "updates", label: "Updates", href: "/system/updates", icon: ArrowUpCircle },
       { id: "maintenance", label: "Maintenance", href: "/system/maintenance", icon: Wrench },
+      { id: "logs", label: "Logs", href: "/system/logs", icon: ScrollText },
     ],
   },
 ];

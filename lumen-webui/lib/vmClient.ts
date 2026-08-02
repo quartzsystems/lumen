@@ -211,9 +211,20 @@ export interface NodeVms {
   vms: VmView[];
 }
 
-/// Grouped by node from day one — one node today, the same shape tomorrow.
+/// A member that could not be asked, and why.
+///
+/// Named rather than dropped: a list that is quietly short is one an operator
+/// reads as "that machine is gone".
+export interface SilentMember {
+  node: string;
+  error: string;
+}
+
+/// Grouped by node — one group per member of the environment, and the members
+/// that did not answer named beside them.
 export interface VmsResponse {
   nodes: NodeVms[];
+  unreachable?: SilentMember[];
 }
 
 /// A rejected setting, tied to the machine and field it belongs to so a dialog
@@ -445,11 +456,14 @@ export const detachCdrom = (vmid: number, id: string): Promise<VmUpdateResponse>
 
 export type TaskStatus = "ok" | "error";
 
-/// One thing that was asked of a machine — the Tasks table's row. Refusals are
+/// One thing that was asked of a node — the Tasks table's row. Refusals are
 /// in the history too, wearing `error` and the domain's own reason.
 export interface TaskView {
   id: number;
-  vmid: number;
+  /// The machine it was about, when it was about one. Absent for something
+  /// that happened to the node itself — an update installed, a set of
+  /// packages that would not resolve.
+  vmid?: number | null;
   /// The verb, as the API spells it: `start`, `stop`, `update`, …
   action: string;
   /// One sentence describing what was asked.
@@ -476,6 +490,30 @@ export const fetchVmTasks = (vmid: number): Promise<TasksResponse> =>
 /// entries does not want one.
 export const fetchRecentTasks = (limit?: number): Promise<TasksResponse> =>
   apiFetch<TasksResponse>(limit === undefined ? "/tasks" : `/tasks?limit=${limit}`);
+
+/// One member's window onto its own log, or why it has none to show.
+export interface MemberTasks {
+  node: string;
+  local: boolean;
+  reachable: boolean;
+  error?: string | null;
+  /// Newest first, as that member's own log hands them over.
+  tasks?: TaskView[];
+}
+
+export interface EnvironmentTasksResponse {
+  members: MemberTasks[];
+}
+
+/// The same window from every member at once — what the Logs page reads.
+///
+/// Each member's list is already newest-first; interleaving them into one
+/// ordering is the caller's, because only the caller knows whether it is about
+/// to narrow the whole thing down to one node.
+export const fetchEnvironmentTasks = (limit?: number): Promise<EnvironmentTasksResponse> =>
+  apiFetch<EnvironmentTasksResponse>(
+    limit === undefined ? "/environment/tasks" : `/environment/tasks?limit=${limit}`,
+  );
 
 // --- the console viewer ------------------------------------------------------
 

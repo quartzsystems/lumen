@@ -1,4 +1,4 @@
-//! What has been done to each machine, and by whom.
+//! What has been done on this node, and by whom.
 //!
 //! Every mutating VM route records one entry here after the domain has
 //! answered — successes and refusals alike, because "who tried to stop this
@@ -7,6 +7,18 @@
 //! subsystem, and it deliberately stays small: a capped in-memory list backed
 //! by one JSON-lines file in the state dir, so history survives a daemon
 //! restart without dragging in a database.
+//!
+//! ## Not every entry is about a machine
+//!
+//! It began as one — the table is still a machine's history when read through
+//! `/api/vms/{vmid}/tasks` — but an update installed on a node is exactly the
+//! kind of thing an operator comes to a log to find, and it belongs to no
+//! machine. So [`TaskRecord::vmid`] is optional, and [`TaskLog::event`] is how
+//! something that happened *to the node* is written down.
+//!
+//! Records already on disk carry a `vmid` and keep meaning what they meant;
+//! `serde(default)` is what lets an old file and a new one be read by the same
+//! code, which matters because the file outlives the upgrade that changed it.
 
 use std::collections::VecDeque;
 use std::fs;
@@ -28,11 +40,15 @@ pub enum TaskStatus {
     Error,
 }
 
-/// One thing that was asked of a machine.
+/// One thing that was asked of this node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRecord {
     pub id: u64,
-    pub vmid: u32,
+    /// The machine it was about, when it was about one. `None` is an entry
+    /// about the node itself — an update installed, a set of packages that
+    /// would not resolve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vmid: Option<u32>,
     /// The verb, as the API spells it: `start`, `stop`, `update`, …
     pub action: String,
     /// One sentence for the table, describing what was asked.
@@ -102,11 +118,31 @@ impl TaskLog {
         }
     }
 
-    /// Record one action. `error` carries the domain's message when it was
-    /// refused; `None` means it happened.
+    /// Record one action against a machine. `error` carries the domain's
+    /// message when it was refused; `None` means it happened.
     pub fn record(
         &self,
         vmid: u32,
+        action: &str,
+        detail: String,
+        user: String,
+        error: Option<String>,
+    ) {
+        self.write(Some(vmid), action, detail, user, error);
+    }
+
+    /// Record one thing that happened to the node rather than to a machine.
+    ///
+    /// Same log, same table, same window: an operator asking "what happened on
+    /// this node" is asking one question, and answering it from two lists they
+    /// have to interleave by hand would be the console making them do the sort.
+    pub fn event(&self, action: &str, detail: String, user: String, error: Option<String>) {
+        self.write(None, action, detail, user, error);
+    }
+
+    fn write(
+        &self,
+        vmid: Option<u32>,
         action: &str,
         detail: String,
         user: String,
@@ -162,7 +198,7 @@ impl TaskLog {
         inner
             .records
             .iter()
-            .filter(|record| record.vmid == vmid)
+            .filter(|record| record.vmid == Some(vmid))
             .rev()
             .cloned()
             .collect()
@@ -256,6 +292,30 @@ mod tests {
         assert_eq!(log.recent(2).len(), 2);
         assert_eq!(log.recent(2)[0].action, "reset");
         assert!(log.recent(0).is_empty());
+    }
+
+    #[test]
+    fn an_event_belongs_to_the_node_and_not_to_a_machine() {
+        let log = TaskLog::ephemeral();
+        log.record(100, "start", "Start the machine".into(), "root@lumen".into(), None);
+        log.event(
+            "update",
+            "Installed 12 updates".into(),
+            "root@lumen".into(),
+            None,
+        );
+
+        // It is in the node's history, at the top, because it is the newest
+        // thing that happened.
+        let recent = log.recent(10);
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].action, "update");
+        assert_eq!(recent[0].vmid, None);
+
+        // And in no machine's, because it was about none of them. A machine's
+        // Tasks table must not grow rows it cannot explain.
+        assert_eq!(log.for_vm(100).len(), 1);
+        assert_eq!(log.for_vm(100)[0].action, "start");
     }
 
     #[test]

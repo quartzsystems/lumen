@@ -7,6 +7,7 @@ import { DataTable, Dash, type Column, type FilterDef } from "@/components/conso
 import { Button } from "@/components/ui/Button";
 import { Meter } from "@/components/vm/VmBits";
 import { CreatePoolDialog, DestroyPoolDialog } from "@/components/storage/CreatePoolDialog";
+import { PooledStorageSection } from "@/components/storage/PooledStorage";
 import {
   fetchInventory,
   poolsByMember,
@@ -153,6 +154,13 @@ export default function PoolsPage() {
               onDestroy={setDestroying}
             />
           )}
+
+          {/* The cluster's own pool, under the nodes' pools rather than on a
+              page of its own: both answer "what storage is there and how much
+              of it is left", and splitting them by who owns them made an
+              operator visit two pages to find out. It renders nothing at all
+              where the feature does not exist. */}
+          <PooledStorageSection />
         </div>
       </PageBody>
 

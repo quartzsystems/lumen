@@ -427,6 +427,54 @@ impl InventoryPeers for FakePeers {
         Ok(())
     }
 
+    async fn tasks(
+        &self,
+        _node: &EnvironmentNode,
+        _limit: usize,
+    ) -> Result<Vec<lumen_controlplane::tasks::TaskRecord>, ClusterError> {
+        unreachable!("the update tests never read a member's log")
+    }
+
+    async fn vms(&self, _node: &EnvironmentNode) -> Result<serde_json::Value, ClusterError> {
+        unreachable!("the update tests never ask a member for its machines")
+    }
+
+    async fn vm_verb(
+        &self,
+        _node: &EnvironmentNode,
+        _verb: &lumen_controlplane::inventory::VmVerb,
+        _by: &str,
+    ) -> Result<serde_json::Value, ClusterError> {
+        unreachable!("the update tests never act on a member's machines")
+    }
+
+    async fn power_state(
+        &self,
+        _node: &EnvironmentNode,
+    ) -> Result<lumen_sys::service::PowerView, ClusterError> {
+        unreachable!("the update tests never read a member's power state")
+    }
+
+    async fn set_power(
+        &self,
+        _node: &EnvironmentNode,
+        _action: lumen_sys::model::PowerAction,
+        _at: Option<u64>,
+        _by: &str,
+    ) -> Result<Option<lumen_sys::service::PowerView>, ClusterError> {
+        // A rolling update restarts a member through `restart` above, which
+        // is the route that carries the maintenance assertion. Reaching this
+        // one would mean it took the operator's path instead.
+        unreachable!("the update tests never set a member's power directly")
+    }
+
+    async fn cancel_power(
+        &self,
+        _node: &EnvironmentNode,
+    ) -> Result<lumen_sys::service::PowerView, ClusterError> {
+        unreachable!("the update tests never cancel a member's schedule")
+    }
+
     async fn network(
         &self,
         _node: &EnvironmentNode,

@@ -83,7 +83,7 @@ function VirtualMachines() {
   const params = useSearchParams();
   const router = useRouter();
   const { setToast } = useConsole();
-  const { nodes, vms, loading, error, refresh, setPaused, setSelected } = useVms();
+  const { nodes, vms, loading, error, unreachable, refresh, setPaused, setSelected } = useVms();
 
   const [creating, setCreating] = useState(false);
   const [importing, setImporting] = useState(false);
@@ -207,7 +207,7 @@ function VirtualMachines() {
         description={
           selected
             ? (selected.description ?? `Machine ${selected.vmid} on ${selected.node}.`)
-            : "Machines defined on this node, and the disks and adapters they run on."
+            : "Machines in this environment, and the disks and adapters they run on."
         }
         // Creating is a control on the list, not on the page: it belongs in
         // the table's toolbar next to Columns and Refresh, the way Interfaces
@@ -240,11 +240,29 @@ function VirtualMachines() {
             </div>
           )}
 
+          {/* Members that could not be asked. Their machines are missing from
+              the list below, and on a page that is the whole environment's
+              that is the difference between "it is gone" and "that node is not
+              answering" — which is exactly the confusion the notice above
+              would otherwise cause. */}
+          {unreachable.length > 0 && (
+            <div className="callout callout-warn">
+              <AlertTriangle size={17} className="flex-shrink-0 text-[var(--qz-warn)] mt-[1px]" />
+              <div className="flex-1 text-[13px] text-[var(--qz-fg-2)]">
+                {unreachable.map((member) => member.node).join(", ")} could not be asked, so{" "}
+                {unreachable.length === 1 ? "its" : "their"} machines are not listed.
+                <span className="text-[var(--qz-fg-4)]"> {unreachable[0].error}</span>
+              </div>
+            </div>
+          )}
+
           {missing && (
             <div className="callout callout-warn">
               <AlertTriangle size={17} className="flex-shrink-0 text-[var(--qz-warn)] mt-[1px]" />
               <div className="flex-1 text-[13px] text-[var(--qz-fg-2)]">
-                Machine {requested} is not on this node.
+                {unreachable.length > 0
+                  ? `Machine ${requested} is not on any node that answered.`
+                  : `There is no machine ${requested} in this environment.`}
               </div>
               <Button kind="secondary" onClick={() => go(null)}>
                 Back to all machines
@@ -260,44 +278,36 @@ function VirtualMachines() {
                 {loading && vms.length === 0 && !error && (
                   <div className="text-[13px] text-[var(--qz-fg-4)]">Reading the machines…</div>
                 )}
-                {nodes.map((node) => (
-                  <section key={node.node} className="flex flex-col gap-2">
-                    {/* One appliance is the usual case, and naming it then is
-                        noise. A cluster is not, and then every table needs
-                        saying whose. */}
-                    {nodes.length > 1 && (
-                      <h2
-                        className="text-[13px] font-semibold text-[var(--qz-fg-2)] m-0"
-                        style={{ fontFamily: "var(--qz-font-mono)" }}
+                {/* One table for the whole environment rather than one per
+                    node. The question an operator asks here — "where is web01",
+                    "what is running" — is asked across the members, and
+                    answering it by scrolling between sections is the console
+                    making them do the join by hand. The node is a column, and
+                    a filter. */}
+                <VmTable
+                  rows={vms}
+                  nodes={nodes.map((node) => node.node)}
+                  busy={busy}
+                  toolbar={
+                    <div className="flex items-center gap-2">
+                      <Button
+                        kind="secondary"
+                        size="sm"
+                        icon={Upload}
+                        onClick={() => setImporting(true)}
                       >
-                        {node.node}
-                      </h2>
-                    )}
-                    <VmTable
-                      rows={node.vms}
-                      busy={busy}
-                      toolbar={
-                        <div className="flex items-center gap-2">
-                          <Button
-                            kind="secondary"
-                            size="sm"
-                            icon={Upload}
-                            onClick={() => setImporting(true)}
-                          >
-                            Import
-                          </Button>
-                          <Button kind="primary" size="sm" icon={Plus} onClick={() => setCreating(true)}>
-                            Create
-                          </Button>
-                        </div>
-                      }
-                      onRefresh={refresh}
-                      onOpen={(vm) => go(vm.vmid)}
-                      onAction={afterAction}
-                      onDelete={setDeleting}
-                    />
-                  </section>
-                ))}
+                        Import
+                      </Button>
+                      <Button kind="primary" size="sm" icon={Plus} onClick={() => setCreating(true)}>
+                        Create
+                      </Button>
+                    </div>
+                  }
+                  onRefresh={refresh}
+                  onOpen={(vm) => go(vm.vmid)}
+                  onAction={afterAction}
+                  onDelete={setDeleting}
+                />
               </>
             )
           )}
@@ -461,6 +471,7 @@ const columns: Column<VmView>[] = [
 
 function VmTable({
   rows,
+  nodes,
   busy,
   toolbar,
   onRefresh,
@@ -469,6 +480,9 @@ function VmTable({
   onDelete,
 }: {
   rows: VmView[];
+  /// Every member that answered, so the Node filter offers a node with no
+  /// machines on it too — "nothing is running on lumen2" is an answer.
+  nodes: string[];
   busy: boolean;
   toolbar?: React.ReactNode;
   onRefresh: () => Promise<void>;
@@ -476,11 +490,22 @@ function VmTable({
   onAction: (message: string) => Promise<void>;
   onDelete: (vm: VmView) => void;
 }) {
-  // The drop-downs offer what is actually on this node, not every value the
-  // API can produce — a filter for a state the node does not have is dead
-  // space.
+  // The drop-downs offer what is actually here, not every value the API can
+  // produce — a filter for a state nothing is in is dead space.
   const filters: FilterDef<VmView>[] = useMemo(
     () => [
+      // Only once there is a second member. On one appliance every row says
+      // the same node and the filter is furniture.
+      ...(nodes.length > 1
+        ? [
+            {
+              key: "node",
+              label: "Node",
+              options: [...nodes].sort().map((node) => ({ value: node, label: node })),
+              predicate: (vm: VmView, value: string) => vm.node === value,
+            },
+          ]
+        : []),
       {
         key: "state",
         label: "State",
@@ -498,7 +523,7 @@ function VmTable({
         predicate: (vm, value) => vm.tags.includes(value),
       },
     ],
-    [rows],
+    [rows, nodes],
   );
 
   return (
@@ -510,7 +535,7 @@ function VmTable({
       rowId={(vm) => String(vm.vmid)}
       storageKey="virtual-machines"
       searchPlaceholder="Search machines…"
-      emptyMessage="No machines on this node yet."
+      emptyMessage="No machines yet."
       onRefresh={onRefresh}
       onRowOpen={onOpen}
       // Open, the one obvious lifecycle control, and removal — the verbs an
