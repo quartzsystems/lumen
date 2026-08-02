@@ -58,10 +58,24 @@ jobs:
           path: upstream.iso
           key: upstream-iso-${{ hashFiles('iso/upstream.env') }}
       - name: Download upstream ISO (cache miss only)
+        # A resume-capable retry loop rather than bare --retry: curl only
+        # retries timeouts and 408/429/5xx on its own — a mid-transfer TCP
+        # reset (exit 35, seen from repo.almalinux.org on hosted runners)
+        # is not on that list and killed a release build. Each pass resumes
+        # the partial file (-C -), and the checksum below is the integrity
+        # gate whatever path the bytes took.
         run: |
           . iso/upstream.env
           if [ ! -f upstream.iso ]; then
-            curl -fL --retry 3 -o upstream.iso "$UPSTREAM_ISO_URL"
+            for attempt in 1 2 3 4 5; do
+              if curl -fL --retry 3 --retry-all-errors -C - \
+                   -o upstream.iso.part "$UPSTREAM_ISO_URL"; then
+                break
+              fi
+              echo "download attempt $attempt failed; retrying in $((attempt * 15))s"
+              sleep $((attempt * 15))
+            done
+            mv upstream.iso.part upstream.iso
           fi
           echo "$UPSTREAM_ISO_SHA256  upstream.iso" | sha256sum -c -
       - name: Build ISO
