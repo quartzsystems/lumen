@@ -90,9 +90,9 @@ struct Guests {
 
 /// Route both nodes' effects: sends onto the wire (if up), flush fates to
 /// the guests. Returns whether anything moved.
-fn drain_effects(
-    a: &mut ReplNode<SimDisk>,
-    b: &mut ReplNode<SimDisk>,
+fn drain_effects<D: lumen_fs::Disk>(
+    a: &mut ReplNode<D>,
+    b: &mut ReplNode<D>,
     net: &mut Net,
     guests: &mut Guests,
 ) -> bool {
@@ -134,9 +134,9 @@ fn drain_effects(
 /// One pump iteration: drain effects, then deliver at most one queued
 /// message to each side. The fine grain is the point — a test can act
 /// between deliveries, which is where a resync is mid-flight.
-fn pump_step(
-    a: &mut ReplNode<SimDisk>,
-    b: &mut ReplNode<SimDisk>,
+fn pump_step<D: lumen_fs::Disk>(
+    a: &mut ReplNode<D>,
+    b: &mut ReplNode<D>,
     net: &mut Net,
     guests: &mut Guests,
 ) -> bool {
@@ -153,7 +153,12 @@ fn pump_step(
 }
 
 /// Drain effects and deliver messages until nothing moves.
-fn pump(a: &mut ReplNode<SimDisk>, b: &mut ReplNode<SimDisk>, net: &mut Net, guests: &mut Guests) {
+fn pump<D: lumen_fs::Disk>(
+    a: &mut ReplNode<D>,
+    b: &mut ReplNode<D>,
+    net: &mut Net,
+    guests: &mut Guests,
+) {
     while pump_step(a, b, net, guests) {}
 }
 
@@ -1046,4 +1051,153 @@ fn run_history(seed: u64) {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Implicit durability: every flush barrier announces, so a writer's first
+// fsync after a long unflushed stream inherits a paid-down debt instead of
+// the whole backlog.
+
+#[test]
+fn a_checkpoint_announces_durability_unasked() {
+    let (mut a, mut b, mut net, mut guests) = synced_pair(70);
+    a.write_block(VDISK, 5, b"debt").unwrap();
+    pump(&mut a, &mut b, &mut net, &mut guests);
+    let (sent, durable, _) = a.stream_counters();
+    assert!(sent > durable, "nothing asked, nothing confirmed — yet");
+    // B's routine maintenance runs. Nobody asked it anything.
+    b.checkpoint().unwrap();
+    pump(&mut a, &mut b, &mut net, &mut guests);
+    let (sent, durable, _) = a.stream_counters();
+    assert_eq!(sent, durable, "the checkpoint's barrier was announced");
+    // A second checkpoint with no new applies announces nothing — the
+    // stream would otherwise carry a heartbeat of empty claims.
+    b.checkpoint().unwrap();
+    assert!(
+        !b.take_effects()
+            .iter()
+            .any(|e| matches!(e, Effect::Send(_, PeerMessage::Durable { .. }))),
+        "an announcement with no progress behind it"
+    );
+    // The paid-down stream makes the writer's next flush wire-free: the
+    // needs are already settled, and the dead net proves nothing is asked.
+    net.up = false;
+    let ticket = a.flush().unwrap();
+    pump_one(&mut a, &mut guests, 0);
+    assert!(guests.done[0].contains(&ticket));
+}
+
+#[test]
+fn an_appliers_own_fsync_pays_the_reverse_stream_down() {
+    let (mut a, mut b, mut net, mut guests) = synced_pair(71);
+    a.write_block(VDISK, 6, b"reverse debt").unwrap();
+    pump(&mut a, &mut b, &mut net, &mut guests);
+    let (sent, durable, _) = a.stream_counters();
+    assert!(sent > durable);
+    // B's guest fsyncs. B was not asked anything by A — but its barrier
+    // covered A's stream, and it says so. This is the bidirectional
+    // case: each node's own flush cadence keeps the other's debt small.
+    b.flush().unwrap();
+    pump(&mut a, &mut b, &mut net, &mut guests);
+    let (sent, durable, _) = a.stream_counters();
+    assert_eq!(sent, durable, "B's own barrier paid A's stream down");
+}
+
+/// A real file, because the two-phase checkpoint only exists where a disk
+/// can offer a detached barrier — the simulator takes the single-phase
+/// path by design.
+struct FileScratch(std::path::PathBuf);
+impl Drop for FileScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn fresh_file_node(name: &str, id: u8) -> (ReplNode<lumen_fs::FileDisk>, FileScratch) {
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "lumen-fs-repl-twophase-{}-{name}-{id}.brick",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(8 * KIB * KIB).unwrap();
+    drop(file);
+    let disk = lumen_fs::FileDisk::open(&path).unwrap();
+    let brick = Brick::format(disk, params(id + 10)).unwrap();
+    (
+        ReplNode::new(Pool::create(brick).unwrap(), id),
+        FileScratch(path),
+    )
+}
+
+#[test]
+fn a_two_phase_commit_announces_the_snapshot_not_the_present() {
+    let (mut a, _sa) = fresh_file_node("announce", 0);
+    let (mut b, _sb) = fresh_file_node("announce", 1);
+    let mut net = Net {
+        up: true,
+        ..Net::default()
+    };
+    let mut guests = Guests::default();
+    a.connect(1);
+    b.connect(0);
+    pump(&mut a, &mut b, &mut net, &mut guests);
+    assert_eq!(a.state(), ReplState::Synced);
+    a.create_vdisk(VDISK, CAPACITY * BLOCK as u64, 0).unwrap();
+    a.write_block(VDISK, 0, b"inside the snapshot").unwrap();
+    pump(&mut a, &mut b, &mut net, &mut guests);
+    let (sent_at_begin, _, _) = a.stream_counters();
+
+    // B begins its checkpoint; while the drain would be running, one
+    // more write streams in and applies.
+    let mut ticket = b.checkpoint_begin().unwrap().expect("files offer barriers");
+    a.write_block(VDISK, 1, b"during the drain").unwrap();
+    pump(&mut a, &mut b, &mut net, &mut guests);
+    let (sent_now, _, _) = a.stream_counters();
+    assert!(sent_now > sent_at_begin);
+
+    for flush in std::mem::take(&mut ticket.flushers) {
+        flush().unwrap();
+    }
+    assert!(b.checkpoint_commit(ticket).unwrap());
+    pump(&mut a, &mut b, &mut net, &mut guests);
+    let (_, durable, _) = a.stream_counters();
+    assert_eq!(
+        durable, sent_at_begin,
+        "the commit may announce what the begin snapshotted — no more"
+    );
+}
+
+#[test]
+fn a_session_reborn_between_the_phases_is_not_lied_about() {
+    let (mut a, _sa) = fresh_file_node("reborn", 0);
+    let (mut b, _sb) = fresh_file_node("reborn", 1);
+    let mut net = Net {
+        up: true,
+        ..Net::default()
+    };
+    let mut guests = Guests::default();
+    a.connect(1);
+    b.connect(0);
+    pump(&mut a, &mut b, &mut net, &mut guests);
+    a.create_vdisk(VDISK, CAPACITY * BLOCK as u64, 0).unwrap();
+    a.write_block(VDISK, 0, b"old stream").unwrap();
+    pump(&mut a, &mut b, &mut net, &mut guests);
+
+    let mut ticket = b.checkpoint_begin().unwrap().expect("files offer barriers");
+    // The link dies between the phases: the snapshot's numbering belongs
+    // to a stream that no longer exists.
+    net.partition();
+    b.peer_lost(0);
+    for flush in std::mem::take(&mut ticket.flushers) {
+        flush().unwrap();
+    }
+    b.checkpoint_commit(ticket).unwrap();
+    assert!(
+        !b.take_effects()
+            .iter()
+            .any(|e| matches!(e, Effect::Send(0, PeerMessage::Durable { .. }))),
+        "a durability claim numbered under a dead stream"
+    );
 }

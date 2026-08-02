@@ -505,6 +505,13 @@ struct PeerSession {
     required_rseq: u64,
     /// Last op applied from this peer (applier side).
     applied_rseq: u64,
+    /// The highest `applied_rseq` this node has announced durable to this
+    /// peer (applier side). Every successful flush barrier makes every
+    /// applied op durable, and saying so unasked is what keeps the peer's
+    /// picture of its debt current — without it, durability is confirmed
+    /// only when the peer's own guests fsync, and the first fsync after a
+    /// long unflushed stream pays the whole backlog at once.
+    durable_announced: u64,
     /// The tiers this peer's brick set carried at its last hello — what a
     /// vdisk create checks before promising a tier the peer cannot hold.
     tiers: Vec<u8>,
@@ -544,6 +551,7 @@ impl PeerSession {
             durable_rseq: 0,
             required_rseq: 0,
             applied_rseq: 0,
+            durable_announced: 0,
             tiers: Vec::new(),
             era_seen: 0,
             fenced: false,
@@ -604,6 +612,12 @@ pub struct ReplNode<D: Disk> {
     /// peer when a source's session dies (the next step re-requests from
     /// whoever holds it then).
     reassign_inflight: HashMap<(u8, BlockHash), NodeId>,
+    /// Each session's `(peer, generation, applied_rseq)` at the moment a
+    /// two-phase checkpoint began — what the commit may announce durable.
+    /// Ops applied *during* the drain are not covered by the drained
+    /// snapshot, and a session reborn between the phases renumbered its
+    /// stream, which is what the generation guards.
+    ckpt_applied: Vec<(NodeId, u64, u64)>,
 }
 
 impl<D: Disk> ReplNode<D> {
@@ -619,6 +633,7 @@ impl<D: Disk> ReplNode<D> {
             pending_reads: HashMap::new(),
             offered_vdisks: HashSet::new(),
             reassign_inflight: HashMap::new(),
+            ckpt_applied: Vec::new(),
         }
     }
 
@@ -1349,16 +1364,31 @@ impl<D: Disk> ReplNode<D> {
         // keeps per block, and the same crash story the wire has: a
         // block without its op is an orphan for GC, never a dangling op.
         self.pool.put_blocks_prehashed(tier, &local)?;
+        // One Payloads message per peer for the whole run — the shape
+        // coalesce would build anyway, without a Vec and an Effect per
+        // block. Payloads ahead of every op is always legal (a payload
+        // may move earlier; an op may not), and if a WAL write below
+        // fails mid-run the peer holds pinned payloads whose ops never
+        // arrive — the same orphan class the local store already has.
+        // Those pins live until the session bounces, which a healthy
+        // session may not do for a long time; a rare local WAL error
+        // costs the peer at most one run of pinned blocks until then.
+        let mut per_peer: BTreeMap<NodeId, Vec<(u8, Vec<u8>)>> = BTreeMap::new();
+        for block in &placed {
+            for peer in &block.remote {
+                per_peer
+                    .entry(*peer)
+                    .or_default()
+                    .push((tier, block.payload.to_vec()));
+            }
+        }
+        for (peer, payloads) in per_peer {
+            self.emit(Effect::Send(peer, PeerMessage::Payloads(payloads)));
+        }
         for (i, block) in placed.iter().enumerate() {
             self.with_wal_room(|pool| {
                 pool.write_block_prehashed(vdisk, first + i as u64, block.hash)
             })?;
-            for peer in &block.remote {
-                self.emit(Effect::Send(
-                    *peer,
-                    PeerMessage::Payloads(vec![(tier, block.payload.to_vec())]),
-                ));
-            }
             self.send_ops_requiring(
                 vec![ReplOp::Write {
                     vdisk,
@@ -1433,6 +1463,11 @@ impl<D: Disk> ReplNode<D> {
     /// adoption decides its fate.
     pub fn flush(&mut self) -> Result<u64> {
         self.pool.flush()?;
+        // The barrier covered the peers' streams too: a bidirectional
+        // writer fsyncing its own guests is also the applier of the other
+        // node's stream, and this is where that stream's debt gets paid
+        // down at the guest's own cadence.
+        self.announce_durable();
         let ticket = self.next_ticket;
         self.next_ticket += 1;
         let mut needs = Vec::new();
@@ -1561,20 +1596,81 @@ impl<D: Disk> ReplNode<D> {
         Ok(ticket)
     }
 
+    /// Everything applied from every peer is durable — a flush barrier
+    /// just returned. Tell each synced peer whose stream advanced since
+    /// the last announcement. Unsolicited, and that is the point: without
+    /// it a writer hears durability only when its own guests fsync, so
+    /// the first fsync after a long unflushed stream waits on the whole
+    /// backlog at once. The receiving side has always accepted a
+    /// `Durable` it did not ask for — it maxes the counter and settles
+    /// whatever parked flushes it can.
+    fn announce_durable(&mut self) {
+        let announce: Vec<(NodeId, u64)> = self
+            .peers
+            .iter()
+            .filter(|(_, s)| s.state == ReplState::Synced && s.applied_rseq > s.durable_announced)
+            .map(|(id, s)| (*id, s.applied_rseq))
+            .collect();
+        for (peer, up_to) in announce {
+            self.session(peer).durable_announced = up_to;
+            self.emit(Effect::Send(peer, PeerMessage::Durable { up_to }));
+        }
+    }
+
     /// Local maintenance; each node runs its own on its own schedule.
+    /// A checkpoint is a flush barrier, so it also announces durability
+    /// to every peer whose stream this node applies.
     pub fn checkpoint(&mut self) -> Result<()> {
-        self.pool.checkpoint()
+        self.pool.checkpoint()?;
+        self.announce_durable();
+        Ok(())
     }
 
     /// The two-phase checkpoint's halves — see [`crate::pool::Pool::checkpoint_begin`].
-    /// The engine adds nothing of its own: replication state rides the
-    /// same WAL and manifest the pool already snapshots.
+    /// The engine adds one thing of its own: each session's applied
+    /// position is snapshotted at begin, and a commit that lands announces
+    /// exactly those positions durable — the drain covered what was
+    /// applied before it started, not what streamed in while it ran.
     pub fn checkpoint_begin(&mut self) -> Result<Option<crate::pool::CheckpointTicket>> {
-        self.pool.checkpoint_begin()
+        let ticket = self.pool.checkpoint_begin()?;
+        if ticket.is_some() {
+            self.ckpt_applied = self
+                .peers
+                .iter()
+                .filter(|(_, s)| s.state == ReplState::Synced && s.applied_rseq > 0)
+                .map(|(id, s)| (*id, s.generation, s.applied_rseq))
+                .collect();
+        }
+        Ok(ticket)
     }
 
     pub fn checkpoint_commit(&mut self, ticket: crate::pool::CheckpointTicket) -> Result<bool> {
-        self.pool.checkpoint_commit(ticket)
+        // The snapshot pairs with exactly this ticket, so it is consumed
+        // whatever the commit answers — an errored commit that left it
+        // behind would let a later, unrelated commit announce positions
+        // its own drain never covered.
+        let snapshot = std::mem::take(&mut self.ckpt_applied);
+        let committed = self.pool.checkpoint_commit(ticket)?;
+        if committed {
+            for (peer, generation, applied) in snapshot {
+                let Some(session) = self.peers.get_mut(&peer) else {
+                    continue;
+                };
+                // A session reborn between the phases renumbered its
+                // stream; a snapshot from the old numbering says nothing
+                // about the new one. A stale ticket (committed == false)
+                // never wrote its anchor, so it promises nothing at all.
+                if session.generation != generation
+                    || session.state != ReplState::Synced
+                    || applied <= session.durable_announced
+                {
+                    continue;
+                }
+                session.durable_announced = applied;
+                self.emit(Effect::Send(peer, PeerMessage::Durable { up_to: applied }));
+            }
+        }
+        Ok(committed)
     }
 
     /// Local collection, legal at any point in a resync on either end:
@@ -1617,12 +1713,51 @@ impl<D: Disk> ReplNode<D> {
             self.session(from).backlog.push(PeerMessage::Payloads(wire));
             return Ok(());
         }
+        let refs: Vec<(u8, BlockHash, &[u8])> = blocks
+            .iter()
+            .map(|(tier, hash, payload)| (*tier, *hash, payload.as_slice()))
+            .collect();
+        self.apply_payloads(from, &refs)
+    }
+
+    /// [`ReplNode::payloads_prehashed`] borrowing the payload bytes — the
+    /// daemon's applier hands slices into the receive frame itself, so a
+    /// stored block goes frame → brick with no `Vec` per payload in
+    /// between; that copy and its allocation were a measured slice of the
+    /// apply path's CPU. The resync-target backlog is the one place a
+    /// copy is still paid, because the buffered wire shape must own its
+    /// bytes — and a pull is rare enough not to care.
+    pub fn payloads_prehashed_ref(
+        &mut self,
+        from: NodeId,
+        blocks: &[(u8, BlockHash, &[u8])],
+    ) -> Result<()> {
+        if !self.peers.contains_key(&from) {
+            return Err(FsError::Corrupt(
+                "a message arrived from a peer that never said hello",
+            ));
+        }
+        if self.peers[&from].state == (ReplState::Resyncing { source: false }) {
+            let wire = blocks
+                .iter()
+                .map(|(tier, _, payload)| (*tier, payload.to_vec()))
+                .collect();
+            self.session(from).backlog.push(PeerMessage::Payloads(wire));
+            return Ok(());
+        }
+        self.apply_payloads(from, blocks)
+    }
+
+    /// The storing half both entries share, past the hello and backlog
+    /// guards.
+    fn apply_payloads(&mut self, from: NodeId, blocks: &[(u8, BlockHash, &[u8])]) -> Result<()> {
         // A payload lands only on a home — committed or, mid-
         // reassignment, pending; the sender routes by the same union.
         // Anything else is a stray, and a stray stored here would be
         // the third copy the accounting never expects.
-        let storable: Vec<(u8, BlockHash, Vec<u8>)> = blocks
-            .into_iter()
+        let storable: Vec<(u8, BlockHash, &[u8])> = blocks
+            .iter()
+            .copied()
             .filter(|(_, hash, payload)| {
                 debug_assert_eq!(
                     crate::hash::hash_block(payload),
@@ -1643,7 +1778,7 @@ impl<D: Disk> ReplNode<D> {
             let items: Vec<(BlockHash, &[u8])> = storable
                 .iter()
                 .filter(|(t, _, _)| *t == tier)
-                .map(|(_, hash, payload)| (*hash, payload.as_slice()))
+                .map(|(_, hash, payload)| (*hash, *payload))
                 .collect();
             self.pool.put_blocks_prehashed(tier, &items)?;
         }
@@ -1716,7 +1851,18 @@ impl<D: Disk> ReplNode<D> {
                     ));
                 }
                 self.pool.flush()?;
+                // Answer with the honest maximum, not the requested
+                // minimum: everything applied is durable once the barrier
+                // returns, and the larger number settles later flushes
+                // the asker may already have parked. The reply is always
+                // sent — an in-flight announcement may cover `up_to`, but
+                // an explicit question deserves an explicit answer.
+                let session = self.session(from);
+                let up_to = session.applied_rseq;
+                session.durable_announced = session.durable_announced.max(up_to);
                 self.emit(Effect::Send(from, PeerMessage::Durable { up_to }));
+                // The same barrier covered every other peer's stream.
+                self.announce_durable();
                 Ok(())
             }
             PeerMessage::Durable { up_to } => {
@@ -1869,6 +2015,7 @@ impl<D: Disk> ReplNode<D> {
         session.durable_rseq = 0;
         session.required_rseq = 0;
         session.applied_rseq = 0;
+        session.durable_announced = 0;
         session.pull = SyncPull::default();
         session.backlog.clear();
         let source = my_era > peer_era || (my_era == peer_era && my_node < peer_node);

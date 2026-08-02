@@ -141,6 +141,12 @@ pub trait ExportControl: Send {
 #[derive(Default)]
 struct PeerLink {
     queue: VecDeque<PeerMessage>,
+    /// What the queue holds, in [`send_cost`] terms. This is the number
+    /// the guest-write brake reads: the queue is unbounded by structure,
+    /// and an unbounded queue is exactly how a fast local engine built
+    /// gigabytes of unflushed debt a first fsync then paid for all at
+    /// once — the intermittent 88-second syncwrite collapse, measured.
+    queued_bytes: usize,
     /// The session generation. Bumped at every session start, every
     /// session death, and every forced link reset — and checked by the
     /// writer and by teardown, so nothing written for one session can act
@@ -148,6 +154,22 @@ struct PeerLink {
     incarnation: u64,
     socket: Option<TcpStream>,
 }
+
+/// What one queued message costs against [`SEND_QUEUE_BYTES`]: its
+/// payload bytes plus a small constant for the frame around them. An
+/// estimate on purpose — the brake needs a bound, not an audit.
+fn send_cost(message: &PeerMessage) -> usize {
+    64 + wire::payload_list(message)
+        .map_or(0, |payloads| payloads.iter().map(|(_, p)| p.len()).sum())
+}
+
+/// How much may sit in one peer's outbound queue before guest writes
+/// wait for the writer to catch up. This bounds the debt a guest fsync
+/// can inherit: at most this much still queued, plus the TCP buffers and
+/// the peer's ingest pipeline — a bounded second or so of apply, where
+/// the unbounded queue was a bounded nothing. It also bounds the
+/// daemon's memory, which the queue alone never did.
+const SEND_QUEUE_BYTES: usize = 128 << 20;
 
 #[derive(Default)]
 struct Flushes {
@@ -174,6 +196,10 @@ struct Shared {
     /// outside its own threads.
     links: Mutex<HashMap<u8, PeerLink>>,
     out_ready: Condvar,
+    /// Notified when a peer queue shrinks below the cap (and whenever a
+    /// session bounces, which empties one) — what a guest write blocked
+    /// on [`SEND_QUEUE_BYTES`] waits for. Paired with `links`.
+    send_room: Condvar,
     flushes: Mutex<Flushes>,
     flush_ready: Condvar,
     reads: Mutex<Reads>,
@@ -274,7 +300,9 @@ impl Shared {
                 // Routed by the addressee the engine named: each peer's
                 // writer drains its own queue.
                 Effect::Send(to, message) => {
-                    links.entry(to).or_default().queue.push_back(message);
+                    let link = links.entry(to).or_default();
+                    link.queued_bytes += send_cost(&message);
+                    link.queue.push_back(message);
                 }
                 Effect::FlushDone(ticket) => {
                     fl.outcomes.insert(ticket, true);
@@ -294,9 +322,33 @@ impl Shared {
 
     fn notify_all(&self) {
         self.out_ready.notify_all();
+        self.send_room.notify_all();
         self.flush_ready.notify_all();
         self.read_ready.notify_all();
         self.changed.notify_all();
+    }
+
+    /// Hold a guest write until every peer's outbound queue is under the
+    /// cap — the flow control the engine's own doc assigns to "the daemon
+    /// that owns the socket". Blocking *before* the engine call keeps the
+    /// queue an image of what the wire can carry soon, instead of a
+    /// mortgage the next fsync forecloses. A session that dies clears its
+    /// queue, so a stalled peer converts into suspension (the engine's
+    /// business), never a parked write nobody will release.
+    fn wait_send_room(&self, cancelled: &AtomicBool) -> Result<(), FsError> {
+        let mut links = self.links.lock().unwrap();
+        loop {
+            if self.shutdown.load(Ordering::SeqCst) || cancelled.load(Ordering::SeqCst) {
+                return Err(FsError::Suspended);
+            }
+            if links
+                .values()
+                .all(|link| link.queued_bytes <= SEND_QUEUE_BYTES)
+            {
+                return Ok(());
+            }
+            links = self.send_room.wait_timeout(links, TICK).unwrap().0;
+        }
     }
 
     /// Run one call against the engine and drain its effects.
@@ -324,6 +376,7 @@ impl Shared {
             link.socket = socket;
             link.incarnation += 1;
             link.queue.clear();
+            link.queued_bytes = 0;
             link.incarnation
         };
         engine.connect(peer);
@@ -366,6 +419,7 @@ impl Shared {
             } else {
                 link.incarnation += 1;
                 link.queue.clear();
+                link.queued_bytes = 0;
                 link.socket = None;
                 false
             }
@@ -393,6 +447,7 @@ impl Shared {
             let link = links.entry(peer).or_default();
             link.incarnation += 1;
             link.queue.clear();
+            link.queued_bytes = 0;
         }
         if engine.is_fenced(peer) {
             drop(engine);
@@ -553,6 +608,10 @@ impl GuestHandle {
     }
 
     pub fn write(&self, vdisk: u64, offset: u64, data: &[u8]) -> Result<(), FsError> {
+        // The brake before anything else: a write accepted while the
+        // outbound queues are over the cap would be one more block of
+        // debt the next fsync inherits.
+        self.shared.wait_send_room(&self.cancelled)?;
         // The whole blocks of this write are hashed HERE, on the export's
         // worker thread, before any engine lock — measured as the largest
         // single cost the lock was carrying. Geometry first, briefly:
@@ -609,6 +668,7 @@ impl GuestHandle {
     /// read-modify-write edges — with the fetch loop those edges need on
     /// a member that does not home the block.
     fn write_fallback(&self, vdisk: u64, offset: u64, data: &[u8]) -> Result<(), FsError> {
+        self.shared.wait_send_room(&self.cancelled)?;
         loop {
             match self.blocking(|engine| engine.write_bytes(vdisk, offset, data)) {
                 Err(FsError::BlockElsewhere { tier, hash }) => self.fetch(tier, hash)?,
@@ -910,7 +970,14 @@ fn run_session(shared: &Arc<Shared>, mut stream: TcpStream) {
     // reader stops reading, TCP window closes — the exact shape the
     // one-thread loop had.
     enum Ingest {
-        Payloads(Vec<(u8, lumen_fs::BlockHash, Vec<u8>)>),
+        /// A `Payloads` frame kept whole: the blocks are `(tier, hash,
+        /// range into the frame)` — hashed by the reader, stored by the
+        /// applier straight out of the frame buffer. The `Vec` per
+        /// payload this used to carry was a measured copy tax.
+        Payloads {
+            frame: Vec<u8>,
+            blocks: Vec<(u8, lumen_fs::BlockHash, std::ops::Range<usize>)>,
+        },
         Message(PeerMessage),
     }
     let (work_tx, work_rx) = std::sync::mpsc::sync_channel::<Ingest>(INGEST_DEPTH);
@@ -922,8 +989,12 @@ fn run_session(shared: &Arc<Shared>, mut stream: TcpStream) {
             // senders gone — nothing decoded is dropped by a clean EOF.
             while let Ok(work) = work_rx.recv() {
                 let outcome = match work {
-                    Ingest::Payloads(hashed) => {
-                        shared.with_engine(|engine| engine.payloads_prehashed(peer_node, hashed))
+                    Ingest::Payloads { frame, blocks } => {
+                        let refs: Vec<(u8, lumen_fs::BlockHash, &[u8])> = blocks
+                            .iter()
+                            .map(|(tier, hash, range)| (*tier, *hash, &frame[range.clone()]))
+                            .collect();
+                        shared.with_engine(|engine| engine.payloads_prehashed_ref(peer_node, &refs))
                     }
                     Ingest::Message(message) => {
                         shared.with_engine(|engine| engine.handle(peer_node, message))
@@ -947,27 +1018,36 @@ fn run_session(shared: &Arc<Shared>, mut stream: TcpStream) {
     };
 
     while let Ok(payload) = read_frame(&mut stream) {
-        let message = match wire::decode(&payload) {
-            Ok(message) => message,
+        // Hashing lives here, overlapped with the applier's engine time:
+        // the address still comes from the bytes on this node — never
+        // the wire. A Payloads frame is kept whole and its blocks named
+        // by range, so the bytes decoded from the socket are the bytes
+        // the brick writes — no copy between.
+        let work = match wire::decode_payload_ranges(&payload) {
+            Ok(Some(ranges)) => {
+                let blocks = ranges
+                    .into_iter()
+                    .map(|(tier, range)| {
+                        let hash = lumen_fs::hash_block(&payload[range.clone()]);
+                        (tier, hash, range)
+                    })
+                    .collect();
+                Ingest::Payloads {
+                    frame: payload,
+                    blocks,
+                }
+            }
+            Ok(None) => match wire::decode(&payload) {
+                Ok(message) => Ingest::Message(message),
+                Err(err) => {
+                    eprintln!("peer sent an undecodable frame: {err}");
+                    break;
+                }
+            },
             Err(err) => {
                 eprintln!("peer sent an undecodable frame: {err}");
                 break;
             }
-        };
-        // Hashing lives here, overlapped with the applier's engine time:
-        // the address still comes from the bytes on this node — never
-        // the wire.
-        let work = match message {
-            PeerMessage::Payloads(payloads) => Ingest::Payloads(
-                payloads
-                    .into_iter()
-                    .map(|(tier, payload)| {
-                        let hash = lumen_fs::hash_block(&payload);
-                        (tier, hash, payload)
-                    })
-                    .collect(),
-            ),
-            message => Ingest::Message(message),
         };
         // A dead applier already shut the socket and said why.
         if work_tx.send(work).is_err() {
@@ -995,9 +1075,11 @@ const SEND_BATCH_BYTES: usize = 4 << 20;
 const INGEST_DEPTH: usize = 8;
 
 fn writer_loop(shared: &Arc<Shared>, peer: u8, stream: &mut TcpStream, incarnation: u64) {
-    let mut batch: Vec<u8> = Vec::new();
+    let mut messages: Vec<PeerMessage> = Vec::new();
+    let mut scratch: Vec<u8> = Vec::new();
+    let mut chunks: Vec<wire::Chunk> = Vec::new();
     loop {
-        batch.clear();
+        messages.clear();
         {
             let mut links = shared.links.lock().unwrap();
             loop {
@@ -1008,22 +1090,46 @@ fn writer_loop(shared: &Arc<Shared>, peer: u8, stream: &mut TcpStream, incarnati
                 // Everything queued goes in one send, frames intact and in
                 // order — the wire format is unchanged, only the syscall
                 // boundaries move.
-                while batch.len() < SEND_BATCH_BYTES {
+                let mut batched = 0usize;
+                while batched < SEND_BATCH_BYTES {
                     let Some(message) = link.queue.pop_front() else {
                         break;
                     };
-                    let payload = wire::encode(&message);
-                    batch.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-                    batch.extend_from_slice(&payload);
+                    let cost = send_cost(&message);
+                    link.queued_bytes = link.queued_bytes.saturating_sub(cost);
+                    batched += cost;
+                    messages.push(message);
                 }
-                if !batch.is_empty() {
+                if !messages.is_empty() {
                     break;
                 }
                 links = shared.out_ready.wait_timeout(links, TICK).unwrap().0;
             }
         };
-        if stream
-            .write_all(&batch)
+        // The queue shrank; a guest write parked on the cap may proceed.
+        shared.send_room.notify_all();
+        // Scattered encode: framing and headers into the reused scratch
+        // buffer, payload bytes named in place — the iovecs below are
+        // what an encode copy and a batch copy per payload used to be.
+        scratch.clear();
+        chunks.clear();
+        for (index, message) in messages.iter().enumerate() {
+            wire::encode_frame_scattered(index, message, &mut scratch, &mut chunks);
+        }
+        let mut iovecs: Vec<std::io::IoSlice> = chunks
+            .iter()
+            .map(|chunk| match chunk {
+                wire::Chunk::Scratch { start, end } => {
+                    std::io::IoSlice::new(&scratch[*start..*end])
+                }
+                wire::Chunk::Payload { message, index } => std::io::IoSlice::new(
+                    &wire::payload_list(&messages[*message]).expect("chunk names a payload")
+                        [*index]
+                        .1,
+                ),
+            })
+            .collect();
+        if write_all_vectored(stream, &mut iovecs)
             .and_then(|_| stream.flush())
             .is_err()
         {
@@ -1032,6 +1138,26 @@ fn writer_loop(shared: &Arc<Shared>, peer: u8, stream: &mut TcpStream, incarnati
             return;
         }
     }
+}
+
+/// `write_all` over a scattered batch: every byte of every slice, in
+/// order, however many syscalls the socket wants to take it in.
+fn write_all_vectored(
+    stream: &mut TcpStream,
+    mut iovecs: &mut [std::io::IoSlice<'_>],
+) -> std::io::Result<()> {
+    // Trailing empty slices would read as "nothing left" mid-loop;
+    // advance_slices consumes empties as it goes, and a wholly empty
+    // batch never reaches the wire.
+    while iovecs.iter().any(|slice| !slice.is_empty()) {
+        match stream.write_vectored(iovecs) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(written) => std::io::IoSlice::advance_slices(&mut iovecs, written),
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1104,6 +1230,7 @@ impl Daemon {
             changed: Condvar::new(),
             links: Mutex::new(HashMap::new()),
             out_ready: Condvar::new(),
+            send_room: Condvar::new(),
             flushes: Mutex::new(Flushes::default()),
             flush_ready: Condvar::new(),
             reads: Mutex::new(Reads::default()),

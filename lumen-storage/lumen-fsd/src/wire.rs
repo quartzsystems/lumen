@@ -192,6 +192,25 @@ fn put_op(out: &mut Vec<u8>, op: &ReplOp) {
 /// layer's business, not the codec's.
 pub fn encode(message: &PeerMessage) -> Vec<u8> {
     let mut out = Vec::new();
+    encode_into(message, &mut out);
+    out
+}
+
+/// The payload list a message carries, when it is one of the three
+/// payload-bearing shapes — the bytes the scattered encoder and the
+/// queue accounting refuse to copy or guess at.
+pub fn payload_list(message: &PeerMessage) -> Option<&[(u8, Vec<u8>)]> {
+    match message {
+        PeerMessage::Payloads(payloads)
+        | PeerMessage::SyncData(payloads)
+        | PeerMessage::ReadData(payloads) => Some(payloads),
+        _ => None,
+    }
+}
+
+/// Encode into a caller-owned buffer — the writer reuses one across its
+/// life instead of allocating per message.
+pub fn encode_into(message: &PeerMessage, out: &mut Vec<u8>) {
     match message {
         PeerMessage::Hello {
             era,
@@ -200,62 +219,62 @@ pub fn encode(message: &PeerMessage) -> Vec<u8> {
             map_version,
         } => {
             out.push(1);
-            put_u64(&mut out, *era);
+            put_u64(out, *era);
             out.push(*node);
-            put_u64(&mut out, *map_version);
+            put_u64(out, *map_version);
             out.push(tiers.len() as u8);
             out.extend_from_slice(tiers);
         }
         PeerMessage::Payloads(payloads) => {
             out.push(2);
-            put_u32(&mut out, payloads.len() as u32);
+            put_u32(out, payloads.len() as u32);
             for (tier, payload) in payloads {
                 out.push(*tier);
-                put_bytes(&mut out, payload);
+                put_bytes(out, payload);
             }
         }
         PeerMessage::Apply { first_rseq, ops } => {
             out.push(3);
-            put_u64(&mut out, *first_rseq);
-            put_u32(&mut out, ops.len() as u32);
+            put_u64(out, *first_rseq);
+            put_u32(out, ops.len() as u32);
             for op in ops {
-                put_op(&mut out, op);
+                put_op(out, op);
             }
         }
         PeerMessage::Flush { up_to } => {
             out.push(4);
-            put_u64(&mut out, *up_to);
+            put_u64(out, *up_to);
         }
         PeerMessage::Durable { up_to } => {
             out.push(5);
-            put_u64(&mut out, *up_to);
+            put_u64(out, *up_to);
         }
         PeerMessage::SyncStart => out.push(6),
         PeerMessage::SyncManifest(offer) => {
             out.push(7);
-            put_u64(&mut out, offer.era);
-            put_u32(&mut out, offer.vdisks.len() as u32);
+            put_u64(out, offer.era);
+            put_u32(out, offer.vdisks.len() as u32);
             for (id, size_bytes, tier, root) in &offer.vdisks {
-                put_u64(&mut out, *id);
-                put_u64(&mut out, *size_bytes);
+                put_u64(out, *id);
+                put_u64(out, *size_bytes);
                 out.push(*tier);
-                put_root(&mut out, root);
+                put_root(out, root);
             }
-            put_u32(&mut out, offer.snapshots.len() as u32);
+            put_u32(out, offer.snapshots.len() as u32);
             for (vdisk, snapshot, size_bytes, root) in &offer.snapshots {
-                put_u64(&mut out, *vdisk);
-                put_u64(&mut out, *snapshot);
-                put_u64(&mut out, *size_bytes);
-                put_root(&mut out, root);
+                put_u64(out, *vdisk);
+                put_u64(out, *snapshot);
+                put_u64(out, *size_bytes);
+                put_root(out, root);
             }
-            put_u32(&mut out, offer.leases.len() as u32);
+            put_u32(out, offer.leases.len() as u32);
             for (vdisk, lease) in &offer.leases {
-                put_lease(&mut out, *vdisk, lease);
+                put_lease(out, *vdisk, lease);
             }
         }
         PeerMessage::SyncNeed(hashes) => {
             out.push(8);
-            put_u32(&mut out, hashes.len() as u32);
+            put_u32(out, hashes.len() as u32);
             for (tier, hash) in hashes {
                 out.push(*tier);
                 out.extend_from_slice(hash.as_bytes());
@@ -263,27 +282,27 @@ pub fn encode(message: &PeerMessage) -> Vec<u8> {
         }
         PeerMessage::SyncData(payloads) => {
             out.push(9);
-            put_u32(&mut out, payloads.len() as u32);
+            put_u32(out, payloads.len() as u32);
             for (tier, payload) in payloads {
                 out.push(*tier);
-                put_bytes(&mut out, payload);
+                put_bytes(out, payload);
             }
         }
         PeerMessage::SyncReady => out.push(10),
         PeerMessage::SyncAdopt { final_rseq } => {
             out.push(11);
-            put_u64(&mut out, *final_rseq);
+            put_u64(out, *final_rseq);
         }
         PeerMessage::SyncDone { era } => {
             out.push(12);
-            put_u64(&mut out, *era);
+            put_u64(out, *era);
         }
         // The fetch pair — phase 5's non-home reads. A two-member daemon
         // never emits them (everyone homes everything), so the handshake
         // magic waits for the mesh to bump it.
         PeerMessage::Read(hashes) => {
             out.push(13);
-            put_u32(&mut out, hashes.len() as u32);
+            put_u32(out, hashes.len() as u32);
             for (tier, hash) in hashes {
                 out.push(*tier);
                 out.extend_from_slice(hash.as_bytes());
@@ -291,23 +310,125 @@ pub fn encode(message: &PeerMessage) -> Vec<u8> {
         }
         PeerMessage::ReadData(payloads) => {
             out.push(14);
-            put_u32(&mut out, payloads.len() as u32);
+            put_u32(out, payloads.len() as u32);
             for (tier, payload) in payloads {
                 out.push(*tier);
-                put_bytes(&mut out, payload);
+                put_bytes(out, payload);
             }
         }
         PeerMessage::MapIs { version, pairs } => {
             out.push(15);
-            put_u64(&mut out, *version);
-            put_u32(&mut out, pairs.len() as u32);
+            put_u64(out, *version);
+            put_u32(out, pairs.len() as u32);
             for homes in pairs {
                 out.push(homes[0]);
                 out.push(homes[1]);
             }
         }
     }
-    out
+}
+
+/// One piece of a scattered frame: bytes the codec wrote into the shared
+/// scratch buffer, or a payload borrowed straight from a queued message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Chunk {
+    /// `scratch[start..end]`.
+    Scratch { start: usize, end: usize },
+    /// Payload `index` of message `message` (see [`payload_list`]).
+    Payload { message: usize, index: usize },
+}
+
+/// Encode one message as a **length-prefixed frame**, scattered: framing
+/// and headers land in `scratch`, while the payload bytes of a
+/// payload-bearing message stay where they are and are named by
+/// [`Chunk::Payload`]. The writer turns the chunk list into iovecs, so a
+/// 16 KiB block goes queue → socket without the two copies (encode, then
+/// batch) it used to pay. The byte stream is exactly `encode`'s, prefix
+/// included — the tests hold the two encoders to identical output.
+pub fn encode_frame_scattered(
+    message_index: usize,
+    message: &PeerMessage,
+    scratch: &mut Vec<u8>,
+    chunks: &mut Vec<Chunk>,
+) {
+    match payload_list(message) {
+        Some(payloads) => {
+            let tag: u8 = match message {
+                PeerMessage::Payloads(_) => 2,
+                PeerMessage::SyncData(_) => 9,
+                PeerMessage::ReadData(_) => 14,
+                _ => unreachable!("payload_list said so"),
+            };
+            let frame_len: usize = 5 + payloads.iter().map(|(_, p)| 5 + p.len()).sum::<usize>();
+            let mut mark = scratch.len();
+            put_u32(scratch, frame_len as u32);
+            scratch.push(tag);
+            put_u32(scratch, payloads.len() as u32);
+            for (index, (tier, payload)) in payloads.iter().enumerate() {
+                scratch.push(*tier);
+                put_u32(scratch, payload.len() as u32);
+                chunks.push(Chunk::Scratch {
+                    start: mark,
+                    end: scratch.len(),
+                });
+                mark = scratch.len();
+                chunks.push(Chunk::Payload {
+                    message: message_index,
+                    index,
+                });
+            }
+            if mark < scratch.len() {
+                // An empty payload list: the header chunk still has to go.
+                chunks.push(Chunk::Scratch {
+                    start: mark,
+                    end: scratch.len(),
+                });
+            }
+        }
+        None => {
+            let start = scratch.len();
+            put_u32(scratch, 0);
+            encode_into(message, scratch);
+            let frame_len = (scratch.len() - start - 4) as u32;
+            scratch[start..start + 4].copy_from_slice(&frame_len.to_le_bytes());
+            chunks.push(Chunk::Scratch {
+                start,
+                end: scratch.len(),
+            });
+        }
+    }
+}
+
+/// A `Payloads` frame's entries, each `(tier, range into the frame
+/// buffer)`.
+pub type PayloadRanges = Vec<(u8, std::ops::Range<usize>)>;
+
+/// A `Payloads` frame's entries as [`PayloadRanges`] — the reader's
+/// zero-copy fast path. Any other message answers `None` and the caller
+/// decodes normally. Exactly as strict as [`decode`]: truncation and
+/// trailing bytes are errors, never a guess.
+pub fn decode_payload_ranges(buf: &[u8]) -> Result<Option<PayloadRanges>, WireError> {
+    if buf.len() > MAX_FRAME {
+        return Err(WireError::TooLarge(buf.len()));
+    }
+    if buf.first() != Some(&2u8) {
+        return Ok(None);
+    }
+    let mut r = Reader::new(buf);
+    let _tag = r.u8()?;
+    let count = r.count(5)?;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let tier = r.u8()?;
+        let len = r.u32()? as usize;
+        let start = r.pos;
+        r.take(len)?;
+        out.push((tier, start..start + len));
+    }
+    if r.remaining() != 0 {
+        return Err(WireError::Trailing);
+    }
+    Ok(Some(out))
 }
 
 // ---------------------------------------------------------------------------
@@ -564,121 +685,177 @@ mod tests {
         BlockHash::from_bytes([byte; 32])
     }
 
-    fn round_trip(message: PeerMessage) {
-        let bytes = encode(&message);
-        assert_eq!(
-            decode(&bytes).unwrap(),
-            message,
-            "round trip changed the message"
-        );
+    /// Every message shape the protocol has, exercised by the round-trip
+    /// test, the scattered encoder, and the range decoder alike.
+    fn corpus() -> Vec<PeerMessage> {
+        vec![
+            PeerMessage::Hello {
+                era: u64::MAX,
+                node: 1,
+                tiers: vec![0, 1, 2],
+                map_version: 9,
+            },
+            PeerMessage::Hello {
+                era: 1,
+                node: 0,
+                tiers: vec![0],
+                map_version: 0,
+            },
+            PeerMessage::Payloads(vec![]),
+            PeerMessage::Payloads(vec![(0, vec![]), (1, vec![0xAB; 16384])]),
+            PeerMessage::Apply {
+                first_rseq: 1,
+                ops: vec![
+                    ReplOp::CreateVdisk {
+                        id: 1,
+                        size_bytes: 1 << 40,
+                        tier: 2,
+                    },
+                    ReplOp::Write {
+                        vdisk: 1,
+                        index: 7,
+                        hash: hash(0x11),
+                    },
+                    ReplOp::Trim { vdisk: 1, index: 9 },
+                    ReplOp::DeleteVdisk { id: 3 },
+                    ReplOp::Snapshot {
+                        vdisk: 1,
+                        snapshot: 4,
+                    },
+                    ReplOp::DeleteSnapshot {
+                        vdisk: 1,
+                        snapshot: 4,
+                    },
+                    ReplOp::Rollback {
+                        vdisk: 1,
+                        snapshot: 4,
+                    },
+                    ReplOp::Clone {
+                        new_id: 9,
+                        vdisk: 1,
+                        snapshot: 4,
+                    },
+                    ReplOp::SetLease {
+                        vdisk: 1,
+                        lease: Lease {
+                            holder: 0,
+                            handing_to: Some(1),
+                            era: 3,
+                        },
+                    },
+                    ReplOp::SetLease {
+                        vdisk: 2,
+                        lease: Lease {
+                            holder: 1,
+                            handing_to: None,
+                            era: 9,
+                        },
+                    },
+                ],
+            },
+            PeerMessage::Flush { up_to: 42 },
+            PeerMessage::Durable { up_to: 42 },
+            PeerMessage::SyncStart,
+            PeerMessage::SyncManifest(SyncOffer {
+                era: 5,
+                vdisks: vec![(1, 1 << 30, 0, Some(hash(0x22))), (2, 4096, 1, None)],
+                snapshots: vec![(1, 1000, 1 << 30, Some(hash(0x33)))],
+                leases: vec![(
+                    1,
+                    Lease {
+                        holder: 1,
+                        handing_to: None,
+                        era: 5,
+                    },
+                )],
+            }),
+            PeerMessage::SyncManifest(SyncOffer {
+                era: 1,
+                vdisks: vec![],
+                snapshots: vec![],
+                leases: vec![],
+            }),
+            PeerMessage::SyncNeed(vec![(0, hash(0x44)), (2, hash(0x55))]),
+            PeerMessage::SyncData(vec![(1, vec![1, 2, 3])]),
+            PeerMessage::SyncReady,
+            PeerMessage::SyncAdopt { final_rseq: 77 },
+            PeerMessage::SyncDone { era: 6 },
+            PeerMessage::Read(vec![(0, hash(0x77)), (1, hash(0x78))]),
+            PeerMessage::Read(vec![]),
+            PeerMessage::ReadData(vec![(0, vec![9, 9, 9]), (2, vec![])]),
+            PeerMessage::MapIs {
+                version: 7,
+                pairs: (0..=255u8).map(|s| [s % 3, (s % 3 + 1) % 3]).collect(),
+            },
+        ]
     }
 
     #[test]
     fn every_message_round_trips_exactly() {
-        round_trip(PeerMessage::Hello {
-            era: u64::MAX,
-            node: 1,
-            tiers: vec![0, 1, 2],
-            map_version: 9,
-        });
-        round_trip(PeerMessage::Hello {
-            era: 1,
-            node: 0,
-            tiers: vec![0],
-            map_version: 0,
-        });
-        round_trip(PeerMessage::Payloads(vec![]));
-        round_trip(PeerMessage::Payloads(vec![
-            (0, vec![]),
-            (1, vec![0xAB; 16384]),
-        ]));
-        round_trip(PeerMessage::Apply {
-            first_rseq: 1,
-            ops: vec![
-                ReplOp::CreateVdisk {
-                    id: 1,
-                    size_bytes: 1 << 40,
-                    tier: 2,
-                },
-                ReplOp::Write {
-                    vdisk: 1,
-                    index: 7,
-                    hash: hash(0x11),
-                },
-                ReplOp::Trim { vdisk: 1, index: 9 },
-                ReplOp::DeleteVdisk { id: 3 },
-                ReplOp::Snapshot {
-                    vdisk: 1,
-                    snapshot: 4,
-                },
-                ReplOp::DeleteSnapshot {
-                    vdisk: 1,
-                    snapshot: 4,
-                },
-                ReplOp::Rollback {
-                    vdisk: 1,
-                    snapshot: 4,
-                },
-                ReplOp::Clone {
-                    new_id: 9,
-                    vdisk: 1,
-                    snapshot: 4,
-                },
-                ReplOp::SetLease {
-                    vdisk: 1,
-                    lease: Lease {
-                        holder: 0,
-                        handing_to: Some(1),
-                        era: 3,
-                    },
-                },
-                ReplOp::SetLease {
-                    vdisk: 2,
-                    lease: Lease {
-                        holder: 1,
-                        handing_to: None,
-                        era: 9,
-                    },
-                },
-            ],
-        });
-        round_trip(PeerMessage::Flush { up_to: 42 });
-        round_trip(PeerMessage::Durable { up_to: 42 });
-        round_trip(PeerMessage::SyncStart);
-        round_trip(PeerMessage::SyncManifest(SyncOffer {
-            era: 5,
-            vdisks: vec![(1, 1 << 30, 0, Some(hash(0x22))), (2, 4096, 1, None)],
-            snapshots: vec![(1, 1000, 1 << 30, Some(hash(0x33)))],
-            leases: vec![(
-                1,
-                Lease {
-                    holder: 1,
-                    handing_to: None,
-                    era: 5,
-                },
-            )],
-        }));
-        round_trip(PeerMessage::SyncManifest(SyncOffer {
-            era: 1,
-            vdisks: vec![],
-            snapshots: vec![],
-            leases: vec![],
-        }));
-        round_trip(PeerMessage::SyncNeed(vec![
-            (0, hash(0x44)),
-            (2, hash(0x55)),
-        ]));
-        round_trip(PeerMessage::SyncData(vec![(1, vec![1, 2, 3])]));
-        round_trip(PeerMessage::SyncReady);
-        round_trip(PeerMessage::SyncAdopt { final_rseq: 77 });
-        round_trip(PeerMessage::SyncDone { era: 6 });
-        round_trip(PeerMessage::Read(vec![(0, hash(0x77)), (1, hash(0x78))]));
-        round_trip(PeerMessage::Read(vec![]));
-        round_trip(PeerMessage::ReadData(vec![(0, vec![9, 9, 9]), (2, vec![])]));
-        round_trip(PeerMessage::MapIs {
-            version: 7,
-            pairs: (0..=255u8).map(|s| [s % 3, (s % 3 + 1) % 3]).collect(),
-        });
+        for message in corpus() {
+            let bytes = encode(&message);
+            assert_eq!(
+                decode(&bytes).unwrap(),
+                message,
+                "round trip changed the message"
+            );
+        }
+    }
+
+    #[test]
+    fn the_scattered_encoder_is_byte_identical() {
+        for message in corpus() {
+            let mut scratch = Vec::new();
+            let mut chunks = Vec::new();
+            encode_frame_scattered(0, &message, &mut scratch, &mut chunks);
+            let mut flat = Vec::new();
+            for chunk in &chunks {
+                match chunk {
+                    Chunk::Scratch { start, end } => flat.extend_from_slice(&scratch[*start..*end]),
+                    Chunk::Payload { index, .. } => flat.extend_from_slice(
+                        &payload_list(&message).expect("chunk names a payload")[*index].1,
+                    ),
+                }
+            }
+            let body = encode(&message);
+            let mut framed = (body.len() as u32).to_le_bytes().to_vec();
+            framed.extend_from_slice(&body);
+            assert_eq!(flat, framed, "scattered stream diverged: {message:?}");
+        }
+    }
+
+    #[test]
+    fn payload_ranges_name_exactly_what_decode_would_copy() {
+        for message in corpus() {
+            let bytes = encode(&message);
+            match (decode_payload_ranges(&bytes).unwrap(), &message) {
+                (Some(ranges), PeerMessage::Payloads(payloads)) => {
+                    assert_eq!(ranges.len(), payloads.len());
+                    for ((tier, range), (expect_tier, payload)) in ranges.iter().zip(payloads) {
+                        assert_eq!(tier, expect_tier);
+                        assert_eq!(&bytes[range.clone()], payload.as_slice());
+                    }
+                }
+                (None, PeerMessage::Payloads(_)) => panic!("the fast path missed a Payloads frame"),
+                (Some(_), other) => panic!("the fast path claimed {other:?}"),
+                (None, _) => {}
+            }
+        }
+        // Exactly as strict as decode: truncation and trailing bytes are
+        // errors, never a guess.
+        let good = encode(&PeerMessage::Payloads(vec![(1, vec![7; 32])]));
+        for cut in 1..good.len() {
+            assert!(
+                decode_payload_ranges(&good[..cut]).is_err(),
+                "a truncation at {cut} decoded anyway"
+            );
+        }
+        let mut long = good.clone();
+        long.push(0);
+        assert_eq!(
+            decode_payload_ranges(&long).unwrap_err(),
+            WireError::Trailing
+        );
     }
 
     #[test]
