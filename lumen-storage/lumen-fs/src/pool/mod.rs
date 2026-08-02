@@ -179,6 +179,15 @@ pub struct Pool<D: Disk> {
     /// before placement existed. Handed in at open (WAL replay's validity
     /// checks consult it); the committed map persists in the manifest.
     placement: Option<Placement>,
+    /// Blocks a local put's reservation counts on across its unlocked
+    /// window, held live against collection until the publish's WAL entry
+    /// lands (or the reservation is abandoned): a dedupe hit's target may
+    /// be an unreferenced orphan, and a collection between reserve and
+    /// publish would sweep it — the guest then reads `Corrupt` under
+    /// space pressure, exactly when GC is active. Counted, because
+    /// concurrent reservations may pin the same block. Volatile on
+    /// purpose: a crash orphans nothing that was promised.
+    write_pins: HashMap<(u8, BlockHash), u32>,
     /// A reassignment in flight: the map the pool is moving *to*. While
     /// present, storage answers for the union of both maps — a write may
     /// land under either — and reads route by the committed map alone,
@@ -438,6 +447,7 @@ impl<D: Disk> Pool<D> {
             era: anchor.era,
             session_pins: BTreeMap::new(),
             placement,
+            write_pins: HashMap::new(),
             pending_map: None,
         };
 
@@ -1610,6 +1620,14 @@ impl<D: Disk> Pool<D> {
                 }
             }
         }
+        // Blocks a reservation's dedupe hit counts on: live until the
+        // publish's WAL entry lands, or the pin would be the gap a
+        // collection sweeps acknowledged-to-be data through.
+        for (tier, hash) in self.write_pins.keys() {
+            if self.store.contains(*tier, hash) {
+                live.insert((*tier, *hash));
+            }
+        }
         let mut seen: HashSet<(BlockHash, u32, u8)> = HashSet::new();
         while let Some((hash, kind, data_tier)) = pending.pop() {
             // A node lives on tier 0; a kind-0 entry is data on its tier.
@@ -1650,6 +1668,102 @@ impl<D: Disk> Pool<D> {
     /// [`crate::BrickSet::put_prehashed_batch`].
     pub fn put_blocks_prehashed(&mut self, tier: u8, items: &[(BlockHash, &[u8])]) -> Result<()> {
         self.store.put_prehashed_batch(tier, items)
+    }
+
+    // -----------------------------------------------------------------
+    // Reserve / write / publish — the store's three-phase put, plus the
+    // pins that keep a reservation's world alive across its unlocked
+    // window. The replication layer owns the semantics (validity at
+    // publish); the pool owns the store and the garbage collector's view.
+
+    /// Reserve extents for a batch of prehashed blocks on a tier — the
+    /// first phase of a put whose payload write happens off the engine
+    /// lock. Dedupe hits against the store are pinned here (see
+    /// `write_pins`); the pins come off at publish or abandon.
+    pub fn reserve_blocks_prehashed(
+        &mut self,
+        tier: u8,
+        items: &[(BlockHash, u32)],
+    ) -> Result<crate::store::brick_set::SetReservation> {
+        let reservation = self.store.reserve_prehashed_batch(tier, items)?;
+        for (index, disposition) in reservation.dispositions().iter().enumerate() {
+            if matches!(
+                disposition,
+                crate::store::brick_set::ReservedDisposition::Held
+            ) {
+                *self.write_pins.entry((tier, items[index].0)).or_insert(0) += 1;
+            }
+        }
+        Ok(reservation)
+    }
+
+    /// The in-lock write of a reservation's bytes — the simulation's
+    /// path, and the fallback when a brick offers no detached writer.
+    pub fn fill_reserved(
+        &mut self,
+        reservation: &crate::store::brick_set::SetReservation,
+        payloads: &[&[u8]],
+    ) -> Result<()> {
+        self.store.fill_reserved(reservation, payloads)
+    }
+
+    /// Publish a reservation: the extents become indexed, routed blocks.
+    /// The write pins stay up — the caller drops them with
+    /// [`Pool::unpin_reserved`] only once the WAL entries referencing the
+    /// blocks have landed, because the pin is a promise about the gap to
+    /// exactly that point.
+    pub fn publish_reserved(&mut self, reservation: crate::store::brick_set::SetReservation) {
+        self.store.publish_reserved(reservation);
+    }
+
+    /// Abandon a reservation: extents become orphans, pins come off.
+    pub fn abandon_reserved(
+        &mut self,
+        tier: u8,
+        items: &[(BlockHash, u32)],
+        reservation: crate::store::brick_set::SetReservation,
+    ) {
+        self.unpin_reserved(tier, items, &reservation);
+        self.store.abandon_reserved(reservation);
+    }
+
+    /// Release the write pins a reserve took for its dedupe hits.
+    pub fn unpin_reserved(
+        &mut self,
+        tier: u8,
+        items: &[(BlockHash, u32)],
+        reservation: &crate::store::brick_set::SetReservation,
+    ) {
+        for (index, disposition) in reservation.dispositions().iter().enumerate() {
+            if matches!(
+                disposition,
+                crate::store::brick_set::ReservedDisposition::Held
+            ) {
+                self.unpin_write(tier, &items[index].0);
+            }
+        }
+    }
+
+    /// Release one write pin — the per-block form the publish path uses
+    /// once a dedupe hit's referencing WAL entry has landed.
+    pub(crate) fn unpin_write(&mut self, tier: u8, hash: &BlockHash) {
+        let key = (tier, *hash);
+        match self.write_pins.get_mut(&key) {
+            Some(count) if *count > 1 => *count -= 1,
+            Some(_) => {
+                self.write_pins.remove(&key);
+            }
+            None => debug_assert!(false, "an unpin for a block holding no write pin"),
+        }
+    }
+
+    /// Detached writers for a reservation's bricks, or `None` when any
+    /// brick cannot offer one — the caller then fills in-lock.
+    pub fn reservation_write_handles(
+        &self,
+        reservation: &crate::store::brick_set::SetReservation,
+    ) -> Option<Vec<crate::disk::WriteHandle>> {
+        self.store.reservation_write_handles(reservation)
     }
 
     /// Whether the store holds a block, by tier and address.

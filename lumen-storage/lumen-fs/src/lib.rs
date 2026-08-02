@@ -43,13 +43,16 @@ pub mod store;
 pub use disk::file::{is_block_device, FileDisk};
 pub use disk::sim::{SimDisk, SplitMix64};
 pub use disk::Disk;
-pub use disk::FlushHandle;
+pub use disk::{FlushHandle, WriteHandle};
 pub use error::{FsError, Result};
 pub use hash::{hash_block, BlockHash};
 pub use pool::bytes::ByteView;
 pub use pool::{AdoptScope, CheckpointTicket, Lease, Pool, ScrubReport};
 pub use repl::slice::{slice_of, Homes, Reassignment, SliceMap, SliceMove, SLICES};
-pub use repl::{Effect, NodeId, PeerMessage, ReplNode, ReplOp, ReplState, SyncOffer};
+pub use repl::{
+    DetachedPut, Effect, NodeId, PayloadTicket, PeerMessage, ReplNode, ReplOp, ReplState,
+    RunTicket, SyncOffer,
+};
 pub use store::brick::{BlockRead, BlockWrite, Brick, BrickParams, BrickStats, ByteSpace, GcStats};
 pub use store::brick_set::{BrickSet, BrickSpace, ScrubCursor, SpaceReport, TierSpace};
 pub use store::format::{RosterEntry, Superblock, ROSTER_CAP, SECTOR_SIZE, SUPERBLOCK_SLOTS};

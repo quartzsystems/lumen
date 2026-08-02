@@ -70,10 +70,21 @@ pub trait ByteView {
     /// Read a byte range. Always returns exactly `len` bytes; what was
     /// never written is zeros.
     fn read_bytes(&mut self, vdisk: u64, offset: u64, len: u64) -> Result<Vec<u8>> {
+        let mut out = vec![0u8; len as usize];
+        self.read_bytes_into(vdisk, offset, &mut out)?;
+        Ok(out)
+    }
+
+    /// Read a byte range straight into a caller-owned buffer — the whole
+    /// buffer is filled; what was never written is zeros. The ublk
+    /// service path reads into the kernel-copy buffer directly, which is
+    /// one whole-request copy it no longer pays.
+    fn read_bytes_into(&mut self, vdisk: u64, offset: u64, out: &mut [u8]) -> Result<()> {
         let size = self.vdisk_size(vdisk)?;
         let block_size = self.block_size() as u64;
+        let len = out.len() as u64;
         byte_bounds(size, block_size, offset, len)?;
-        let mut out = vec![0u8; len as usize];
+        out.fill(0);
         let mut pos = offset;
         while pos < offset + len {
             let block = pos / block_size;
@@ -86,7 +97,7 @@ pub trait ByteView {
             }
             pos += take as u64;
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Write a byte range. Blocks covered only in part are read, overlaid,

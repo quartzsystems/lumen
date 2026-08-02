@@ -1,10 +1,25 @@
 # LumenFS engine concurrency — sharding the one lock
 
-**Status: design, not yet code — revised once, after an adversarial
-review (2026-08-02) found nine holes in the first draft.** The review's
-findings are folded in below and marked ⚠ where they changed the
-design; the biggest ones made the original "step 1 is small" claim
-false, and the revised step 1 is honest about what it needs.
+**Status: step 1 shipped (2026-08-02), steps 2–3 still design — revised
+once before any code, after an adversarial review (2026-08-02) found
+nine holes in the first draft.** The review's findings are folded in
+below and marked ⚠ where they changed the design; the biggest ones made
+the original "step 1 is small" claim false, and the revised step 1 was
+honest about what it needed. What landed as step 1 (see the migration
+list at the bottom): the three-phase put on `Brick`/`BrickSet`/`Pool`/
+`ReplNode` (`reserve → detached pwritev → publish`), segment
+reservation pins that GC refuses to cross, dedupe-hit write pins,
+publish-time revalidation under a world-generation ABA guard
+(`FsError::WorldMoved` → caller re-runs), both daemon directions
+(guest `write_run` and the applier's `payloads_begin/publish`) doing
+their pwrites with the engine lock released, the seeded three-phase
+interleaving histories (lumen-fs/tests/reserve_publish.rs) plus a
+threaded duplicate-heavy stress with forced collections
+(lumen-fsd/tests/stress_puts.rs) — and three riders from step 4:
+`pwritev` scatter through the new `Disk::write_handle` seam,
+`read_bytes_into` on the ublk read path, and the payload-message cap
+(engine-side 8 MiB, at emission *and* in `coalesce`) that retires the
+MAX_FRAME tripwire.
 
 This document is the architecture conversation the write-path work of
 2026-08-01/02 ended at. Every incremental fix landed (SIMD hashing,
@@ -279,17 +294,25 @@ drift, barrier livelock.
 
 ## Migration steps, each shippable and measurable
 
-1. **Puts off the lock — the `FlushHandle` pattern.** Keep the engine
-   mutex; split the put into reserve (in-lock: head bump, segment pin,
-   dedupe check-and-pin) → pwrite (out-of-lock) → publish (in-lock:
-   index insert, pin release, **revalidation** of lease/era/serving/
-   adoption generation, refusal-and-orphan when the world moved). GC
-   learns to respect reservation pins. The sim keeps the single-call
-   form *and* gains the interleaved three-phase histories. *Expected:
-   bidirectional total roughly doubles; single-writer seqwrite gains
-   the pwrite overlap.* Not the "evening patch" the first draft
-   implied — the pins and revalidation are real engine surface — but
-   still the smallest correct step.
+1. **Puts off the lock — the `FlushHandle` pattern.** ✅ **Shipped
+   2026-08-02.** Keep the engine mutex; split the put into reserve
+   (in-lock: head bump, segment pin, dedupe check-and-pin) → pwrite
+   (out-of-lock) → publish (in-lock: index insert, pin release,
+   **revalidation** of lease/era/serving/adoption generation,
+   refusal-and-orphan when the world moved). GC learns to respect
+   reservation pins. The sim keeps the single-call form *and* gains the
+   interleaved three-phase histories. *Expected: bidirectional total
+   roughly doubles; single-writer seqwrite gains the pwrite overlap.*
+   As landed: `Disk::write_handle` (dup'd-fd `pwritev`, the
+   `FlushHandle` shape exactly), `reserve_hashed_batch`/`fill`/
+   `publish`/`abandon` up the whole stack, `RunTicket`/`PayloadTicket`
+   with `take_detached()`, the world-generation counter bumped at every
+   session/verdict/adoption/placement event, and `WorldMoved` as the
+   caller's re-run signal. Both daemon directions converted; the
+   revalidation histories are seeded sim tests, and disabling the
+   segment pin makes the headline history fail exactly as predicted
+   (acknowledged run gone at recovery) — the hazard was real and is
+   pinned.
 2. **Stream lock**: extract WAL-append + dirty-map insert + rseq +
    per-peer enqueue into the short sequencer (drain moves inside it);
    `WalFull` becomes abort-and-retry; `Durable`/`announce_durable`
@@ -297,11 +320,17 @@ drift, barrier livelock.
    the dirty consult only. The big mutex becomes plane C.
 3. **Sharded index + per-brick heads**: full plane A — dedupe CAS,
    orphan-on-loss, per-shard `payload_bytes`, scrub shard-snapshots,
-   atomic publish+pin on the applier path.
-4. **Follow-ons that ride along**: `pwritev` scatter into the segment
-   (kills the last staging memcpy — `libc` at the `FileDisk` seam),
-   `read_into` for the ublk read path, per-brick flush fan-out at
-   guest-flush time.
+   atomic publish+pin on the applier path. (Step 1 already makes
+   publish+`pin_inflight` one lock hold on the applier path; the shard
+   work must keep it one atomic act.)
+4. **Follow-ons that ride along**: ✅ `pwritev` scatter (shipped with
+   step 1 — the detached writer gathers header/payload/pad per
+   contiguous extent run; `libc` at the `FileDisk` seam), ✅
+   `read_bytes_into` for the ublk read path (shipped — the service
+   loop fills the kernel-copy buffer directly), ✅ payload-message cap
+   (shipped — 8 MiB engine-side, enforced at emission and in
+   `coalesce`'s merge window, retiring the MAX_FRAME session-bounce
+   tripwire). Still open: per-brick flush fan-out at guest-flush time.
 
 ## What this does not fix
 

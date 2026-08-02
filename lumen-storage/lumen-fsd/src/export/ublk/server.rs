@@ -566,11 +566,8 @@ fn service(guest: &GuestHandle, vdisk: u64, desc: &IoDesc, buffer: &mut [u8]) ->
         return -libc::EINVAL;
     }
     match desc.op() {
-        IO_OP_READ => match guest.read(vdisk, offset, len) {
-            Ok(data) => {
-                buffer[..data.len()].copy_from_slice(&data);
-                data.len() as i32
-            }
+        IO_OP_READ => match guest.read_into(vdisk, offset, &mut buffer[..len as usize]) {
+            Ok(()) => len as i32,
             Err(err) => errno(&err),
         },
         IO_OP_WRITE => match guest.write(vdisk, offset, &buffer[..len as usize]) {

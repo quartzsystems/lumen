@@ -549,6 +549,21 @@ impl GuestHandle {
         }
     }
 
+    /// [`GuestHandle::read`] straight into a caller-owned buffer — the
+    /// ublk path fills the kernel-copy buffer directly, dropping the one
+    /// whole-request `Vec` and copy the boxed return carried.
+    pub fn read_into(&self, vdisk: u64, offset: u64, out: &mut [u8]) -> Result<(), FsError> {
+        loop {
+            let outcome = self
+                .shared
+                .with_engine(|engine| engine.read_bytes_into(vdisk, offset, out));
+            match outcome {
+                Err(FsError::BlockElsewhere { tier, hash }) => self.fetch(tier, hash)?,
+                other => return other,
+            }
+        }
+    }
+
     /// Fetch one block from a home and wait for it to land. Arrived or
     /// failed, the answer is another pass by the caller: a landed payload
     /// serves the retry, a dead session's retry re-fetches from the
@@ -657,11 +672,75 @@ impl GuestHandle {
         if head_len > 0 {
             self.write_fallback(vdisk, offset, &data[..head_len])?;
         }
-        self.blocking(|engine| engine.write_block_run_prehashed(vdisk, first_whole, &items))?;
+        self.write_run(vdisk, first_whole, &items)?;
         if from < data.len() {
             self.write_fallback(vdisk, offset + from as u64, &data[from..])?;
         }
         Ok(())
+    }
+
+    /// The three-phase run: reserve under the engine lock, land the
+    /// payload bytes through the reservation's dup'd descriptors with
+    /// the lock **released**, publish under the lock. This is where the
+    /// measured 30% of lock-held time — the `pwrite` page-cache memcpy —
+    /// stops serializing every other guest and the peer's whole apply
+    /// stream behind one writer's bytes.
+    ///
+    /// Every exit between begin and publish must abandon the ticket: a
+    /// dropped one pins its segments against collection forever.
+    fn write_run(
+        &self,
+        vdisk: u64,
+        first: u64,
+        items: &[(lumen_fs::BlockHash, &[u8])],
+    ) -> Result<(), FsError> {
+        let meta: Vec<(lumen_fs::BlockHash, u32)> = items
+            .iter()
+            .map(|(hash, payload)| (*hash, payload.len() as u32))
+            .collect();
+        let payloads: Vec<&[u8]> = items.iter().map(|(_, payload)| *payload).collect();
+        loop {
+            let mut ticket = self.blocking(|engine| engine.write_run_begin(vdisk, first, &meta))?;
+            match ticket.take_detached() {
+                Some(put) => {
+                    if let Err(err) = put.write(&payloads) {
+                        self.shared
+                            .with_engine(|engine| engine.write_run_abandon(ticket));
+                        return Err(err);
+                    }
+                }
+                // No detached writer (never the daemon's FileDisks, but
+                // stated rather than assumed): fill in-lock.
+                None => {
+                    let filled = self
+                        .shared
+                        .with_engine(|engine| engine.write_run_fill(&ticket, &payloads));
+                    if let Err(err) = filled {
+                        self.shared
+                            .with_engine(|engine| engine.write_run_abandon(ticket));
+                        return Err(err);
+                    }
+                }
+            }
+            let outcome = self
+                .shared
+                .with_engine(|engine| engine.write_run_publish(ticket, items));
+            match outcome {
+                // The world moved while the lock was down; the extents
+                // are already orphaned and the fresh entry judgement
+                // passed — go again against the new world.
+                Err(FsError::WorldMoved) => continue,
+                // Suspension keeps its parked semantics: the guest holds,
+                // the daemon waits for the world to change, the retry
+                // re-judges at begin.
+                Err(FsError::Suspended) => {
+                    if self.cancelled.load(Ordering::SeqCst) || !self.shared.wait_change() {
+                        return Err(FsError::Suspended);
+                    }
+                }
+                other => return other,
+            }
+        }
     }
 
     /// The unhoisted path: the engine chunks, hashes, and handles the
@@ -994,7 +1073,7 @@ fn run_session(shared: &Arc<Shared>, mut stream: TcpStream) {
                             .iter()
                             .map(|(tier, hash, range)| (*tier, *hash, &frame[range.clone()]))
                             .collect();
-                        shared.with_engine(|engine| engine.payloads_prehashed_ref(peer_node, &refs))
+                        apply_payloads(&shared, peer_node, &refs)
                     }
                     Ingest::Message(message) => {
                         shared.with_engine(|engine| engine.handle(peer_node, message))
@@ -1061,6 +1140,37 @@ fn run_session(shared: &Arc<Shared>, mut stream: TcpStream) {
     shared.session_down(peer_node, incarnation);
     eprintln!("peer session {incarnation} down");
     let _ = writer.join();
+}
+
+/// Apply one `Payloads` batch: the three-phase path when the engine
+/// grants it — reserve under the lock, store the frame's bytes into the
+/// bricks with the lock **released**, publish-and-pin under the lock —
+/// and the inline path when it does not (this node is the peer's resync
+/// target and must backlog). The applier's store `pwrite` was the same
+/// measured lock tax the guest path paid; now the two directions overlap
+/// instead of queueing on one mutex.
+fn apply_payloads(
+    shared: &Arc<Shared>,
+    peer: u8,
+    refs: &[(u8, lumen_fs::BlockHash, &[u8])],
+) -> Result<(), FsError> {
+    let meta: Vec<(u8, lumen_fs::BlockHash, u32)> = refs
+        .iter()
+        .map(|(tier, hash, payload)| (*tier, *hash, payload.len() as u32))
+        .collect();
+    let Some(mut ticket) = shared.with_engine(|engine| engine.payloads_begin(peer, &meta))? else {
+        return shared.with_engine(|engine| engine.payloads_prehashed_ref(peer, refs));
+    };
+    let payloads: Vec<&[u8]> = refs.iter().map(|(_, _, payload)| *payload).collect();
+    let written = match ticket.take_detached() {
+        Some(put) => put.write(&payloads),
+        None => shared.with_engine(|engine| engine.payloads_fill(&ticket, &payloads)),
+    };
+    if let Err(err) = written {
+        shared.with_engine(|engine| engine.payloads_abandon(ticket));
+        return Err(err);
+    }
+    shared.with_engine(|engine| engine.payloads_publish(peer, ticket, refs))
 }
 
 /// How much of the queue one send gathers, at most. A 1 MiB guest write

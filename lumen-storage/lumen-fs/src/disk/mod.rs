@@ -26,6 +26,15 @@ pub mod sim;
 /// never changes what the bytes are.
 pub type FlushHandle = Box<dyn Fn() -> Result<()> + Send>;
 
+/// A detached positional writer: gathers the slices to one offset, in
+/// order, without holding the disk's `&mut`. The counterpart of
+/// [`FlushHandle`] for the reserve/write/publish put path — the engine
+/// reserves an extent under its lock, hands one of these out, and the
+/// caller lands the bytes with the lock released. Safe for exactly the
+/// reason the reservation exists: nothing else may touch a reserved
+/// extent until it is published or abandoned.
+pub type WriteHandle = Box<dyn Fn(u64, &[std::io::IoSlice<'_>]) -> Result<()> + Send + Sync>;
+
 // `Send` because the engine that owns disks lives behind a mutex shared
 // across threads, and a multi-brick flush syncs bricks concurrently —
 // both already demand it of any real implementation.
@@ -50,6 +59,15 @@ pub trait Disk: Send {
     /// engine lock; a `None` anywhere sends the caller back to the
     /// in-lock single-phase path.
     fn flush_handle(&self) -> Option<FlushHandle> {
+        None
+    }
+
+    /// A [`WriteHandle`] for this disk, or `None` if it cannot offer one
+    /// (the simulator: its writes must stay inside the deterministic
+    /// model). The reserve/write/publish put path lands payloads through
+    /// these outside the engine lock; a `None` sends the caller back to
+    /// the in-lock single-call put.
+    fn write_handle(&self) -> Option<WriteHandle> {
         None
     }
 }

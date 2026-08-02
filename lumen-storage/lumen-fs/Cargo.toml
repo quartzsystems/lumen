@@ -24,3 +24,9 @@ license = "MIT"
 # the crate building on every dev box with no C toolchain; the daemon stage
 # can revisit the assembly kernels if hashing ever shows up in a profile.
 blake3 = "1"
+
+# The one impure seam this crate carries (FileDisk) needs pwritev — the
+# scattered positional write std does not expose. Unix only, seam only;
+# the engine proper never touches it.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

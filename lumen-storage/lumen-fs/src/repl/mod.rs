@@ -139,6 +139,8 @@ use crate::error::{FsError, Result};
 use crate::hash::BlockHash;
 use crate::pool::map;
 use crate::pool::{AdoptScope, Lease, Pool};
+use crate::store::brick_set::SetReservation;
+use crate::store::format::RECORD_HEADER_LEN;
 
 pub type NodeId = u8;
 
@@ -348,6 +350,11 @@ fn coalesce(effects: Vec<Effect>) -> Vec<Effect> {
     #[derive(Default, Clone, Copy)]
     struct Window {
         payloads: Option<usize>,
+        /// Payload bytes already in the open `Payloads` window — merges
+        /// stop at [`PAYLOAD_MESSAGE_CAP`], because a merge that grew
+        /// without a ceiling was one config change away from a frame the
+        /// wire's hard stop would bounce the session over, forever.
+        payload_bytes: usize,
         apply: Option<(usize, u64)>,
     }
 
@@ -357,16 +364,22 @@ fn coalesce(effects: Vec<Effect>) -> Vec<Effect> {
     for effect in effects {
         match effect {
             Effect::Send(peer, PeerMessage::Payloads(mut blocks)) => {
+                let incoming: usize = blocks.iter().map(|(_, payload)| payload.len()).sum();
                 let window = windows.entry(peer).or_default();
                 match window.payloads {
-                    Some(at) => {
+                    Some(at)
+                        if window.payload_bytes + incoming <= PAYLOAD_MESSAGE_CAP
+                            || blocks.is_empty() =>
+                    {
                         let Effect::Send(_, PeerMessage::Payloads(open)) = &mut out[at] else {
                             unreachable!("the window indexes what this fn put there");
                         };
                         open.append(&mut blocks);
+                        window.payload_bytes += incoming;
                     }
-                    None => {
+                    _ => {
                         window.payloads = Some(out.len());
+                        window.payload_bytes = incoming;
                         // Ops emitted before this point must not merge
                         // backward past it: an op after this payload may
                         // reference it.
@@ -413,6 +426,166 @@ fn coalesce(effects: Vec<Effect>) -> Vec<Effect> {
         }
     }
     out
+}
+
+/// The most payload bytes one `Payloads` message may carry, whether
+/// emitted whole or grown by [`coalesce`]. The wire's frame ceiling is
+/// the daemon's business (64 MiB today), but the engine is where runs
+/// and merges are built — a 32 MiB guest write must not coalesce into
+/// one frame that a halved ceiling, or a bigger guest request, would
+/// turn into a permanent session-bounce loop. Well under any plausible
+/// ceiling, and big enough that a full-size run still ships in a
+/// handful of frames.
+const PAYLOAD_MESSAGE_CAP: usize = 8 << 20;
+
+/// One record of a detached put: where it goes, the header that fronts
+/// it, and which of the caller's payloads fills it.
+#[derive(Debug)]
+struct PlannedRecord {
+    offset: u64,
+    header: [u8; RECORD_HEADER_LEN],
+    pad: usize,
+    /// Index into the caller's payload batch.
+    item: usize,
+}
+
+/// Zero padding for the tail of each record's sector span — shared,
+/// because a pad is never longer than one sector.
+static ZERO_PAD: [u8; 4096] = [0u8; 4096];
+
+/// The off-lock half of a reservation: detached writers plus the exact
+/// bytes-to-offset plan. Handed out by [`ReplNode::write_run_begin`] and
+/// [`ReplNode::payloads_begin`], exercised with no engine lock held.
+pub struct DetachedPut {
+    parts: Vec<(crate::disk::WriteHandle, Vec<PlannedRecord>)>,
+}
+
+impl DetachedPut {
+    /// Whether there is anything to write at all — a run of dedupe hits
+    /// reserves nothing.
+    pub fn is_empty(&self) -> bool {
+        self.parts.iter().all(|(_, records)| records.is_empty())
+    }
+
+    /// Land every reserved record — header, payload, zero pad — gathered
+    /// into one positional write per contiguous extent run. `payloads`
+    /// aligns with the begin call's items.
+    pub fn write(&self, payloads: &[&[u8]]) -> Result<()> {
+        for (handle, records) in &self.parts {
+            let mut at = 0;
+            while at < records.len() {
+                let start = records[at].offset;
+                let mut expected = start;
+                let mut slices: Vec<std::io::IoSlice<'_>> = Vec::new();
+                let mut end = at;
+                while end < records.len() && records[end].offset == expected {
+                    let record = &records[end];
+                    let payload = payloads[record.item];
+                    debug_assert_eq!(
+                        payload.len() + RECORD_HEADER_LEN + record.pad,
+                        crate::store::format::record_span(payload.len() as u32) as usize,
+                    );
+                    slices.push(std::io::IoSlice::new(&record.header));
+                    slices.push(std::io::IoSlice::new(payload));
+                    if record.pad > 0 {
+                        slices.push(std::io::IoSlice::new(&ZERO_PAD[..record.pad]));
+                    }
+                    expected += (RECORD_HEADER_LEN + payload.len() + record.pad) as u64;
+                    end += 1;
+                }
+                handle(start, &slices)?;
+                at = end;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Build the detached plan for one reservation, or `None` when any brick
+/// offers no detached writer (the simulator) — the caller then fills
+/// in-lock. `item_map` translates the reservation's local item indices
+/// back to the caller's batch.
+fn detached_plan<D: Disk>(
+    pool: &Pool<D>,
+    reservation: &SetReservation,
+    item_map: &[usize],
+) -> Option<Vec<(crate::disk::WriteHandle, Vec<PlannedRecord>)>> {
+    let handles = pool.reservation_write_handles(reservation)?;
+    Some(
+        handles
+            .into_iter()
+            .zip(reservation.parts().iter())
+            .map(|(handle, (_, brick_reservation, taken))| {
+                let records = brick_reservation
+                    .extents()
+                    .iter()
+                    .zip(taken.iter())
+                    .map(|(extent, local_index)| PlannedRecord {
+                        offset: extent.offset(),
+                        header: extent.header(),
+                        pad: extent.pad_len(),
+                        item: item_map[*local_index],
+                    })
+                    .collect();
+                (handle, records)
+            })
+            .collect(),
+    )
+}
+
+/// An open three-phase guest write: everything the publish needs to
+/// revalidate and finish the run, captured under the lock by
+/// [`ReplNode::write_run_begin`]. Publish it or abandon it — a dropped
+/// ticket pins its segments against collection forever.
+pub struct RunTicket {
+    vdisk: u64,
+    first: u64,
+    tier: u8,
+    /// The whole run's `(hash, payload length)`, in order.
+    items: Vec<(BlockHash, u32)>,
+    /// Per item: whether this member stores it.
+    local: Vec<bool>,
+    /// The locally-stored subset of `items`, reserve order.
+    local_items: Vec<(BlockHash, u32)>,
+    /// Run index of each local item.
+    local_map: Vec<usize>,
+    reservation: SetReservation,
+    world_generation: u64,
+    detached: Option<DetachedPut>,
+}
+
+impl RunTicket {
+    /// The off-lock writer, present when every reserved brick offers a
+    /// detached handle. Take it, write with no lock held, then publish.
+    /// `None` (the simulator) means fill in-lock via
+    /// [`ReplNode::write_run_fill`].
+    pub fn take_detached(&mut self) -> Option<DetachedPut> {
+        self.detached.take()
+    }
+}
+
+/// One tier's slice of a payload ticket: the tier, its `(hash, len)`
+/// items, each item's index into the begin call's batch, and the
+/// reservation those items landed in.
+type PayloadGroup = (u8, Vec<(BlockHash, u32)>, Vec<usize>, SetReservation);
+
+/// An open three-phase peer-payload apply — [`RunTicket`]'s applier-side
+/// sibling, from [`ReplNode::payloads_begin`]. Same discipline: publish
+/// or abandon, never drop.
+pub struct PayloadTicket {
+    from: NodeId,
+    session_generation: u64,
+    world_generation: u64,
+    /// One [`PayloadGroup`] per tier present among the storable blocks.
+    groups: Vec<PayloadGroup>,
+    detached: Option<DetachedPut>,
+}
+
+impl PayloadTicket {
+    /// The off-lock writer — see [`RunTicket::take_detached`].
+    pub fn take_detached(&mut self) -> Option<DetachedPut> {
+        self.detached.take()
+    }
 }
 
 /// What the node wants the outside world to do.
@@ -618,6 +791,14 @@ pub struct ReplNode<D: Disk> {
     /// snapshot, and a session reborn between the phases renumbered its
     /// stream, which is what the generation guards.
     ckpt_applied: Vec<(NodeId, u64, u64)>,
+    /// Bumped whenever the world a reservation was judged against can
+    /// have moved: session changes, fence verdicts, adoptions, placement
+    /// changes. A put's publish compares the number it captured at
+    /// reserve; a mismatch abandons the extents and re-runs the entry
+    /// judgement — the ABA guard the point-in-time re-checks alone cannot
+    /// give (a world that moved away and back would pass every re-check
+    /// while having interleaved another writer in between).
+    world_generation: u64,
 }
 
 impl<D: Disk> ReplNode<D> {
@@ -634,6 +815,7 @@ impl<D: Disk> ReplNode<D> {
             offered_vdisks: HashSet::new(),
             reassign_inflight: HashMap::new(),
             ckpt_applied: Vec::new(),
+            world_generation: 0,
         }
     }
 
@@ -762,6 +944,7 @@ impl<D: Disk> ReplNode<D> {
     /// bytes across connection incarnations. Guest-facing effects are not
     /// messages and survive — a parked flush is still owed an answer.
     pub fn peer_lost(&mut self, peer: NodeId) {
+        self.world_generation += 1;
         self.effects
             .retain(|effect| !matches!(effect, Effect::Send(to, _) if *to == peer));
         let session = self.session(peer);
@@ -834,6 +1017,7 @@ impl<D: Disk> ReplNode<D> {
             ));
         }
         session.fenced = true;
+        self.world_generation += 1;
         self.pool.bump_era_to(era)?;
         // The bump retired every lease of the era it closed — including
         // this node's own. The dead member's leases must stay retired, so
@@ -976,6 +1160,9 @@ impl<D: Disk> ReplNode<D> {
     /// a crash, and the arithmetic recomputes the identical map.
     pub fn prepare_reassign(&mut self, version: u64, members: &[NodeId]) -> Result<()> {
         self.pool.prepare_reassign(version, members)?;
+        // The write-homes union just widened; reservations judged against
+        // the old homes must not publish under the new ones.
+        self.world_generation += 1;
         Ok(())
     }
 
@@ -1029,6 +1216,7 @@ impl<D: Disk> ReplNode<D> {
                 "moves are still owed; a commit now would license dropping their sources",
             ));
         }
+        self.world_generation += 1;
         self.pool.commit_reassign()
     }
 
@@ -1383,7 +1571,7 @@ impl<D: Disk> ReplNode<D> {
             }
         }
         for (peer, payloads) in per_peer {
-            self.emit(Effect::Send(peer, PeerMessage::Payloads(payloads)));
+            self.emit_payloads_capped(peer, payloads);
         }
         for (i, block) in placed.iter().enumerate() {
             self.with_wal_room(|pool| {
@@ -1399,6 +1587,245 @@ impl<D: Disk> ReplNode<D> {
             );
         }
         Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // The three-phase guest write: reserve under the lock, pwrite with
+    // no lock held, publish under the lock — the FlushHandle pattern
+    // applied to the put, which the profile showed was mostly the kernel
+    // memcpy of `pwrite` serialized behind this engine's mutex.
+
+    /// Phase one: judge the write (lease, era, serving, placement),
+    /// reserve extents for every block this member stores, pin what the
+    /// reservation counts on, and snapshot the world generation the
+    /// publish will be held to. The caller writes the payloads through
+    /// [`RunTicket::take_detached`] with no lock held (or in-lock via
+    /// [`ReplNode::write_run_fill`] where the disk offers no detached
+    /// writer — the simulator), then offers the ticket to
+    /// [`ReplNode::write_run_publish`]. A ticket that will not be
+    /// published must go to [`ReplNode::write_run_abandon`]: dropping it
+    /// on the floor pins its segments against collection forever.
+    pub fn write_run_begin(
+        &mut self,
+        vdisk: u64,
+        first: u64,
+        items: &[(BlockHash, u32)],
+    ) -> Result<RunTicket> {
+        self.writable(vdisk)?;
+        let tier = self.pool.vdisk_tier(vdisk)?;
+        let block_size = self.pool.block_size() as u64;
+        let capacity = self.pool.vdisk_size(vdisk)?.div_ceil(block_size);
+        if first + items.len() as u64 > capacity {
+            return Err(FsError::OutOfRange {
+                index: first + items.len() as u64 - 1,
+                capacity,
+            });
+        }
+        // Placement, judged for the whole run before anything lands: an
+        // unreachable slice refuses the run instead of leaving half of
+        // it behind. Remote delivery is re-derived at publish — sessions
+        // move while the lock is down — but zero reachable homes is
+        // refused on both ends.
+        let mut local = Vec::with_capacity(items.len());
+        for (hash, _) in items {
+            local.push(self.reachable_homes(hash)?.0);
+        }
+        let local_map: Vec<usize> = (0..items.len()).filter(|i| local[*i]).collect();
+        let local_items: Vec<(BlockHash, u32)> =
+            local_map.iter().map(|index| items[*index]).collect();
+        let reservation = self.pool.reserve_blocks_prehashed(tier, &local_items)?;
+        let detached =
+            detached_plan(&self.pool, &reservation, &local_map).map(|parts| DetachedPut { parts });
+        Ok(RunTicket {
+            vdisk,
+            first,
+            tier,
+            items: items.to_vec(),
+            local,
+            local_items,
+            local_map,
+            reservation,
+            world_generation: self.world_generation,
+            detached,
+        })
+    }
+
+    /// Whether this node stores a block, and whether at least one home
+    /// can take it right now — the entry judgement `write_block` and the
+    /// run path share.
+    fn reachable_homes(&self, hash: &BlockHash) -> Result<(bool, Vec<NodeId>)> {
+        let homes: Vec<NodeId> = match self.pool.write_homes_of(hash) {
+            Some(homes) => homes,
+            None => {
+                let mut everyone: Vec<NodeId> = self.peers.keys().copied().collect();
+                everyone.push(self.node);
+                everyone
+            }
+        };
+        let local = homes.contains(&self.node);
+        let remote: Vec<NodeId> = homes
+            .iter()
+            .copied()
+            .filter(|home| {
+                *home != self.node
+                    && self
+                        .peers
+                        .get(home)
+                        .is_some_and(|session| session.stream_active())
+            })
+            .collect();
+        if !local && remote.is_empty() {
+            return Err(FsError::SliceUnreachable(slice::slice_of(hash) as u8));
+        }
+        Ok((local, remote))
+    }
+
+    /// The in-lock write of a run ticket's reserved bytes — the
+    /// simulation's phase two, an engine call so the sim pump can order
+    /// it adversarially against GC, verdicts, and adoptions. `blocks`
+    /// aligns with the begin call's `items`.
+    pub fn write_run_fill(&mut self, ticket: &RunTicket, blocks: &[&[u8]]) -> Result<()> {
+        let picks: Vec<&[u8]> = ticket
+            .local_map
+            .iter()
+            .map(|index| blocks[*index])
+            .collect();
+        self.pool.fill_reserved(&ticket.reservation, &picks)
+    }
+
+    /// Phase three: revalidate the world, make the blocks real, and run
+    /// the stream tail every write runs — WAL, dirty map, payloads and
+    /// ops to the peers. A world that moved answers
+    /// [`FsError::WorldMoved`] (extents abandoned as orphans; the caller
+    /// re-runs the whole put) unless the fresh judgement fails outright,
+    /// in which case the caller hears exactly the refusal entry would
+    /// have given.
+    pub fn write_run_publish(
+        &mut self,
+        ticket: RunTicket,
+        blocks: &[(BlockHash, &[u8])],
+    ) -> Result<()> {
+        let RunTicket {
+            vdisk,
+            first,
+            tier,
+            items,
+            local,
+            local_items,
+            local_map: _,
+            reservation,
+            world_generation,
+            detached: _,
+        } = ticket;
+        debug_assert_eq!(items.len(), blocks.len());
+        debug_assert!(items
+            .iter()
+            .zip(blocks)
+            .all(|((hash, len), (offered, payload))| hash == offered
+                && *len as usize == payload.len()));
+        // The fresh judgement first: a real refusal beats WorldMoved.
+        if let Err(refusal) = self.writable(vdisk) {
+            self.pool.abandon_reserved(tier, &local_items, reservation);
+            return Err(refusal);
+        }
+        let moved =
+            self.world_generation != world_generation || self.pool.vdisk_tier(vdisk) != Ok(tier);
+        if moved {
+            self.pool.abandon_reserved(tier, &local_items, reservation);
+            return Err(FsError::WorldMoved);
+        }
+        // Remote delivery, derived now: the generation guard pins the
+        // placement, but which sessions stream moved with the lock down,
+        // and an op sent to a streaming peer without its payload is that
+        // session's death.
+        let mut remotes: Vec<Vec<NodeId>> = Vec::with_capacity(blocks.len());
+        for (index, (hash, _)) in blocks.iter().enumerate() {
+            match self.reachable_homes(hash) {
+                Ok((local_now, remote)) => {
+                    if local_now != local[index] {
+                        // Placement decides local, and the generation
+                        // pins placement — unreachable in practice, but
+                        // stated as the guard it is.
+                        self.pool.abandon_reserved(tier, &local_items, reservation);
+                        return Err(FsError::WorldMoved);
+                    }
+                    remotes.push(remote);
+                }
+                Err(refusal) => {
+                    self.pool.abandon_reserved(tier, &local_items, reservation);
+                    return Err(refusal);
+                }
+            }
+        }
+        // What the reservation counted on beyond its own extents: the
+        // dedupe hits, whose pins outlive the reservation object and come
+        // off only once the WAL entries referencing them land below.
+        let held: Vec<BlockHash> = reservation
+            .dispositions()
+            .iter()
+            .enumerate()
+            .filter(|(_, disposition)| {
+                matches!(
+                    disposition,
+                    crate::store::brick_set::ReservedDisposition::Held
+                )
+            })
+            .map(|(index, _)| local_items[index].0)
+            .collect();
+        // The blocks become real: indexed, routed, flush-covered.
+        self.pool.publish_reserved(reservation);
+        // Payloads ahead of every op, one capped message run per peer —
+        // exactly the shape the single-call path emits.
+        let mut per_peer: BTreeMap<NodeId, Vec<(u8, Vec<u8>)>> = BTreeMap::new();
+        for (index, (_, payload)) in blocks.iter().enumerate() {
+            for peer in &remotes[index] {
+                per_peer
+                    .entry(*peer)
+                    .or_default()
+                    .push((tier, payload.to_vec()));
+            }
+        }
+        for (peer, payloads) in per_peer {
+            self.emit_payloads_capped(peer, payloads);
+        }
+        let outcome = (|| {
+            for (index, (hash, _)) in blocks.iter().enumerate() {
+                let hash = *hash;
+                self.with_wal_room(|pool| {
+                    pool.write_block_prehashed(vdisk, first + index as u64, hash)
+                })?;
+                self.send_ops_requiring(
+                    vec![ReplOp::Write {
+                        vdisk,
+                        index: first + index as u64,
+                        hash,
+                    }],
+                    Some(&remotes[index]),
+                );
+            }
+            Ok(())
+        })();
+        // The WAL entries referencing the dedupe hits have landed (or the
+        // failure surfaces with the blocks still safely indexed and the
+        // hits reachable through the dirty maps) — the pins are done
+        // either way.
+        for hash in held {
+            self.pool.unpin_write(tier, &hash);
+        }
+        outcome
+    }
+
+    /// Release a ticket that will not be published — a failed off-lock
+    /// write, or a caller unwinding. The extents become orphans for the
+    /// next collection; the pins come off now.
+    pub fn write_run_abandon(&mut self, ticket: RunTicket) {
+        let RunTicket {
+            tier,
+            local_items,
+            reservation,
+            ..
+        } = ticket;
+        self.pool.abandon_reserved(tier, &local_items, reservation);
     }
 
     pub fn trim_block(&mut self, vdisk: u64, index: u64) -> Result<()> {
@@ -1681,8 +2108,178 @@ impl<D: Disk> ReplNode<D> {
         self.pool.collect_garbage()
     }
 
+    /// Emit one peer's payload list as as many `Payloads` messages as
+    /// [`PAYLOAD_MESSAGE_CAP`] requires — the sender-side half of the
+    /// frame-ceiling guarantee; [`coalesce`] holds the same line when it
+    /// merges.
+    fn emit_payloads_capped(&mut self, peer: NodeId, payloads: Vec<(u8, Vec<u8>)>) {
+        let mut batch: Vec<(u8, Vec<u8>)> = Vec::new();
+        let mut bytes = 0usize;
+        for (tier, payload) in payloads {
+            if !batch.is_empty() && bytes + payload.len() > PAYLOAD_MESSAGE_CAP {
+                self.emit(Effect::Send(
+                    peer,
+                    PeerMessage::Payloads(std::mem::take(&mut batch)),
+                ));
+                bytes = 0;
+            }
+            bytes += payload.len();
+            batch.push((tier, payload));
+        }
+        if !batch.is_empty() {
+            self.emit(Effect::Send(peer, PeerMessage::Payloads(batch)));
+        }
+    }
+
     // -----------------------------------------------------------------
     // The peers' messages.
+
+    /// Phase one of the applier-side put: judge and reserve under the
+    /// lock so the payload pwrites can happen off it — the same split as
+    /// [`ReplNode::write_run_begin`], for the stream's other direction.
+    /// `Ok(None)` means the batch cannot take the three-phase path (this
+    /// node is the peer's resync target and must backlog): the caller
+    /// runs the inline [`ReplNode::payloads_prehashed_ref`] instead.
+    pub fn payloads_begin(
+        &mut self,
+        from: NodeId,
+        blocks: &[(u8, BlockHash, u32)],
+    ) -> Result<Option<PayloadTicket>> {
+        if !self.peers.contains_key(&from) {
+            return Err(FsError::Corrupt(
+                "a message arrived from a peer that never said hello",
+            ));
+        }
+        if self.peers[&from].state == (ReplState::Resyncing { source: false }) {
+            return Ok(None);
+        }
+        // A payload lands only on a home — the same filter the inline
+        // path applies; strays reserve nothing and publish pins nothing.
+        let storable: Vec<usize> = (0..blocks.len())
+            .filter(|index| {
+                self.pool
+                    .write_homes_of(&blocks[*index].1)
+                    .is_none_or(|homes| homes.contains(&self.node))
+            })
+            .collect();
+        let mut tiers: Vec<u8> = storable.iter().map(|index| blocks[*index].0).collect();
+        tiers.sort_unstable();
+        tiers.dedup();
+        let mut groups: Vec<PayloadGroup> = Vec::new();
+        let mut parts: Vec<(crate::disk::WriteHandle, Vec<PlannedRecord>)> = Vec::new();
+        let mut all_detached = true;
+        for tier in tiers {
+            let map: Vec<usize> = storable
+                .iter()
+                .copied()
+                .filter(|index| blocks[*index].0 == tier)
+                .collect();
+            let items: Vec<(BlockHash, u32)> = map
+                .iter()
+                .map(|index| (blocks[*index].1, blocks[*index].2))
+                .collect();
+            let reservation = match self.pool.reserve_blocks_prehashed(tier, &items) {
+                Ok(reservation) => reservation,
+                Err(err) => {
+                    for (tier, items, _, reservation) in groups {
+                        self.pool.abandon_reserved(tier, &items, reservation);
+                    }
+                    return Err(err);
+                }
+            };
+            match detached_plan(&self.pool, &reservation, &map) {
+                Some(mut plan) => parts.append(&mut plan),
+                None => all_detached = false,
+            }
+            groups.push((tier, items, map, reservation));
+        }
+        Ok(Some(PayloadTicket {
+            from,
+            session_generation: self.peers[&from].generation,
+            world_generation: self.world_generation,
+            groups,
+            detached: all_detached.then_some(DetachedPut { parts }),
+        }))
+    }
+
+    /// The in-lock write of a payload ticket's reserved bytes — the
+    /// simulation's phase two. `blocks` aligns with the begin call's.
+    pub fn payloads_fill(&mut self, ticket: &PayloadTicket, blocks: &[&[u8]]) -> Result<()> {
+        for (_, _, map, reservation) in &ticket.groups {
+            let picks: Vec<&[u8]> = map.iter().map(|index| blocks[*index]).collect();
+            self.pool.fill_reserved(reservation, &picks)?;
+        }
+        Ok(())
+    }
+
+    /// Phase three of the applier-side put: publish every group and take
+    /// the arrival pins **in the same lock hold** — a barrier'd
+    /// collection between an index insert and its `pin_inflight` would
+    /// re-open the payload-ahead-of-op sweep this codebase already found
+    /// and fixed once. A session that bounced while the lock was down
+    /// orphans the extents (its ops are never coming); a world that
+    /// moved re-runs the inline path against the new judgement.
+    pub fn payloads_publish(
+        &mut self,
+        from: NodeId,
+        ticket: PayloadTicket,
+        blocks: &[(u8, BlockHash, &[u8])],
+    ) -> Result<()> {
+        let PayloadTicket {
+            from: ticket_from,
+            session_generation,
+            world_generation,
+            groups,
+            detached: _,
+        } = ticket;
+        debug_assert_eq!(from, ticket_from);
+        let session_now = self.peers.get(&from).map(|s| s.generation);
+        if session_now != Some(session_generation) {
+            for (tier, items, _, reservation) in groups {
+                self.pool.abandon_reserved(tier, &items, reservation);
+            }
+            return Ok(());
+        }
+        if self.world_generation != world_generation {
+            for (tier, items, _, reservation) in groups {
+                self.pool.abandon_reserved(tier, &items, reservation);
+            }
+            return self.payloads_prehashed_ref(from, blocks);
+        }
+        for (tier, items, _, reservation) in groups {
+            let held: Vec<BlockHash> = reservation
+                .dispositions()
+                .iter()
+                .enumerate()
+                .filter(|(_, disposition)| {
+                    matches!(
+                        disposition,
+                        crate::store::brick_set::ReservedDisposition::Held
+                    )
+                })
+                .map(|(index, _)| items[index].0)
+                .collect();
+            self.pool.publish_reserved(reservation);
+            for (hash, _) in &items {
+                // Pinned until the op that references it lands — the
+                // write pin (if any) hands off to the arrival pin under
+                // this same lock hold.
+                self.pool.pin_inflight(from, tier, *hash);
+            }
+            for hash in held {
+                self.pool.unpin_write(tier, &hash);
+            }
+        }
+        Ok(())
+    }
+
+    /// Release a payload ticket that will not be published — a failed
+    /// off-lock write. Extents orphan; pins come off.
+    pub fn payloads_abandon(&mut self, ticket: PayloadTicket) {
+        for (tier, items, _, reservation) in ticket.groups {
+            self.pool.abandon_reserved(tier, &items, reservation);
+        }
+    }
 
     /// `Payloads`, with the addresses already computed from the bytes.
     ///
@@ -1813,6 +2410,7 @@ impl<D: Disk> ReplNode<D> {
                 let mine = self.map_version();
                 if version > mine {
                     let map = slice::SliceMap::from_pairs(version, pairs)?;
+                    self.world_generation += 1;
                     self.pool.adopt_map(map)?;
                 }
                 if version >= mine {
@@ -1955,6 +2553,7 @@ impl<D: Disk> ReplNode<D> {
                 session.state = ReplState::Synced;
                 session.serving_source = false;
                 session.stream_live = false;
+                self.world_generation += 1;
                 self.pool.unpin_sync(from);
                 self.excuse_needs(from);
                 Ok(())
@@ -2000,6 +2599,7 @@ impl<D: Disk> ReplNode<D> {
         // means both hold every acknowledged write, and the diff is cheap.
         let my_era = self.pool.era();
         let my_node = self.node;
+        self.world_generation += 1;
         self.pool.drop_session_pins(peer_node);
         let session = self.session(peer_node);
         session.era_seen = session.era_seen.max(peer_era);
@@ -2288,6 +2888,7 @@ impl<D: Disk> ReplNode<D> {
             .ok_or(FsError::Corrupt(
                 "finishing a pull that never had a manifest",
             ))?;
+        self.world_generation += 1;
         let era = offer.era;
         if self.pool.placement().is_some() {
             // Per-vdisk adoption: every op for a vdisk originates at its
@@ -2705,6 +3306,36 @@ mod coalesce_tests {
             ),
         ];
         assert_eq!(coalesce(effects.clone()), effects);
+    }
+
+    /// The merge stops at the payload cap: a stream of big payloads
+    /// coalesces into several bounded messages, never one frame that
+    /// grows toward the wire's hard ceiling. Order is preserved, so
+    /// payload-before-op still holds.
+    #[test]
+    fn a_payload_merge_stops_at_the_cap() {
+        let big = 1 << 20; // 1 MiB payloads against the 8 MiB cap
+        let effects: Vec<Effect> = (0..20)
+            .map(|i| Effect::Send(1, PeerMessage::Payloads(vec![(0, vec![i as u8; big])])))
+            .collect();
+        let out = coalesce(effects);
+        assert!(out.len() > 1, "twenty MiB must not merge into one frame");
+        let mut seen = 0u8;
+        for effect in &out {
+            let Effect::Send(_, PeerMessage::Payloads(payloads)) = effect else {
+                panic!("only payload messages went in");
+            };
+            let bytes: usize = payloads.iter().map(|(_, p)| p.len()).sum();
+            assert!(
+                bytes <= PAYLOAD_MESSAGE_CAP,
+                "a merged message of {bytes} bytes exceeds the cap"
+            );
+            for (_, payload) in payloads {
+                assert_eq!(payload[0], seen, "the merge reordered payloads");
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, 20, "every payload arrived exactly once");
     }
 
     /// Non-send effects answer local waiters, not the wire — they pass

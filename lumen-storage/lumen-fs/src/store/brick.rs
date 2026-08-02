@@ -88,6 +88,61 @@ struct OpenSegment {
     cursor: u64,
 }
 
+/// One reserved extent: where a record will land once its bytes are
+/// written and its publish makes it real. Between reserve and publish the
+/// extent is invisible to the index and protected only by its segment's
+/// pin — see [`Brick::reserve_hashed_batch`].
+#[derive(Debug, Clone, Copy)]
+pub struct ReservedExtent {
+    pub(crate) hash: BlockHash,
+    /// Absolute disk offset of the record header.
+    pub(crate) offset: u64,
+    /// Payload bytes.
+    pub(crate) length: u32,
+    seq: u64,
+    segment: u64,
+}
+
+impl ReservedExtent {
+    /// The record header the off-lock writer lays down ahead of the
+    /// payload — computed here so the reservation is the whole recipe.
+    pub(crate) fn header(&self) -> [u8; RECORD_HEADER_LEN] {
+        RecordHeader {
+            seq: self.seq,
+            length: self.length,
+            hash: self.hash,
+        }
+        .encode()
+    }
+
+    /// Where the record header goes.
+    pub(crate) fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// The pad from payload end to the next sector boundary — bytes the
+    /// off-lock writer zeroes so the on-disk image matches the in-lock
+    /// path's byte for byte.
+    pub(crate) fn pad_len(&self) -> usize {
+        (record_span(self.length) as usize) - RECORD_HEADER_LEN - self.length as usize
+    }
+}
+
+/// A batch of reserved extents on one brick, holding one pin per extent
+/// on its segment until published or abandoned. Dropping one without
+/// doing either would pin its segments forever — the engine's callers
+/// own that discipline, exactly as they own a `CheckpointTicket`'s.
+#[derive(Debug)]
+pub struct BrickReservation {
+    extents: Vec<ReservedExtent>,
+}
+
+impl BrickReservation {
+    pub(crate) fn extents(&self) -> &[ReservedExtent] {
+        &self.extents
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BrickStats {
     pub blocks: u64,
@@ -167,6 +222,15 @@ pub struct Brick<D: Disk> {
     /// Whether the reserve is currently available — true only inside a
     /// collection.
     reserve_open: bool,
+    /// Outstanding reservation pins per segment: extents handed out by
+    /// [`Brick::reserve_hashed_batch`] and not yet published or
+    /// abandoned. A pinned segment is invisible work the index cannot
+    /// vouch for, so seal, release, and compaction refuse to cross it —
+    /// without this, the shipping one-second GC trigger could release
+    /// the open segment out from under an unpublished reservation and
+    /// reuse it for compaction rewrites: two writers on one byte range,
+    /// acknowledged-data loss with no crash involved.
+    pins: HashMap<u64, u32>,
 }
 
 impl<D: Disk> Brick<D> {
@@ -311,6 +375,7 @@ impl<D: Disk> Brick<D> {
             open: None,
             reserve: reserve_segments(segment_count),
             reserve_open: false,
+            pins: HashMap::new(),
         })
     }
 
@@ -367,6 +432,7 @@ impl<D: Disk> Brick<D> {
             open: None,
             reserve,
             reserve_open: false,
+            pins: HashMap::new(),
         };
         for segment in 0..brick.sb.segment_count {
             brick.recover_segment(segment)?;
@@ -571,6 +637,129 @@ impl<D: Disk> Brick<D> {
             }
         }
         Ok(done)
+    }
+
+    // -----------------------------------------------------------------
+    // Reserve / write / publish — the put split open so the pwrite (the
+    // measured 30% of lock-held time) can happen with no lock held. The
+    // shape is the FlushHandle pattern the two-phase checkpoint set: a
+    // capability handed out under the lock, exercised off it, committed
+    // back under it.
+
+    /// Reserve extents at the write head for a batch of fresh records —
+    /// the caller has already deduped. Bumps the cursor and pins each
+    /// touched segment; nothing is written except fresh segment headers,
+    /// and the index learns nothing until [`Brick::publish_reserved`].
+    ///
+    /// Reserves as many of `items` as fit, returning how many (the
+    /// [`Brick::put_hashed_batch`] partial-progress contract); a brick
+    /// with no room for even the first answers [`FsError::Full`].
+    pub(crate) fn reserve_hashed_batch(
+        &mut self,
+        items: &[(BlockHash, u32)],
+    ) -> Result<(BrickReservation, usize)> {
+        for (_, length) in items {
+            if *length == 0 {
+                return Err(FsError::EmptyPayload);
+            }
+            if *length > self.sb.block_size {
+                return Err(FsError::PayloadTooLarge {
+                    len: *length as usize,
+                    block_size: self.sb.block_size,
+                });
+            }
+        }
+        let mut extents = Vec::with_capacity(items.len());
+        for (hash, length) in items {
+            let span = record_span(*length);
+            let open = match self.writable_segment(span) {
+                Ok(open) => open,
+                Err(FsError::Full) if !extents.is_empty() => break,
+                Err(err) => {
+                    // Nothing landed: unwind the pins already taken.
+                    self.abandon_reserved(BrickReservation { extents });
+                    return Err(err);
+                }
+            };
+            extents.push(ReservedExtent {
+                hash: *hash,
+                offset: open.cursor,
+                length: *length,
+                seq: open.seq,
+                segment: open.index,
+            });
+            *self.pins.entry(open.index).or_insert(0) += 1;
+            self.open = Some(OpenSegment {
+                cursor: open.cursor + span,
+                ..open
+            });
+        }
+        let count = extents.len();
+        Ok((BrickReservation { extents }, count))
+    }
+
+    /// The in-lock write of a reservation's bytes — the simulator's path,
+    /// and the fallback when the disk offers no detached
+    /// [`crate::disk::WriteHandle`]. Byte-identical to what the off-lock
+    /// writer lays down: header, payload, zero pad to the sector.
+    pub(crate) fn fill_reserved(
+        &mut self,
+        reservation: &BrickReservation,
+        payloads: &[&[u8]],
+    ) -> Result<()> {
+        debug_assert_eq!(reservation.extents.len(), payloads.len());
+        for (extent, payload) in reservation.extents.iter().zip(payloads) {
+            debug_assert_eq!(extent.length as usize, payload.len());
+            let span = record_span(extent.length) as usize;
+            let mut record = vec![0u8; span];
+            record[..RECORD_HEADER_LEN].copy_from_slice(&extent.header());
+            record[RECORD_HEADER_LEN..RECORD_HEADER_LEN + payload.len()].copy_from_slice(payload);
+            self.disk.write_at(extent.offset, &record)?;
+        }
+        Ok(())
+    }
+
+    /// Make a reservation's records real: index each extent and release
+    /// its pin. The caller vouches the bytes are on the platter-bound
+    /// path (written in-lock or through the detached handle) — publish is
+    /// bookkeeping, not I/O.
+    pub(crate) fn publish_reserved(&mut self, reservation: BrickReservation) {
+        for extent in &reservation.extents {
+            self.index_put(
+                extent.hash,
+                Location {
+                    offset: extent.offset,
+                    length: extent.length,
+                    seq: extent.seq,
+                },
+            );
+        }
+        self.unpin(reservation);
+    }
+
+    /// The world moved (or the write failed): release the pins and leave
+    /// the extents as orphans — debris the salvage scan and the next
+    /// collection already know how to ignore.
+    pub(crate) fn abandon_reserved(&mut self, reservation: BrickReservation) {
+        self.unpin(reservation);
+    }
+
+    fn unpin(&mut self, reservation: BrickReservation) {
+        for extent in reservation.extents {
+            match self.pins.get_mut(&extent.segment) {
+                Some(count) if *count > 1 => *count -= 1,
+                Some(_) => {
+                    self.pins.remove(&extent.segment);
+                }
+                None => debug_assert!(false, "an unpin for a segment holding no pin"),
+            }
+        }
+    }
+
+    /// The disk's detached positional writer, if it offers one — see
+    /// [`crate::disk::Disk::write_handle`].
+    pub fn write_handle(&self) -> Option<crate::disk::WriteHandle> {
+        self.disk.write_handle()
     }
 
     /// Append one record at the write head, regardless of the index — the
@@ -864,8 +1053,14 @@ impl<D: Disk> Brick<D> {
 
         for (_, segment) in candidates {
             // Freshly, not from a snapshot: this loop frees segments as it
-            // goes, and the write head moves into them.
-            if self.open.map(|open| open.index) == Some(segment) || self.free.contains(&segment) {
+            // goes, and the write head moves into them. A pinned segment
+            // carries reservations the index cannot see — releasing or
+            // compacting it would hand out bytes an unpublished put is
+            // about to write, so it is simply not a candidate.
+            if self.open.map(|open| open.index) == Some(segment)
+                || self.free.contains(&segment)
+                || self.pins.contains_key(&segment)
+            {
                 continue;
             }
             // Blocks may have moved out of this segment earlier in the

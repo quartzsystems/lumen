@@ -146,4 +146,82 @@ impl Disk for FileDisk {
         let file = self.file.try_clone().ok()?;
         Some(Box::new(move || file.sync_data().map_err(io_failed)))
     }
+
+    fn write_handle(&self) -> Option<crate::disk::WriteHandle> {
+        // Same dup'd-descriptor trick as the flush handle. The bounds
+        // check is kept: a reservation is the engine's promise about
+        // *which* extent, but the handle still refuses to write past the
+        // device it was made for.
+        let file = self.file.try_clone().ok()?;
+        let size = self.size;
+        Some(Box::new(move |offset, slices| {
+            let len: u64 = slices.iter().map(|s| s.len() as u64).sum();
+            match offset.checked_add(len) {
+                Some(end) if end <= size => {}
+                _ => {
+                    return Err(FsError::OutOfBounds {
+                        offset,
+                        len,
+                        disk_size: size,
+                    })
+                }
+            }
+            write_at_vectored(&file, offset, slices).map_err(io_failed)
+        }))
+    }
+}
+
+/// `pwritev` until every byte of every slice has landed, in order.
+#[cfg(unix)]
+fn write_at_vectored(
+    file: &File,
+    mut offset: u64,
+    slices: &[std::io::IoSlice<'_>],
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let mut owned: Vec<std::io::IoSlice<'_>> = slices.to_vec();
+    let mut cursor: &mut [std::io::IoSlice<'_>] = &mut owned;
+    while cursor.iter().any(|slice| !slice.is_empty()) {
+        // IOV_MAX is 1024 everywhere Linux runs; a longer batch goes in
+        // passes, each picking up exactly where the last stopped.
+        let take = cursor.len().min(1024);
+        // SAFETY: IoSlice is ABI-compatible with iovec by its contract;
+        // the fd is a file we own, and every base/len pair points into
+        // borrowed slices alive across the call.
+        let wrote = unsafe {
+            libc::pwritev(
+                file.as_raw_fd(),
+                cursor.as_ptr().cast::<libc::iovec>(),
+                take as libc::c_int,
+                offset as libc::off_t,
+            )
+        };
+        if wrote < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if wrote == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        offset += wrote as u64;
+        std::io::IoSlice::advance_slices(&mut cursor, wrote as usize);
+    }
+    Ok(())
+}
+
+/// The portable fallback: each slice through the plain positional write.
+#[cfg(not(unix))]
+fn write_at_vectored(
+    file: &File,
+    mut offset: u64,
+    slices: &[std::io::IoSlice<'_>],
+) -> std::io::Result<()> {
+    for slice in slices {
+        write_at(file, offset, slice)?;
+        offset += slice.len() as u64;
+    }
+    Ok(())
 }

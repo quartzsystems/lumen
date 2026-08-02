@@ -100,6 +100,13 @@ pub enum FsError {
     /// a write acknowledged with zero durable copies would be the lie the
     /// whole acknowledgement rule exists to prevent.
     SliceUnreachable(u8),
+    /// The world moved between a put's reserve and its publish — a
+    /// session change, a verdict, an adoption, a placement change — and
+    /// the reservation was judged against a state that no longer stands.
+    /// The extents are abandoned as orphans; the caller re-runs the whole
+    /// put, and the re-entry check either proceeds under the new world or
+    /// surfaces the real refusal by name.
+    WorldMoved,
 }
 
 impl fmt::Display for FsError {
@@ -177,6 +184,12 @@ impl fmt::Display for FsError {
             }
             FsError::SliceUnreachable(slice) => {
                 write!(f, "no home of slice {slice} is reachable to take the write")
+            }
+            FsError::WorldMoved => {
+                write!(
+                    f,
+                    "the world moved between reserve and publish; re-run the put"
+                )
             }
         }
     }

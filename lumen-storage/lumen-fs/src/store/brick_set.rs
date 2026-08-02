@@ -40,7 +40,9 @@ use std::sync::Mutex;
 use crate::disk::Disk;
 use crate::error::{FsError, Result};
 use crate::hash::{hash_block, BlockHash};
-use crate::store::brick::{BlockRead, BlockWrite, Brick, BrickStats, ByteSpace, GcStats};
+use crate::store::brick::{
+    BlockRead, BlockWrite, Brick, BrickReservation, BrickStats, ByteSpace, GcStats,
+};
 use crate::store::format::RosterEntry;
 
 /// How much recently-read payload the set keeps in memory. Enough to hold
@@ -100,6 +102,47 @@ impl PayloadCache {
 pub struct ScrubCursor {
     pub brick: usize,
     pub after: Option<BlockHash>,
+}
+
+/// Where one item of a set-level reservation stands.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ReservedDisposition {
+    /// The tier's route already holds the block. The block may be an
+    /// unreferenced orphan a collection would sweep before the publish's
+    /// WAL entry lands — the caller pins it for the reservation's life.
+    Held,
+    /// An in-batch duplicate: its bytes land with the first occurrence's
+    /// extent, in this same reservation's publish. No pin needed — an
+    /// unpublished extent is invisible to collection and its segment is
+    /// pinned.
+    Follows,
+    /// A fresh extent: which brick part of the reservation, which extent
+    /// within it.
+    #[allow(dead_code)]
+    Fresh { slot: usize, extent: usize },
+}
+
+/// A batch of extents reserved across one tier's bricks — see
+/// [`BrickSet::reserve_prehashed_batch`]. Publish or abandon it; dropping
+/// it on the floor pins its segments forever.
+#[derive(Debug)]
+pub struct SetReservation {
+    tier: u8,
+    dispositions: Vec<ReservedDisposition>,
+    /// One entry per brick holding extents: `(brick position, its
+    /// reservation, the item index each extent serves — extent order)`.
+    bricks: Vec<(usize, BrickReservation, Vec<usize>)>,
+}
+
+impl SetReservation {
+    pub(crate) fn dispositions(&self) -> &[ReservedDisposition] {
+        &self.dispositions
+    }
+
+    /// The per-brick parts, for building a detached write plan.
+    pub(crate) fn parts(&self) -> &[(usize, BrickReservation, Vec<usize>)] {
+        &self.bricks
+    }
 }
 
 #[derive(Debug)]
@@ -377,6 +420,149 @@ impl<D: Disk> BrickSet<D> {
             remaining = &remaining[landed..];
         }
         Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // Reserve / write / publish, set-wide: the batched put split open so
+    // the payload pwrites can happen with no lock held.
+
+    /// Reserve extents for a batch of prehashed puts to one tier. Dedupe
+    /// is decided here — against the route and within the batch — and
+    /// fresh items are placed exactly as [`BrickSet::put_prehashed_batch`]
+    /// places them: most-free brick first, spilling on Full. Nothing is
+    /// routed or indexed until [`BrickSet::publish_reserved`]; a caller
+    /// that walks away must [`BrickSet::abandon_reserved`], or the pinned
+    /// segments never collect.
+    pub(crate) fn reserve_prehashed_batch(
+        &mut self,
+        tier: u8,
+        items: &[(BlockHash, u32)],
+    ) -> Result<SetReservation> {
+        let mut dispositions = vec![ReservedDisposition::Follows; items.len()];
+        let mut seen: HashSet<BlockHash> = HashSet::new();
+        let mut fresh: Vec<(usize, BlockHash, u32)> = Vec::new();
+        for (index, (hash, length)) in items.iter().enumerate() {
+            if self.route.contains_key(&(tier, *hash)) {
+                dispositions[index] = ReservedDisposition::Held;
+            } else if seen.insert(*hash) {
+                fresh.push((index, *hash, *length));
+            }
+            // An in-batch duplicate keeps `Follows`: its bytes arrive
+            // with the first occurrence's extent, in this same publish.
+        }
+        let mut bricks: Vec<(usize, BrickReservation, Vec<usize>)> = Vec::new();
+        let unwind = |set: &mut Self, bricks: Vec<(usize, BrickReservation, Vec<usize>)>| {
+            for (position, reservation, _) in bricks {
+                set.bricks[position].abandon_reserved(reservation);
+            }
+        };
+        let mut remaining: &[(usize, BlockHash, u32)] = &fresh;
+        while !remaining.is_empty() {
+            let mut candidates: Vec<usize> = (0..self.bricks.len())
+                .filter(|&i| self.bricks[i].tier() == tier)
+                .collect();
+            if candidates.is_empty() {
+                unwind(self, bricks);
+                return Err(FsError::NoSuchTier(tier));
+            }
+            candidates.sort_by_key(|&i| std::cmp::Reverse(self.bricks[i].free_segments()));
+            let metas: Vec<(BlockHash, u32)> = remaining
+                .iter()
+                .map(|(_, hash, length)| (*hash, *length))
+                .collect();
+            let mut landed = 0;
+            let mut full_everywhere = true;
+            for position in candidates {
+                match self.bricks[position].reserve_hashed_batch(&metas) {
+                    Ok((reservation, count)) => {
+                        let taken: Vec<usize> = remaining[..count]
+                            .iter()
+                            .map(|(index, _, _)| *index)
+                            .collect();
+                        for (extent, index) in taken.iter().enumerate() {
+                            dispositions[*index] = ReservedDisposition::Fresh {
+                                slot: bricks.len(),
+                                extent,
+                            };
+                        }
+                        bricks.push((position, reservation, taken));
+                        landed = count;
+                        full_everywhere = false;
+                        break;
+                    }
+                    Err(FsError::Full) => continue,
+                    Err(err) => {
+                        unwind(self, bricks);
+                        return Err(err);
+                    }
+                }
+            }
+            if full_everywhere {
+                unwind(self, bricks);
+                return Err(FsError::Full);
+            }
+            remaining = &remaining[landed..];
+        }
+        Ok(SetReservation {
+            tier,
+            dispositions,
+            bricks,
+        })
+    }
+
+    /// The in-lock write of a set reservation's bytes — the simulator's
+    /// path, and the fallback when a brick offers no detached writer.
+    /// `payloads` aligns with the reserve call's `items`.
+    pub(crate) fn fill_reserved(
+        &mut self,
+        reservation: &SetReservation,
+        payloads: &[&[u8]],
+    ) -> Result<()> {
+        for (position, brick_reservation, items) in &reservation.bricks {
+            let picks: Vec<&[u8]> = items.iter().map(|index| payloads[*index]).collect();
+            self.bricks[*position].fill_reserved(brick_reservation, &picks)?;
+        }
+        Ok(())
+    }
+
+    /// Make a reservation real: index and route every fresh extent, mark
+    /// the touched bricks dirty (at publish, not reserve — a flush
+    /// between the phases must not clear a flag for bytes it never
+    /// covered), release the pins.
+    pub(crate) fn publish_reserved(&mut self, reservation: SetReservation) {
+        let tier = reservation.tier;
+        for (position, brick_reservation, _) in reservation.bricks {
+            for extent in brick_reservation.extents() {
+                // First writer in wins, as with crash-made duplicates:
+                // a same-hash race's losing extent stays unrouted and the
+                // next collection sweeps it.
+                self.route.entry((tier, extent.hash)).or_insert(position);
+            }
+            self.bricks[position].publish_reserved(brick_reservation);
+            self.dirty[position] = true;
+        }
+    }
+
+    /// Release a reservation without publishing: the extents become
+    /// orphans — the debris class recovery and collection already handle.
+    pub(crate) fn abandon_reserved(&mut self, reservation: SetReservation) {
+        for (position, brick_reservation, _) in reservation.bricks {
+            self.bricks[position].abandon_reserved(brick_reservation);
+        }
+    }
+
+    /// Detached writers for every brick a reservation touches, or `None`
+    /// if any of them cannot offer one — the caller then falls back to
+    /// the in-lock [`BrickSet::fill_reserved`].
+    pub(crate) fn reservation_write_handles(
+        &self,
+        reservation: &SetReservation,
+    ) -> Option<Vec<crate::disk::WriteHandle>> {
+        reservation
+            .bricks
+            .iter()
+            .map(|(position, _, _)| self.bricks[*position].write_handle())
+            .collect()
     }
 
     /// A stored block's payload, by tier and address. Existence is the
