@@ -127,9 +127,13 @@ pub enum NetworkVerb {
 #[serde(tag = "verb", content = "with", rename_all = "snake_case")]
 pub enum VmVerb {
     /// One machine, in full — the detail page's read.
-    Get { vmid: u32 },
+    Get {
+        vmid: u32,
+    },
     /// One machine's history, newest first.
-    Tasks { vmid: u32 },
+    Tasks {
+        vmid: u32,
+    },
     Create(Box<lumen_virt::service::VmCreate>),
     Update {
         vmid: u32,

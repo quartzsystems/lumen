@@ -297,7 +297,13 @@ mod tests {
     #[test]
     fn an_event_belongs_to_the_node_and_not_to_a_machine() {
         let log = TaskLog::ephemeral();
-        log.record(100, "start", "Start the machine".into(), "root@lumen".into(), None);
+        log.record(
+            100,
+            "start",
+            "Start the machine".into(),
+            "root@lumen".into(),
+            None,
+        );
         log.event(
             "update",
             "Installed 12 updates".into(),

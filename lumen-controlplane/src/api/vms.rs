@@ -221,7 +221,14 @@ pub async fn run_verb(
 
         VmVerb::Reboot { vmid } => {
             let result = state.virt.reboot(vmid).await;
-            record(state, by, vmid, "reboot", "Ask the guest to reboot", &result);
+            record(
+                state,
+                by,
+                vmid,
+                "reboot",
+                "Ask the guest to reboot",
+                &result,
+            );
             out(result?)
         }
 
@@ -540,13 +547,7 @@ pub async fn create(
     raw: Body,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (target, request): (_, VmCreate) = routed_required_body(raw)?;
-    dispatch(
-        &state,
-        &session,
-        target,
-        VmVerb::Create(Box::new(request)),
-    )
-    .await
+    dispatch(&state, &session, target, VmVerb::Create(Box::new(request))).await
 }
 
 /// PATCH /api/vms/{vmid} — change the configuration, and report which changes
@@ -895,7 +896,14 @@ pub async fn push_file(
         })?;
     let detail = format!("Copy a file into the guest at {}", target.path);
     let result = state.virt.push_file(vmid, &target.path, &contents).await;
-    record(&state, &principal(&session), vmid, "push-file", detail, &result);
+    record(
+        &state,
+        &principal(&session),
+        vmid,
+        "push-file",
+        detail,
+        &result,
+    );
     Ok(Json(result?))
 }
 

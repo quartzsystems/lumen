@@ -733,7 +733,11 @@ async fn walk(state: &Arc<AppState>, order: Vec<String>, by: &str, rolling: bool
                 // this process's memory and the log is on disk, so this is
                 // what an operator still has after the coordinator restarts.
                 state.tasks.event(
-                    if rolling { "rolling-update" } else { "update-all" },
+                    if rolling {
+                        "rolling-update"
+                    } else {
+                        "update-all"
+                    },
                     format!(
                         "{} across {} node{}",
                         if rolling {
@@ -777,7 +781,11 @@ async fn walk(state: &Arc<AppState>, order: Vec<String>, by: &str, rolling: bool
     // `crate::updates::begin`, which logs there — so this one says the thing
     // no member can: that somebody updated the environment, and it finished.
     state.tasks.event(
-        if rolling { "rolling-update" } else { "update-all" },
+        if rolling {
+            "rolling-update"
+        } else {
+            "update-all"
+        },
         format!(
             "{} across {} node{}: {}",
             if rolling {
