@@ -1645,6 +1645,13 @@ impl<D: Disk> Pool<D> {
         self.store.put_prehashed(tier, hash, payload)
     }
 
+    /// The batched form — a run of prehashed blocks in as few disk
+    /// writes as they have segment runs. See
+    /// [`crate::BrickSet::put_prehashed_batch`].
+    pub fn put_blocks_prehashed(&mut self, tier: u8, items: &[(BlockHash, &[u8])]) -> Result<()> {
+        self.store.put_prehashed_batch(tier, items)
+    }
+
     /// Whether the store holds a block, by tier and address.
     pub fn has_block(&self, tier: u8, hash: &BlockHash) -> bool {
         self.store.contains(tier, hash)

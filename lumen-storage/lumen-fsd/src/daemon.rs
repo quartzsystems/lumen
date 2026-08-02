@@ -553,9 +553,62 @@ impl GuestHandle {
     }
 
     pub fn write(&self, vdisk: u64, offset: u64, data: &[u8]) -> Result<(), FsError> {
-        // A write can need a block too: the read-modify-write edge of a
-        // partial block on a member that does not home it. Same loop as a
-        // read — fetch what the engine names, go again.
+        // The whole blocks of this write are hashed HERE, on the export's
+        // worker thread, before any engine lock — measured as the largest
+        // single cost the lock was carrying. Geometry first, briefly:
+        let geometry = self
+            .shared
+            .with_engine(|engine| -> Result<(u64, u64), FsError> {
+                Ok((
+                    engine.pool().block_size() as u64,
+                    engine.pool().vdisk_size(vdisk)?,
+                ))
+            });
+        let Ok((block_size, size)) = geometry else {
+            // No such vdisk (or worse) — the plain path says it properly.
+            return self.write_fallback(vdisk, offset, data);
+        };
+        let end = offset + data.len() as u64;
+        if end > size || data.is_empty() {
+            // Out of range errors exactly as before, from the engine.
+            return self.write_fallback(vdisk, offset, data);
+        }
+        // [head partial][whole blocks][tail partial] — the whole blocks
+        // are one run, prehashed; the edges are read-modify-writes that
+        // keep the fetching path.
+        let first_whole = offset.div_ceil(block_size);
+        let head_len = ((first_whole * block_size).min(end) - offset) as usize;
+        let mut items: Vec<(lumen_fs::BlockHash, &[u8])> = Vec::new();
+        let mut from = head_len;
+        let mut block = first_whole;
+        loop {
+            let start = block * block_size;
+            let logical = block_size.min(size - start) as usize;
+            if start >= end || (end - start) < logical as u64 {
+                break;
+            }
+            let payload = &data[from..from + logical];
+            items.push((lumen_fs::hash_block(payload), payload));
+            from += logical;
+            block += 1;
+        }
+        if items.is_empty() {
+            return self.write_fallback(vdisk, offset, data);
+        }
+        if head_len > 0 {
+            self.write_fallback(vdisk, offset, &data[..head_len])?;
+        }
+        self.blocking(|engine| engine.write_block_run_prehashed(vdisk, first_whole, &items))?;
+        if from < data.len() {
+            self.write_fallback(vdisk, offset + from as u64, &data[from..])?;
+        }
+        Ok(())
+    }
+
+    /// The unhoisted path: the engine chunks, hashes, and handles the
+    /// read-modify-write edges — with the fetch loop those edges need on
+    /// a member that does not home the block.
+    fn write_fallback(&self, vdisk: u64, offset: u64, data: &[u8]) -> Result<(), FsError> {
         loop {
             match self.blocking(|engine| engine.write_bytes(vdisk, offset, data)) {
                 Err(FsError::BlockElsewhere { tier, hash }) => self.fetch(tier, hash)?,
@@ -848,6 +901,51 @@ fn run_session(shared: &Arc<Shared>, mut stream: TcpStream) {
         })
     };
 
+    // Ingest is a two-stage pipeline: this thread receives, decodes, and
+    // hashes; the applier owns the engine calls. One thread doing all
+    // four was measured as the pool's whole write ceiling — a single
+    // saturated core on the receiving node while the wire, the disks,
+    // and every other core idled. The channel is bounded so a slow
+    // engine still reaches the sender as backpressure — channel full,
+    // reader stops reading, TCP window closes — the exact shape the
+    // one-thread loop had.
+    enum Ingest {
+        Payloads(Vec<(u8, lumen_fs::BlockHash, Vec<u8>)>),
+        Message(PeerMessage),
+    }
+    let (work_tx, work_rx) = std::sync::mpsc::sync_channel::<Ingest>(INGEST_DEPTH);
+    let applier = {
+        let shared = Arc::clone(shared);
+        let stream = stream.try_clone();
+        std::thread::spawn(move || {
+            // recv drains what the reader queued before reporting the
+            // senders gone — nothing decoded is dropped by a clean EOF.
+            while let Ok(work) = work_rx.recv() {
+                let outcome = match work {
+                    Ingest::Payloads(hashed) => {
+                        shared.with_engine(|engine| engine.payloads_prehashed(peer_node, hashed))
+                    }
+                    Ingest::Message(message) => {
+                        shared.with_engine(|engine| engine.handle(peer_node, message))
+                    }
+                };
+                if let Err(err) = outcome {
+                    // A protocol violation or an engine refusal. Dropping
+                    // the session is always safe: reconnect runs a resync,
+                    // and the acknowledgement rule means both nodes hold
+                    // every acknowledged write however the reconciliation
+                    // resolves. Shutting the socket is how the reader
+                    // hears it.
+                    eprintln!("peer message refused by the engine: {err}");
+                    if let Ok(stream) = &stream {
+                        let _ = stream.shutdown(Shutdown::Both);
+                    }
+                    return;
+                }
+            }
+        })
+    };
+
     while let Ok(payload) = read_frame(&mut stream) {
         let message = match wire::decode(&payload) {
             Ok(message) => message,
@@ -856,34 +954,29 @@ fn run_session(shared: &Arc<Shared>, mut stream: TcpStream) {
                 break;
             }
         };
-        // Payload batches are hashed here, on the reader, before the
-        // engine lock: the address still comes from the bytes on this
-        // node — never the wire — but a big write's hashing no longer
-        // serializes behind every other caller of the engine. This
-        // thread was the stream's bottleneck; the lock was why.
-        let outcome = match message {
-            PeerMessage::Payloads(payloads) => {
-                let hashed = payloads
+        // Hashing lives here, overlapped with the applier's engine time:
+        // the address still comes from the bytes on this node — never
+        // the wire.
+        let work = match message {
+            PeerMessage::Payloads(payloads) => Ingest::Payloads(
+                payloads
                     .into_iter()
                     .map(|(tier, payload)| {
                         let hash = lumen_fs::hash_block(&payload);
                         (tier, hash, payload)
                     })
-                    .collect();
-                shared.with_engine(|engine| engine.payloads_prehashed(peer_node, hashed))
-            }
-            message => shared.with_engine(|engine| engine.handle(peer_node, message)),
+                    .collect(),
+            ),
+            message => Ingest::Message(message),
         };
-        if let Err(err) = outcome {
-            // A protocol violation or an engine refusal. Dropping the
-            // session is always safe: reconnect runs a resync, and the
-            // acknowledgement rule means both nodes hold every
-            // acknowledged write however the reconciliation resolves.
-            eprintln!("peer message refused by the engine: {err}");
+        // A dead applier already shut the socket and said why.
+        if work_tx.send(work).is_err() {
             break;
         }
     }
 
+    drop(work_tx);
+    let _ = applier.join();
     let _ = stream.shutdown(Shutdown::Both);
     shared.session_down(peer_node, incarnation);
     eprintln!("peer session {incarnation} down");
@@ -895,6 +988,11 @@ fn run_session(shared: &Arc<Shared>, mut stream: TcpStream) {
 /// socket made every block two packets. Bounded so a deep queue cannot
 /// hold megabytes twice over (queue and send buffer both).
 const SEND_BATCH_BYTES: usize = 4 << 20;
+
+/// The ingest pipeline's depth, in decoded messages. Bounds the memory a
+/// slow applier can pin at depth × MAX_FRAME; deep enough that the
+/// reader's decode-and-hash keeps overlapping the applier's engine time.
+const INGEST_DEPTH: usize = 8;
 
 fn writer_loop(shared: &Arc<Shared>, peer: u8, stream: &mut TcpStream, incarnation: u64) {
     let mut batch: Vec<u8> = Vec::new();

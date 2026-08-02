@@ -45,6 +45,51 @@ pub fn full_check(covered: &[u8]) -> [u8; 32] {
     *blake3::hash(covered).as_bytes()
 }
 
+/// A hasher for maps keyed by [`BlockHash`] (or small tuples around it).
+/// The key is a BLAKE3 output — uniform by construction — so folding its
+/// words with one multiply each is a full-strength hash; running all
+/// thirty-two bytes through std's SipHash was measured at several percent
+/// of the peer apply thread's CPU. Collisions would need a pair of blocks
+/// whose BLAKE3s agree on the folded 64 bits — the address itself breaks
+/// first.
+#[derive(Clone, Copy, Default)]
+pub struct AddressHasher(u64);
+
+impl std::hash::Hasher for AddressHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut word = [0u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.0 = (self.0 ^ u64::from_le_bytes(word)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+
+    fn write_u8(&mut self, byte: u8) {
+        self.0 = (self.0 ^ u64::from(byte)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    fn write_usize(&mut self, n: usize) {
+        // Slice-length prefixes land here; they carry no entropy the
+        // fold needs, but skipping them would be a lie about the input.
+        self.0 = (self.0 ^ n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+/// The [`BuildHasher`](std::hash::BuildHasher) handing out [`AddressHasher`]s.
+#[derive(Clone, Copy, Default)]
+pub struct AddressBuild;
+
+impl std::hash::BuildHasher for AddressBuild {
+    type Hasher = AddressHasher;
+    fn build_hasher(&self) -> AddressHasher {
+        AddressHasher(0)
+    }
+}
+
 impl fmt::Debug for BlockHash {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Eight hex chars identify a block in a log line; the full address

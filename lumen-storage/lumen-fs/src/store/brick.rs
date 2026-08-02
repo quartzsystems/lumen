@@ -152,7 +152,11 @@ fn reserve_segments(segment_count: u64) -> u64 {
 pub struct Brick<D: Disk> {
     disk: D,
     sb: Superblock,
-    index: HashMap<BlockHash, Location>,
+    index: HashMap<BlockHash, Location, crate::hash::AddressBuild>,
+    /// Running sum of record lengths over the index — kept with it,
+    /// because summing the whole map once a second under the engine
+    /// lock was a measured stall.
+    payload_bytes: u64,
     /// Segment indices with no live data, lowest first.
     free: Vec<u64>,
     /// Highest incarnation ever observed on this brick.
@@ -301,7 +305,8 @@ impl<D: Disk> Brick<D> {
             disk,
             free: (0..segment_count).collect(),
             sb,
-            index: HashMap::new(),
+            index: HashMap::default(),
+            payload_bytes: 0,
             max_seq: 0,
             open: None,
             reserve: reserve_segments(segment_count),
@@ -355,7 +360,8 @@ impl<D: Disk> Brick<D> {
         let mut brick = Brick {
             disk,
             sb,
-            index: HashMap::new(),
+            index: HashMap::default(),
+            payload_bytes: 0,
             free: Vec::new(),
             max_seq: 0,
             open: None,
@@ -409,7 +415,7 @@ impl<D: Disk> Brick<D> {
                 cursor += SECTOR_SIZE;
                 continue;
             }
-            self.index.insert(
+            self.index_put(
                 record.hash,
                 Location {
                     offset: cursor,
@@ -448,7 +454,7 @@ impl<D: Disk> Brick<D> {
             return Ok(hash);
         }
         let location = self.append_record(hash, payload)?;
-        self.index.insert(hash, location);
+        self.index_put(hash, location);
         Ok(hash)
     }
 
@@ -471,8 +477,100 @@ impl<D: Disk> Brick<D> {
             return Ok(());
         }
         let location = self.append_record(hash, payload)?;
-        self.index.insert(hash, location);
+        self.index_put(hash, location);
         Ok(())
+    }
+
+    /// A batch of prehashed puts, packed into as few disk writes as they
+    /// have segment runs. One record per `write_at` was measured as the
+    /// apply and guest paths' single largest cost — a syscall, a page
+    /// dirtying, and an allocation per 16 KiB — and every record of a
+    /// batch lands contiguously at the write head anyway.
+    ///
+    /// Returns how many of `items` are stored (written now, or already
+    /// present — dedupe counts as done). Fewer than all means the brick
+    /// filled mid-batch; the caller offers the remainder elsewhere. A
+    /// brick with no room for even the first fresh record answers
+    /// [`FsError::Full`] like the single put would.
+    pub(crate) fn put_hashed_batch(&mut self, items: &[(BlockHash, &[u8])]) -> Result<usize> {
+        for (_, payload) in items {
+            if payload.is_empty() {
+                return Err(FsError::EmptyPayload);
+            }
+            if payload.len() > self.sb.block_size as usize {
+                return Err(FsError::PayloadTooLarge {
+                    len: payload.len(),
+                    block_size: self.sb.block_size,
+                });
+            }
+        }
+        let mut done = 0;
+        while done < items.len() {
+            let (hash, payload) = items[done];
+            if self.index.contains_key(&hash) {
+                done += 1;
+                continue;
+            }
+            let first_span = record_span(payload.len() as u32);
+            let open = match self.writable_segment(first_span) {
+                Ok(open) => open,
+                // Nothing landed at all is the single put's Full; partial
+                // progress is the caller's to place elsewhere.
+                Err(FsError::Full) if done > 0 => return Ok(done),
+                Err(err) => return Err(err),
+            };
+            let end = self.sb.segment_offset(open.index) + self.sb.segment_size;
+            let mut buf: Vec<u8> = Vec::new();
+            let mut packed: Vec<(BlockHash, Location)> = Vec::new();
+            let mut cursor = open.cursor;
+            while done + packed.len() < items.len() {
+                let (hash, payload) = items[done + packed.len()];
+                if self.index.contains_key(&hash) || packed.iter().any(|(seen, _)| *seen == hash) {
+                    // Deduped against the platter or against this very
+                    // batch — but only at a pack boundary; counting it
+                    // done mid-pack would misalign the resume point.
+                    break;
+                }
+                let span = record_span(payload.len() as u32);
+                if cursor + span > end {
+                    break;
+                }
+                let header = RecordHeader {
+                    seq: open.seq,
+                    length: payload.len() as u32,
+                    hash,
+                };
+                let base = buf.len();
+                buf.resize(base + span as usize, 0);
+                buf[base..base + RECORD_HEADER_LEN].copy_from_slice(&header.encode());
+                buf[base + RECORD_HEADER_LEN..base + RECORD_HEADER_LEN + payload.len()]
+                    .copy_from_slice(payload);
+                packed.push((
+                    hash,
+                    Location {
+                        offset: cursor,
+                        length: payload.len() as u32,
+                        seq: open.seq,
+                    },
+                ));
+                cursor += span;
+            }
+            if packed.is_empty() {
+                // The head had no room for even one record (or the next
+                // item is a duplicate): loop around to reopen or skip.
+                if self.index.contains_key(&items[done].0) {
+                    done += 1;
+                }
+                continue;
+            }
+            self.disk.write_at(open.cursor, &buf)?;
+            self.open = Some(OpenSegment { cursor, ..open });
+            done += packed.len();
+            for (hash, location) in packed {
+                self.index_put(hash, location);
+            }
+        }
+        Ok(done)
     }
 
     /// Append one record at the write head, regardless of the index — the
@@ -708,6 +806,7 @@ impl<D: Disk> Brick<D> {
     pub fn retain_and_reclaim(&mut self, live: &HashSet<BlockHash>) -> Result<GcStats> {
         let before = self.index.len() as u64;
         self.index.retain(|hash, _| live.contains(hash));
+        self.payload_bytes = self.index.values().map(|l| u64::from(l.length)).sum();
         let mut stats = GcStats {
             blocks_dropped: before - self.index.len() as u64,
             ..Default::default()
@@ -822,7 +921,7 @@ impl<D: Disk> Brick<D> {
                 let payload = self.read_location(hash, &location)?;
                 match self.append_record(*hash, &payload) {
                     Ok(new_location) => {
-                        self.index.insert(*hash, new_location);
+                        self.index_put(*hash, new_location);
                         stats.blocks_moved += 1;
                     }
                     Err(FsError::Full) => {
@@ -944,6 +1043,15 @@ impl<D: Disk> Brick<D> {
         self.sb.pool_uuid
     }
 
+    /// The one door into the index for inserts, so payload_bytes can
+    /// never drift from what the map holds.
+    fn index_put(&mut self, hash: BlockHash, location: Location) {
+        if let Some(old) = self.index.insert(hash, location) {
+            self.payload_bytes -= u64::from(old.length);
+        }
+        self.payload_bytes += u64::from(location.length);
+    }
+
     pub fn stats(&self) -> BrickStats {
         BrickStats {
             blocks: self.index.len() as u64,
@@ -952,7 +1060,7 @@ impl<D: Disk> Brick<D> {
             segments_live: self.sb.segment_count
                 - self.free.len() as u64
                 - self.open.map(|_| 0).unwrap_or(0),
-            payload_bytes: self.index.values().map(|l| l.length as u64).sum(),
+            payload_bytes: self.payload_bytes,
         }
     }
 

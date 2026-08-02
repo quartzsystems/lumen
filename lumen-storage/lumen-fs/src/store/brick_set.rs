@@ -112,7 +112,7 @@ pub struct BrickSet<D: Disk> {
     /// `(tier, hash)` → position in `bricks`. Rebuilt from the scans at
     /// open; a block on a brick belongs to that brick's tier by
     /// construction, because allocation never crosses tiers.
-    route: HashMap<(u8, BlockHash), usize>,
+    route: HashMap<(u8, BlockHash), usize, crate::hash::AddressBuild>,
     /// Bricks written since their last flush. The holder is marked on
     /// every mutable borrow — WAL appends and anchors go around the set's
     /// own write path, and a presumed-dirty holder costs one fsync.
@@ -251,7 +251,8 @@ impl<D: Disk> BrickSet<D> {
             ));
         }
 
-        let mut route = HashMap::new();
+        let mut route: HashMap<(u8, BlockHash), usize, crate::hash::AddressBuild> =
+            HashMap::default();
         for (position, brick) in bricks.iter().enumerate() {
             let tier = brick.tier();
             for hash in brick.indexed_hashes() {
@@ -320,6 +321,62 @@ impl<D: Disk> BrickSet<D> {
             }
         }
         Err(FsError::Full)
+    }
+
+    /// A batch of prehashed puts to one tier: routed like the single put
+    /// — most-free brick first — but written through
+    /// [`Brick::put_hashed_batch`], so a run of blocks costs its segment
+    /// runs in syscalls rather than its block count. The most-free choice
+    /// moves to batch granularity; the bricks still equalize, one batch
+    /// per decision instead of one block.
+    pub fn put_prehashed_batch(&mut self, tier: u8, items: &[(BlockHash, &[u8])]) -> Result<()> {
+        for (_, payload) in items {
+            if payload.is_empty() {
+                return Err(FsError::EmptyPayload);
+            }
+        }
+        // Set-wide dedupe, and within the batch itself: the batch's
+        // duplicates would otherwise race each other to different bricks.
+        let mut seen: std::collections::HashSet<BlockHash, crate::hash::AddressBuild> =
+            std::collections::HashSet::default();
+        let fresh: Vec<(BlockHash, &[u8])> = items
+            .iter()
+            .filter(|(hash, _)| !self.route.contains_key(&(tier, *hash)) && seen.insert(*hash))
+            .copied()
+            .collect();
+        let mut remaining: &[(BlockHash, &[u8])] = &fresh;
+        while !remaining.is_empty() {
+            let mut candidates: Vec<usize> = (0..self.bricks.len())
+                .filter(|&i| self.bricks[i].tier() == tier)
+                .collect();
+            if candidates.is_empty() {
+                return Err(FsError::NoSuchTier(tier));
+            }
+            candidates.sort_by_key(|&i| std::cmp::Reverse(self.bricks[i].free_segments()));
+            let mut landed = 0;
+            let mut full_everywhere = true;
+            for position in candidates {
+                match self.bricks[position].put_hashed_batch(remaining) {
+                    Ok(count) => {
+                        for (hash, payload) in &remaining[..count] {
+                            self.route.insert((tier, *hash), position);
+                            self.cache.lock().unwrap().insert((tier, *hash), payload);
+                        }
+                        self.dirty[position] = true;
+                        landed = count;
+                        full_everywhere = false;
+                        break;
+                    }
+                    Err(FsError::Full) => continue,
+                    Err(err) => return Err(err),
+                }
+            }
+            if full_everywhere {
+                return Err(FsError::Full);
+            }
+            remaining = &remaining[landed..];
+        }
+        Ok(())
     }
 
     /// A stored block's payload, by tier and address. Existence is the

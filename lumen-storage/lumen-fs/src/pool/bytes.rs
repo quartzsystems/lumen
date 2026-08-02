@@ -56,6 +56,17 @@ pub trait ByteView {
     fn write_block(&mut self, vdisk: u64, index: u64, payload: &[u8]) -> Result<()>;
     fn trim_block(&mut self, vdisk: u64, index: u64) -> Result<()>;
 
+    /// A run of consecutive whole blocks. The default is the per-block
+    /// loop; an implementation may land the run as a batch — the
+    /// replicated node does, and a large sequential write is almost
+    /// entirely runs.
+    fn write_block_run(&mut self, vdisk: u64, first: u64, blocks: &[&[u8]]) -> Result<()> {
+        for (i, payload) in blocks.iter().enumerate() {
+            self.write_block(vdisk, first + i as u64, payload)?;
+        }
+        Ok(())
+    }
+
     /// Read a byte range. Always returns exactly `len` bytes; what was
     /// never written is zeros.
     fn read_bytes(&mut self, vdisk: u64, offset: u64, len: u64) -> Result<Vec<u8>> {
@@ -79,23 +90,45 @@ pub trait ByteView {
     }
 
     /// Write a byte range. Blocks covered only in part are read, overlaid,
-    /// and rewritten whole.
+    /// and rewritten whole; blocks covered whole go as runs.
     fn write_bytes(&mut self, vdisk: u64, offset: u64, data: &[u8]) -> Result<()> {
         let size = self.vdisk_size(vdisk)?;
         let block_size = self.block_size() as u64;
         byte_bounds(size, block_size, offset, data.len() as u64)?;
+        let end = offset + data.len() as u64;
         let mut pos = offset;
-        while pos < offset + data.len() as u64 {
+        while pos < end {
             let block = pos / block_size;
             let block_start = block * block_size;
             // The final block of an unaligned vdisk is logically shorter;
             // covering it to the vdisk's edge is covering it whole.
             let logical = block_size.min(size - block_start) as usize;
             let in_off = (pos - block_start) as usize;
-            let take = (logical - in_off).min((offset + data.len() as u64 - pos) as usize);
+            let take = (logical - in_off).min((end - pos) as usize);
             let from = (pos - offset) as usize;
             if in_off == 0 && take == logical {
-                self.write_block(vdisk, block, &data[from..from + take])?;
+                // Gather every whole block from here — the run the
+                // implementation may batch.
+                let mut run: Vec<&[u8]> = Vec::new();
+                let mut run_pos = pos;
+                let mut run_from = from;
+                let mut run_block = block;
+                loop {
+                    let start = run_block * block_size;
+                    if run_pos != start || run_pos >= end {
+                        break;
+                    }
+                    let logical = block_size.min(size - start) as usize;
+                    if (end - run_pos) < logical as u64 {
+                        break;
+                    }
+                    run.push(&data[run_from..run_from + logical]);
+                    run_pos += logical as u64;
+                    run_from += logical;
+                    run_block += 1;
+                }
+                self.write_block_run(vdisk, block, &run)?;
+                pos = run_pos;
             } else {
                 let mut whole = vec![0u8; logical];
                 if let Some(existing) = self.read_block(vdisk, block)? {
@@ -104,8 +137,8 @@ pub trait ByteView {
                 }
                 whole[in_off..in_off + take].copy_from_slice(&data[from..from + take]);
                 self.write_block(vdisk, block, &whole)?;
+                pos += take as u64;
             }
-            pos += take as u64;
         }
         Ok(())
     }
@@ -168,6 +201,9 @@ impl<D: Disk> ByteView for ReplNode<D> {
     }
     fn trim_block(&mut self, vdisk: u64, index: u64) -> Result<()> {
         ReplNode::trim_block(self, vdisk, index)
+    }
+    fn write_block_run(&mut self, vdisk: u64, first: u64, blocks: &[&[u8]]) -> Result<()> {
+        ReplNode::write_block_run(self, vdisk, first, blocks)
     }
 }
 

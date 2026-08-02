@@ -1267,6 +1267,110 @@ impl<D: Disk> ReplNode<D> {
         Ok(())
     }
 
+    /// A run of consecutive whole blocks, written as one act: every block
+    /// is hashed and placed exactly as [`ReplNode::write_block`] would,
+    /// but the local stores land through the pool's batched put — one
+    /// disk write per segment run instead of one per block, which was
+    /// the guest path's measured ceiling. Placement is decided for the
+    /// whole run before anything lands, so an unreachable slice refuses
+    /// the run instead of leaving half of it behind.
+    pub fn write_block_run(&mut self, vdisk: u64, first: u64, blocks: &[&[u8]]) -> Result<()> {
+        let hashed: Vec<(BlockHash, &[u8])> = blocks
+            .iter()
+            .map(|payload| (crate::hash::hash_block(payload), *payload))
+            .collect();
+        self.write_block_run_prehashed(vdisk, first, &hashed)
+    }
+
+    /// The run with its addresses already computed — the daemon's guest
+    /// path hashes on the export's worker threads, outside whatever lock
+    /// owns this engine, for the same reason the peer reader does: the
+    /// hash was the largest single cost measured inside that lock. The
+    /// addresses must still be this node's own arithmetic over these same
+    /// bytes — never an outside claim.
+    pub fn write_block_run_prehashed(
+        &mut self,
+        vdisk: u64,
+        first: u64,
+        blocks: &[(BlockHash, &[u8])],
+    ) -> Result<()> {
+        self.writable(vdisk)?;
+        let tier = self.pool.vdisk_tier(vdisk)?;
+        struct PlacedBlock<'a> {
+            hash: BlockHash,
+            payload: &'a [u8],
+            local: bool,
+            remote: Vec<NodeId>,
+        }
+        let mut placed = Vec::with_capacity(blocks.len());
+        for (hash, payload) in blocks {
+            let hash = *hash;
+            debug_assert_eq!(
+                crate::hash::hash_block(payload),
+                hash,
+                "a prehashed block's address must be its content's"
+            );
+            let homes: Vec<NodeId> = match self.pool.write_homes_of(&hash) {
+                Some(homes) => homes,
+                None => {
+                    let mut everyone: Vec<NodeId> = self.peers.keys().copied().collect();
+                    everyone.push(self.node);
+                    everyone
+                }
+            };
+            let local = homes.contains(&self.node);
+            let remote: Vec<NodeId> = homes
+                .iter()
+                .copied()
+                .filter(|home| {
+                    *home != self.node
+                        && self
+                            .peers
+                            .get(home)
+                            .is_some_and(|session| session.stream_active())
+                })
+                .collect();
+            if !local && remote.is_empty() {
+                return Err(FsError::SliceUnreachable(slice::slice_of(&hash) as u8));
+            }
+            placed.push(PlacedBlock {
+                hash,
+                payload,
+                local,
+                remote,
+            });
+        }
+        let local: Vec<(BlockHash, &[u8])> = placed
+            .iter()
+            .filter(|block| block.local)
+            .map(|block| (block.hash, block.payload))
+            .collect();
+        // Stores before ops, run-wide — the same order the single write
+        // keeps per block, and the same crash story the wire has: a
+        // block without its op is an orphan for GC, never a dangling op.
+        self.pool.put_blocks_prehashed(tier, &local)?;
+        for (i, block) in placed.iter().enumerate() {
+            self.with_wal_room(|pool| {
+                pool.write_block_prehashed(vdisk, first + i as u64, block.hash)
+            })?;
+            for peer in &block.remote {
+                self.emit(Effect::Send(
+                    *peer,
+                    PeerMessage::Payloads(vec![(tier, block.payload.to_vec())]),
+                ));
+            }
+            self.send_ops_requiring(
+                vec![ReplOp::Write {
+                    vdisk,
+                    index: first + i as u64,
+                    hash: block.hash,
+                }],
+                Some(&block.remote),
+            );
+        }
+        Ok(())
+    }
+
     pub fn trim_block(&mut self, vdisk: u64, index: u64) -> Result<()> {
         self.writable(vdisk)?;
         self.with_wal_room(|pool| pool.trim_block(vdisk, index))?;
@@ -1513,29 +1617,41 @@ impl<D: Disk> ReplNode<D> {
             self.session(from).backlog.push(PeerMessage::Payloads(wire));
             return Ok(());
         }
-        for (tier, hash, payload) in blocks {
-            debug_assert_eq!(
-                crate::hash::hash_block(&payload),
-                hash,
-                "a prehashed payload's address must be its content's"
-            );
-            // A payload lands only on a home — committed or, mid-
-            // reassignment, pending; the sender routes by the same
-            // union. Anything else is a stray, and a stray stored
-            // here would be the third copy the accounting never
-            // expects.
-            let stores = self
-                .pool
-                .write_homes_of(&hash)
-                .is_none_or(|homes| homes.contains(&self.node));
-            if !stores {
-                continue;
-            }
-            self.pool.put_block_prehashed(tier, hash, &payload)?;
-            // Pinned until the op that references it lands: a
-            // collection between the payload and its op would
-            // otherwise sweep the block and kill the op's replay.
-            self.pool.pin_inflight(from, tier, hash);
+        // A payload lands only on a home — committed or, mid-
+        // reassignment, pending; the sender routes by the same union.
+        // Anything else is a stray, and a stray stored here would be
+        // the third copy the accounting never expects.
+        let storable: Vec<(u8, BlockHash, Vec<u8>)> = blocks
+            .into_iter()
+            .filter(|(_, hash, payload)| {
+                debug_assert_eq!(
+                    crate::hash::hash_block(payload),
+                    *hash,
+                    "a prehashed payload's address must be its content's"
+                );
+                self.pool
+                    .write_homes_of(hash)
+                    .is_none_or(|homes| homes.contains(&self.node))
+            })
+            .collect();
+        // Batched per tier: a coalesced Payloads is a run, and a run
+        // stores in as few disk writes as it has segment runs.
+        let mut tiers: Vec<u8> = storable.iter().map(|(tier, _, _)| *tier).collect();
+        tiers.sort_unstable();
+        tiers.dedup();
+        for tier in tiers {
+            let items: Vec<(BlockHash, &[u8])> = storable
+                .iter()
+                .filter(|(t, _, _)| *t == tier)
+                .map(|(_, hash, payload)| (*hash, payload.as_slice()))
+                .collect();
+            self.pool.put_blocks_prehashed(tier, &items)?;
+        }
+        for (tier, hash, _) in &storable {
+            // Pinned until the op that references it lands: a collection
+            // between the payload and its op would otherwise sweep the
+            // block and kill the op's replay.
+            self.pool.pin_inflight(from, *tier, *hash);
         }
         Ok(())
     }
