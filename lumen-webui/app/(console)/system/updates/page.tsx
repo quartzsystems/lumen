@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -17,92 +17,97 @@ import { Page, PageBody, PageHeader } from "@/components/PageHeader";
 import { Button } from "@/components/ui/Button";
 import { ModalHeader, ModalShell } from "@/components/ui/Modal";
 import { ErrorText, ModalFooter } from "@/components/ui/formkit";
-import { DataTable, type Column } from "@/components/console/DataTable";
-import { Fact, Facts, Mono, Panel } from "@/components/vm/VmBits";
+import { DataTable, type Column, type FilterDef } from "@/components/console/DataTable";
+import { Mono, Panel } from "@/components/vm/VmBits";
 import { useConsole } from "@/lib/ConsoleContext";
 import { ApiError } from "@/lib/authClient";
 import { formatMoment } from "@/lib/systemClient";
+import { fetchEnvironment } from "@/lib/clusterClient";
 import {
   KIND_LABEL,
   KIND_TONE,
   STAGE_LABEL,
   checkClusterUpdates,
-  checkUpdates,
+  collectPending,
   fetchClusterUpdates,
   fetchRollProgress,
   fetchUpdateProgress,
-  fetchUpdates,
   formatAgo,
   formatElapsed,
   installClusterUpdates,
   installPlatform,
-  installUpdates,
   rollClusterUpdates,
-  summarize,
   type ClusterUpdateView,
   type MemberStep,
   type MemberUpdates,
+  type PendingUpdate,
   type RollProgress,
-  type Update,
   type UpdateProgress,
-  type UpdateView,
 } from "@/lib/updateClient";
 
-/// Installing updates on this node.
+/// Everything the environment has waiting, and installing it.
 ///
-/// The page is two decisions, deliberately kept apart and never joined into
+/// The page is written from the environment down rather than from this node
+/// out: an operator asking what is waiting is asking about the appliance they
+/// run, which is every node in it, and a page that answered for whichever node
+/// happened to be serving the console made them visit each one to assemble the
+/// real answer themselves. So the tables below are the whole environment's,
+/// with the nodes waiting on each package named in the row.
+///
+/// The two decisions are still deliberately kept apart and never joined into
 /// one button.
 ///
 /// **Updates** is everything in userland — Lumen's own packages and the
-/// distribution's. Installing them cannot move the kernel, because the
-/// transaction the backend builds excludes the whole platform set by name.
+/// distribution's. Installing them cannot move any node's kernel, because the
+/// transaction each node builds excludes the whole platform set by name.
 ///
-/// **Kernel and storage modules** is the other one. On this appliance the root
+/// **Kernel and Storage Modules** is the other one. On this appliance the root
 /// file system is ZFS and ZFS is an out-of-tree module tracking the kernel's
-/// ABI. They have to move together, and the backend refuses to
-/// install any of them unless the package manager has already confirmed, in a
-/// dry run, that it can move them all. When it cannot, this page says so and
-/// offers nothing — that is the state that would otherwise end with a node
-/// that cannot import its pool at the next restart.
+/// ABI. They have to move together, and a node refuses to install any of them
+/// unless its package manager has already confirmed, in a dry run, that it can
+/// move them all. That set takes effect only on a restart, so it moves through
+/// a rolling update — which drains each node and restarts it — rather than
+/// being installed everywhere and running nowhere.
 ///
-/// Nothing here restarts anything. A new kernel is installed and not running
-/// until somebody says so on Maintenance, which is where the cluster quorum
-/// guard and the drain already live.
+/// The exception is a node that has not joined a cluster: a rolling update
+/// needs somewhere to move the machines, refuses without one, and would leave
+/// such a node with no way to take its kernel at all. That node, and only that
+/// node, still installs its platform set here and restarts from Maintenance.
 export default function UpdatesPage() {
   const { setToast } = useConsole();
-  const [view, setView] = useState<UpdateView | null>(null);
-  const [progress, setProgress] = useState<UpdateProgress | null>(null);
   const [cluster, setCluster] = useState<ClusterUpdateView | null>(null);
   const [roll, setRoll] = useState<RollProgress | null>(null);
+  const [progress, setProgress] = useState<UpdateProgress | null>(null);
+  /// Whether the node serving this page has joined a cluster. Only this
+  /// decides whether the platform fallback below is offered, because it is
+  /// exactly what the backend refuses a rolling update for.
+  const [unclustered, setUnclustered] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [checking, setChecking] = useState(false);
   const [checkingCluster, setCheckingCluster] = useState(false);
   const [busy, setBusy] = useState(false);
   const [confirmingPlatform, setConfirmingPlatform] = useState(false);
   const [confirmingCluster, setConfirmingCluster] = useState(false);
   const [confirmingRoll, setConfirmingRoll] = useState(false);
-  /// The browser's clock when the node's answer arrived, so "last checked"
-  /// ages against the node's clock rather than against a workstation that is a
+  /// The browser's clock when the nodes' answers arrived, so "last checked"
+  /// ages against their clocks rather than against a workstation that is a
   /// minute out — the same discipline the power page uses.
   const [, setTick] = useState(0);
   const polling = useRef(false);
 
   const refresh = useCallback(async () => {
     try {
-      const [next, job, members, walk] = await Promise.all([
-        fetchUpdates(),
-        fetchUpdateProgress(),
+      const [members, walk, job] = await Promise.all([
         fetchClusterUpdates(),
         fetchRollProgress(),
+        fetchUpdateProgress(),
       ]);
-      setView(next);
-      setProgress(job);
       setCluster(members);
       setRoll(walk);
+      setProgress(job);
       setError(null);
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) return;
-      setError(err instanceof Error ? err.message : "Could not read this node's updates.");
+      setError(err instanceof Error ? err.message : "Could not read the environment's updates.");
     }
   }, []);
 
@@ -110,13 +115,28 @@ export default function UpdatesPage() {
     void refresh();
   }, [refresh]);
 
+  // Asked once, and separately: it is a fact about how this node is deployed,
+  // not about what it has waiting, and a failure to read it must not take the
+  // page down with it. Not knowing means not offering the fallback, which is
+  // the safe way round — the rolling update is still there.
+  useEffect(() => {
+    void (async () => {
+      try {
+        const environment = await fetchEnvironment();
+        setUnclustered(environment.unassigned.some((node) => node.local));
+      } catch {
+        setUnclustered(false);
+      }
+    })();
+  }, []);
+
   // A running transaction is polled; a finished one is not. The elapsed
   // counter still needs a re-render every second, which is what the tick is.
   //
   // A running *walk* is polled together with the member table, because the
   // table is where its progress is actually visible: the walk's own record
   // stops when this node updates itself, and the members' own answers do not.
-  const watching = progress?.phase === "running" || roll?.phase === "running";
+  const watching = roll?.phase === "running" || progress?.phase === "running";
   useEffect(() => {
     const timer = setInterval(() => {
       setTick((n) => n + 1);
@@ -124,18 +144,18 @@ export default function UpdatesPage() {
         polling.current = true;
         void (async () => {
           try {
-            const [job, walk, members] = await Promise.all([
-              fetchUpdateProgress(),
+            const [walk, job, members] = await Promise.all([
               fetchRollProgress(),
+              fetchUpdateProgress(),
               fetchClusterUpdates(),
             ]);
-            setProgress(job);
             setRoll(walk);
+            setProgress(job);
             setCluster(members);
             // The moment it finishes, re-read what is left waiting.
             if (
-              (job === null || job.phase !== "running") &&
-              (walk === null || walk.phase !== "running")
+              (walk === null || walk.phase !== "running") &&
+              (job === null || job.phase !== "running")
             ) {
               void refresh();
             }
@@ -156,9 +176,6 @@ export default function UpdatesPage() {
     setCheckingCluster(true);
     try {
       setCluster(await checkClusterUpdates());
-      // This node is one of the members that was just asked, so its own panel
-      // is stale until it is re-read.
-      setView(await fetchUpdates());
       setError(null);
     } catch (err) {
       setToast(err instanceof Error ? err.message : "Could not ask every node.");
@@ -185,22 +202,10 @@ export default function UpdatesPage() {
     }
   };
 
-  const check = async () => {
-    setChecking(true);
-    try {
-      setView(await checkUpdates());
-      setError(null);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not reach the repositories.");
-    } finally {
-      setChecking(false);
-    }
-  };
-
-  const install = async (platform: boolean, acknowledged = false) => {
+  const installLocalPlatform = async () => {
     setBusy(true);
     try {
-      setProgress(platform ? await installPlatform(acknowledged) : await installUpdates());
+      setProgress(await installPlatform(true));
       setConfirmingPlatform(false);
       setToast("Installing. This page shows it through to the end.");
     } catch (err) {
@@ -213,14 +218,14 @@ export default function UpdatesPage() {
   const running = progress?.phase === "running";
   const rolling = roll?.phase === "running";
   const nowSeconds = Math.floor(Date.now() / 1000);
-  const platform = view?.platform;
-  const ordinaryCount = view?.updates.length ?? 0;
-  /// The cluster panel earns its space only when there is more than one node
-  /// to talk about. On a single appliance the panel below says everything it
-  /// would, and a table of one row is furniture.
-  const members = cluster?.members ?? [];
-  const clustered = members.length > 1;
+  const members = useMemo(() => cluster?.members ?? [], [cluster]);
   const clusterWaiting = cluster?.counts.updates ?? 0;
+  const blockedPlatform = cluster?.counts.platform_blocked ?? 0;
+
+  /// Every package waiting anywhere, each row naming the nodes waiting on it.
+  const ordinary = useMemo(() => collectPending(members, false), [members]);
+  const platform = useMemo(() => collectPending(members, true), [members]);
+
   /// Nodes a rolling update would actually restart: a kernel waiting that can
   /// move, or a restart already owed from an earlier install. A node with only
   /// userland updates is not taken down for them, so it does not count here.
@@ -229,13 +234,26 @@ export default function UpdatesPage() {
     if (!view) return false;
     return (view.platform.updates.length > 0 && view.platform.resolves) || view.reboot.required;
   });
-  const blockedPlatform = cluster?.counts.platform_blocked ?? 0;
+  /// Nodes already waiting on a restart to finish something installed earlier.
+  /// A different fact from the line above, and the one worth a callout: the
+  /// work is done and the node is not yet running it.
+  const owedRestart = members.filter((member) => member.updates?.view.reboot.required);
+  /// Nodes whose last check did not finish. The rest of the page still renders
+  /// — including the restart notice, which is read from the nodes themselves
+  /// and is often exactly what an operator in this state needs to see.
+  const checkFailed = members.filter((member) => member.updates?.view.error);
+
+  const localMember = members.find((member) => member.local);
+  const localPlatform = localMember?.updates?.view.platform;
+  /// The one node that cannot take its kernel through a rolling update, so it
+  /// takes it here instead. See the page note.
+  const offerLocalPlatform = unclustered && (localPlatform?.updates.length ?? 0) > 0;
 
   return (
     <Page>
       <PageHeader
         title="Updates"
-        description="What this node could install, and installing it."
+        description="What every node in this environment has waiting, and installing it."
       />
       <PageBody>
         <div className="flex flex-col gap-4">
@@ -246,27 +264,43 @@ export default function UpdatesPage() {
             </div>
           )}
 
-          {/* The last check failed but the page still renders — including the
-              restart notice below, which is read from the node itself and is
-              often exactly what an operator in this state needs to see. */}
-          {view?.error && !error && (
+          {checkFailed.length > 0 && !error && (
             <div className="callout callout-warn">
               <AlertTriangle size={17} className="flex-shrink-0 text-[var(--qz-warn)] mt-[1px]" />
-              <div className="text-[13px] text-[var(--qz-fg-2)]">
-                The last check did not finish: {view.error}
+              <div className="flex-1 min-w-0">
+                <div className="text-[13px] font-semibold text-[var(--qz-fg-1)]">
+                  {checkFailed.length === 1
+                    ? `${checkFailed[0].node}'s last check did not finish`
+                    : `${checkFailed.length} nodes' last check did not finish`}
+                </div>
+                <div className="text-[13px] text-[var(--qz-fg-3)] mt-1">
+                  {checkFailed.length === 1
+                    ? checkFailed[0].updates!.view.error
+                    : `What each of them has waiting is whatever was found before that: ${checkFailed
+                        .map((member) => member.node)
+                        .join(", ")}.`}
+                </div>
               </div>
             </div>
           )}
 
-          {view?.reboot.required && (
+          {owedRestart.length > 0 && (
             <div className="callout callout-warn">
               <RotateCw size={17} className="flex-shrink-0 text-[var(--qz-warn)] mt-[1px]" />
               <div className="flex-1 min-w-0">
                 <div className="text-[13px] font-semibold text-[var(--qz-fg-1)]">
-                  This node needs restarting to finish an update
+                  {owedRestart.length === 1
+                    ? `${owedRestart[0].node} needs restarting to finish an update`
+                    : `${owedRestart.length} nodes need restarting to finish an update`}
                 </div>
                 <div className="text-[13px] text-[var(--qz-fg-3)] mt-1">
-                  {view.reboot.reason}
+                  {owedRestart.length === 1
+                    ? owedRestart[0].updates!.view.reboot.reason
+                    : `${owedRestart
+                        .map((member) => member.node)
+                        .join(", ")} — each is running an older kernel than the one it has ` +
+                      "installed. A rolling update takes them through it one at a time, machines " +
+                      "moved off first."}
                 </div>
               </div>
               <Link href="/system/maintenance" className="flex-shrink-0">
@@ -279,218 +313,193 @@ export default function UpdatesPage() {
 
           {progress && <TransactionCard progress={progress} nowSeconds={nowSeconds} />}
 
-          {clustered && (
-            <Panel
-              title="Every node"
-              actions={
-                <div className="flex items-center gap-2">
-                  <Button
-                    kind="secondary"
-                    icon={RefreshCw}
-                    disabled={checkingCluster || rolling}
-                    onClick={() => void checkEveryNode()}
-                  >
-                    {checkingCluster ? "Checking…" : "Check All"}
-                  </Button>
-                  <Button
-                    kind="secondary"
-                    icon={Layers}
-                    disabled={busy || rolling || running || clusterWaiting === 0}
-                    onClick={() => setConfirmingCluster(true)}
-                  >
-                    Update All Nodes
-                  </Button>
-                  <span
-                    title={
-                      needingRestart.length === 0
+          <Panel
+            title="Every Node"
+            actions={
+              <div className="flex items-center gap-2">
+                <Button
+                  kind="secondary"
+                  icon={RefreshCw}
+                  disabled={checkingCluster || rolling}
+                  onClick={() => void checkEveryNode()}
+                >
+                  {checkingCluster ? "Checking…" : "Check All"}
+                </Button>
+                <Button
+                  kind="secondary"
+                  icon={Layers}
+                  disabled={busy || rolling || running || clusterWaiting === 0}
+                  onClick={() => setConfirmingCluster(true)}
+                >
+                  Update All Nodes
+                </Button>
+                <span
+                  title={
+                    unclustered
+                      ? "This node has not joined a cluster, so there is nowhere to move its machines while it restarts."
+                      : needingRestart.length === 0
                         ? "No node needs a restart, so there is nothing to roll."
                         : undefined
-                    }
+                  }
+                >
+                  <Button
+                    icon={RotateCw}
+                    disabled={busy || rolling || running || unclustered || needingRestart.length === 0}
+                    onClick={() => setConfirmingRoll(true)}
                   >
-                    <Button
-                      icon={RotateCw}
-                      disabled={busy || rolling || running || needingRestart.length === 0}
-                      onClick={() => setConfirmingRoll(true)}
-                    >
-                      Rolling Update
-                    </Button>
-                  </span>
-                </div>
-              }
-            >
-              <p className="text-[13px] text-[var(--qz-fg-3)] m-0 mb-4">
-                {summarizeCluster(cluster)}
-              </p>
-              <p className="text-[13px] text-[var(--qz-fg-3)] m-0 mb-4">
-                <strong>Update All Nodes</strong> installs the ordinary updates on one node at a
-                time. Nothing is taken out of service and nothing restarts, so the kernel is not
-                moved by it. <strong>Rolling Update</strong> is the one that moves the kernel: each
-                node that needs a restart is emptied of its machines, brought fully up to date,
-                restarted, and waited for before the next one is touched. Either way, the first
-                node that fails stops the rest — an update that will not install on one member
-                usually will not install on the next.
-              </p>
-
-              {blockedPlatform > 0 && (
-                <div className="callout callout-warn mb-4">
-                  <AlertTriangle
-                    size={17}
-                    className="flex-shrink-0 text-[var(--qz-warn)] mt-[1px]"
-                  />
-                  <div className="text-[13px] text-[var(--qz-fg-2)]">
-                    {blockedPlatform} node{blockedPlatform === 1 ? "" : "s"} cannot install
-                    {blockedPlatform === 1 ? " its " : " their "}kernel and storage modules
-                    together yet, so a rolling update would stop there. This is ordinary for a few
-                    days after a point release — the storage module has not caught up with the new
-                    kernel. Hover the node&apos;s badge for what its package manager said.
-                  </div>
-                </div>
-              )}
-
-              {roll && <RollCard roll={roll} nowSeconds={nowSeconds} />}
-
-              <MembersTable
-                members={members}
-                roll={roll}
-                nowSeconds={nowSeconds}
-                onRefresh={() => void refresh()}
-              />
-            </Panel>
-          )}
-
-          <Panel
-            title="This node"
-            actions={
-              <Button kind="secondary" icon={RefreshCw} disabled={checking || running} onClick={check}>
-                {checking ? "Checking…" : "Check Now"}
-              </Button>
-            }
-          >
-            <Facts>
-              <Fact label="Node">
-                <Mono>{view?.node ?? "—"}</Mono>
-              </Fact>
-              <Fact label="Last checked">
-                {view?.checked_at ? (
-                  <span title={formatMoment(view.checked_at)}>
-                    {formatAgo(view.checked_at, nowSeconds)}
-                  </span>
-                ) : (
-                  <span className="qz-dim">never</span>
-                )}
-              </Fact>
-              <Fact label="Waiting">{view ? summarize(view) : "—"}</Fact>
-              <Fact label="Running kernel">
-                <Mono>{view?.reboot.kernel.running || "—"}</Mono>
-              </Fact>
-              <Fact label="Newest installed">
-                {view?.reboot.kernel.newest ? (
-                  <Mono>{view.reboot.kernel.newest}</Mono>
-                ) : (
-                  <span className="qz-dim">unknown</span>
-                )}
-              </Fact>
-            </Facts>
-          </Panel>
-
-          <Panel
-            title="Updates"
-            actions={
-              <Button
-                icon={Download}
-                disabled={busy || running || ordinaryCount === 0}
-                onClick={() => void install(false)}
-              >
-                Install {ordinaryCount > 0 ? `${ordinaryCount} ` : ""}Update
-                {ordinaryCount === 1 ? "" : "s"}
-              </Button>
+                    Rolling Update
+                  </Button>
+                </span>
+              </div>
             }
           >
             <p className="text-[13px] text-[var(--qz-fg-3)] m-0 mb-4">
-              Lumen&apos;s own packages and the rest of the system. Installing these never moves the
-              kernel or the storage modules — those are the set below, and they are installed
-              separately on purpose.
+              {summarizeCluster(cluster)}
             </p>
-            <UpdatesTable rows={view?.updates ?? []} onRefresh={check} storageKey="updates" />
+            <p className="text-[13px] text-[var(--qz-fg-3)] m-0 mb-4">
+              <strong>Update All Nodes</strong> installs the ordinary updates on one node at a
+              time. Nothing is taken out of service and nothing restarts, so no kernel is moved by
+              it. <strong>Rolling Update</strong> is the one that moves the kernel: each node that
+              needs a restart is emptied of its machines, brought fully up to date, restarted, and
+              waited for before the next one is touched. Either way, the first node that fails stops
+              the rest — an update that will not install on one member usually will not install on
+              the next.
+            </p>
+
+            {blockedPlatform > 0 && (
+              <div className="callout callout-warn mb-4">
+                <AlertTriangle
+                  size={17}
+                  className="flex-shrink-0 text-[var(--qz-warn)] mt-[1px]"
+                />
+                <div className="text-[13px] text-[var(--qz-fg-2)]">
+                  {blockedPlatform} node{blockedPlatform === 1 ? "" : "s"} cannot install
+                  {blockedPlatform === 1 ? " its " : " their "}kernel and storage modules
+                  together yet, so a rolling update would stop there. This is ordinary for a few
+                  days after a point release — the storage module has not caught up with the new
+                  kernel. Hover the node&apos;s badge for what its package manager said.
+                </div>
+              </div>
+            )}
+
+            {roll && <RollCard roll={roll} nowSeconds={nowSeconds} />}
+
+            <MembersTable
+              members={members}
+              roll={roll}
+              nowSeconds={nowSeconds}
+              onRefresh={() => void refresh()}
+            />
+          </Panel>
+
+          <Panel title="Updates">
+            <p className="text-[13px] text-[var(--qz-fg-3)] m-0 mb-4">
+              Lumen&apos;s own packages and the rest of the system, across every node that
+              answered. One row is one package at one version, naming the nodes waiting on it —
+              so a package waiting everywhere reads as one line, not as one line per node.
+              Installing these never moves a kernel or the storage modules: those are the set
+              below, and they are installed separately on purpose.
+            </p>
+            <PendingTable
+              rows={ordinary}
+              members={members}
+              onRefresh={() => void checkEveryNode()}
+              storageKey="updates-environment"
+            />
           </Panel>
 
           <Panel
-            title="Kernel and storage modules"
+            title="Kernel and Storage Modules"
             actions={
-              platform?.updates.length ? (
-                <span title={platform.resolves ? undefined : "The package manager cannot install these together yet."}>
+              offerLocalPlatform ? (
+                <span
+                  title={
+                    localPlatform!.resolves
+                      ? undefined
+                      : "The package manager cannot install these together yet."
+                  }
+                >
                   <Button
                     kind="secondary"
                     icon={Download}
-                    disabled={busy || running || !platform.resolves}
+                    disabled={busy || running || rolling || !localPlatform!.resolves}
                     onClick={() => setConfirmingPlatform(true)}
                   >
-                    Install {platform.updates.length} Package
-                    {platform.updates.length === 1 ? "" : "s"}
+                    Install {localPlatform!.updates.length} Package
+                    {localPlatform!.updates.length === 1 ? "" : "s"}
                   </Button>
                 </span>
               ) : undefined
             }
           >
             <p className="text-[13px] text-[var(--qz-fg-3)] m-0 mb-4">
-              This node boots from ZFS, and ZFS — like the replication module — is built against one
-              exact kernel. They move as one set or not at all, and Lumen installs them only after
-              the package manager has confirmed it can move all of them together.
+              These nodes boot from ZFS, and ZFS — like the replication module — is built against
+              one exact kernel. They move as one set or not at all, and a node installs them only
+              after its package manager has confirmed it can move all of them together. They take
+              effect only on a restart, which is why they move through a{" "}
+              <strong>Rolling Update</strong> above rather than being installed here: a kernel
+              installed on every node and running on none is an environment that looks updated and
+              is not.
             </p>
 
-            {platform && !platform.resolves && platform.updates.length > 0 && (
+            {offerLocalPlatform && (
+              <div className="callout callout-info mb-4">
+                <Wrench size={17} className="flex-shrink-0 text-[var(--qz-info)] mt-[1px]" />
+                <div className="text-[13px] text-[var(--qz-fg-2)]">
+                  <strong>{localMember!.node}</strong> has not joined a cluster, so a rolling
+                  update has nowhere to move its machines while it restarts and will not take it.
+                  Its {localPlatform!.updates.length} package
+                  {localPlatform!.updates.length === 1 ? "" : "s"} can be installed here instead —
+                  it keeps running its current kernel afterwards, until it is restarted from
+                  Maintenance.
+                </div>
+              </div>
+            )}
+
+            {blockedPlatform > 0 && (
               <div className="callout callout-warn mb-4">
                 <AlertTriangle size={17} className="flex-shrink-0 text-[var(--qz-warn)] mt-[1px]" />
                 <div className="flex-1 min-w-0">
                   <div className="text-[13px] font-semibold text-[var(--qz-fg-1)]">
-                    These cannot be installed together yet
+                    {blockedPlatform === 1 ? "One node" : `${blockedPlatform} nodes`} cannot install
+                    these together yet
                   </div>
                   <div className="text-[13px] text-[var(--qz-fg-3)] mt-1">
                     Usually the storage module has not caught up with a new kernel yet, which
                     happens for a few days after a point release. Nothing is installed until it
                     has — installing the kernel on its own is what leaves a node unable to import
-                    its pool. The package manager said:
-                  </div>
-                  <div className="text-[12px] qz-mono text-[var(--qz-fg-3)] mt-2 break-words">
-                    {platform.detail}
+                    its pool. What each package manager said is on that node&apos;s badge in the
+                    table above.
                   </div>
                 </div>
               </div>
             )}
 
-            {platform && platform.resolves && platform.updates.length > 0 && (
-              <div className="callout callout-ok mb-4">
-                <CheckCircle2 size={17} className="flex-shrink-0 text-[var(--qz-success)] mt-[1px]" />
-                <div className="text-[13px] text-[var(--qz-fg-2)]">
-                  The package manager can install these together. The node keeps running its
-                  current kernel until it is restarted.
-                </div>
-              </div>
-            )}
-
-            <UpdatesTable
-              rows={platform?.updates ?? []}
-              onRefresh={check}
-              storageKey="updates-platform"
+            <PendingTable
+              rows={platform}
+              members={members}
+              onRefresh={() => void checkEveryNode()}
+              storageKey="updates-environment-platform"
             />
           </Panel>
         </div>
       </PageBody>
 
-      {confirmingPlatform && platform && (
+      {confirmingPlatform && offerLocalPlatform && (
         <ConfirmPlatformDialog
-          count={platform.updates.length}
-          names={platform.updates.map((u) => u.name)}
+          node={localMember!.node}
+          count={localPlatform!.updates.length}
+          names={localPlatform!.updates.map((u) => u.name)}
           working={busy}
           onClose={() => setConfirmingPlatform(false)}
-          onConfirm={() => void install(true, true)}
+          onConfirm={() => void installLocalPlatform()}
         />
       )}
 
       {confirmingCluster && cluster && (
         <ConfirmClusterDialog
           order={members.map((member) => member.node)}
-          localNode={members.find((member) => member.local)?.node ?? ""}
+          localNode={localMember?.node ?? ""}
           waiting={clusterWaiting}
           working={busy}
           onClose={() => setConfirmingCluster(false)}
@@ -501,7 +510,7 @@ export default function UpdatesPage() {
       {confirmingRoll && cluster && (
         <ConfirmRollingDialog
           restarting={needingRestart.map((member) => member.node)}
-          localNode={members.find((member) => member.local)?.node ?? ""}
+          localNode={localMember?.node ?? ""}
           working={busy}
           onClose={() => setConfirmingRoll(false)}
           onConfirm={() => void updateEveryNode(true, true)}
@@ -717,7 +726,7 @@ function MembersTable({
             className={`badge badge-${plan.resolves ? "warn" : "crit"}`}
             title={
               plan.resolves
-                ? "Installed from that node's own page, and only with a restart afterwards."
+                ? "Installed by a rolling update, which restarts this node afterwards."
                 : (plan.detail ?? undefined)
             }
           >
@@ -743,6 +752,30 @@ function MembersTable({
           </span>
         ) : (
           <span className="qz-dim">no</span>
+        );
+      },
+    },
+    {
+      key: "kernel",
+      header: "Running kernel",
+      value: (row) => row.updates?.view.reboot.kernel.running ?? "",
+      mono: true,
+      width: 200,
+      render: (row) => {
+        const kernel = row.updates?.view.reboot.kernel;
+        if (!kernel?.running) return <span className="qz-dim">—</span>;
+        return (
+          <Mono>
+            <span
+              title={
+                kernel.newest && kernel.newest !== kernel.running
+                  ? `Newest installed: ${kernel.newest}`
+                  : undefined
+              }
+            >
+              {kernel.running}
+            </span>
+          </Mono>
         );
       },
     },
@@ -871,7 +904,9 @@ function ConfirmClusterDialog({
   return (
     <ModalShell onClose={onClose}>
       <ModalHeader
-        title={`Install ${waiting} update${waiting === 1 ? "" : "s"} across ${order.length} nodes?`}
+        title={`Install ${waiting} update${waiting === 1 ? "" : "s"} across ${order.length} node${
+          order.length === 1 ? "" : "s"
+        }?`}
         subtitle="One node at a time. Nothing restarts."
         onClose={onClose}
       />
@@ -905,8 +940,7 @@ function ConfirmClusterDialog({
 
         <div className="text-[13px] text-[var(--qz-fg-3)]">
           The kernel and the storage modules are not installed by this. They take effect only on a
-          restart, and that is a decision per node — on that node&apos;s own page, through
-          Maintenance.
+          restart, and that is what a rolling update is for.
         </div>
 
         <ModalFooter
@@ -923,6 +957,11 @@ function ConfirmClusterDialog({
 }
 
 /// One transaction, running or finished.
+///
+/// The only thing that still starts one from this page is the platform
+/// fallback for a node with no cluster, but the card is shown whenever the
+/// node has a record — a walk that ended on this node leaves one too, and it
+/// is what the operator has left to read after the control plane came back.
 function TransactionCard({
   progress,
   nowSeconds,
@@ -942,7 +981,7 @@ function TransactionCard({
         />
         <div className="flex-1 min-w-0">
           <div className="text-[13px] font-semibold text-[var(--qz-fg-1)]">
-            Installing {what} — {formatElapsed(Math.max(0, elapsed))}
+            {progress.node}: installing {what} — {formatElapsed(Math.max(0, elapsed))}
           </div>
           <div className="text-[13px] text-[var(--qz-fg-3)] mt-1">
             Started by {progress.by}. The package manager reports nothing until the transaction
@@ -964,8 +1003,8 @@ function TransactionCard({
       <div className="flex-1 min-w-0">
         <div className="text-[13px] font-semibold text-[var(--qz-fg-1)]">
           {failed
-            ? `Installing ${what} did not finish`
-            : `Installed ${progress.changed.length} package${
+            ? `${progress.node}: installing ${what} did not finish`
+            : `${progress.node}: installed ${progress.changed.length} package${
                 progress.changed.length === 1 ? "" : "s"
               } in ${formatElapsed(Math.max(0, elapsed))}`}
         </div>
@@ -993,30 +1032,40 @@ function TransactionCard({
   );
 }
 
-/// The table both panels use. One definition, because a package waiting to be
-/// installed reads the same either way — what differs is the decision above it,
-/// not the columns.
-function UpdatesTable({
+/// The table both package panels use. One definition, because a package
+/// waiting to be installed reads the same either way — what differs is the
+/// decision above it, not the columns.
+///
+/// The Nodes column is the whole point of the page: it is where "waiting" stops
+/// meaning *here* and starts meaning *these three*. The node filter beside the
+/// search box is the other half of it, for an operator who does want one node's
+/// list back.
+function PendingTable({
   rows,
+  members,
   onRefresh,
   storageKey,
 }: {
-  rows: Update[];
+  rows: PendingUpdate[];
+  members: MemberUpdates[];
   onRefresh: () => void;
   storageKey: string;
 }) {
-  const columns: Column<Update>[] = [
+  const columns: Column<PendingUpdate>[] = [
     {
       key: "name",
       header: "Package",
-      value: (row) => row.name,
+      value: (row) => row.update.name,
       mono: true,
       width: 240,
       render: (row) => (
         <span className="inline-flex items-center gap-2 min-w-0">
-          <span className="qz-mono truncate">{row.name}</span>
-          {row.security && (
-            <span className="badge badge-crit inline-flex items-center gap-1" title={row.advisory ?? undefined}>
+          <span className="qz-mono truncate">{row.update.name}</span>
+          {row.update.security && (
+            <span
+              className="badge badge-crit inline-flex items-center gap-1"
+              title={row.update.advisory ?? undefined}
+            >
               <ShieldAlert size={11} />
               security
             </span>
@@ -1025,47 +1074,84 @@ function UpdatesTable({
       ),
     },
     {
+      key: "nodes",
+      header: "Nodes",
+      // The names, not the count: this is what an operator searches by, and
+      // sorting a package list alphabetically by node is how they read "what
+      // is waiting on lumen2" without touching the filter.
+      value: (row) => row.nodes.join(" "),
+      width: 220,
+      render: (row) => (
+        <span className="inline-flex items-center gap-2 min-w-0" title={row.nodes.join(", ")}>
+          {row.nodes.length > 1 && (
+            <span className="badge badge-muted flex-shrink-0">{row.nodes.length}</span>
+          )}
+          <span className="qz-mono truncate">{row.nodes.join(", ")}</span>
+        </span>
+      ),
+    },
+    {
       key: "installed",
       header: "Installed",
-      value: (row) => row.installed ?? "",
+      value: (row) => row.update.installed ?? "",
       mono: true,
       width: 160,
       render: (row) =>
-        row.installed ? <Mono>{row.installed}</Mono> : <span className="qz-dim">not installed</span>,
+        row.update.installed ? (
+          <Mono>{row.update.installed}</Mono>
+        ) : (
+          <span className="qz-dim">not installed</span>
+        ),
     },
     {
       key: "version",
       header: "Available",
-      value: (row) => row.version,
+      value: (row) => row.update.version,
       mono: true,
       width: 160,
     },
     {
       key: "kind",
       header: "Kind",
-      value: (row) => KIND_LABEL[row.kind],
+      value: (row) => KIND_LABEL[row.update.kind],
       width: 140,
       render: (row) => (
-        <span className={`badge badge-${KIND_TONE[row.kind]}`}>{KIND_LABEL[row.kind]}</span>
+        <span className={`badge badge-${KIND_TONE[row.update.kind]}`}>
+          {KIND_LABEL[row.update.kind]}
+        </span>
       ),
     },
-    { key: "repo", header: "From", value: (row) => row.repo, mono: true, width: 150 },
+    { key: "repo", header: "From", value: (row) => row.update.repo, mono: true, width: 150 },
     {
       key: "advisory",
       header: "Advisory",
-      value: (row) => row.advisory ?? "",
+      value: (row) => row.update.advisory ?? "",
       mono: true,
       width: 160,
       render: (row) =>
-        row.advisory ? <Mono>{row.advisory}</Mono> : <span className="qz-dim">—</span>,
+        row.update.advisory ? <Mono>{row.update.advisory}</Mono> : <span className="qz-dim">—</span>,
     },
   ];
+
+  // Only worth offering when there is more than one node to narrow to.
+  const filters: FilterDef<PendingUpdate>[] =
+    members.length > 1
+      ? [
+          {
+            key: "node",
+            label: "Node",
+            options: members.map((member) => ({ value: member.node, label: member.node })),
+            predicate: (row, value) => row.nodes.includes(value),
+          },
+        ]
+      : [];
 
   return (
     <DataTable
       rows={rows}
       columns={columns}
-      rowId={(row) => `${row.name}.${row.arch}`}
+      filters={filters}
+      rowId={(row) => row.key}
       searchPlaceholder="Search packages…"
       emptyMessage="Nothing waiting."
       onRefresh={onRefresh}
@@ -1175,7 +1261,7 @@ function ConfirmRollingDialog({
   );
 }
 
-/// The confirmation in front of a platform install.
+/// The confirmation in front of a platform install on a node with no cluster.
 ///
 /// A checkbox rather than typing the node's name, and that is a deliberate
 /// difference from the restart dialog. Installing these packages is not the
@@ -1184,12 +1270,14 @@ function ConfirmRollingDialog({
 /// quorum guard, and its own drain. What this dialog has to do is make sure
 /// nobody presses it thinking it is the ordinary button.
 function ConfirmPlatformDialog({
+  node,
   count,
   names,
   working,
   onClose,
   onConfirm,
 }: {
+  node: string;
   count: number;
   names: string[];
   working: boolean;
@@ -1202,7 +1290,7 @@ function ConfirmPlatformDialog({
   return (
     <ModalShell onClose={onClose}>
       <ModalHeader
-        title={`Install ${count} kernel and storage package${count === 1 ? "" : "s"}?`}
+        title={`Install ${count} kernel and storage package${count === 1 ? "" : "s"} on ${node}?`}
         subtitle="They move as one set. Nothing restarts."
         onClose={onClose}
       />
@@ -1212,8 +1300,9 @@ function ConfirmPlatformDialog({
           <div className="text-[13px] text-[var(--qz-fg-2)]">
             This replaces the kernel and the storage modules built against it. The package manager
             has already confirmed it can install them together — that check is why this button is
-            offered at all. Afterwards this node keeps running its <strong>current</strong> kernel
-            until it is restarted from Maintenance, where its machines are moved off first.
+            offered at all. Afterwards <strong>{node}</strong> keeps running its{" "}
+            <strong>current</strong> kernel until it is restarted from Maintenance, where its
+            machines are moved off first.
           </div>
         </div>
 
@@ -1229,8 +1318,8 @@ function ConfirmPlatformDialog({
             className="mt-[3px]"
           />
           <span>
-            I understand the kernel and storage modules are being replaced, and that this node has
-            to be restarted before they take effect.
+            I understand the kernel and storage modules are being replaced, and that {node} has to
+            be restarted before they take effect.
           </span>
         </label>
 

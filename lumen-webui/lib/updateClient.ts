@@ -252,6 +252,48 @@ export const STAGE_LABEL: Record<MemberStage, string> = {
 export const fetchRollProgress = (): Promise<RollProgress | null> =>
   apiFetch<RollProgress | null>("/environment/updates/progress");
 
+/// One package waiting somewhere in the environment, and the nodes waiting on
+/// it.
+///
+/// The same package at the same version on six nodes is six transactions, but
+/// it is one thing to read — so it is one row carrying six node names, rather
+/// than six rows saying the same sentence. The counts in [`ClusterCounts`] are
+/// deliberately *not* built this way and should not be reconciled with this
+/// table: those count the work, this lists what the work installs.
+export interface PendingUpdate {
+  /// Stable across refreshes, which is what lets the table keep a selection.
+  key: string;
+  /// One member's row, standing for all of them. Every field the table shows
+  /// is part of the key below, so no node disagrees with it.
+  update: Update;
+  /// In the order the members came back, which is the order the table shows
+  /// them in everywhere else.
+  nodes: string[];
+}
+
+/// Roll every member's pending packages up into one list.
+///
+/// Keyed by what would be installed *and* what is installed now: a node two
+/// versions behind is not the same fact as a node one behind, and merging them
+/// would quietly hide the one that is further back.
+export const collectPending = (
+  members: MemberUpdates[],
+  platform: boolean,
+): PendingUpdate[] => {
+  const byKey = new Map<string, PendingUpdate>();
+  for (const member of members) {
+    const view = member.updates?.view;
+    if (!view) continue;
+    for (const update of platform ? view.platform.updates : view.updates) {
+      const key = `${update.name}.${update.arch}|${update.version}|${update.installed ?? ""}`;
+      const seen = byKey.get(key);
+      if (seen) seen.nodes.push(member.node);
+      else byKey.set(key, { key, update, nodes: [member.node] });
+    }
+  }
+  return [...byKey.values()].sort((a, b) => a.update.name.localeCompare(b.update.name));
+};
+
 // --- display helpers ---------------------------------------------------------
 
 export const KIND_LABEL: Record<UpdateKind, string> = {
@@ -284,20 +326,4 @@ export const formatElapsed = (seconds: number): string => {
   if (seconds < 60) return `${seconds} s`;
   const minutes = Math.floor(seconds / 60);
   return `${minutes} m ${seconds % 60} s`;
-};
-
-/// The one-line summary of what is waiting. Written as a sentence because it
-/// is the first thing on the page and a bare count answers the wrong question.
-export const summarize = (view: UpdateView): string => {
-  const ordinary = view.updates.length;
-  const platform = view.counts.platform;
-  if (ordinary === 0 && platform === 0) {
-    return view.checked_at ? "This node is up to date." : "Nothing has been checked yet.";
-  }
-  const parts: string[] = [];
-  if (ordinary > 0) parts.push(`${ordinary} update${ordinary === 1 ? "" : "s"}`);
-  if (platform > 0) parts.push(`${platform} kernel and storage package${platform === 1 ? "" : "s"}`);
-  const security = view.counts.security;
-  const tail = security > 0 ? ` ${security} of them named in a security advisory.` : "";
-  return `${parts.join(", and ")} waiting.${tail}`;
 };

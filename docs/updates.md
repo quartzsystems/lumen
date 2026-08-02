@@ -240,21 +240,48 @@ said, and whether a restart is now outstanding.
 
 ## Web UI
 
-`System → Updates`, two panels for the two decisions, never joined into one
-button. The platform panel carries the solver's verdict: a green note when the
-set can move, and when it cannot, the solver's own words plus a sentence
-explaining that this is ordinary for a few days after a point release.
+`System → Updates`, written from the environment down rather than from this node
+out. An operator asking what is waiting is asking about the appliance they run,
+which is every node in it; a page that answered for whichever node happened to
+be serving the console made them visit each one and assemble the real answer
+themselves.
 
-The acknowledgement in front of a platform install is a checkbox rather than
-typing the node's name — a deliberate difference from the restart dialog.
-Installing the packages is not the dangerous step; the node carries on running
-its current kernel afterwards. The restart that makes them live has its own
-confirmation, its own quorum guard, and its own drain.
+**Every Node** is the first panel: one row per member with what it has waiting,
+and the two environment-wide buttons. It is there on a single appliance too —
+`GET /api/environment/updates` answers with this node alone when there is no
+environment, so the same table renders either way and the one-node case needs no
+second code path.
 
-Above those two panels, and only when there is more than one member to talk
-about, is **Every node**: one row per member with what it has waiting, and the
-two environment-wide buttons. A table of one row is furniture, so a single
-appliance does not get one.
+Below it are the two decisions, never joined into one button, and both tables
+are the whole environment's. One row is one package at one version naming the
+nodes waiting on it, so a package waiting everywhere reads as one line rather
+than as one line per node. Rows are keyed by what would be installed *and* what
+is installed now — a node two versions behind is not the same fact as a node one
+behind, and merging them would quietly hide the one that is further back. The
+counts in `ClusterCounts` are deliberately not built this way and are not to be
+reconciled with these tables: those count the work, these list what the work
+installs.
+
+**Kernel and Storage Modules** carries the solver's verdict for the nodes that
+are blocked — the solver's own words on each node's badge, plus a sentence
+explaining that this is ordinary for a few days after a point release — and
+normally offers no install button at all. That set takes effect only on a
+restart, so it moves through a rolling update rather than being installed
+everywhere and running nowhere.
+
+The exception is a node that has not joined a cluster. A rolling update has
+nowhere to move its machines, refuses to take it, and would leave it with no way
+to take its kernel from the console at all — so that node, and only that node,
+installs its platform set from this panel and restarts from Maintenance. The
+console decides that from `GET /api/environment`, by whether this node is in
+`unassigned`, which is exactly the condition `visiting_order` refuses the roll
+for.
+
+The acknowledgement in front of that install is a checkbox rather than typing
+the node's name — a deliberate difference from the restart dialog. Installing
+the packages is not the dangerous step; the node carries on running its current
+kernel afterwards. The restart that makes them live has its own confirmation,
+its own quorum guard, and its own drain.
 
 While a walk is running, a member's row shows its step rather than its own
 answer — during a walk the step is the more current of the two, and it is what
