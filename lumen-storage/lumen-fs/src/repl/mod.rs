@@ -1473,6 +1473,64 @@ impl<D: Disk> ReplNode<D> {
     // -----------------------------------------------------------------
     // The peers' messages.
 
+    /// `Payloads`, with the addresses already computed from the bytes.
+    ///
+    /// The address must come from hashing the payload here — never from
+    /// the wire, or a peer could file bytes under a lie — but *here*
+    /// means this node, not this engine: the daemon hashes the batch on
+    /// its reader thread, outside the engine lock, and the apply loop
+    /// stops spending its lock time on arithmetic the reader could have
+    /// done. The stream stays honest; only the core it burns moves.
+    pub fn payloads_prehashed(
+        &mut self,
+        from: NodeId,
+        blocks: Vec<(u8, BlockHash, Vec<u8>)>,
+    ) -> Result<()> {
+        if !self.peers.contains_key(&from) {
+            return Err(FsError::Corrupt(
+                "a message arrived from a peer that never said hello",
+            ));
+        }
+        // A pulling target buffers rather than applies — same rule as
+        // `handle`'s guard. The backlog keeps the wire shape; a replay
+        // after adoption is rare enough to pay the re-hash.
+        if self.peers[&from].state == (ReplState::Resyncing { source: false }) {
+            let wire = blocks
+                .into_iter()
+                .map(|(tier, _, payload)| (tier, payload))
+                .collect();
+            self.session(from)
+                .backlog
+                .push(PeerMessage::Payloads(wire));
+            return Ok(());
+        }
+        for (tier, hash, payload) in blocks {
+            debug_assert_eq!(
+                crate::hash::hash_block(&payload),
+                hash,
+                "a prehashed payload's address must be its content's"
+            );
+            // A payload lands only on a home — committed or, mid-
+            // reassignment, pending; the sender routes by the same
+            // union. Anything else is a stray, and a stray stored
+            // here would be the third copy the accounting never
+            // expects.
+            let stores = self
+                .pool
+                .write_homes_of(&hash)
+                .is_none_or(|homes| homes.contains(&self.node));
+            if !stores {
+                continue;
+            }
+            self.pool.put_block_prehashed(tier, hash, &payload)?;
+            // Pinned until the op that references it lands: a
+            // collection between the payload and its op would
+            // otherwise sweep the block and kill the op's replay.
+            self.pool.pin_inflight(from, tier, hash);
+        }
+        Ok(())
+    }
+
     pub fn handle(&mut self, from: NodeId, message: PeerMessage) -> Result<()> {
         if !matches!(message, PeerMessage::Hello { .. }) && !self.peers.contains_key(&from) {
             return Err(FsError::Corrupt(
@@ -1516,27 +1574,14 @@ impl<D: Disk> ReplNode<D> {
                 Ok(())
             }
             PeerMessage::Payloads(payloads) => {
-                for (tier, payload) in payloads {
-                    let hash = crate::hash::hash_block(&payload);
-                    // A payload lands only on a home — committed or, mid-
-                    // reassignment, pending; the sender routes by the same
-                    // union. Anything else is a stray, and a stray stored
-                    // here would be the third copy the accounting never
-                    // expects.
-                    let stores = self
-                        .pool
-                        .write_homes_of(&hash)
-                        .is_none_or(|homes| homes.contains(&self.node));
-                    if !stores {
-                        continue;
-                    }
-                    self.pool.put_block(tier, &payload)?;
-                    // Pinned until the op that references it lands: a
-                    // collection between the payload and its op would
-                    // otherwise sweep the block and kill the op's replay.
-                    self.pool.pin_inflight(from, tier, hash);
-                }
-                Ok(())
+                let hashed = payloads
+                    .into_iter()
+                    .map(|(tier, payload)| {
+                        let hash = crate::hash::hash_block(&payload);
+                        (tier, hash, payload)
+                    })
+                    .collect();
+                self.payloads_prehashed(from, hashed)
             }
             PeerMessage::Apply { first_rseq, ops } => self.on_apply(from, first_rseq, ops),
             PeerMessage::Flush { up_to } => {

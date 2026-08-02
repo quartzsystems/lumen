@@ -4188,8 +4188,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_member_that_fails_leaves_the_record_on_the_old_definition() {
-        let (service, peers) =
-            core_edit_harness("core-fail", |p| p.fail_core_seat_on("alpha-2"));
+        let (service, peers) = core_edit_harness("core-fail", |p| p.fail_core_seat_on("alpha-2"));
         let error = service
             .update_core_network(
                 "alpha",
@@ -4311,10 +4310,7 @@ mod tests {
         assert_eq!(nic2.mtu, Some(9000));
         assert_eq!(
             backend.cluster_ports(),
-            vec![
-                ("nic1".into(), None, false),
-                ("nic2".into(), None, true)
-            ]
+            vec![("nic1".into(), None, false), ("nic2".into(), None, true)]
         );
 
         // A retry — the coordinator's "ask again" after a failure elsewhere

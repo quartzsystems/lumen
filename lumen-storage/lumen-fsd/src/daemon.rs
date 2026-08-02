@@ -856,7 +856,24 @@ fn run_session(shared: &Arc<Shared>, mut stream: TcpStream) {
                 break;
             }
         };
-        let outcome = shared.with_engine(|engine| engine.handle(peer_node, message));
+        // Payload batches are hashed here, on the reader, before the
+        // engine lock: the address still comes from the bytes on this
+        // node — never the wire — but a big write's hashing no longer
+        // serializes behind every other caller of the engine. This
+        // thread was the stream's bottleneck; the lock was why.
+        let outcome = match message {
+            PeerMessage::Payloads(payloads) => {
+                let hashed = payloads
+                    .into_iter()
+                    .map(|(tier, payload)| {
+                        let hash = lumen_fs::hash_block(&payload);
+                        (tier, hash, payload)
+                    })
+                    .collect();
+                shared.with_engine(|engine| engine.payloads_prehashed(peer_node, hashed))
+            }
+            message => shared.with_engine(|engine| engine.handle(peer_node, message)),
+        };
         if let Err(err) = outcome {
             // A protocol violation or an engine refusal. Dropping the
             // session is always safe: reconnect runs a resync, and the

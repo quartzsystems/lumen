@@ -248,7 +248,9 @@ pub async fn update_core_network(
     raw: Body,
 ) -> Result<Json<lumen_cluster::CoreNetwork>, ApiError> {
     let update: lumen_cluster::CoreNetworkUpdate = required_body(raw)?;
-    Ok(Json(state.cluster.update_core_network(&name, update).await?))
+    Ok(Json(
+        state.cluster.update_core_network(&name, update).await?,
+    ))
 }
 
 /// PUT /api/environment/clusters/{name}/networks/external/{network} — change

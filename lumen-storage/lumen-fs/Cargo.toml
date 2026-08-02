@@ -23,4 +23,4 @@ license = "MIT"
 # block is its address and its checksum. The pure-Rust implementation keeps
 # the crate building on every dev box with no C toolchain; the daemon stage
 # can revisit the assembly kernels if hashing ever shows up in a profile.
-blake3 = { version = "1", features = ["pure"] }
+blake3 = "1"

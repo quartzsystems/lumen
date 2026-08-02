@@ -121,7 +121,10 @@ fi
 if control_cmd vdisks | tr ' ' '\n' | grep -q "^$vdisk="; then
     if [ "$fresh" = 1 ]; then
         echo "pool-bench: deleting leftover scratch vdisk $vdisk"
-        control_cmd unexport "$vdisk" >/dev/null 2>&1 || true
+        # Subshell: a leftover that was never exported makes unexport a
+        # refusal, and control_cmd's die would exit the whole script —
+        # `|| true` cannot catch an `exit`, only a status.
+        (control_cmd unexport "$vdisk") >/dev/null 2>&1 || true
         control_cmd vdisk-delete "$vdisk" >/dev/null
     else
         die "vdisk $vdisk already exists — a leftover from an interrupted run? \

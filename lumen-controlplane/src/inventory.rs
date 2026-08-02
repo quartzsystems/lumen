@@ -61,21 +61,43 @@ pub enum NetworkVerb {
     CreateBridge(lumen_net::Bridge),
     CreateBond(lumen_net::Bond),
     CreateVlan(lumen_net::Vlan),
-    UpdateBridge { name: String, patch: BridgePatch },
-    UpdateBond { name: String, patch: BondPatch },
-    UpdateVlan { name: String, patch: VlanPatch },
-    UpdateNic { name: String, patch: NicPatch },
-    DeleteLink { name: String, kind: lumen_net::LinkKind },
-    Apply { may_disconnect: bool },
+    UpdateBridge {
+        name: String,
+        patch: BridgePatch,
+    },
+    UpdateBond {
+        name: String,
+        patch: BondPatch,
+    },
+    UpdateVlan {
+        name: String,
+        patch: VlanPatch,
+    },
+    UpdateNic {
+        name: String,
+        patch: NicPatch,
+    },
+    DeleteLink {
+        name: String,
+        kind: lumen_net::LinkKind,
+    },
+    Apply {
+        may_disconnect: bool,
+    },
     Confirm,
     Rollback,
-    Extend { seconds: u32 },
+    Extend {
+        seconds: u32,
+    },
     ManagementBridge,
     /// The nicN pins: names that have lost their hardware, and adapters
     /// nothing has claimed.
     Pins,
     /// Give an orphaned nicN to the adapter that replaced its card.
-    Adopt { slot: u32, mac: String },
+    Adopt {
+        slot: u32,
+        mac: String,
+    },
 }
 
 impl NetworkVerb {

@@ -300,11 +300,8 @@ pub trait PeerChannel: Send + Sync {
     /// MTU, never a different address. The Core edit's per-member write,
     /// landing in that node's own networking domain the way `create_bond`
     /// does, staged and applied inside that node's own checkpoint.
-    async fn update_core_seat(
-        &self,
-        node: &EnvironmentNode,
-        update: &CoreSeatUpdate,
-    ) -> Result<()>;
+    async fn update_core_seat(&self, node: &EnvironmentNode, update: &CoreSeatUpdate)
+        -> Result<()>;
 
     async fn start(&self, node: &EnvironmentNode) -> Result<()>;
     async fn teardown(&self, node: &EnvironmentNode, payload: &TeardownPayload) -> Result<()>;

@@ -349,13 +349,45 @@ impl<D: Disk> BrickSet<D> {
     /// The acknowledgement barrier: everything put since the last flush is
     /// durable when this returns, on every brick it touched.
     pub fn flush(&mut self) -> Result<()> {
-        for (position, dirty) in self.dirty.iter_mut().enumerate() {
-            if *dirty {
-                self.bricks[position].flush()?;
-                *dirty = false;
+        // A guest flush dirties at most a data brick and the WAL brick,
+        // and for one or two the spawn costs more than the second sync —
+        // measured: threads here halved syncwrite iops. Inline those.
+        // Three or more is a checkpoint draining the set's writeback,
+        // where six drives should take the time of the slowest, not the
+        // sum.
+        let dirty_count = self.dirty.iter().filter(|d| **d).count();
+        if dirty_count <= 2 {
+            for (position, dirty) in self.dirty.iter_mut().enumerate() {
+                if *dirty {
+                    self.bricks[position].flush()?;
+                    *dirty = false;
+                }
             }
+            return Ok(());
         }
-        Ok(())
+        let mut first_err = None;
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(dirty_count);
+            for (brick, dirty) in self.bricks.iter_mut().zip(self.dirty.iter_mut()) {
+                if *dirty {
+                    handles.push(scope.spawn(move || {
+                        brick.flush()?;
+                        *dirty = false;
+                        Ok(())
+                    }));
+                }
+            }
+            for handle in handles {
+                let outcome: Result<()> = handle.join().expect("a brick flush panicked");
+                if outcome.is_err() && first_err.is_none() {
+                    first_err = outcome.err();
+                }
+            }
+        });
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 
     // -----------------------------------------------------------------

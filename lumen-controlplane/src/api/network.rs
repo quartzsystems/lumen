@@ -68,10 +68,7 @@ impl NodeQuery {
 /// definition of what each verb does — the operator-facing handlers below
 /// and the peer relay in `api/peer.rs` both end here, which is what makes a
 /// forwarded write indistinguishable from a local one.
-pub async fn run_verb(
-    state: &AppState,
-    verb: NetworkVerb,
-) -> Result<serde_json::Value, ApiError> {
+pub async fn run_verb(state: &AppState, verb: NetworkVerb) -> Result<serde_json::Value, ApiError> {
     fn out<T: serde::Serialize>(value: T) -> Result<serde_json::Value, ApiError> {
         serde_json::to_value(value).map_err(|err| ApiError::Internal(anyhow::anyhow!("{err}")))
     }
@@ -96,12 +93,10 @@ pub async fn run_verb(
         NetworkVerb::DeleteLink { name, kind } => {
             out(state.network.delete_link(&name, kind).await?)
         }
-        NetworkVerb::Apply { may_disconnect } => out(
-            state
-                .network
-                .apply(Acknowledgements { may_disconnect })
-                .await?,
-        ),
+        NetworkVerb::Apply { may_disconnect } => out(state
+            .network
+            .apply(Acknowledgements { may_disconnect })
+            .await?),
         NetworkVerb::Confirm => out(state.network.confirm().await?),
         NetworkVerb::Rollback => out(state.network.rollback().await?),
         NetworkVerb::Extend { seconds } => out(state.network.extend(seconds).await?),

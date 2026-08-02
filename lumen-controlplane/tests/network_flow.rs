@@ -627,7 +627,9 @@ async fn a_request_for_a_stranger_is_refused_clearly() {
     );
 
     // The reads a remote edit leans on refuse a stranger the same way.
-    let (status, body) = h.call("GET", "/api/network/pending?node=lumen02", None).await;
+    let (status, body) = h
+        .call("GET", "/api/network/pending?node=lumen02", None)
+        .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
 
@@ -665,8 +667,7 @@ async fn the_peer_verb_route_runs_here_with_a_ticket_and_never_with_a_cookie() {
     // same dispatcher the local routes use, so what it staged shows up in
     // this node's own pending set.
     let h = harness("peer-verb").await;
-    let ticket =
-        lumen_controlplane::security::issue_peer_ticket(TICKET_SECRET, "lumen02").unwrap();
+    let ticket = lumen_controlplane::security::issue_peer_ticket(TICKET_SECRET, "lumen02").unwrap();
     let request = Request::post("/api/peer/network/verb")
         .header(header::AUTHORIZATION, format!("Bearer {ticket}"))
         .header(header::CONTENT_TYPE, "application/json")

@@ -21,7 +21,10 @@ pub mod file;
 /// The tortured thing: the deterministic crash-simulation disk.
 pub mod sim;
 
-pub trait Disk {
+// `Send` because the engine that owns disks lives behind a mutex shared
+// across threads, and a multi-brick flush syncs bricks concurrently —
+// both already demand it of any real implementation.
+pub trait Disk: Send {
     /// Total size in bytes. Fixed for the life of the handle.
     fn size(&self) -> u64;
 
